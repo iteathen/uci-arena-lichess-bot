@@ -1,0 +1,5 @@
+config.yml
+config.local.yml
+*.local.yml
+*.token
+logs/

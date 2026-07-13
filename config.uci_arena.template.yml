@@ -1,0 +1,43 @@
+# Merge this block into a local lichess-bot config.yml.
+# Replace placeholders outside Git before live use.
+token: "<LICHESS_OAUTH_TOKEN>"
+url: "https://lichess.org/"
+
+engine:
+  dir: "<UCI_ARENA_REPO>/build/Release"
+  name: "flashfork_uci.exe"
+  working_dir: "<UCI_ARENA_REPO>"
+  protocol: "uci"
+  ponder: true
+  debug: false
+  uci_options:
+    Threads: 4
+    BackgroundSearch: true
+    BehaviorProfile: "balanced"
+    ModelBackend: "flashfork"
+    ModelRoot: "engine/runtime/models/flashfork_pv12_mobile_nnue_v1/engine"
+
+polyglot:
+  enabled: false
+
+online_moves:
+  chessdb_book:
+    enabled: false
+  lichess_cloud_analysis:
+    enabled: false
+  lichess_opening_explorer:
+    enabled: false
+
+challenge:
+  concurrency: 1
+  variants:
+    - standard
+  time_controls:
+    - blitz
+    - rapid
+    - classical
+  modes:
+    - casual
+
+matchmaking:
+  allow_matchmaking: false
