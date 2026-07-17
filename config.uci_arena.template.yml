@@ -1,43 +1,32 @@
-# Merge this block into a local lichess-bot config.yml.
-# Replace placeholders outside Git before live use.
-token: "<LICHESS_OAUTH_TOKEN>"
-url: "https://lichess.org/"
-
-engine:
-  dir: "<UCI_ARENA_REPO>/build/Release"
-  name: "flashfork_uci.exe"
-  working_dir: "<UCI_ARENA_REPO>"
-  protocol: "uci"
-  ponder: true
-  debug: false
-  uci_options:
-    Threads: 4
-    BackgroundSearch: true
-    BehaviorProfile: "balanced"
-    ModelBackend: "flashfork"
-    ModelRoot: "engine/runtime/models/flashfork_pv12_mobile_nnue_v1/engine"
-
-polyglot:
-  enabled: false
-
-online_moves:
-  chessdb_book:
-    enabled: false
-  lichess_cloud_analysis:
-    enabled: false
-  lichess_opening_explorer:
-    enabled: false
-
-challenge:
-  concurrency: 1
-  variants:
-    - standard
-  time_controls:
-    - blitz
-    - rapid
-    - classical
-  modes:
-    - casual
-
-matchmaking:
-  allow_matchmaking: false
+{
+  "schema": "uci_arena_lichess_adapter_v1",
+  "url": "https://lichess.org/",
+  "engine": {
+    "executable": "<UCI_ARENA_REPO>/build/Release/flashfork_uci.exe",
+    "working_directory": "<UCI_ARENA_REPO>",
+    "search_timeout_grace_ms": 10000,
+    "uci_options": {
+      "Threads": 4,
+      "BackgroundSearch": true,
+      "BehaviorProfile": "balanced",
+      "ModelBackend": "flashfork",
+      "ModelRoot": "engine/runtime/models/resnet_fp16/engine"
+    }
+  },
+  "challenges": {
+    "concurrency": 1,
+    "accept_bots": true,
+    "min_base": 180,
+    "max_base": 1800,
+    "min_increment": 0,
+    "max_increment": 10,
+    "speeds": ["rapid", "classical"],
+    "modes": ["casual"]
+  },
+  "outbound_challenge": {
+    "rated": false,
+    "color": "random",
+    "clock_limit": 180,
+    "clock_increment": 2
+  }
+}

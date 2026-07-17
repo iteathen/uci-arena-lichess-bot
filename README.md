@@ -1,15 +1,27 @@
-# UCI Arena Lichess Bot Bridge
+# UCI Arena Lichess Adapter
 
-This directory contains the Lichess deployment adapter surface for UCI Arena.
-It targets the existing `lichess-bot` UCI bridge and does not implement a
-custom Lichess API client.
+This directory owns the Node deployment adapter between the Lichess Bot API
+and UCI Arena. The adapter keeps all Lichess transport, challenge filtering,
+game reconstruction, and UCI process orchestration outside the C++ engine.
+
+The adapter uses only Node built-ins. It does not require a Python bridge or
+third-party runtime package.
 
 ## Files
 
-- `config.uci_arena.template.yml`: engine block/template values to merge into a
-  local `lichess-bot` `config.yml`.
-- `smoke_uci_startup.py`: local readiness smoke for the engine command in the
-  template. It does not contact Lichess and does not read any token file.
+- `config.uci_arena.template.yml`: credential-free JSON-compatible YAML for
+  engine paths, UCI options, incoming challenge policy, and the optional
+  outbound challenge.
+- `lichess-adapter.mjs`: authenticated account probe, NDJSON stream handling,
+  challenge lifecycle, game sessions, and persistent UCI engine ownership.
+- `smoke-uci-startup.mjs`: local readiness smoke that does not contact Lichess
+  and does not read any token file.
+
+## Account Requirement
+
+Lichess Bot API play requires a BOT account. Lichess only permits conversion
+before an account has played any game, and conversion is irreversible. Create
+a fresh dedicated account if the intended account has already played.
 
 ## Setup
 
@@ -19,36 +31,50 @@ custom Lichess API client.
    cmake --build build --config Release --target flashfork_uci
    ```
 
-2. Copy or merge `config.uci_arena.template.yml` into your local
-   `lichess-bot` `config.yml`.
+2. Verify local UCI startup and configured options:
 
-3. Replace placeholders outside Git:
+   ```powershell
+   node deploy\lichess\smoke-uci-startup.mjs `
+     --config deploy\lichess\config.uci_arena.template.yml
+   ```
 
-   - `<UCI_ARENA_REPO>`: absolute path to this repository.
-   - `<LICHESS_OAUTH_TOKEN>`: Lichess OAuth token value in the local
-     `lichess-bot` config only.
+3. Probe the authenticated BOT account. The adapter reads the token internally
+   and never places it in config, argv, logs, or tracked files:
 
-4. Keep live configs untracked. `deploy/lichess/config.yml`,
-   `deploy/lichess/config.local.yml`, `*.local.yml`, and `*.token` are ignored.
+   ```powershell
+   node deploy\lichess\lichess-adapter.mjs probe `
+     --token-file secrets\lichess_bot_token.txt `
+     --expected-account <LICHESS_ACCOUNT>
+   ```
 
-## Local Readiness Smoke
+4. Start the adapter to accept supported incoming challenges:
 
-Run this before attempting live bot play:
+   ```powershell
+   node deploy\lichess\lichess-adapter.mjs run `
+     --token-file secrets\lichess_bot_token.txt `
+     --expected-account <LICHESS_ACCOUNT>
+   ```
 
-```powershell
-python deploy\lichess\smoke_uci_startup.py --config deploy\lichess\config.uci_arena.template.yml
-```
+   Add `--opponent <LICHESS_ACCOUNT>` to send one casual standard `3+2`
+   challenge after the event stream is connected.
 
-The smoke replaces `<UCI_ARENA_REPO>` in memory with the current repository
-root, starts `build/Release/flashfork_uci.exe`, applies the template UCI
-options, waits for `uciok` and `readyok`, then asks for `go depth 1` from the
-starting position.
+## Runtime Policy
+
+- One casual standard game runs at a time.
+- Incoming rapid and classical challenges from humans or bots are accepted
+  when their clock is between `3+0` and `30+10`.
+- Rated, correspondence, non-standard, and concurrent challenges are declined.
+- The adapter starts one persistent UCI process per game, applies only
+  advertised options, reconstructs `position startpos moves ...`, forwards the
+  live clocks through `go wtime ...`, and submits only a valid UCI `bestmove`.
+- Move telemetry is emitted as token-free JSON lines.
 
 ## Guardrails
 
-- Do not commit a live `lichess-bot` config containing credentials.
-- Do not read, print, validate, or summarize `secrets/lichess_bot_token.txt`.
+- Do not read, print, validate, or summarize
+  `secrets/lichess_bot_token.txt`; pass its path only to the adapter process.
+- Do not commit credentials, account handles, generated runtime metadata, or
+  game output.
 - Keep Lichess integration outside `engine/src` and `engine/include`.
-- Only list UCI options that `flashfork_uci.exe` advertises during startup.
-- Do not copy model binaries into this directory; the template references the
-  existing `engine/runtime/models` layout through the engine working directory.
+- Keep model artifacts in `engine/runtime/models`; override `ModelRoot` at
+  invocation time when needed.
