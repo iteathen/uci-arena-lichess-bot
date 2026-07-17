@@ -284,9 +284,9 @@ export class UciEngine {
 }
 
 export function challengeDeclineReason(challenge, policy, activeGames = 0) {
-  if (challenge.direction && challenge.direction !== "in") return "generic";
   if (activeGames >= Number(policy.concurrency ?? 1)) return "later";
-  if (challenge.variant?.key !== "standard" || challenge.initialFen) return "variant";
+  if (challenge.variant?.key !== "standard") return "variant";
+  if (challenge.initialFen && challenge.initialFen !== "startpos") return "variant";
   if (!policy.modes.includes(challenge.rated ? "rated" : "casual")) {
     return challenge.rated ? "rated" : "casual";
   }
@@ -297,6 +297,11 @@ export function challengeDeclineReason(challenge, policy, activeGames = 0) {
   if (clock.increment < policy.min_increment || clock.increment > policy.max_increment) return "timeControl";
   if (!policy.accept_bots && String(challenge.challenger?.title ?? "").toUpperCase() === "BOT") return "noBot";
   return null;
+}
+
+export function challengeFromSelf(challenge, account) {
+  const challenger = String(challenge.challenger?.name ?? challenge.challenger?.id ?? "");
+  return challenger.toLocaleLowerCase() === account.toLocaleLowerCase();
 }
 
 function log(event, details = {}) {
@@ -434,7 +439,7 @@ class BotController {
   async onEvent(event) {
     if (event.type === "challenge") {
       const challenge = event.challenge;
-      if (challenge.direction !== "in") {
+      if (challengeFromSelf(challenge, this.account)) {
         log("outbound_challenge_observed", { challenge_id: challenge.id });
         return;
       }

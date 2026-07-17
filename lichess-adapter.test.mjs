@@ -8,6 +8,7 @@ import {
   DEFAULT_TEMPLATE,
   LichessClient,
   ROOT,
+  challengeFromSelf,
   challengeDeclineReason,
   loadRuntimeConfig,
   parseNdjsonStream,
@@ -97,7 +98,16 @@ test("challenge policy accepts only the configured clean standard shape", () => 
     challenger: { title: "BOT" },
   };
   assert.equal(challengeDeclineReason(challenge, policy), null);
+  assert.equal(challengeDeclineReason({ ...challenge, initialFen: "startpos" }, policy), null);
   assert.equal(challengeDeclineReason({ ...challenge, rated: true }, policy), "rated");
   assert.equal(challengeDeclineReason({ ...challenge, variant: { key: "chess960" } }, policy), "variant");
+  assert.equal(challengeDeclineReason({ ...challenge, initialFen: "8/8/8/8/8/8/8/8 w - - 0 1" }, policy), "variant");
   assert.equal(challengeDeclineReason(challenge, policy, 1), "later");
+});
+
+test("challenge ownership comes from challenger identity, not direction", () => {
+  const selfChallenge = { direction: "in", challenger: { name: "UCI_Arena_Bot" } };
+  const incomingChallenge = { direction: "out", challenger: { name: "Opponent" } };
+  assert.equal(challengeFromSelf(selfChallenge, "uci_arena_bot"), true);
+  assert.equal(challengeFromSelf(incomingChallenge, "UCI_Arena_Bot"), false);
 });
