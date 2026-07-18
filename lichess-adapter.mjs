@@ -30,6 +30,7 @@ export function loadRuntimeConfig({
   templatePath = DEFAULT_TEMPLATE,
   repoRoot = ROOT,
   modelRoot,
+  environment = process.env,
 } = {}) {
   const parsed = JSON.parse(readFileSync(templatePath, "utf8"));
   if (parsed.schema !== "uci_arena_lichess_adapter_v1") {
@@ -46,7 +47,8 @@ export function loadRuntimeConfig({
   if (!config.engine.uci_options || typeof config.engine.uci_options !== "object") {
     throw new Error("Lichess adapter config is missing engine UCI options");
   }
-  if (modelRoot) config.engine.uci_options.ModelRoot = modelRoot;
+  const selectedModelRoot = modelRoot || environment.UCI_ARENA_MODEL_ROOT?.trim();
+  if (selectedModelRoot) config.engine.uci_options.ModelRoot = selectedModelRoot;
   return config;
 }
 

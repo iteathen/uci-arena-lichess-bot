@@ -35,6 +35,24 @@ test("runtime config is credential-free and resolves repository paths", () => {
   assert.equal(config.engine.executable.includes(ROOT.replaceAll("\\", "/")), true);
 });
 
+test("runtime config accepts the shared active model environment override", () => {
+  const selected = "engine/runtime/models/compact_chessformer_gab_v1/engine";
+  const config = loadRuntimeConfig({
+    templatePath: DEFAULT_TEMPLATE,
+    repoRoot: ROOT,
+    environment: { UCI_ARENA_MODEL_ROOT: selected },
+  });
+  assert.equal(config.engine.uci_options.ModelRoot, selected);
+
+  const explicit = loadRuntimeConfig({
+    templatePath: DEFAULT_TEMPLATE,
+    repoRoot: ROOT,
+    modelRoot: "engine/runtime/models/explicit/engine",
+    environment: { UCI_ARENA_MODEL_ROOT: selected },
+  });
+  assert.equal(explicit.engine.uci_options.ModelRoot, "engine/runtime/models/explicit/engine");
+});
+
 test("NDJSON parser handles split chunks and keepalive lines", async () => {
   const encoder = new TextEncoder();
   const chunks = ["{\"type\":\"game", "Start\"}\n\n{\"type\":\"gameFinish\"}"];
