@@ -13,7 +13,8 @@ third-party runtime package.
   engine paths, UCI options, incoming challenge policy, and the optional
   outbound challenge.
 - `lichess-adapter.mjs`: authenticated account probe, NDJSON stream handling,
-  challenge lifecycle, game sessions, and persistent UCI engine ownership.
+  qualified-profile enforcement, challenge lifecycle, game sessions, and
+  persistent UCI engine ownership.
 - `smoke-uci-startup.mjs`: local readiness smoke that does not contact Lichess
   and does not read any token file.
 
@@ -38,7 +39,20 @@ a fresh dedicated account if the intended account has already played.
      --config deploy\lichess\config.uci_arena.template.yml
    ```
 
-3. Probe the authenticated BOT account. The adapter reads the token internally
+3. Publish a current `uci_arena_single_game_profile_v1` only after the bound
+   model, GPU provider, cursor, deadline, topology, and complete-game evidence
+   passes. Then validate the exact executable, model manifest, evidence hashes,
+   and a local V2 start-position search:
+
+   ```powershell
+   node deploy\lichess\lichess-adapter.mjs qualify `
+     --profile runtime_state\models\<MODEL_ID>\cache\uci_arena_single_game_profile_v1.json
+   ```
+
+   `UCI_ARENA_SINGLE_GAME_PROFILE` is the equivalent environment override.
+   Qualification does not contact Lichess or read a credential.
+
+4. Probe the authenticated BOT account. The adapter reads the token internally
    and never places it in config, argv, logs, or tracked files:
 
    ```powershell
@@ -47,7 +61,8 @@ a fresh dedicated account if the intended account has already played.
      --expected-account <LICHESS_ACCOUNT>
    ```
 
-4. Start the adapter to accept supported incoming challenges:
+5. Start the adapter to accept supported incoming challenges. `run` repeats the
+   local qualification before reading the token or opening a Lichess stream:
 
    ```powershell
    node deploy\lichess\lichess-adapter.mjs run `
@@ -61,6 +76,11 @@ a fresh dedicated account if the intended account has already played.
 ## Runtime Policy
 
 - One casual standard game runs at a time.
+- The qualified profile owns SearchCore V2, threads, root workers, split depth,
+  GPU provider, batch controls, speculation, and disabled background search.
+- Launch fails on identity drift, GPU-to-CPU fallback, inactive persistent/root
+  workers, absent pending/resumed cursor activity, stale publications, cache
+  pin deferrals, repetition imbalance, or leaked terminal tickets/leases.
 - Incoming rapid and classical challenges from humans or bots are accepted
   when their clock is between `3+0` and `30+10`.
 - Rated, correspondence, non-standard, and concurrent challenges are declined.

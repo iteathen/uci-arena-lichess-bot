@@ -1,16 +1,16 @@
 {
-  "schema": "uci_arena_lichess_adapter_v1",
+  "schema": "uci_arena_lichess_adapter_v2",
   "url": "https://lichess.org/",
   "engine": {
     "executable": "<UCI_ARENA_REPO>/build/Release/flashfork_uci.exe",
     "working_directory": "<UCI_ARENA_REPO>",
+    "single_game_profile": "<UCI_ARENA_REPO>/runtime_state/models/compact_chessformer_gab_v1/cache/uci_arena_single_game_profile_v1.json",
     "search_timeout_grace_ms": 10000,
+    "shutdown_grace_ms": 5000,
     "uci_options": {
-      "Threads": 4,
-      "BackgroundSearch": true,
       "BehaviorProfile": "balanced",
       "ModelBackend": "flashfork",
-      "ModelRoot": "engine/runtime/models/resnet_fp16/engine"
+      "ModelRoot": "engine/runtime/models/compact_chessformer_gab_v1/engine"
     }
   },
   "challenges": {

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
@@ -12,6 +13,43 @@ export const REPO_PLACEHOLDER = "<UCI_ARENA_REPO>";
 export const DEFAULT_TEMPLATE = path.join(HERE, "config.uci_arena.template.yml");
 export const DEFAULT_TOKEN_FILE = path.join(ROOT, "secrets", "lichess_bot_token.txt");
 export const DEFAULT_RUNTIME_DIR = path.join(HERE, "runtime");
+
+const PROFILE_OWNED_UCI_OPTIONS = Object.freeze({
+  search_core: "SearchCore",
+  threads: "Threads",
+  root_workers: "RootWorkers",
+  split_depth: "V2SplitDepth",
+  provider: "OnnxProvider",
+  batch_size: "NNBatchSize",
+  batch_wait_us: "NNBatchWaitUs",
+  speculation: "NNSpeculation",
+  background_search: "BackgroundSearch",
+});
+const REQUIRED_PROFILE_EVIDENCE = Object.freeze([
+  "cursor_correctness",
+  "provider_parity",
+  "deadline",
+  "topology",
+  "complete_game",
+]);
+
+function sha256File(filePath) {
+  return `sha256:${createHash("sha256").update(readFileSync(filePath)).digest("hex")}`;
+}
+
+function requireString(value, label, pattern) {
+  if (typeof value !== "string" || !value || (pattern && !pattern.test(value))) {
+    throw new Error(`Single-game profile ${label} is invalid`);
+  }
+  return value;
+}
+
+function requireInteger(value, label, minimum, maximum = Number.MAX_SAFE_INTEGER) {
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`Single-game profile ${label} must be in ${minimum}..${maximum}`);
+  }
+  return value;
+}
 
 function replaceRepoPlaceholder(value, repoRoot) {
   if (typeof value === "string") {
@@ -30,10 +68,11 @@ export function loadRuntimeConfig({
   templatePath = DEFAULT_TEMPLATE,
   repoRoot = ROOT,
   modelRoot,
+  profilePath,
   environment = process.env,
 } = {}) {
   const parsed = JSON.parse(readFileSync(templatePath, "utf8"));
-  if (parsed.schema !== "uci_arena_lichess_adapter_v1") {
+  if (parsed.schema !== "uci_arena_lichess_adapter_v2") {
     throw new Error(`Unsupported Lichess adapter config schema: ${parsed.schema ?? "missing"}`);
   }
   const serialized = JSON.stringify(parsed).toLowerCase();
@@ -49,7 +88,119 @@ export function loadRuntimeConfig({
   }
   const selectedModelRoot = modelRoot || environment.UCI_ARENA_MODEL_ROOT?.trim();
   if (selectedModelRoot) config.engine.uci_options.ModelRoot = selectedModelRoot;
+  const selectedProfile = profilePath || environment.UCI_ARENA_SINGLE_GAME_PROFILE?.trim();
+  if (selectedProfile) config.engine.single_game_profile = selectedProfile;
+  if (!config.engine.single_game_profile) {
+    throw new Error("Lichess adapter config is missing engine.single_game_profile");
+  }
+  if (Number(config.challenges?.concurrency) !== 1) {
+    throw new Error("The single-game Lichess profile requires challenge concurrency 1");
+  }
   return config;
+}
+
+export function loadSingleGameProfile(profilePath) {
+  const resolvedPath = path.resolve(profilePath);
+  const profile = JSON.parse(readFileSync(resolvedPath, "utf8"));
+  if (profile.schema !== "uci_arena_single_game_profile_v1") {
+    throw new Error(`Unsupported single-game profile schema: ${profile.schema ?? "missing"}`);
+  }
+  if (profile.qualified !== true) throw new Error("Single-game profile is not qualified");
+  requireString(profile.published_at, "published_at");
+  if (!Number.isFinite(Date.parse(profile.published_at))) {
+    throw new Error("Single-game profile published_at is not an RFC3339 timestamp");
+  }
+  requireString(profile.model_id, "model_id", /^[A-Za-z0-9_.-]+$/);
+  requireString(profile.model_fingerprint, "model_fingerprint", /^\d+$/);
+  requireString(profile.checkpoint_hash, "checkpoint_hash", /^[0-9a-f]{64}$/);
+  requireString(profile.adapter_id, "adapter_id", /^[A-Za-z0-9_.-]+$/);
+  requireString(profile.engine_build_fingerprint, "engine_build_fingerprint", /^sha256:[0-9a-f]{64}$/);
+  requireString(profile.hardware_driver_fingerprint, "hardware_driver_fingerprint", /^\d+$/);
+  requireString(profile.onnx_runtime_version, "onnx_runtime_version");
+  requireString(profile.provider_numeric_fingerprint, "provider_numeric_fingerprint", /^\d+$/);
+  if (profile.search_core !== "v2") throw new Error("Single-game profile must select SearchCore v2");
+  if (!new Set(["directml", "cuda"]).has(profile.provider)) {
+    throw new Error("Single-game profile provider must be directml or cuda");
+  }
+  requireInteger(profile.threads, "threads", 1, 64);
+  requireInteger(profile.root_workers, "root_workers", 1, 16);
+  requireInteger(profile.split_depth, "split_depth", 2, 64);
+  requireInteger(profile.batch_size, "batch_size", 2, 256);
+  requireInteger(profile.batch_wait_us, "batch_wait_us", 0, 2_000);
+  if (typeof profile.speculation !== "boolean") {
+    throw new Error("Single-game profile speculation must be boolean");
+  }
+  if (!profile.qualification_probe || typeof profile.qualification_probe !== "object") {
+    throw new Error("Single-game profile qualification_probe is missing");
+  }
+  requireInteger(profile.qualification_probe.depth, "qualification_probe.depth", profile.split_depth, 64);
+  requireInteger(profile.qualification_probe.timeout_ms, "qualification_probe.timeout_ms", 1_000, 600_000);
+  if (!profile.evidence || typeof profile.evidence !== "object") {
+    throw new Error("Single-game profile evidence is missing");
+  }
+  for (const name of REQUIRED_PROFILE_EVIDENCE) {
+    const evidence = profile.evidence[name];
+    if (!evidence || evidence.passed !== true) {
+      throw new Error(`Single-game profile evidence ${name} is not passed`);
+    }
+    requireString(evidence.artifact, `evidence.${name}.artifact`);
+    requireString(evidence.artifact_sha256, `evidence.${name}.artifact_sha256`, /^sha256:[0-9a-f]{64}$/);
+    const artifactCandidates = path.isAbsolute(evidence.artifact)
+      ? [evidence.artifact]
+      : [
+        path.resolve(ROOT, evidence.artifact),
+        path.resolve(path.dirname(resolvedPath), evidence.artifact),
+      ];
+    const artifactPath = artifactCandidates.find((candidate) => existsSync(candidate));
+    if (!artifactPath) {
+      throw new Error(`Single-game profile evidence ${name} artifact is missing`);
+    }
+    if (sha256File(artifactPath) !== evidence.artifact_sha256) {
+      throw new Error(`Single-game profile evidence ${name} hash mismatch`);
+    }
+  }
+  return { ...profile, profile_path: resolvedPath };
+}
+
+export function applySingleGameProfile(config) {
+  const profile = loadSingleGameProfile(config.engine.single_game_profile);
+  const engineFingerprint = sha256File(config.engine.executable);
+  if (engineFingerprint !== profile.engine_build_fingerprint) {
+    throw new Error("Single-game profile engine build fingerprint mismatch");
+  }
+  const modelRoot = path.resolve(
+    config.engine.working_directory,
+    config.engine.uci_options.ModelRoot,
+  );
+  const checkpointManifestPath = path.join(modelRoot, "checkpoint_manifest.json");
+  if (!existsSync(checkpointManifestPath)) {
+    throw new Error("Single-game profile model checkpoint manifest is missing");
+  }
+  const checkpointManifest = JSON.parse(readFileSync(checkpointManifestPath, "utf8"));
+  if (checkpointManifest.model_id !== profile.model_id
+      || checkpointManifest.checkpoint_hash !== profile.checkpoint_hash) {
+    throw new Error("Single-game profile model/checkpoint identity mismatch");
+  }
+  const profileValues = {
+    SearchCore: profile.search_core,
+    Threads: profile.threads,
+    RootWorkers: profile.root_workers,
+    V2SplitDepth: profile.split_depth,
+    OnnxProvider: profile.provider,
+    NNBatchSize: profile.batch_size,
+    NNBatchWaitUs: profile.batch_wait_us,
+    NNSpeculation: profile.speculation,
+    BackgroundSearch: false,
+  };
+  for (const optionName of Object.values(PROFILE_OWNED_UCI_OPTIONS)) {
+    if (Object.hasOwn(config.engine.uci_options, optionName)
+        && String(config.engine.uci_options[optionName]) !== String(profileValues[optionName])) {
+      throw new Error(`Tracked config conflicts with profile-owned UCI option ${optionName}`);
+    }
+  }
+  config.engine.uci_options = { ...config.engine.uci_options, ...profileValues };
+  config.engine.qualification_profile = profile;
+  return profile;
 }
 
 export function parseNdjsonStream(stream) {
@@ -169,13 +320,109 @@ export async function probeAccount({
 
 function parseInfo(line) {
   const telemetry = {};
-  for (const key of ["depth", "seldepth", "nodes", "nps", "time", "hashfull"]) {
+  for (const key of [
+    "depth",
+    "seldepth",
+    "nodes",
+    "nps",
+    "time",
+    "hashfull",
+    "actual_active_workers",
+    "v2_cursor_admissions",
+    "v2_cursor_async_pending",
+    "v2_cursor_ready_resumes",
+    "v2_cursor_capacity_deferrals",
+    "v2_cursor_readiness_waits",
+    "v2_cursor_peak_waiting",
+  ]) {
     const match = line.match(new RegExp(`(?:^| )${key} (\\d+)`));
     if (match) telemetry[key] = Number(match[1]);
   }
   const score = line.match(/(?:^| )score (cp|mate) (-?\d+)/);
   if (score) telemetry.score = { unit: score[1], value: Number(score[2]) };
   return telemetry;
+}
+
+export function parseRuntimeStatus(line) {
+  const prefix = "info string runtime_status_v1 ";
+  if (!line.startsWith(prefix)) throw new Error("UCI runtime status response is malformed");
+  const status = JSON.parse(line.slice(prefix.length));
+  if (status.schema !== "uci_runtime_status_v1") {
+    throw new Error(`Unsupported UCI runtime status schema: ${status.schema ?? "missing"}`);
+  }
+  return status;
+}
+
+function requireRuntimeStatus(condition, message) {
+  if (!condition) throw new Error(`Single-game runtime qualification failed: ${message}`);
+}
+
+export function validateRuntimeStatus(profile, status) {
+  requireRuntimeStatus(status.model_loaded === true, "model is not loaded");
+  requireRuntimeStatus(status.model_id === profile.model_id, "model_id mismatch");
+  requireRuntimeStatus(status.model_fingerprint === profile.model_fingerprint, "model fingerprint mismatch");
+  requireRuntimeStatus(status.adapter_id === profile.adapter_id, "adapter mismatch");
+  requireRuntimeStatus(status.provider_requested === profile.provider, "requested provider mismatch");
+  requireRuntimeStatus(status.provider_effective === profile.provider, "GPU provider fallback");
+  requireRuntimeStatus(
+    status.provider_numeric_fingerprint === profile.provider_numeric_fingerprint,
+    "provider numeric fingerprint mismatch",
+  );
+  requireRuntimeStatus(
+    status.hardware_driver_fingerprint === profile.hardware_driver_fingerprint,
+    "hardware/driver fingerprint mismatch",
+  );
+  requireRuntimeStatus(
+    status.onnx_runtime_version === profile.onnx_runtime_version,
+    "ONNX Runtime version mismatch",
+  );
+  requireRuntimeStatus(status.search_core_configured === "v2", "SearchCore v2 is not configured");
+  requireRuntimeStatus(status.threads_configured === profile.threads, "thread topology mismatch");
+  requireRuntimeStatus(
+    status.root_workers_configured === profile.root_workers,
+    "root-worker topology mismatch",
+  );
+  requireRuntimeStatus(status.split_depth_configured === profile.split_depth, "split depth mismatch");
+  requireRuntimeStatus(status.batch_size_configured === profile.batch_size, "configured batch mismatch");
+  requireRuntimeStatus(status.batch_size_effective === profile.batch_size, "effective batch mismatch");
+  requireRuntimeStatus(
+    status.batch_wait_us_configured === profile.batch_wait_us
+      && status.batch_wait_us_effective === profile.batch_wait_us,
+    "batch wait mismatch",
+  );
+  requireRuntimeStatus(status.background_search === false, "background search must be disabled");
+  requireRuntimeStatus(status.last_search_available === true, "qualification search is missing");
+  requireRuntimeStatus(status.last_search_core === "v2", "qualification search used legacy core");
+  requireRuntimeStatus(status.last_search_threads === profile.threads, "active thread topology mismatch");
+  requireRuntimeStatus(
+    status.last_search_root_workers === profile.root_workers,
+    "active root-worker topology mismatch",
+  );
+  requireRuntimeStatus(status.actual_active_workers > 0, "no V2 worker became active");
+  requireRuntimeStatus(status.root_workers_active === true, "root workers were inactive");
+  requireRuntimeStatus(status.worker_gate_active === true, "V2 worker gate was inactive");
+  requireRuntimeStatus(status.persistent_workers === true, "persistent workers were inactive");
+  requireRuntimeStatus(status.search_batch_coupling === true, "search/batch coupling was inactive");
+  requireRuntimeStatus(status.v2_cursor_admissions > 0, "no root cursor was admitted");
+  requireRuntimeStatus(status.v2_cursor_async_pending > 0, "no root cursor suspended on inference");
+  requireRuntimeStatus(status.v2_cursor_ready_resumes > 0, "no ready root cursor resumed");
+  requireRuntimeStatus(status.v2_cursor_peak_waiting > 0, "no concurrent cursor wait was observed");
+  requireRuntimeStatus(
+    status.evaluation_service_async_lease_completions > 0,
+    "no asynchronous inference lease completed",
+  );
+  requireRuntimeStatus(
+    status.evaluation_service_stale_publications_discarded === 0,
+    "stale evaluation publication",
+  );
+  requireRuntimeStatus(
+    status.evaluation_service_active_async_leases === 0,
+    "terminal async leases remain active",
+  );
+  requireRuntimeStatus(status.evaluation_service_active_tickets === 0, "terminal tickets remain active");
+  requireRuntimeStatus(status.model_cache_eviction_deferrals === 0, "model cache pin deferral");
+  requireRuntimeStatus(status.repetition_unbalanced_workers === 0, "repetition state imbalance");
+  return status;
 }
 
 export class UciEngine {
@@ -213,6 +460,7 @@ export class UciEngine {
       this.send(`setoption name ${name} value ${String(value)}`);
     }
     await this.exchange("isready", (line) => line === "readyok", 30_000);
+    if (this.config.qualification_profile) await this.qualifyRuntime();
   }
 
   onLine(line) {
@@ -263,6 +511,32 @@ export class UciEngine {
     await this.exchange("isready", (line) => line === "readyok", 30_000);
   }
 
+  async runtimeStatus() {
+    const line = await this.exchange(
+      "runtime_status",
+      (candidate) => candidate.startsWith("info string runtime_status_v1 "),
+      30_000,
+    );
+    return parseRuntimeStatus(line);
+  }
+
+  async qualifyRuntime() {
+    const profile = this.config.qualification_profile;
+    await this.newGame();
+    this.send("position startpos");
+    const line = await this.exchange(
+      `go depth ${profile.qualification_probe.depth}`,
+      (candidate) => candidate.startsWith("bestmove "),
+      profile.qualification_probe.timeout_ms,
+    );
+    const bestmove = line.split(/\s+/)[1];
+    if (!/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(bestmove)) {
+      throw new Error(`Qualification search returned unusable bestmove: ${bestmove ?? "missing"}`);
+    }
+    this.qualificationStatus = validateRuntimeStatus(profile, await this.runtimeStatus());
+    return this.qualificationStatus;
+  }
+
   async search({ moves, wtime, btime, winc, binc, color }) {
     this.latestInfo = {};
     this.send(moves.length ? `position startpos moves ${moves.join(" ")}` : "position startpos");
@@ -277,10 +551,29 @@ export class UciEngine {
     return { bestmove, telemetry: this.latestInfo };
   }
 
-  close() {
-    if (!this.child) return;
-    if (this.child.stdin.writable) this.send("quit");
-    this.child.kill();
+  async close() {
+    const child = this.child;
+    if (!child) return;
+    this.child = undefined;
+    let exited = child.exitCode !== null;
+    const exitPromise = exited
+      ? Promise.resolve()
+      : new Promise((resolve) => child.once("exit", () => {
+        exited = true;
+        resolve();
+      }));
+    if (child.stdin.writable) {
+      child.stdin.write("quit\n");
+      child.stdin.end();
+    }
+    let timer;
+    await Promise.race([
+      exitPromise,
+      new Promise((resolve) => {
+        timer = setTimeout(resolve, Number(this.config.shutdown_grace_ms ?? 5_000));
+      }),
+    ]).finally(() => clearTimeout(timer));
+    if (!exited) child.kill();
     this.lines?.close();
   }
 }
@@ -355,7 +648,7 @@ class GameSession {
           if (!this.finished) throw new Error("Lichess game stream closed before the game finished");
         } catch (error) {
           if (this.signal.aborted) break;
-          engine?.close();
+          await engine?.close();
           engine = undefined;
           consecutiveFailures += 1;
           log("game_stream_error", { game_id: this.gameId, message: error.message, retry_ms: reconnectDelay });
@@ -367,7 +660,7 @@ class GameSession {
         }
       }
     } finally {
-      engine?.close();
+      await engine?.close();
     }
   }
 
@@ -470,6 +763,10 @@ class BotController {
 
   startGame(gameId) {
     if (!gameId || this.activeGames.has(gameId)) return;
+    if (this.activeGames.size >= 1) {
+      log("concurrent_game_blocked", { game_id: gameId, active_games: this.activeGames.size });
+      return;
+    }
     this.pendingChallenges.delete(gameId);
     const task = new GameSession({
       client: this.client,
@@ -517,7 +814,7 @@ function writeRuntimeMetadata(runtimeDir, metadata) {
 
 function parseArguments(argv) {
   const [command, ...rest] = argv;
-  if (!command) throw new Error("Expected config, probe, or run command");
+  if (!command) throw new Error("Expected config, qualify, probe, or run command");
   const options = { command };
   for (let index = 0; index < rest.length; index += 2) {
     const key = rest[index];
@@ -528,18 +825,46 @@ function parseArguments(argv) {
   return options;
 }
 
+async function preflightQualifiedEngine(config) {
+  const engine = new UciEngine(config.engine);
+  try {
+    await engine.start();
+    return engine.qualificationStatus;
+  } finally {
+    await engine.close();
+  }
+}
+
 export async function main(argv = process.argv.slice(2)) {
   const options = parseArguments(argv);
   const config = loadRuntimeConfig({
     templatePath: path.resolve(options.config ?? DEFAULT_TEMPLATE),
     repoRoot: path.resolve(options.repo_root ?? ROOT),
     modelRoot: options.model_root,
+    profilePath: options.profile,
   });
   if (options.command === "config") {
     console.log(JSON.stringify({ status: "ready", schema: config.schema, engine: config.engine.executable }));
     return 0;
   }
-  if (!new Set(["probe", "run"]).has(options.command)) throw new Error(`Unknown command: ${options.command}`);
+  if (!new Set(["qualify", "probe", "run"]).has(options.command)) {
+    throw new Error(`Unknown command: ${options.command}`);
+  }
+  let qualificationStatus;
+  if (options.command === "qualify" || options.command === "run") {
+    const qualificationProfile = applySingleGameProfile(config);
+    qualificationStatus = await preflightQualifiedEngine(config);
+    if (options.command === "qualify") {
+      console.log(JSON.stringify({
+        status: "qualified",
+        schema: qualificationProfile.schema,
+        model_id: qualificationProfile.model_id,
+        provider: qualificationStatus.provider_effective,
+        cursor_ready_resumes: qualificationStatus.v2_cursor_ready_resumes,
+      }));
+      return 0;
+    }
+  }
   const expectedAccount = options.expected_account;
   if (!expectedAccount) throw new Error("--expected-account is required");
   const tokenFile = path.resolve(options.token_file ?? DEFAULT_TOKEN_FILE);
@@ -561,6 +886,9 @@ export async function main(argv = process.argv.slice(2)) {
     account: profile.username,
     engine: config.engine.executable,
     model_root: config.engine.uci_options.ModelRoot,
+    qualification_profile: config.engine.qualification_profile.profile_path,
+    model_id: config.engine.qualification_profile.model_id,
+    provider: qualificationStatus.provider_effective,
     outbound_opponent: options.opponent ?? null,
   });
   log("adapter_started", { account: profile.username, opponent: options.opponent ?? null });
