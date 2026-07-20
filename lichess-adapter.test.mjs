@@ -1,25 +1,29 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
 import {
   DEFAULT_TEMPLATE,
+  BotController,
   LichessClient,
   ROOT,
   UciEngine,
   challengeFromSelf,
   challengeDeclineReason,
   applySingleGameProfile,
+  loadCapacityProfile,
   loadRuntimeConfig,
   loadSingleGameProfile,
   parseNdjsonStream,
+  parseArguments,
   parseRuntimeStatus,
   probeAccount,
   validateRuntimeStatus,
 } from "./lichess-adapter.mjs";
+import { LichessStore } from "./lichess-store.mjs";
 
 function temporaryToken() {
   const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-lichess-"));
@@ -167,6 +171,40 @@ test("runtime config accepts the shared active model environment override", () =
   assert.equal(explicit.engine.uci_options.ModelRoot, "engine/runtime/models/explicit/engine");
 });
 
+test("v2 config migrates to one shared slot with automatic scheduling disabled", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-v2-config-"));
+  const template = JSON.parse(readFileSync(DEFAULT_TEMPLATE, "utf8"));
+  template.schema = "uci_arena_lichess_adapter_v2";
+  delete template.capacity;
+  delete template.scheduler;
+  template.challenges.concurrency = 1;
+  const configPath = path.join(directory, "v2.json");
+  writeFileSync(configPath, JSON.stringify(template));
+  const config = loadRuntimeConfig({ templatePath: configPath });
+  assert.equal(config.capacity.total_slots, 1);
+  assert.equal(config.capacity.legacy_shared, true);
+  assert.equal(config.scheduler.enabled, false);
+});
+
+test("v3 accepts a configurable sixteen-slot layout and rejects invalid sums", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-v3-config-"));
+  const template = JSON.parse(readFileSync(DEFAULT_TEMPLATE, "utf8"));
+  template.capacity = {
+    ...template.capacity,
+    total_slots: 16,
+    startup_parallelism: 4,
+    human: { ...template.capacity.human, slots: 2 },
+    bot: { ...template.capacity.bot, slots: 14, target_active: 14 },
+  };
+  const configPath = path.join(directory, "v3.json");
+  writeFileSync(configPath, JSON.stringify(template));
+  assert.equal(loadRuntimeConfig({ templatePath: configPath }).capacity.total_slots, 16);
+  template.capacity.bot.slots = 13;
+  template.capacity.bot.target_active = 13;
+  writeFileSync(configPath, JSON.stringify(template));
+  assert.throws(() => loadRuntimeConfig({ templatePath: configPath }), /must sum/);
+});
+
 test("qualified single-game profile is identity-bound and owns the parallel topology", () => {
   const fixture = qualifiedFixture();
   const loaded = loadSingleGameProfile(fixture.profilePath);
@@ -202,6 +240,33 @@ test("profile-owned topology rejects a conflicting tracked option", () => {
   const fixture = qualifiedFixture();
   fixture.config.engine.uci_options.SearchCore = "legacy";
   assert.throws(() => applySingleGameProfile(fixture.config), /conflicts.*SearchCore/);
+});
+
+test("capacity profile is exact-identity-bound and may qualify a larger configured pool", () => {
+  const fixture = qualifiedFixture();
+  const single = loadSingleGameProfile(fixture.profilePath);
+  fixture.config.capacity = { total_slots: 2, legacy_shared: false };
+  const capacityPath = path.join(path.dirname(fixture.profilePath), "capacity.json");
+  const capacity = {
+    schema: "uci_arena_lichess_capacity_profile_v1",
+    qualified: true,
+    published_at: "2026-07-20T00:00:00Z",
+    maximum_concurrency: 4,
+    engine_build_fingerprint: fixture.profile.engine_build_fingerprint,
+    single_game_profile_sha256: sha256(readFileSync(fixture.profilePath)),
+    model_fingerprint: fixture.profile.model_fingerprint,
+    provider_numeric_fingerprint: fixture.profile.provider_numeric_fingerprint,
+    hardware_driver_fingerprint: fixture.profile.hardware_driver_fingerprint,
+    evidence: Array.from({ length: 4 }, (_, index) => ({ child: index + 1, qualified: true })),
+  };
+  writeFileSync(capacityPath, JSON.stringify(capacity));
+  assert.equal(loadCapacityProfile(capacityPath, fixture.config, single).maximum_concurrency, 4);
+  fixture.config.capacity.total_slots = 5;
+  assert.throws(() => loadCapacityProfile(capacityPath, fixture.config, single), /exceeds qualified/);
+  fixture.config.capacity.total_slots = 2;
+  capacity.model_fingerprint = "different";
+  writeFileSync(capacityPath, JSON.stringify(capacity));
+  assert.throws(() => loadCapacityProfile(capacityPath, fixture.config, single), /model_fingerprint mismatch/);
 });
 
 test("runtime status gate accepts active one-game cursor batching and rejects fallback", () => {
@@ -271,6 +336,20 @@ test("API client keeps credentials in the authorization header", async () => {
   assert.equal(JSON.stringify(request.options).includes("test-token"), true);
 });
 
+test("API client applies at least sixty seconds of non-move backoff after 429", async () => {
+  const client = new LichessClient({
+    token: "test-token",
+    fetchImpl: async () => ({
+      ok: false,
+      status: 429,
+      headers: { get: () => "1" },
+    }),
+  });
+  const before = Date.now();
+  await assert.rejects(client.json("api/account"), /HTTP 429/);
+  assert.ok(client.requestQueue.nonMoveBlockedUntil >= before + 60_000);
+});
+
 test("account probe rejects a mismatched account", async () => {
   const fetchImpl = async () => ({
     ok: true,
@@ -319,4 +398,129 @@ test("challenge ownership comes from challenger identity, not direction", () => 
   const incomingChallenge = { direction: "out", challenger: { name: "Opponent" } };
   assert.equal(challengeFromSelf(selfChallenge, "uci_arena_bot"), true);
   assert.equal(challengeFromSelf(incomingChallenge, "UCI_Arena_Bot"), false);
+});
+
+test("nested local control commands parse without touching credentials", () => {
+  assert.deepEqual(parseArguments(["owner", "add", "--username", "owner"]), {
+    command: "owner", action: "add", username: "owner",
+  });
+  assert.deepEqual(parseArguments(["reserve", "--opponent", "owner", "--games", "2"]), {
+    command: "reserve", opponent: "owner", games: "2",
+  });
+});
+
+test("concurrent inbound events cannot overbook one bot slot", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-admission-"));
+  const store = new LichessStore(path.join(directory, "matches.sqlite"));
+  const posts = [];
+  const client = {
+    post: async (endpoint, form) => {
+      posts.push({ endpoint, form });
+      return { json: async () => ({}) };
+    },
+  };
+  const config = {
+    capacity: {
+      total_slots: 1,
+      startup_parallelism: 1,
+      legacy_shared: false,
+      human: { slots: 0, allow_borrowing: false, accept_public: true },
+      bot: { slots: 1, target_active: 0 },
+    },
+    challenges: {
+      accept_bots: true,
+      min_base: 180,
+      max_base: 1800,
+      min_increment: 0,
+      max_increment: 10,
+      speeds: ["blitz", "rapid", "classical"],
+      modes: ["casual"],
+    },
+    scheduler: { decline_cooldown_minutes: 360 },
+  };
+  const controller = new BotController({
+    client,
+    config,
+    account: "self",
+    runtimeDir: directory,
+    signal: new AbortController().signal,
+    store,
+  });
+  let releasePreparation;
+  const preparationGate = new Promise((resolve) => { releasePreparation = resolve; });
+  controller.prepareSlot = async (slot) => {
+    await preparationGate;
+    controller.slots.attachEngine(slot, { close: async () => {} });
+    return slot;
+  };
+  const challenge = (id, name) => ({
+    id,
+    rated: false,
+    speed: "blitz",
+    variant: { key: "standard" },
+    timeControl: { type: "clock", limit: 180, increment: 2 },
+    challenger: { id: name, title: "BOT" },
+  });
+  try {
+    const first = controller.onChallenge(challenge("one", "bot-one"));
+    const second = controller.onChallenge(challenge("two", "bot-two"));
+    releasePreparation();
+    await Promise.all([first, second]);
+    assert.equal(posts.filter((entry) => entry.endpoint.endsWith("/accept")).length, 1);
+    assert.equal(posts.filter((entry) => entry.endpoint.endsWith("/decline")
+      && entry.form.reason === "later").length, 1);
+    assert.equal(controller.slots.snapshot().byAudience.bot.pending, 1);
+  } finally {
+    await controller.slots.drainAll();
+    store.close();
+  }
+});
+
+test("restart recovery prefers canonical opponent id over a title-prefixed display name", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-recovery-"));
+  const store = new LichessStore(path.join(directory, "matches.sqlite"));
+  store.replaceOnlineBots([{ username: "usunfish", title: "BOT" }]);
+  let requestedEndpoint;
+  const client = {
+    json: async (endpoint) => {
+      requestedEndpoint = endpoint;
+      return {
+        nowPlaying: [{
+          gameId: "game",
+          opponent: { id: "usunfish", username: "BOT uSunfish" },
+        }],
+      };
+    },
+  };
+  const config = {
+    capacity: {
+      total_slots: 2,
+      startup_parallelism: 2,
+      human: { slots: 1, allow_borrowing: false, accept_public: true },
+      bot: { slots: 1, target_active: 1 },
+    },
+  };
+  const controller = new BotController({
+    client,
+    config,
+    account: "self",
+    runtimeDir: directory,
+    signal: new AbortController().signal,
+    store,
+  });
+  let recovered;
+  controller.prepareSlot = async (slot) => {
+    controller.slots.attachEngine(slot, { close: async () => {} });
+    return slot;
+  };
+  controller.startGame = async (game, slot) => { recovered = { game, slot }; };
+  try {
+    await controller.recoverPlayingGames();
+    assert.equal(requestedEndpoint, "api/account/playing?nb=50");
+    assert.equal(recovered.slot.opponent, "usunfish");
+    assert.equal(recovered.slot.audience, "bot");
+  } finally {
+    await controller.slots.drainAll();
+    store.close();
+  }
 });

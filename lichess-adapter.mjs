@@ -2,17 +2,33 @@
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+
+import {
+  AsyncSemaphore,
+  LichessHttpError,
+  PriorityRequestQueue,
+  SlotPool,
+  reservationBlocksPublicHuman,
+  selectWeightedCandidate,
+} from "./lichess-scheduler.mjs";
+import { LichessStore, normalizedUsername } from "./lichess-store.mjs";
+import {
+  installWindowsStartup,
+  queryWindowsStartup,
+  uninstallWindowsStartup,
+} from "./windows-startup.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT = path.resolve(HERE, "../..");
 export const REPO_PLACEHOLDER = "<UCI_ARENA_REPO>";
 export const DEFAULT_TEMPLATE = path.join(HERE, "config.uci_arena.template.yml");
 export const DEFAULT_TOKEN_FILE = path.join(ROOT, "secrets", "lichess_bot_token.txt");
-export const DEFAULT_RUNTIME_DIR = path.join(HERE, "runtime");
+export const DEFAULT_RUNTIME_DIR = path.join(ROOT, "runtime_state", "lichess");
+export const DEFAULT_STORE_FILE = path.join(DEFAULT_RUNTIME_DIR, "matches.sqlite");
 
 const PROFILE_OWNED_UCI_OPTIONS = Object.freeze({
   search_core: "SearchCore",
@@ -33,6 +49,13 @@ const REQUIRED_PROFILE_EVIDENCE = Object.freeze([
   "complete_game",
 ]);
 
+export function assertSupportedNode() {
+  const [major, minor] = process.versions.node.split(".").map(Number);
+  if (major < 24 || (major === 24 && minor < 15)) {
+    throw new Error(`Lichess adapter requires Node.js >=24.15.0; found ${process.versions.node}`);
+  }
+}
+
 function sha256File(filePath) {
   return `sha256:${createHash("sha256").update(readFileSync(filePath)).digest("hex")}`;
 }
@@ -46,7 +69,7 @@ function requireString(value, label, pattern) {
 
 function requireInteger(value, label, minimum, maximum = Number.MAX_SAFE_INTEGER) {
   if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
-    throw new Error(`Single-game profile ${label} must be in ${minimum}..${maximum}`);
+    throw new Error(`${label} must be in ${minimum}..${maximum}`);
   }
   return value;
 }
@@ -64,6 +87,70 @@ function replaceRepoPlaceholder(value, repoRoot) {
   return value;
 }
 
+function validateCapacityConfig(config) {
+  const capacity = config.capacity;
+  if (!capacity || typeof capacity !== "object") throw new Error("Lichess adapter config is missing capacity");
+  requireInteger(capacity.total_slots, "capacity.total_slots", 1, 64);
+  requireInteger(capacity.startup_parallelism, "capacity.startup_parallelism", 1, 64);
+  for (const audience of ["human", "bot"]) {
+    if (!capacity[audience] || typeof capacity[audience] !== "object") {
+      throw new Error(`Lichess adapter config is missing capacity.${audience}`);
+    }
+    requireInteger(capacity[audience].slots, `capacity.${audience}.slots`, 0, 64);
+  }
+  requireInteger(capacity.bot.target_active, "capacity.bot.target_active", 0, capacity.bot.slots);
+  if (capacity.human.slots + capacity.bot.slots !== capacity.total_slots) {
+    throw new Error("Lichess adapter capacity human and bot slots must sum to total_slots");
+  }
+  if (typeof capacity.human.allow_borrowing !== "boolean"
+      || typeof capacity.human.accept_public !== "boolean") {
+    throw new Error("Lichess adapter human capacity flags must be boolean");
+  }
+  if (!capacity.legacy_shared && !capacity.capacity_profile) {
+    throw new Error("Lichess adapter config is missing capacity.capacity_profile");
+  }
+  const scheduler = config.scheduler;
+  if (!scheduler || typeof scheduler.enabled !== "boolean") {
+    throw new Error("Lichess adapter config is missing scheduler policy");
+  }
+  for (const [name, minimum, maximum] of [
+    ["discovery_interval_seconds", 15, 3600],
+    ["challenge_interval_seconds", 1, 300],
+    ["reservation_retry_seconds", 5, 600],
+    ["challenge_timeout_seconds", 10, 300],
+    ["max_games_per_opponent_per_day", 1, 100],
+    ["timeout_cooldown_minutes", 1, 1440],
+    ["decline_cooldown_minutes", 1, 10080],
+    ["rating_target", 400, 4000],
+    ["rating_spread", 50, 2000],
+  ]) requireInteger(scheduler[name], `scheduler.${name}`, minimum, maximum);
+  return config;
+}
+
+function migrateV2Config(config) {
+  config.capacity = {
+    total_slots: 1,
+    capacity_profile: null,
+    startup_parallelism: 1,
+    legacy_shared: true,
+    human: { slots: 1, allow_borrowing: false, accept_public: true },
+    bot: { slots: 0, target_active: 0 },
+  };
+  config.scheduler = {
+    enabled: false,
+    discovery_interval_seconds: 60,
+    challenge_interval_seconds: 5,
+    reservation_retry_seconds: 30,
+    challenge_timeout_seconds: 25,
+    max_games_per_opponent_per_day: 2,
+    timeout_cooldown_minutes: 30,
+    decline_cooldown_minutes: 360,
+    rating_target: 2200,
+    rating_spread: 600,
+  };
+  return config;
+}
+
 export function loadRuntimeConfig({
   templatePath = DEFAULT_TEMPLATE,
   repoRoot = ROOT,
@@ -72,7 +159,7 @@ export function loadRuntimeConfig({
   environment = process.env,
 } = {}) {
   const parsed = JSON.parse(readFileSync(templatePath, "utf8"));
-  if (parsed.schema !== "uci_arena_lichess_adapter_v2") {
+  if (!new Set(["uci_arena_lichess_adapter_v2", "uci_arena_lichess_adapter_v3"]).has(parsed.schema)) {
     throw new Error(`Unsupported Lichess adapter config schema: ${parsed.schema ?? "missing"}`);
   }
   const serialized = JSON.stringify(parsed).toLowerCase();
@@ -80,6 +167,7 @@ export function loadRuntimeConfig({
     throw new Error("Tracked Lichess config must not contain credentials");
   }
   const config = replaceRepoPlaceholder(parsed, path.resolve(repoRoot));
+  if (config.schema === "uci_arena_lichess_adapter_v2") migrateV2Config(config);
   if (!config.engine?.executable || !config.engine?.working_directory) {
     throw new Error("Lichess adapter config is missing engine paths");
   }
@@ -93,10 +181,7 @@ export function loadRuntimeConfig({
   if (!config.engine.single_game_profile) {
     throw new Error("Lichess adapter config is missing engine.single_game_profile");
   }
-  if (Number(config.challenges?.concurrency) !== 1) {
-    throw new Error("The single-game Lichess profile requires challenge concurrency 1");
-  }
-  return config;
+  return validateCapacityConfig(config);
 }
 
 export function loadSingleGameProfile(profilePath) {
@@ -203,6 +288,72 @@ export function applySingleGameProfile(config) {
   return profile;
 }
 
+export function loadCapacityProfile(profilePath, config, singleGameProfile) {
+  if (config.capacity.legacy_shared) return null;
+  const resolvedPath = path.resolve(profilePath);
+  const capacity = JSON.parse(readFileSync(resolvedPath, "utf8"));
+  if (capacity.schema !== "uci_arena_lichess_capacity_profile_v1") {
+    throw new Error(`Unsupported Lichess capacity profile schema: ${capacity.schema ?? "missing"}`);
+  }
+  if (capacity.qualified !== true) throw new Error("Lichess capacity profile is not qualified");
+  if (!Number.isFinite(Date.parse(capacity.published_at))) {
+    throw new Error("Lichess capacity profile published_at is invalid");
+  }
+  requireInteger(capacity.maximum_concurrency, "capacity.maximum_concurrency", 1, 64);
+  if (config.capacity.total_slots > capacity.maximum_concurrency) {
+    throw new Error(`Configured Lichess capacity ${config.capacity.total_slots} exceeds qualified maximum ${capacity.maximum_concurrency}`);
+  }
+  const bindings = {
+    engine_build_fingerprint: sha256File(config.engine.executable),
+    single_game_profile_sha256: sha256File(singleGameProfile.profile_path),
+    model_fingerprint: singleGameProfile.model_fingerprint,
+    provider_numeric_fingerprint: singleGameProfile.provider_numeric_fingerprint,
+    hardware_driver_fingerprint: singleGameProfile.hardware_driver_fingerprint,
+  };
+  for (const [name, expected] of Object.entries(bindings)) {
+    if (capacity[name] !== expected) {
+      throw new Error(`Lichess capacity profile ${name} mismatch`);
+    }
+  }
+  if (!Array.isArray(capacity.evidence) || capacity.evidence.length !== capacity.maximum_concurrency
+      || capacity.evidence.some((entry) => entry?.qualified !== true)) {
+    throw new Error("Lichess capacity profile concurrent evidence is incomplete");
+  }
+  return { ...capacity, profile_path: resolvedPath };
+}
+
+function publishCapacityProfile(targetPath, maximumConcurrency, config, singleGameProfile, statuses) {
+  const target = path.resolve(targetPath);
+  mkdirSync(path.dirname(target), { recursive: true });
+  const profile = {
+    schema: "uci_arena_lichess_capacity_profile_v1",
+    qualified: true,
+    published_at: new Date().toISOString(),
+    maximum_concurrency: maximumConcurrency,
+    engine_build_fingerprint: sha256File(config.engine.executable),
+    single_game_profile_sha256: sha256File(singleGameProfile.profile_path),
+    model_fingerprint: singleGameProfile.model_fingerprint,
+    provider_numeric_fingerprint: singleGameProfile.provider_numeric_fingerprint,
+    hardware_driver_fingerprint: singleGameProfile.hardware_driver_fingerprint,
+    provider: singleGameProfile.provider,
+    model_id: singleGameProfile.model_id,
+    evidence: statuses.map((status, index) => ({
+      child: index + 1,
+      qualified: true,
+      provider: status.provider_effective,
+      actual_active_workers: status.actual_active_workers,
+      v2_cursor_admissions: status.v2_cursor_admissions,
+      v2_cursor_async_pending: status.v2_cursor_async_pending,
+      v2_cursor_ready_resumes: status.v2_cursor_ready_resumes,
+      v2_cursor_peak_waiting: status.v2_cursor_peak_waiting,
+    })),
+  };
+  const temporary = `${target}.tmp-${process.pid}`;
+  writeFileSync(temporary, `${JSON.stringify(profile, null, 2)}\n`, "utf8");
+  renameSync(temporary, target);
+  return { ...profile, profile_path: target };
+}
+
 export function parseNdjsonStream(stream) {
   return (async function* parse() {
     const decoder = new TextDecoder();
@@ -247,13 +398,14 @@ function readTokenForRuntime(tokenFile) {
 }
 
 export class LichessClient {
-  constructor({ token, baseUrl = "https://lichess.org/", fetchImpl = globalThis.fetch }) {
+  constructor({ token, baseUrl = "https://lichess.org/", fetchImpl = globalThis.fetch, requestQueue }) {
     this.token = token;
     this.baseUrl = baseUrl;
     this.fetchImpl = fetchImpl;
+    this.requestQueue = requestQueue ?? new PriorityRequestQueue();
   }
 
-  async request(endpoint, { method = "GET", form, stream = false, signal } = {}) {
+  async requestDirect(endpoint, { method = "GET", form, stream = false, signal } = {}) {
     const headers = {
       Accept: stream ? "application/x-ndjson" : "application/json",
       Authorization: `Bearer ${this.token}`,
@@ -271,17 +423,30 @@ export class LichessClient {
       signal,
     });
     if (!response.ok) {
-      throw new Error(`Lichess ${method} ${endpoint} failed with HTTP ${response.status}`);
+      let retryAfterMs = 0;
+      if (response.status === 429) {
+        const retryAfter = Number(response.headers?.get?.("retry-after"));
+        retryAfterMs = Math.max(60_000, Number.isFinite(retryAfter) ? retryAfter * 1_000 : 0);
+        this.requestQueue.blockNonMove(retryAfterMs);
+      }
+      throw new LichessHttpError(method, endpoint, response.status, retryAfterMs);
     }
     return response;
+  }
+
+  request(endpoint, options = {}) {
+    if (options.stream) return this.requestDirect(endpoint, options);
+    const priority = options.priority ?? 20;
+    return this.requestQueue.enqueue(() => this.requestDirect(endpoint, options), priority);
   }
 
   async json(endpoint, options) {
     return (await this.request(endpoint, options)).json();
   }
 
-  async post(endpoint, form, signal) {
-    return this.request(endpoint, { method: "POST", form, signal });
+  async post(endpoint, form, signal, priority) {
+    const requestPriority = priority ?? (endpoint.includes("/move/") ? 0 : 10);
+    return this.request(endpoint, { method: "POST", form, signal, priority: requestPriority });
   }
 
   async openStream(endpoint, signal) {
@@ -608,80 +773,152 @@ export function challengeDeclineReason(challenge, policy, activeGames = 0) {
 }
 
 export function challengeFromSelf(challenge, account) {
-  const challenger = String(challenge.challenger?.name ?? challenge.challenger?.id ?? "");
+  const challenger = String(challenge.challenger?.id ?? challenge.challenger?.name ?? "");
   return challenger.toLocaleLowerCase() === account.toLocaleLowerCase();
 }
 
+let runtimeLogFile = null;
+
+function configureRuntimeLog(runtimeDir) {
+  mkdirSync(runtimeDir, { recursive: true });
+  runtimeLogFile = path.join(runtimeDir, "adapter.ndjson");
+}
+
 function log(event, details = {}) {
-  console.log(JSON.stringify({ timestamp: new Date().toISOString(), event, ...details }));
+  const line = JSON.stringify({ timestamp: new Date().toISOString(), event, ...details });
+  console.log(line);
+  if (runtimeLogFile) {
+    try {
+      appendFileSync(runtimeLogFile, `${line}\n`, "utf8");
+    } catch {
+      // Runtime logging must not interrupt move submission or game handling.
+    }
+  }
+}
+
+function bookConfigurationIdentity(config) {
+  const options = config.engine.uci_options;
+  const value = JSON.stringify({
+    OwnBook: options.OwnBook ?? true,
+    BookFile: options.BookFile ?? "",
+    BookSelectionPolicy: options.BookSelectionPolicy ?? "",
+  });
+  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
 }
 
 class GameSession {
-  constructor({ client, config, account, gameId, signal }) {
+  constructor({ client, config, account, gameId, signal, slot, store }) {
     this.client = client;
     this.config = config;
     this.account = account.toLocaleLowerCase();
-    this.gameId = gameId;
+    this.gameId = String(gameId);
     this.signal = signal;
+    this.slot = slot;
+    this.store = store;
     this.lastSearchPly = -1;
   }
 
   async run() {
-    let engine;
+    const engine = this.slot.engine;
+    if (!engine) throw new Error(`Game ${this.gameId} has no prepared engine`);
     let reconnectDelay = 1_000;
     let consecutiveFailures = 0;
-    try {
-      while (!this.finished && !this.signal.aborted) {
-        try {
-          for await (const event of this.client.stream(`api/bot/game/stream/${encodeURIComponent(this.gameId)}`, this.signal)) {
-            if (event.type === "gameFull") {
-              if (event.variant?.key !== "standard" || event.initialFen !== "startpos") {
-                throw new Error(`Unsupported live game shape for ${this.gameId}`);
-              }
-              const white = String(event.white?.id ?? event.white?.name ?? "").toLocaleLowerCase();
-              const black = String(event.black?.id ?? event.black?.name ?? "").toLocaleLowerCase();
-              this.color = white === this.account ? "white" : black === this.account ? "black" : null;
-              if (!this.color) throw new Error(`Account is not a player in game ${this.gameId}`);
-              if (!engine) {
-                engine = new UciEngine(this.config.engine, (details) => log(details.event, { game_id: this.gameId, ...details }));
-                await engine.start();
-                await engine.newGame();
-                log("game_ready", { game_id: this.gameId, color: this.color });
-              }
-              await this.onState(event.state, engine);
-              consecutiveFailures = 0;
-              reconnectDelay = 1_000;
-            } else if (event.type === "gameState") {
-              if (!engine) throw new Error(`Game state arrived before game metadata for ${this.gameId}`);
-              await this.onState(event, engine);
-              consecutiveFailures = 0;
-              reconnectDelay = 1_000;
-            }
+    while (!this.finished && !this.signal.aborted) {
+      try {
+        for await (const event of this.client.stream(
+          `api/bot/game/stream/${encodeURIComponent(this.gameId)}`,
+          this.signal,
+        )) {
+          if (event.type === "gameFull") {
+            await this.initialize(event, engine);
+            await this.onState(event.state, engine);
+          } else if (event.type === "gameState") {
+            if (!this.initialized) throw new Error(`Game state arrived before metadata for ${this.gameId}`);
+            await this.onState(event, engine);
           }
-          if (!this.finished) throw new Error("Lichess game stream closed before the game finished");
-        } catch (error) {
-          if (this.signal.aborted) break;
-          await engine?.close();
-          engine = undefined;
-          consecutiveFailures += 1;
-          log("game_stream_error", { game_id: this.gameId, message: error.message, retry_ms: reconnectDelay });
-          if (consecutiveFailures >= 5) {
-            throw new Error(`Game session failed ${consecutiveFailures} consecutive times: ${error.message}`);
-          }
-          await delay(reconnectDelay, this.signal);
-          reconnectDelay = Math.min(reconnectDelay * 2, 30_000);
+          consecutiveFailures = 0;
+          reconnectDelay = 1_000;
         }
+        if (!this.finished) throw new Error("Lichess game stream closed before the game finished");
+      } catch (error) {
+        if (this.signal.aborted) break;
+        consecutiveFailures += 1;
+        const retryMs = error instanceof LichessHttpError && error.status === 429
+          ? Math.max(60_000, error.retryAfterMs)
+          : reconnectDelay;
+        log("game_stream_error", {
+          game_id: this.gameId,
+          message: error.message,
+          retry_ms: retryMs,
+        });
+        if (consecutiveFailures >= 5) {
+          throw new Error(`Game session failed ${consecutiveFailures} consecutive times: ${error.message}`);
+        }
+        await delay(retryMs, this.signal);
+        reconnectDelay = Math.min(reconnectDelay * 2, 30_000);
       }
-    } finally {
-      await engine?.close();
     }
+  }
+
+  async initialize(event, engine) {
+    if (event.variant?.key !== "standard" || event.initialFen !== "startpos") {
+      throw new Error(`Unsupported live game shape for ${this.gameId}`);
+    }
+    const white = String(event.white?.id ?? event.white?.name ?? "").toLocaleLowerCase();
+    const black = String(event.black?.id ?? event.black?.name ?? "").toLocaleLowerCase();
+    this.color = white === this.account ? "white" : black === this.account ? "black" : null;
+    if (!this.color) throw new Error(`Account is not a player in game ${this.gameId}`);
+    if (this.initialized) return;
+    this.opponent = this.color === "white" ? black : white;
+    this.slot.opponent = this.opponent;
+    await engine.newGame();
+    const profile = this.config.engine.qualification_profile;
+    this.store.beginGame({
+      id: this.gameId,
+      opponent: this.opponent,
+      audience: this.slot.audience,
+      color: this.color,
+      rated: event.rated,
+      speed: event.speed,
+      clockLimit: event.clock?.initial,
+      clockIncrement: event.clock?.increment,
+      engineBuildFingerprint: profile.engine_build_fingerprint,
+      modelFingerprint: profile.model_fingerprint,
+      providerFingerprint: profile.provider_numeric_fingerprint,
+      bookIdentity: bookConfigurationIdentity(this.config),
+    });
+    this.initialized = true;
+    log("game_ready", {
+      game_id: this.gameId,
+      audience: this.slot.audience,
+      opponent: this.opponent,
+      color: this.color,
+    });
   }
 
   async onState(state, engine) {
     const moves = String(state.moves ?? "").trim().split(/\s+/).filter(Boolean);
     if (state.status !== "started") {
       this.finished = true;
-      log("game_finished", { game_id: this.gameId, status: state.status, winner: state.winner ?? null, plies: moves.length });
+      const winner = String(state.winner ?? "");
+      const result = winner
+        ? winner === this.color ? "win" : "loss"
+        : new Set(["draw", "stalemate"]).has(state.status) ? "draw" : "";
+      this.store.finishGame({
+        id: this.gameId,
+        status: state.status,
+        result,
+        winner,
+        plies: moves.length,
+      });
+      log("game_finished", {
+        game_id: this.gameId,
+        opponent: this.opponent,
+        status: state.status,
+        result,
+        winner: winner || null,
+        plies: moves.length,
+      });
       return;
     }
     const sideToMove = moves.length % 2 === 0 ? "white" : "black";
@@ -711,108 +948,408 @@ class GameSession {
   }
 }
 
-class BotController {
-  constructor({ client, config, account, runtimeDir, signal }) {
+export class BotController {
+  constructor({ client, config, account, runtimeDir, signal, store, random = Math.random }) {
     this.client = client;
     this.config = config;
-    this.account = account;
+    this.account = normalizedUsername(account);
     this.runtimeDir = runtimeDir;
     this.signal = signal;
+    this.store = store;
+    this.random = random;
+    this.slots = new SlotPool(config.capacity);
+    this.engineStarts = new AsyncSemaphore(config.capacity.startup_parallelism);
     this.activeGames = new Map();
-    this.pendingChallenges = new Set();
+    this.lastDiscoveryAt = 0;
+    this.lastBotChallengeAt = 0;
+    this.lastOwnerChallengeAt = 0;
+    this.lastReconciliationAt = 0;
+    this.needsReconciliation = false;
+    this.streamConnected = false;
+    this.tickRunning = false;
   }
 
   async run(opponent) {
-    let outboundSent = false;
+    this.manualOpponent = opponent ? normalizedUsername(opponent) : null;
+    await this.recoverPlayingGames();
+    const schedulerTask = this.schedulerLoop();
     let reconnectDelay = 1_000;
-    while (!this.signal.aborted) {
-      try {
-        const events = await this.client.openStream("api/stream/event", this.signal);
-        if (opponent && !outboundSent) {
-          await this.createChallenge(opponent);
-          outboundSent = true;
+    try {
+      while (!this.signal.aborted) {
+        try {
+          const events = await this.client.openStream("api/stream/event", this.signal);
+          const connectedAt = Date.now();
+          this.streamConnected = true;
+          await this.writeStatus();
+          for await (const event of events) {
+            reconnectDelay = 1_000;
+            await this.onEvent(event);
+          }
+          this.streamConnected = false;
+          this.needsReconciliation = true;
+          if (Date.now() - connectedAt >= 30_000) reconnectDelay = 1_000;
+          if (!this.signal.aborted) throw new Error("Lichess event stream closed");
+        } catch (error) {
+          this.streamConnected = false;
+          this.needsReconciliation = true;
+          if (this.signal.aborted) break;
+          const retryMs = error instanceof LichessHttpError && error.status === 429
+            ? Math.max(60_000, error.retryAfterMs)
+            : reconnectDelay;
+          log("event_stream_error", { message: error.message, retry_ms: retryMs });
+          await this.writeStatus();
+          await delay(retryMs, this.signal);
+          reconnectDelay = Math.min(reconnectDelay * 2, 30_000);
         }
-        for await (const event of events) await this.onEvent(event);
-        reconnectDelay = 1_000;
-      } catch (error) {
-        if (this.signal.aborted) break;
-        log("event_stream_error", { message: error.message, retry_ms: reconnectDelay });
-        await delay(reconnectDelay, this.signal);
-        reconnectDelay = Math.min(reconnectDelay * 2, 30_000);
       }
+    } finally {
+      await Promise.allSettled(this.activeGames.values());
+      await this.slots.drainAll();
+      await schedulerTask;
+      await this.writeStatus();
     }
-    await Promise.allSettled(this.activeGames.values());
+  }
+
+  async prepareSlot(slot) {
+    try {
+      const engine = await this.engineStarts.run(async () => {
+        const prepared = new UciEngine(this.config.engine, (details) => log(details.event, {
+          slot_id: slot.id,
+          ...details,
+        }));
+        try {
+          await prepared.start();
+          return prepared;
+        } catch (error) {
+          await prepared.close();
+          throw error;
+        }
+      });
+      this.slots.attachEngine(slot, engine);
+      return slot;
+    } catch (error) {
+      await this.slots.release(slot);
+      throw error;
+    }
+  }
+
+  async recoverPlayingGames() {
+    const playing = await this.client.json("api/account/playing?nb=50", { signal: this.signal });
+    const games = playing.nowPlaying ?? [];
+    let recovered = 0;
+    await Promise.all(games.map(async (game) => {
+      const gameId = String(game.gameId ?? game.id ?? "");
+      if (!gameId || this.activeGames.has(gameId) || this.slots.findGame(gameId)) return;
+      const pending = this.slots.findPending(game);
+      if (pending) {
+        await this.startGame(game, pending);
+        recovered += 1;
+        return;
+      }
+      const opponent = normalizedUsername(game.opponent?.id ?? game.opponent?.username ?? game.opponent?.name);
+      const audience = await this.resolveAudience(opponent, game.opponent?.title);
+      const slot = this.slots.acquire(audience, { opponent, direction: "recovered" });
+      if (!slot) throw new Error(`Configured ${audience} capacity cannot recover active game ${game.gameId ?? game.id}`);
+      await this.prepareSlot(slot);
+      await this.startGame(game, slot);
+      recovered += 1;
+    }));
+    this.lastReconciliationAt = Date.now();
+    this.needsReconciliation = false;
+    if (recovered) log("games_recovered", { count: recovered });
+    return recovered;
+  }
+
+  async resolveAudience(opponent, knownTitle) {
+    if (String(knownTitle ?? "").toUpperCase() === "BOT") return "bot";
+    const stored = this.store.opponentAudience(opponent);
+    if (stored) return stored;
+    try {
+      const profile = await this.client.json(`api/user/${encodeURIComponent(opponent)}`, { signal: this.signal });
+      return String(profile.title ?? "").toUpperCase() === "BOT" ? "bot" : "human";
+    } catch {
+      return "human";
+    }
   }
 
   async onEvent(event) {
     if (event.type === "challenge") {
-      const challenge = event.challenge;
-      if (challengeFromSelf(challenge, this.account)) {
-        log("outbound_challenge_observed", { challenge_id: challenge.id });
-        return;
-      }
-      const occupiedSlots = this.activeGames.size + this.pendingChallenges.size;
-      const reason = challengeDeclineReason(challenge, this.config.challenges, occupiedSlots);
-      const endpoint = `api/challenge/${encodeURIComponent(challenge.id)}`;
-      if (reason) {
-        await this.client.post(`${endpoint}/decline`, { reason }, this.signal);
-        log("challenge_declined", { challenge_id: challenge.id, reason });
-      } else {
-        await this.client.post(`${endpoint}/accept`, undefined, this.signal);
-        this.pendingChallenges.add(challenge.id);
-        log("challenge_accepted", { challenge_id: challenge.id });
-      }
+      await this.onChallenge(event.challenge);
+    } else if (event.type === "gameStart") {
+      await this.startGame(event.game);
+    } else if (event.type === "challengeCanceled" || event.type === "challengeDeclined") {
+      await this.finishPendingChallenge(event);
+    } else if (event.type === "gameFinish") {
+      log("game_finish_event", { game_id: event.game?.gameId ?? event.game?.id ?? null });
+    }
+    await this.writeStatus();
+  }
+
+  async onChallenge(challenge) {
+    if (challengeFromSelf(challenge, this.account)) {
+      log("outbound_challenge_observed", { challenge_id: challenge.id });
       return;
     }
-    if (event.type === "gameStart") this.startGame(event.game?.gameId ?? event.game?.id);
-    if (event.type === "challengeCanceled" || event.type === "challengeDeclined") {
-      const challengeId = event.challenge?.id;
-      if (challengeId) this.pendingChallenges.delete(challengeId);
+    const opponent = normalizedUsername(
+      challenge.challenger?.id ?? challenge.challenger?.name,
+    );
+    const audience = String(challenge.challenger?.title ?? "").toUpperCase() === "BOT" ? "bot" : "human";
+    let reason = challengeDeclineReason(challenge, this.config.challenges, 0);
+    const owner = audience === "human" && this.store.isOwner(opponent);
+    if (!reason && audience === "human" && !owner && !this.config.capacity.human.accept_public) reason = "later";
+    const reservation = this.store.getReservation();
+    if (!reason && audience === "human" && reservationBlocksPublicHuman({
+      reservation,
+      opponent,
+      reservationOccupied: this.slots.hasOpponent(reservation?.opponent, "human"),
+      availableHuman: this.slots.available("human"),
+    })) reason = "later";
+    let slot = null;
+    if (!reason) {
+      slot = this.slots.acquire(audience, {
+        opponent,
+        direction: "inbound",
+        challengeId: challenge.id,
+      });
+      if (!slot) reason = "later";
     }
-    if (event.type === "gameFinish") {
-      log("game_finish_event", { game_id: event.game?.gameId ?? event.game?.id ?? null });
+    const endpoint = `api/challenge/${encodeURIComponent(challenge.id)}`;
+    if (reason) {
+      await this.client.post(`${endpoint}/decline`, { reason }, this.signal);
+      log("challenge_declined", { challenge_id: challenge.id, opponent, audience, reason });
+      return;
+    }
+    try {
+      await this.prepareSlot(slot);
+      await this.client.post(`${endpoint}/accept`, undefined, this.signal);
+      this.slots.pending(slot, challenge.id);
+      this.store.recordChallenge({
+        id: challenge.id,
+        opponent,
+        audience,
+        direction: "inbound",
+        status: "accepted",
+        color: challenge.color,
+        clockLimit: challenge.timeControl?.limit,
+        clockIncrement: challenge.timeControl?.increment,
+      });
+      log("challenge_accepted", { challenge_id: challenge.id, opponent, audience, slot_id: slot.id });
+    } catch (error) {
+      await this.slots.release(slot);
+      throw error;
     }
   }
 
-  startGame(gameId) {
+  async finishPendingChallenge(event) {
+    const challengeId = event.challenge?.id;
+    if (!challengeId) return;
+    const slot = this.slots.findChallenge(challengeId);
+    const declined = event.type === "challengeDeclined";
+    this.store.updateChallenge(challengeId, declined ? "declined" : "canceled", {
+      cooldownMinutes: declined && slot?.audience === "bot"
+        ? this.config.scheduler.decline_cooldown_minutes
+        : 0,
+    });
+    if (slot?.state === "pending" || slot?.state === "preparing") await this.slots.release(slot);
+    log("challenge_terminal", { challenge_id: challengeId, status: declined ? "declined" : "canceled" });
+  }
+
+  async startGame(game, suppliedSlot = null) {
+    const gameId = String(game?.gameId ?? game?.id ?? "");
     if (!gameId || this.activeGames.has(gameId)) return;
-    if (this.activeGames.size >= 1) {
-      log("concurrent_game_blocked", { game_id: gameId, active_games: this.activeGames.size });
-      return;
+    let slot = suppliedSlot ?? this.slots.findPending(game);
+    if (!slot) {
+      const opponent = normalizedUsername(game?.opponent?.id ?? game?.opponent?.username ?? game?.opponent?.name);
+      const audience = await this.resolveAudience(opponent, game?.opponent?.title);
+      slot = this.slots.acquire(audience, { opponent, direction: "event-recovery" });
+      if (!slot) throw new Error(`No ${audience} slot is available for started game ${gameId}`);
+      await this.prepareSlot(slot);
     }
-    this.pendingChallenges.delete(gameId);
-    const task = new GameSession({
+    this.slots.active(slot, gameId);
+    if (slot.challengeId) this.store.updateChallenge(slot.challengeId, "accepted");
+    if (slot.audience === "human" && slot.opponent) this.store.consumeReservation(slot.opponent);
+    const session = new GameSession({
       client: this.client,
       config: this.config,
       account: this.account,
       gameId,
       signal: this.signal,
-    }).run().catch((error) => {
+      slot,
+      store: this.store,
+    });
+    const task = session.run().catch((error) => {
       log("game_error", { game_id: gameId, message: error.message });
-    }).finally(() => this.activeGames.delete(gameId));
+    }).finally(async () => {
+      this.activeGames.delete(gameId);
+      await this.slots.release(slot);
+      await this.writeStatus();
+    });
     this.activeGames.set(gameId, task);
+    log("game_started", { game_id: gameId, audience: slot.audience, opponent: slot.opponent, slot_id: slot.id });
   }
 
-  async createChallenge(opponent) {
-    const playing = await this.client.json("api/account/playing", { signal: this.signal });
-    if ((playing.nowPlaying?.length ?? 0) > 0 || this.activeGames.size > 0) {
-      throw new Error("Cannot create an outbound challenge while a game is active");
+  async createChallenge(opponent, audience) {
+    const normalized = normalizedUsername(opponent);
+    if (normalized === this.account || this.slots.hasOpponent(normalized)) return false;
+    const slot = this.slots.acquire(audience, { opponent: normalized, direction: "outbound" });
+    if (!slot) return false;
+    try {
+      await this.prepareSlot(slot);
+      const outbound = this.config.outbound_challenge;
+      if (audience === "bot") this.lastBotChallengeAt = Date.now();
+      else this.lastOwnerChallengeAt = Date.now();
+      const response = await this.client.post(`api/challenge/${encodeURIComponent(normalized)}`, {
+        rated: outbound.rated,
+        color: outbound.color,
+        variant: "standard",
+        "clock.limit": outbound.clock_limit,
+        "clock.increment": outbound.clock_increment,
+        keepAliveStream: false,
+      }, this.signal);
+      const challenge = await response.json();
+      const challengeId = challenge.id ?? challenge.challenge?.id;
+      if (!challengeId) throw new Error(`Lichess challenge response for ${normalized} has no id`);
+      this.slots.pending(slot, challengeId);
+      this.store.recordChallenge({
+        id: challengeId,
+        opponent: normalized,
+        audience,
+        direction: "outbound",
+        status: "pending",
+        color: outbound.color,
+        clockLimit: outbound.clock_limit,
+        clockIncrement: outbound.clock_increment,
+      });
+      log("challenge_created", {
+        challenge_id: challengeId,
+        opponent: normalized,
+        audience,
+        rated: outbound.rated,
+        clock: `${outbound.clock_limit}+${outbound.clock_increment}`,
+        slot_id: slot.id,
+      });
+      return true;
+    } catch (error) {
+      await this.slots.release(slot);
+      if (!(error instanceof LichessHttpError && error.status === 429) && audience === "bot") {
+        this.store.setOpponentCooldown(normalized, this.config.scheduler.timeout_cooldown_minutes);
+      }
+      throw error;
     }
-    const outbound = this.config.outbound_challenge;
-    const response = await this.client.post(`api/challenge/${encodeURIComponent(opponent)}`, {
-      rated: outbound.rated,
-      color: outbound.color,
-      variant: "standard",
-      "clock.limit": outbound.clock_limit,
-      "clock.increment": outbound.clock_increment,
-      keepAliveStream: false,
-    }, this.signal);
-    const challenge = await response.json();
-    if (challenge.id) this.pendingChallenges.add(challenge.id);
-    log("challenge_created", {
-      opponent,
-      rated: outbound.rated,
-      clock: `${outbound.clock_limit}+${outbound.clock_increment}`,
+  }
+
+  async schedulerLoop() {
+    while (!this.signal.aborted) {
+      try {
+        await this.schedulerTick();
+      } catch (error) {
+        if (!this.signal.aborted) log("scheduler_error", { message: error.message });
+      }
+      try {
+        await delay(1_000, this.signal);
+      } catch {
+        break;
+      }
+    }
+  }
+
+  async schedulerTick(now = Date.now()) {
+    if (this.tickRunning || !this.streamConnected) return;
+    this.tickRunning = true;
+    try {
+      if (this.needsReconciliation) {
+        if (now - this.lastReconciliationAt < 15_000) return;
+        await this.recoverPlayingGames();
+      }
+      await this.expirePending(now);
+      const control = this.store.control(now);
+      if (control.paused) return;
+      if (this.manualOpponent) {
+        const opponent = this.manualOpponent;
+        this.manualOpponent = null;
+        const audience = this.store.isOwner(opponent) ? "human" : "bot";
+        await this.createChallenge(opponent, audience);
+      }
+      const reservation = control.reservation;
+      if (reservation && !this.slots.hasOpponent(reservation.opponent, "human")
+          && this.slots.available("human") > 0
+          && now - this.lastOwnerChallengeAt >= this.config.scheduler.reservation_retry_seconds * 1_000) {
+        await this.createChallenge(reservation.opponent, "human");
+      }
+      if (!this.config.scheduler.enabled || this.config.capacity.bot.target_active === 0) return;
+      if (now - this.lastDiscoveryAt >= this.config.scheduler.discovery_interval_seconds * 1_000) {
+        await this.discoverBots(now);
+      }
+      if (now - this.lastBotChallengeAt < this.config.scheduler.challenge_interval_seconds * 1_000) return;
+      while (this.slots.occupied("bot") < this.config.capacity.bot.target_active
+          && this.slots.available("bot") > 0) {
+        const eligible = this.store.eligibleBots({
+          self: this.account,
+          now,
+          maximumGamesPerDay: this.config.scheduler.max_games_per_opponent_per_day,
+        }).filter((candidate) => !this.slots.hasOpponent(candidate.username));
+        const candidate = selectWeightedCandidate(eligible, this.config.scheduler, this.random, now);
+        if (!candidate) break;
+        await this.createChallenge(candidate.username, "bot");
+        break;
+      }
+    } finally {
+      this.tickRunning = false;
+      await this.writeStatus();
+    }
+  }
+
+  async discoverBots(now = Date.now()) {
+    const bots = [];
+    for await (const bot of this.client.stream("api/bot/online?nb=512", this.signal)) bots.push(bot);
+    this.store.replaceOnlineBots(bots, now);
+    this.lastDiscoveryAt = now;
+    log("bot_discovery_complete", { online_bots: bots.length });
+  }
+
+  async expirePending(now = Date.now()) {
+    const timeout = this.config.scheduler.challenge_timeout_seconds * 1_000;
+    for (const slot of this.slots.slots.filter((candidate) => candidate.state === "pending"
+      && candidate.direction === "outbound"
+      && now - candidate.createdAt >= timeout)) {
+      if (slot.challengeId) {
+        this.store.updateChallenge(slot.challengeId, "timeout", {
+          cooldownMinutes: slot.audience === "bot" ? this.config.scheduler.timeout_cooldown_minutes : 0,
+        }, now);
+      }
+      log("challenge_timeout", { challenge_id: slot.challengeId, opponent: slot.opponent, audience: slot.audience });
+      await this.slots.release(slot);
+    }
+  }
+
+  async writeStatus() {
+    writeRuntimeMetadata(this.runtimeDir, {
+      schema: "uci_arena_lichess_runtime_v2",
+      adapter_id: "lichess_node_adapter_v2",
+      pid: process.pid,
+      account: this.account,
+      stream_connected: this.streamConnected,
+      configured_capacity: this.config.capacity.total_slots,
+      qualified_capacity: this.config.capacity_profile?.maximum_concurrency ?? 1,
+      slots: this.slots.snapshot(),
+      scheduler: {
+        enabled: this.config.scheduler.enabled,
+        target_active_bots: this.config.capacity.bot.target_active,
+        last_discovery_at: this.lastDiscoveryAt || null,
+        last_bot_challenge_at: this.lastBotChallengeAt || null,
+        last_owner_challenge_at: this.lastOwnerChallengeAt || null,
+        last_reconciliation_at: this.lastReconciliationAt || null,
+        reconciliation_pending: this.needsReconciliation,
+        ...this.store.control(),
+      },
+      opponents: this.store.opponentStats(),
+      engine: this.config.engine.executable,
+      model_root: this.config.engine.uci_options.ModelRoot,
+      qualification_profile: this.config.engine.qualification_profile.profile_path,
+      capacity_profile: this.config.capacity_profile?.profile_path ?? null,
+      model_id: this.config.engine.qualification_profile.model_id,
+      provider: this.config.engine.qualification_profile.provider,
+      updated_at: new Date().toISOString(),
     });
   }
 }
@@ -825,10 +1362,15 @@ function writeRuntimeMetadata(runtimeDir, metadata) {
   renameSync(temporary, target);
 }
 
-function parseArguments(argv) {
-  const [command, ...rest] = argv;
-  if (!command) throw new Error("Expected config, qualify, probe, or run command");
+export function parseArguments(argv) {
+  const [command, ...argumentsList] = argv;
+  if (!command) throw new Error("Expected a Lichess adapter command");
+  const rest = [...argumentsList];
   const options = { command };
+  if (new Set(["owner", "reservation", "scheduler", "startup"]).has(command)
+      && rest[0] && !rest[0].startsWith("--")) {
+    options.action = rest.shift();
+  }
   for (let index = 0; index < rest.length; index += 2) {
     const key = rest[index];
     const value = rest[index + 1];
@@ -848,8 +1390,83 @@ async function preflightQualifiedEngine(config) {
   }
 }
 
+async function preflightQualifiedEngines(config, count) {
+  const engines = Array.from({ length: count }, () => new UciEngine(config.engine));
+  try {
+    const outcomes = await Promise.allSettled(engines.map((engine) => engine.start()));
+    const failure = outcomes.find((outcome) => outcome.status === "rejected");
+    if (failure) throw failure.reason;
+    return engines.map((engine) => engine.qualificationStatus);
+  } finally {
+    await Promise.allSettled(engines.map((engine) => engine.close()));
+  }
+}
+
+function integerOption(value, label, fallback) {
+  const parsed = value === undefined ? fallback : Number(value);
+  if (!Number.isSafeInteger(parsed)) throw new Error(`${label} must be an integer`);
+  return parsed;
+}
+
+function runStoreCommand(options) {
+  const runtimeDir = path.resolve(options.runtime_dir ?? DEFAULT_RUNTIME_DIR);
+  const store = new LichessStore(path.resolve(options.store ?? path.join(runtimeDir, "matches.sqlite")));
+  try {
+    let result;
+    if (options.command === "owner" && options.action === "add") {
+      if (!options.username) throw new Error("owner add requires --username");
+      result = { username: store.addOwner(options.username), added: true };
+    } else if (options.command === "owner" && options.action === "remove") {
+      if (!options.username) throw new Error("owner remove requires --username");
+      result = { username: normalizedUsername(options.username), removed: store.removeOwner(options.username) };
+    } else if (options.command === "owner" && options.action === "list") {
+      result = { owners: store.listOwners() };
+    } else if (options.command === "reserve") {
+      if (!options.opponent) throw new Error("reserve requires --opponent");
+      result = { reservation: store.reserve(
+        options.opponent,
+        integerOption(options.games, "--games", 1),
+        integerOption(options.minutes, "--minutes", 15),
+      ) };
+    } else if (options.command === "reservation" && options.action === "status") {
+      result = { reservation: store.getReservation() };
+    } else if (options.command === "reservation" && options.action === "cancel") {
+      result = { canceled: store.cancelReservation() };
+    } else if (options.command === "scheduler" && options.action === "status") {
+      result = store.status();
+    } else if (options.command === "scheduler" && options.action === "pause") {
+      store.setPaused(true);
+      result = store.status();
+    } else if (options.command === "scheduler" && options.action === "resume") {
+      store.setPaused(false);
+      result = store.status();
+    } else {
+      throw new Error(`Unknown local control command: ${options.command}${options.action ? ` ${options.action}` : ""}`);
+    }
+    console.log(JSON.stringify({ status: "ready", ...result }));
+    return 0;
+  } finally {
+    store.close();
+  }
+}
+
 export async function main(argv = process.argv.slice(2)) {
+  assertSupportedNode();
   const options = parseArguments(argv);
+  if (options.command === "reserve"
+      || new Set(["owner", "reservation", "scheduler"]).has(options.command)) {
+    return runStoreCommand(options);
+  }
+  const runtimeDir = path.resolve(options.runtime_dir ?? DEFAULT_RUNTIME_DIR);
+  if (options.command === "run") configureRuntimeLog(runtimeDir);
+  if (options.command === "startup" && options.action === "status") {
+    console.log(JSON.stringify({ status: "ready", startup: await queryWindowsStartup() }));
+    return 0;
+  }
+  if (options.command === "startup" && options.action === "uninstall") {
+    console.log(JSON.stringify({ status: "ready", startup: await uninstallWindowsStartup(runtimeDir) }));
+    return 0;
+  }
   const config = loadRuntimeConfig({
     templatePath: path.resolve(options.config ?? DEFAULT_TEMPLATE),
     repoRoot: path.resolve(options.repo_root ?? ROOT),
@@ -857,15 +1474,66 @@ export async function main(argv = process.argv.slice(2)) {
     profilePath: options.profile,
   });
   if (options.command === "config") {
-    console.log(JSON.stringify({ status: "ready", schema: config.schema, engine: config.engine.executable }));
+    console.log(JSON.stringify({
+      status: "ready",
+      schema: config.schema,
+      engine: config.engine.executable,
+      capacity: config.capacity,
+      scheduler: config.scheduler,
+    }));
     return 0;
   }
-  if (!new Set(["qualify", "probe", "run"]).has(options.command)) {
+  if (options.command === "startup" && options.action === "install") {
+    const qualificationProfile = applySingleGameProfile(config);
+    loadCapacityProfile(
+      options.capacity_profile ?? config.capacity.capacity_profile,
+      config,
+      qualificationProfile,
+    );
+    const startup = await installWindowsStartup({
+      config: path.resolve(options.config ?? DEFAULT_TEMPLATE),
+      tokenFile: path.resolve(options.token_file ?? DEFAULT_TOKEN_FILE),
+      expectedAccount: options.expected_account,
+      runtimeDir,
+      profile: config.engine.single_game_profile,
+      capacityProfile: options.capacity_profile ?? config.capacity.capacity_profile,
+      modelRoot: config.engine.uci_options.ModelRoot,
+    });
+    console.log(JSON.stringify({ status: "ready", startup }));
+    return 0;
+  }
+  if (!new Set(["qualify", "capacity-qualify", "probe", "run"]).has(options.command)) {
     throw new Error(`Unknown command: ${options.command}`);
   }
   let qualificationStatus;
-  if (options.command === "qualify" || options.command === "run") {
+  if (new Set(["qualify", "capacity-qualify", "run"]).has(options.command)) {
     const qualificationProfile = applySingleGameProfile(config);
+    if (options.command === "capacity-qualify") {
+      const maximumConcurrency = integerOption(
+        options.max_concurrency,
+        "--max-concurrency",
+        config.capacity.total_slots,
+      );
+      requireInteger(maximumConcurrency, "capacity.maximum_concurrency", 1, 64);
+      const statuses = await preflightQualifiedEngines(config, maximumConcurrency);
+      const configuredCapacityPath = options.capacity_profile ?? config.capacity.capacity_profile;
+      if (!configuredCapacityPath) throw new Error("capacity-qualify requires --capacity-profile");
+      const capacityPath = path.resolve(configuredCapacityPath);
+      const capacityProfile = publishCapacityProfile(
+        capacityPath,
+        maximumConcurrency,
+        config,
+        qualificationProfile,
+        statuses,
+      );
+      console.log(JSON.stringify({
+        status: "qualified",
+        schema: capacityProfile.schema,
+        maximum_concurrency: capacityProfile.maximum_concurrency,
+        profile: capacityProfile.profile_path,
+      }));
+      return 0;
+    }
     qualificationStatus = await preflightQualifiedEngine(config);
     if (options.command === "qualify") {
       console.log(JSON.stringify({
@@ -877,6 +1545,11 @@ export async function main(argv = process.argv.slice(2)) {
       }));
       return 0;
     }
+    config.capacity_profile = loadCapacityProfile(
+      options.capacity_profile ?? config.capacity.capacity_profile,
+      config,
+      qualificationProfile,
+    );
   }
   const expectedAccount = options.expected_account;
   if (!expectedAccount) throw new Error("--expected-account is required");
@@ -887,37 +1560,37 @@ export async function main(argv = process.argv.slice(2)) {
     return 0;
   }
 
-  const runtimeDir = path.resolve(options.runtime_dir ?? DEFAULT_RUNTIME_DIR);
   const controller = new AbortController();
   for (const signal of ["SIGINT", "SIGTERM"]) {
     process.once(signal, () => controller.abort(new Error(`Received ${signal}`)));
   }
-  writeRuntimeMetadata(runtimeDir, {
-    schema: "uci_arena_lichess_runtime_v1",
-    adapter_id: "lichess_node_adapter_v1",
-    pid: process.pid,
+  log("adapter_started", {
     account: profile.username,
-    engine: config.engine.executable,
-    model_root: config.engine.uci_options.ModelRoot,
-    qualification_profile: config.engine.qualification_profile.profile_path,
-    model_id: config.engine.qualification_profile.model_id,
+    opponent: options.opponent ?? null,
+    configured_capacity: config.capacity.total_slots,
+    qualified_capacity: config.capacity_profile?.maximum_concurrency ?? 1,
     provider: qualificationStatus.provider_effective,
-    outbound_opponent: options.opponent ?? null,
   });
-  log("adapter_started", { account: profile.username, opponent: options.opponent ?? null });
   const client = new LichessClient({ token: readTokenForRuntime(tokenFile), baseUrl: config.url });
-  await new BotController({
-    client,
-    config,
-    account: profile.username,
-    runtimeDir,
-    signal: controller.signal,
-  }).run(options.opponent);
+  const store = new LichessStore(path.resolve(options.store ?? path.join(runtimeDir, "matches.sqlite")));
+  try {
+    await new BotController({
+      client,
+      config,
+      account: profile.username,
+      runtimeDir,
+      signal: controller.signal,
+      store,
+    }).run(options.opponent);
+  } finally {
+    store.close();
+  }
   return 0;
 }
 
 if (path.resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
   main().then((code) => { process.exitCode = code; }).catch((error) => {
+    log("adapter_fatal", { message: error.message });
     console.error(`lichess-adapter: ${error.message}`);
     process.exitCode = 1;
   });

@@ -5,3 +5,4 @@ config.local.yml
 runtime/
 games/
 logs/
+native/build/
