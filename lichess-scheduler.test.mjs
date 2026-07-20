@@ -39,6 +39,17 @@ test("configured borrowing is explicit and one-way into idle human capacity", ()
   assert.equal(pool.acquire("human", { opponent: "human" }), null);
 });
 
+test("already-started recovery uses idle qualified capacity without weakening admission pools", () => {
+  const pool = new SlotPool(capacity({ humans: 1, bots: 1, borrowing: false }));
+  assert.ok(pool.acquire("bot", { opponent: "scheduled" }));
+  assert.equal(pool.acquire("bot", { opponent: "new-challenge" }), null);
+  const recovered = pool.acquireStarted("bot", { opponent: "late-accept", direction: "recovered" });
+  assert.ok(recovered);
+  assert.equal(recovered.configuredAudience, "human");
+  assert.equal(recovered.audience, "bot");
+  assert.equal(pool.acquireStarted("bot", { opponent: "over-capacity" }), null);
+});
+
 test("pending lookup is deterministic by challenge id then opponent", () => {
   const pool = new SlotPool(capacity({ humans: 0, bots: 2 }));
   const first = pool.acquire("bot", { opponent: "one", createdAt: 1 });

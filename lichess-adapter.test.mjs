@@ -1376,3 +1376,103 @@ test("restart recovery prefers canonical opponent id over a title-prefixed displ
     store.close();
   }
 });
+
+test("outbound timeout cancels the remote challenge before releasing its slot", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-timeout-cancel-"));
+  const store = new LichessStore(path.join(directory, "matches.sqlite"));
+  const posts = [];
+  let closes = 0;
+  const controller = new BotController({
+    client: {
+      post: async (endpoint, form) => {
+        posts.push({ endpoint, form });
+        return { json: async () => ({}) };
+      },
+    },
+    config: {
+      capacity: {
+        total_slots: 1,
+        startup_parallelism: 1,
+        human: { slots: 0, allow_borrowing: false, accept_public: true },
+        bot: { slots: 1, target_active: 1 },
+      },
+      scheduler: { challenge_timeout_seconds: 25, timeout_cooldown_minutes: 30 },
+    },
+    account: "self",
+    runtimeDir: directory,
+    signal: new AbortController().signal,
+    store,
+  });
+  const slot = controller.slots.acquire("bot", {
+    opponent: "late-bot",
+    direction: "outbound",
+    createdAt: 1,
+  });
+  controller.slots.attachEngine(slot, { close: async () => { closes += 1; } });
+  controller.slots.pending(slot, "late-challenge");
+  store.recordChallenge({
+    id: "late-challenge",
+    opponent: "late-bot",
+    audience: "bot",
+    direction: "outbound",
+    status: "created",
+    clockLimit: 180,
+    clockIncrement: 2,
+  }, 1);
+  try {
+    await controller.expirePending(25_001);
+    assert.deepEqual(posts, [{
+      endpoint: "api/challenge/late-challenge/cancel",
+      form: undefined,
+    }]);
+    assert.equal(closes, 1);
+    assert.equal(slot.state, "empty");
+  } finally {
+    await controller.slots.drainAll();
+    store.close();
+  }
+});
+
+test("failed timeout cancellation retains the slot for a racing gameStart", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-timeout-race-"));
+  const store = new LichessStore(path.join(directory, "matches.sqlite"));
+  let closes = 0;
+  const controller = new BotController({
+    client: {
+      post: async (endpoint) => {
+        throw new LichessHttpError("POST", endpoint, 400);
+      },
+    },
+    config: {
+      capacity: {
+        total_slots: 1,
+        startup_parallelism: 1,
+        human: { slots: 0, allow_borrowing: false, accept_public: true },
+        bot: { slots: 1, target_active: 1 },
+      },
+      scheduler: { challenge_timeout_seconds: 25, timeout_cooldown_minutes: 30 },
+    },
+    account: "self",
+    runtimeDir: directory,
+    signal: new AbortController().signal,
+    store,
+  });
+  const slot = controller.slots.acquire("bot", {
+    opponent: "late-bot",
+    direction: "outbound",
+    createdAt: 1,
+  });
+  controller.slots.attachEngine(slot, { close: async () => { closes += 1; } });
+  controller.slots.pending(slot, "late-challenge");
+  try {
+    await controller.expirePending(25_001);
+    assert.equal(slot.state, "pending");
+    assert.equal(slot.challengeId, "late-challenge");
+    assert.equal(slot.cancelRetryAt, 40_001);
+    assert.equal(controller.needsReconciliation, true);
+    assert.equal(closes, 0);
+  } finally {
+    await controller.slots.drainAll();
+    store.close();
+  }
+});

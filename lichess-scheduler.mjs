@@ -39,6 +39,17 @@ export class SlotPool {
       slot = this.slots.find((candidate) => candidate.state === "empty");
     }
     if (!slot) return null;
+    return this.claim(slot, audience, details);
+  }
+
+  acquireStarted(audience, details = {}) {
+    const native = this.acquire(audience, details);
+    if (native) return native;
+    const recovery = this.slots.find((candidate) => candidate.state === "empty");
+    return recovery ? this.claim(recovery, audience, details) : null;
+  }
+
+  claim(slot, audience, details) {
     slot.audience = audience;
     slot.state = "preparing";
     slot.generation = ++this.sequence;
@@ -48,6 +59,7 @@ export class SlotPool {
     slot.challengeId = details.challengeId ? String(details.challengeId) : null;
     slot.gameId = null;
     slot.engine = null;
+    slot.cancelRetryAt = null;
     return slot;
   }
 
@@ -133,6 +145,7 @@ export class SlotPool {
       slot.direction = null;
       slot.challengeId = null;
       slot.gameId = null;
+      slot.cancelRetryAt = null;
     }
     return true;
   }

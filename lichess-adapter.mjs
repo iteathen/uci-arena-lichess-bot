@@ -2125,7 +2125,7 @@ export class BotController {
       }
       const opponent = normalizedUsername(game.opponent?.id ?? game.opponent?.username ?? game.opponent?.name);
       const audience = await this.resolveAudience(opponent, game.opponent?.title);
-      const slot = this.slots.acquire(audience, { opponent, direction: "recovered" });
+      const slot = this.slots.acquireStarted(audience, { opponent, direction: "recovered" });
       if (!slot) throw new Error(`Configured ${audience} capacity cannot recover active game ${game.gameId ?? game.id}`);
       await this.prepareSlot(slot);
       await this.startGame(game, slot);
@@ -2238,7 +2238,7 @@ export class BotController {
     if (!slot) {
       const opponent = normalizedUsername(game?.opponent?.id ?? game?.opponent?.username ?? game?.opponent?.name);
       const audience = await this.resolveAudience(opponent, game?.opponent?.title);
-      slot = this.slots.acquire(audience, { opponent, direction: "event-recovery" });
+      slot = this.slots.acquireStarted(audience, { opponent, direction: "event-recovery" });
       if (!slot) throw new Error(`No ${audience} slot is available for started game ${gameId}`);
       await this.prepareSlot(slot);
     }
@@ -2391,13 +2391,37 @@ export class BotController {
     const timeout = this.config.scheduler.challenge_timeout_seconds * 1_000;
     for (const slot of this.slots.slots.filter((candidate) => candidate.state === "pending"
       && candidate.direction === "outbound"
-      && now - candidate.createdAt >= timeout)) {
-      if (slot.challengeId) {
-        this.store.updateChallenge(slot.challengeId, "timeout", {
-          cooldownMinutes: slot.audience === "bot" ? this.config.scheduler.timeout_cooldown_minutes : 0,
-        }, now);
+      && now - candidate.createdAt >= timeout
+      && (candidate.cancelRetryAt == null || now >= candidate.cancelRetryAt))) {
+      const challengeId = slot.challengeId;
+      if (!challengeId) continue;
+      slot.cancelRetryAt = Number.POSITIVE_INFINITY;
+      try {
+        await this.client.post(`api/challenge/${encodeURIComponent(challengeId)}/cancel`, undefined, this.signal);
+      } catch (error) {
+        const retryMs = error instanceof LichessHttpError && error.status === 429
+          ? Math.max(60_000, error.retryAfterMs)
+          : 15_000;
+        slot.cancelRetryAt = now + retryMs;
+        this.needsReconciliation = true;
+        log("challenge_timeout_cancel_error", {
+          challenge_id: challengeId,
+          opponent: slot.opponent,
+          audience: slot.audience,
+          message: error.message,
+          retry_ms: retryMs,
+        });
+        continue;
       }
-      log("challenge_timeout", { challenge_id: slot.challengeId, opponent: slot.opponent, audience: slot.audience });
+      this.store.updateChallenge(challengeId, "timeout", {
+        cooldownMinutes: slot.audience === "bot" ? this.config.scheduler.timeout_cooldown_minutes : 0,
+      }, now);
+      log("challenge_timeout", {
+        challenge_id: challengeId,
+        opponent: slot.opponent,
+        audience: slot.audience,
+        canceled: true,
+      });
       await this.slots.release(slot);
     }
   }
