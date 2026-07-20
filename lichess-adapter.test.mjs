@@ -515,6 +515,24 @@ test("qualified single-game profile is identity-bound and owns the parallel topo
   );
 });
 
+test("qualified MCGS profile owns graph and batching topology", () => {
+  const fixture = qualifiedFixture();
+  Object.assign(fixture.profile, {
+    search_core: "mcgs",
+    search_graph_mb: 384,
+    mcgs_cpuct_permille: 1750,
+    mcgs_outstanding_batches: 3,
+  });
+  writeFileSync(fixture.profilePath, JSON.stringify(fixture.profile));
+  const loaded = loadSingleGameProfile(fixture.profilePath);
+  assert.equal(loaded.search_core, "mcgs");
+  applySingleGameProfile(fixture.config);
+  assert.equal(fixture.config.engine.uci_options.SearchCore, "mcgs");
+  assert.equal(fixture.config.engine.uci_options.SearchGraphMB, 384);
+  assert.equal(fixture.config.engine.uci_options.McgsCpuctPermille, 1750);
+  assert.equal(fixture.config.engine.uci_options.McgsOutstandingBatches, 3);
+});
+
 test("profile-owned topology rejects a conflicting tracked option", () => {
   const fixture = qualifiedFixture();
   fixture.config.engine.uci_options.SearchCore = "legacy";
@@ -557,6 +575,37 @@ test("runtime status gate accepts active one-game cursor batching and rejects fa
   assert.throws(
     () => validateRuntimeStatus(profile, { ...status, provider_effective: "cpu" }),
     /GPU provider fallback/,
+  );
+});
+
+test("runtime status gate accepts qualified batched MCGS and rejects incomplete root coverage", () => {
+  const { profile } = qualifiedFixture();
+  Object.assign(profile, {
+    search_core: "mcgs",
+    search_graph_mb: 384,
+    mcgs_cpuct_permille: 1750,
+    mcgs_outstanding_batches: 3,
+  });
+  const status = {
+    ...qualifiedRuntimeStatus(profile),
+    search_core_configured: "mcgs",
+    last_search_core: "mcgs",
+    last_search_root_workers: profile.threads,
+    persistent_workers: false,
+    mcgs_graph_nodes: 73,
+    mcgs_graph_edges: 411,
+    mcgs_completed_simulations: 96,
+    mcgs_async_admissions: 88,
+    mcgs_outstanding_peak: 16,
+    mcgs_root_seeded_moves: 20,
+    mcgs_root_legal_moves: 20,
+    mcgs_stale_backups_discarded: 0,
+    mcgs_reservation_leaks: 0,
+  };
+  assert.equal(validateRuntimeStatus(profile, status), status);
+  assert.throws(
+    () => validateRuntimeStatus(profile, { ...status, mcgs_root_seeded_moves: 19 }),
+    /did not seed every legal root move/,
   );
 });
 
@@ -843,6 +892,34 @@ test("game stream promotes an exact predicted reply and never posts before autho
   assert.equal(posts.length, 2);
   assert.match(posts[1], /\/move\/g1f3$/);
   assert.equal(engine.searchCalls.length, 1, "ponder hit reuses the running search");
+});
+
+test("MCGS starts full opponent-root search at move POST dispatch before acknowledgement", async () => {
+  let acknowledgePost;
+  let markDispatched;
+  const dispatched = new Promise((resolve) => { markDispatched = resolve; });
+  const client = {
+    post: async (_endpoint, _form, _signal, _priority, beforeDispatch) => {
+      beforeDispatch();
+      markDispatched();
+      await new Promise((resolve) => { acknowledgePost = resolve; });
+    },
+  };
+  const engine = new MockGameEngine([{ bestmove: "e2e4", ponder: "e7e5" }]);
+  const session = createGameSession(engine, client);
+  session.config.engine.uci_options.SearchCore = "mcgs";
+  const initial = startedState("");
+  await session.initialize(gameFull(initial), engine);
+
+  const move = session.onState(initial, engine);
+  await dispatched;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(engine.opponentCalls.length, 1);
+  assert.equal(engine.opponentCalls[0].predictedMove, null);
+  assert.deepEqual(engine.opponentCalls[0].moves, ["e2e4"]);
+  assert.equal(engine.active?.kind, "opponent_root");
+  acknowledgePost();
+  await move;
 });
 
 test("black starts opponent-root work from gameFull and searches only after White moves", async () => {

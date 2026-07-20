@@ -45,6 +45,9 @@ const PROFILE_OWNED_UCI_OPTIONS = Object.freeze({
   threads: "Threads",
   root_workers: "RootWorkers",
   split_depth: "V2SplitDepth",
+  search_graph_mb: "SearchGraphMB",
+  mcgs_cpuct_permille: "McgsCpuctPermille",
+  mcgs_outstanding_batches: "McgsOutstandingBatches",
   provider: "OnnxProvider",
   batch_size: "NNBatchSize",
   batch_wait_us: "NNBatchWaitUs",
@@ -80,6 +83,7 @@ const TRANSPORT_RESERVE_MAXIMUM_MS = 1_500;
 const UCI_MOVE_PATTERN = /^[a-h][1-8][a-h][1-8][qrbn]?$/;
 const TIME_PROFILE_RESERVED_OPTIONS = new Set([
   "SearchCore", "Threads", "RootWorkers", "V2SplitDepth", "BackgroundSearch",
+  "SearchGraphMB", "McgsCpuctPermille", "McgsOutstandingBatches",
   "NNSpeculation", "ModelRoot", "NNBatchSize", "NNBatchWaitUs", "OnnxProvider",
   "IterativeTimeController", "TimeProfileProviderReserveUs",
   "TimeProfileIterationForecastScalePermille", "Move Overhead", "Ponder",
@@ -449,13 +453,20 @@ export function loadSingleGameProfile(profilePath) {
   requireString(profile.hardware_driver_fingerprint, "hardware_driver_fingerprint", /^\d+$/);
   requireString(profile.onnx_runtime_version, "onnx_runtime_version");
   requireString(profile.provider_numeric_fingerprint, "provider_numeric_fingerprint", /^\d+$/);
-  if (profile.search_core !== "v2") throw new Error("Single-game profile must select SearchCore v2");
+  if (!new Set(["v2", "mcgs"]).has(profile.search_core)) {
+    throw new Error("Single-game profile must select SearchCore v2 or mcgs");
+  }
   if (!new Set(["directml", "cuda"]).has(profile.provider)) {
     throw new Error("Single-game profile provider must be directml or cuda");
   }
   requireInteger(profile.threads, "threads", 1, 64);
   requireInteger(profile.root_workers, "root_workers", 1, 16);
   requireInteger(profile.split_depth, "split_depth", 2, 64);
+  if (profile.search_core === "mcgs") {
+    requireInteger(profile.search_graph_mb, "search_graph_mb", 64, 4_096);
+    requireInteger(profile.mcgs_cpuct_permille, "mcgs_cpuct_permille", 100, 10_000);
+    requireInteger(profile.mcgs_outstanding_batches, "mcgs_outstanding_batches", 1, 4);
+  }
   requireInteger(profile.batch_size, "batch_size", 2, 256);
   requireInteger(profile.batch_wait_us, "batch_wait_us", 0, 2_000);
   if (typeof profile.speculation !== "boolean") {
@@ -523,7 +534,13 @@ export function applySingleGameProfile(config) {
     NNSpeculation: profile.speculation,
     BackgroundSearch: false,
   };
-  for (const optionName of Object.values(PROFILE_OWNED_UCI_OPTIONS)) {
+  if (profile.search_core === "mcgs") {
+    profileValues.SearchGraphMB = profile.search_graph_mb;
+    profileValues.McgsCpuctPermille = profile.mcgs_cpuct_permille;
+    profileValues.McgsOutstandingBatches = profile.mcgs_outstanding_batches;
+  }
+  for (const optionName of Object.values(PROFILE_OWNED_UCI_OPTIONS)
+    .filter((name) => Object.hasOwn(profileValues, name))) {
     if (Object.hasOwn(config.engine.uci_options, optionName)
         && String(config.engine.uci_options[optionName]) !== String(profileValues[optionName])) {
       throw new Error(`Tracked config conflicts with profile-owned UCI option ${optionName}`);
@@ -592,6 +609,11 @@ function publishCapacityProfile(targetPath, maximumConcurrency, config, singleGa
       v2_cursor_async_pending: status.v2_cursor_async_pending,
       v2_cursor_ready_resumes: status.v2_cursor_ready_resumes,
       v2_cursor_peak_waiting: status.v2_cursor_peak_waiting,
+      mcgs_graph_nodes: status.mcgs_graph_nodes,
+      mcgs_graph_edges: status.mcgs_graph_edges,
+      mcgs_completed_simulations: status.mcgs_completed_simulations,
+      mcgs_async_admissions: status.mcgs_async_admissions,
+      mcgs_outstanding_peak: status.mcgs_outstanding_peak,
     })),
   };
   const temporary = `${target}.tmp-${process.pid}`;
@@ -757,6 +779,18 @@ function parseInfo(line) {
     "v2_cursor_capacity_deferrals",
     "v2_cursor_readiness_waits",
     "v2_cursor_peak_waiting",
+    "mcgs_graph_nodes",
+    "mcgs_graph_edges",
+    "mcgs_graph_reuses",
+    "mcgs_completed_simulations",
+    "mcgs_outstanding_peak",
+    "mcgs_async_admissions",
+    "mcgs_async_capacity_deferrals",
+    "mcgs_root_seeded_moves",
+    "mcgs_root_legal_moves",
+    "mcgs_stale_backups_discarded",
+    "mcgs_reservation_leaks",
+    "mcgs_snapshot_sequence",
   ]) {
     const match = line.match(new RegExp(`(?:^| )${key} (\\d+)`));
     if (match) telemetry[key] = Number(match[1]);
@@ -846,7 +880,10 @@ export function validateRuntimeStatus(profile, status) {
     status.onnx_runtime_version === profile.onnx_runtime_version,
     "ONNX Runtime version mismatch",
   );
-  requireRuntimeStatus(status.search_core_configured === "v2", "SearchCore v2 is not configured");
+  requireRuntimeStatus(
+    status.search_core_configured === profile.search_core,
+    `SearchCore ${profile.search_core} is not configured`,
+  );
   requireRuntimeStatus(status.threads_configured === profile.threads, "thread topology mismatch");
   requireRuntimeStatus(
     status.root_workers_configured === profile.root_workers,
@@ -862,21 +899,43 @@ export function validateRuntimeStatus(profile, status) {
   );
   requireRuntimeStatus(status.background_search === false, "background search must be disabled");
   requireRuntimeStatus(status.last_search_available === true, "qualification search is missing");
-  requireRuntimeStatus(status.last_search_core === "v2", "qualification search used legacy core");
-  requireRuntimeStatus(status.last_search_threads === profile.threads, "active thread topology mismatch");
   requireRuntimeStatus(
-    status.last_search_root_workers === profile.root_workers,
-    "active root-worker topology mismatch",
+    status.last_search_core === profile.search_core,
+    `qualification search did not use ${profile.search_core}`,
   );
-  requireRuntimeStatus(status.actual_active_workers > 0, "no V2 worker became active");
+  requireRuntimeStatus(status.last_search_threads === profile.threads, "active thread topology mismatch");
+  if (profile.search_core === "v2") {
+    requireRuntimeStatus(
+      status.last_search_root_workers === profile.root_workers,
+      "active root-worker topology mismatch",
+    );
+  }
+  requireRuntimeStatus(status.actual_active_workers > 0, "no search worker became active");
   requireRuntimeStatus(status.root_workers_active === true, "root workers were inactive");
-  requireRuntimeStatus(status.worker_gate_active === true, "V2 worker gate was inactive");
-  requireRuntimeStatus(status.persistent_workers === true, "persistent workers were inactive");
+  requireRuntimeStatus(status.worker_gate_active === true, "parallel worker gate was inactive");
   requireRuntimeStatus(status.search_batch_coupling === true, "search/batch coupling was inactive");
-  requireRuntimeStatus(status.v2_cursor_admissions > 0, "no root cursor was admitted");
-  requireRuntimeStatus(status.v2_cursor_async_pending > 0, "no root cursor suspended on inference");
-  requireRuntimeStatus(status.v2_cursor_ready_resumes > 0, "no ready root cursor resumed");
-  requireRuntimeStatus(status.v2_cursor_peak_waiting > 0, "no concurrent cursor wait was observed");
+  if (profile.search_core === "v2") {
+    requireRuntimeStatus(status.persistent_workers === true, "persistent workers were inactive");
+    requireRuntimeStatus(status.v2_cursor_admissions > 0, "no root cursor was admitted");
+    requireRuntimeStatus(status.v2_cursor_async_pending > 0, "no root cursor suspended on inference");
+    requireRuntimeStatus(status.v2_cursor_ready_resumes > 0, "no ready root cursor resumed");
+    requireRuntimeStatus(status.v2_cursor_peak_waiting > 0, "no concurrent cursor wait was observed");
+  } else {
+    requireRuntimeStatus(status.mcgs_graph_nodes > 0, "MCGS graph contains no nodes");
+    requireRuntimeStatus(status.mcgs_graph_edges > 0, "MCGS graph contains no edges");
+    requireRuntimeStatus(status.mcgs_completed_simulations > 0, "MCGS completed no simulations");
+    requireRuntimeStatus(status.mcgs_async_admissions > 0, "MCGS admitted no asynchronous leaves");
+    requireRuntimeStatus(status.mcgs_outstanding_peak > 0, "MCGS observed no inference overlap");
+    requireRuntimeStatus(
+      status.mcgs_root_seeded_moves === status.mcgs_root_legal_moves,
+      "MCGS did not seed every legal root move",
+    );
+    requireRuntimeStatus(
+      status.mcgs_stale_backups_discarded === 0,
+      "MCGS discarded a stale backup during qualification",
+    );
+    requireRuntimeStatus(status.mcgs_reservation_leaks === 0, "MCGS leaked reservations");
+  }
   requireRuntimeStatus(
     status.evaluation_service_async_lease_completions > 0,
     "no asynchronous inference lease completed",
@@ -1542,8 +1601,11 @@ export class ForegroundSearchCoordinator {
     this.activeGames = new Set();
   }
 
-  canStartOpponentTurnSearch() {
-    return !this.enabled || this.activeGames.size === 0;
+  canStartOpponentTurnSearch(gameId = null) {
+    if (!this.enabled || this.activeGames.size === 0) return true;
+    return gameId !== null
+      && this.activeGames.size === 1
+      && this.activeGames.has(String(gameId));
   }
 
   async begin(gameId) {
@@ -1818,14 +1880,16 @@ export class GameSession {
           || !this.config.timing.opponent_turn_search
           || engine.mode !== "idle"
           || this.authoritativeGeneration !== this.observedGeneration
-          || !this.foregroundCoordinator.canStartOpponentTurnSearch()) return null;
+          || !this.foregroundCoordinator.canStartOpponentTurnSearch(this.gameId)) return null;
 
       let moves;
       let predictedMove = null;
       let clocks = this.lastClock;
       if (this.pendingOwnMove) {
         moves = this.pendingOwnMove.projectedMoves;
-        predictedMove = this.pendingOwnMove.predictedMove;
+        predictedMove = String(this.config.engine.uci_options.SearchCore).toLowerCase() === "mcgs"
+          ? null
+          : this.pendingOwnMove.predictedMove;
         clocks = this.pendingOwnMove.estimatedClock;
       } else if (this.authoritativeMoves && colorToMove(this.authoritativeMoves) !== this.color) {
         moves = this.authoritativeMoves;
@@ -2100,6 +2164,7 @@ export class GameSession {
     let foregroundLeaseWaitMs = 0;
     let bestmoveToLegalityMs = 0;
     let moveQueueWaitMs = 0;
+    let projectedSearchRequested = false;
     try {
       if (!this.observationIsCurrent(observation)) {
         throw new StaleAuthoritativeSearchError(this.gameId, "superseded_before_search");
@@ -2159,6 +2224,33 @@ export class GameSession {
       const postSignal = this.signal && typeof this.signal.addEventListener === "function"
         ? AbortSignal.any([this.signal, controller.signal])
         : controller.signal;
+      const startProjectedSearch = (dispatchedAt) => {
+        if (projectedSearchRequested) return;
+        postDispatchedAt = dispatchedAt;
+        moveQueueWaitMs = postDispatchedAt - moveQueuedAt;
+        const elapsedClockMs = Math.max(0, Math.ceil(postDispatchedAt - receivedAt));
+        const estimatedClock = subtractLocalClockDelay(this.lastClock, this.color, elapsedClockMs);
+        const ownTimeKey = this.color === "white" ? "wtime" : "btime";
+        const ownIncrementKey = this.color === "white" ? "winc" : "binc";
+        estimatedClock[ownTimeKey] += estimatedClock[ownIncrementKey];
+        this.pendingOwnMove = {
+          baseRootKey: rootKey,
+          projectedMoves: [...moves, result.bestmove],
+          predictedMove: result.ponder,
+          runtimeGeneration: result.runtimeGeneration,
+          ponderSearchGeneration: null,
+          estimatedClock,
+        };
+        this.lastPonderMissReason = null;
+        this.staleBestmoveDrained = false;
+        projectedSearchRequested = true;
+        void this.resumeOpponentSearch().catch((error) => {
+          log("projected_opponent_search_failed", {
+            game_id: this.gameId,
+            message: error.message,
+          });
+        });
+      };
       await this.client.post(
         `api/bot/game/${encodeURIComponent(this.gameId)}/move/${result.bestmove}`,
         undefined,
@@ -2169,28 +2261,13 @@ export class GameSession {
               || this.authoritativeGeneration !== stateGeneration) {
             throw new StaleAuthoritativeSearchError(this.gameId, "superseded_in_move_queue");
           }
-          postDispatchedAt = performance.now();
-          moveQueueWaitMs = postDispatchedAt - moveQueuedAt;
+          startProjectedSearch(performance.now());
         },
       );
       const postAcknowledgedAt = performance.now();
+      startProjectedSearch(postAcknowledgedAt);
       this.onMoveTransportSample(this.gameId, postAcknowledgedAt - postDispatchedAt);
       this.lastSubmittedRootKey = rootKey;
-      const elapsedClockMs = Math.max(0, Math.ceil(postAcknowledgedAt - receivedAt));
-      const estimatedClock = subtractLocalClockDelay(this.lastClock, this.color, elapsedClockMs);
-      const ownTimeKey = this.color === "white" ? "wtime" : "btime";
-      const ownIncrementKey = this.color === "white" ? "winc" : "binc";
-      estimatedClock[ownTimeKey] += estimatedClock[ownIncrementKey];
-      this.pendingOwnMove = {
-        baseRootKey: rootKey,
-        projectedMoves: [...moves, result.bestmove],
-        predictedMove: result.ponder,
-        runtimeGeneration: result.runtimeGeneration,
-        ponderSearchGeneration: null,
-        estimatedClock,
-      };
-      this.lastPonderMissReason = null;
-      this.staleBestmoveDrained = false;
       log("move_played", {
         game_id: this.gameId,
         ply: moves.length + 1,
@@ -2224,6 +2301,9 @@ export class GameSession {
       this.opponentSearchDrainMs = 0;
     } catch (error) {
       this.lastSubmittedRootKey = null;
+      if (projectedSearchRequested) {
+        await this.invalidateOpponentSearch("move_post_failed").catch(() => {});
+      }
       this.pendingOwnMove = null;
       const staleError = error instanceof StaleAuthoritativeSearchError
         ? error

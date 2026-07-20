@@ -2,7 +2,7 @@
   "schema": "uci_arena_lichess_adapter_v5",
   "url": "https://lichess.org/",
   "engine": {
-    "executable": "<UCI_ARENA_REPO>/build/Release/flashfork_uci.exe",
+    "executable": "<UCI_ARENA_REPO>/build/Release/uci_arena.exe",
     "working_directory": "<UCI_ARENA_REPO>",
     "single_game_profile": "<UCI_ARENA_REPO>/runtime_state/models/compact_chessformer_gab_v1/cache/uci_arena_single_game_profile_v1.json",
     "time_profile": "<UCI_ARENA_REPO>/runtime_state/models/compact_chessformer_gab_v1/cache/uci_time_profile_v2.json",
@@ -10,7 +10,7 @@
     "shutdown_grace_ms": 5000,
     "uci_options": {
       "BehaviorProfile": "balanced",
-      "ModelBackend": "flashfork",
+      "ModelBackend": "native",
       "ModelRoot": "engine/runtime/models/compact_chessformer_gab_v1/engine"
     }
   },
