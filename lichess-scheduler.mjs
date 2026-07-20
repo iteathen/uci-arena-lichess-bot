@@ -63,8 +63,8 @@ export class SlotPool {
     return slot;
   }
 
-  attachEngine(slot, engine) {
-    this.requireOwned(slot, "preparing");
+  attachEngine(slot, engine, expectedGeneration = slot?.generation) {
+    this.requireOwned(slot, "preparing", expectedGeneration);
     slot.engine = engine;
     return slot;
   }
@@ -130,8 +130,9 @@ export class SlotPool {
       && (!audience || slot.audience === audience));
   }
 
-  async release(slot) {
-    if (!slot || !this.slots.includes(slot) || slot.state === "empty") return false;
+  async release(slot, expectedGeneration = slot?.generation) {
+    if (!slot || !this.slots.includes(slot) || slot.state === "empty" || slot.state === "draining"
+        || slot.generation !== expectedGeneration) return false;
     slot.state = "draining";
     const engine = slot.engine;
     slot.engine = null;
@@ -179,8 +180,11 @@ export class SlotPool {
     };
   }
 
-  requireOwned(slot, expectedState) {
+  requireOwned(slot, expectedState, expectedGeneration = slot?.generation) {
     if (!slot || !this.slots.includes(slot)) throw new Error("Lichess slot is not owned by this pool");
+    if (slot.generation !== expectedGeneration) {
+      throw new Error(`Lichess slot ${slot.id} generation changed from ${expectedGeneration} to ${slot.generation}`);
+    }
     const expected = Array.isArray(expectedState) ? expectedState : [expectedState];
     if (!expected.includes(slot.state)) {
       throw new Error(`Lichess slot ${slot.id} is ${slot.state}; expected ${expected.join(" or ")}`);

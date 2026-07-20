@@ -2088,8 +2088,10 @@ export class BotController {
   }
 
   async prepareSlot(slot) {
+    const slotGeneration = slot.generation;
+    let engine = null;
     try {
-      const engine = await this.engineStarts.run(async () => {
+      engine = await this.engineStarts.run(async () => {
         const prepared = new UciEngine(this.config.engine, (details) => log(details.event, {
           slot_id: slot.id,
           ...details,
@@ -2102,10 +2104,11 @@ export class BotController {
           throw error;
         }
       });
-      this.slots.attachEngine(slot, engine);
+      this.slots.attachEngine(slot, engine, slotGeneration);
       return slot;
     } catch (error) {
-      await this.slots.release(slot);
+      if (engine && slot.engine !== engine) await engine.close();
+      await this.slots.release(slot, slotGeneration);
       throw error;
     }
   }

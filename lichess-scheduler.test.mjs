@@ -50,6 +50,30 @@ test("already-started recovery uses idle qualified capacity without weakening ad
   assert.equal(pool.acquireStarted("bot", { opponent: "over-capacity" }), null);
 });
 
+test("concurrent releases keep a slot draining until its engine closes", async () => {
+  const pool = new SlotPool(capacity({ humans: 0, bots: 1 }));
+  const slot = pool.acquire("bot", { opponent: "timed-out" });
+  let finishClose;
+  const closeGate = new Promise((resolve) => { finishClose = resolve; });
+  let closes = 0;
+  pool.attachEngine(slot, {
+    close: async () => {
+      closes += 1;
+      await closeGate;
+    },
+  });
+  const firstRelease = pool.release(slot);
+  assert.equal(slot.state, "draining");
+  assert.equal(await pool.release(slot), false);
+  assert.equal(slot.state, "draining");
+  assert.equal(pool.acquireStarted("bot", { opponent: "next" }), null);
+  finishClose();
+  assert.equal(await firstRelease, true);
+  assert.equal(closes, 1);
+  assert.equal(slot.state, "empty");
+  assert.ok(pool.acquire("bot", { opponent: "next" }));
+});
+
 test("pending lookup is deterministic by challenge id then opponent", () => {
   const pool = new SlotPool(capacity({ humans: 0, bots: 2 }));
   const first = pool.acquire("bot", { opponent: "one", createdAt: 1 });
