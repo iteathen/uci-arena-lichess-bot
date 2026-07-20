@@ -9,6 +9,7 @@ import {
   DEFAULT_TEMPLATE,
   LichessClient,
   ROOT,
+  UciEngine,
   challengeFromSelf,
   challengeDeclineReason,
   applySingleGameProfile,
@@ -92,6 +93,49 @@ function qualifiedFixture() {
   return { config, profile, profilePath };
 }
 
+function qualifiedRuntimeStatus(profile) {
+  return {
+    schema: "uci_runtime_status_v1",
+    model_loaded: true,
+    model_id: profile.model_id,
+    model_fingerprint: profile.model_fingerprint,
+    adapter_id: profile.adapter_id,
+    provider_requested: profile.provider,
+    provider_effective: profile.provider,
+    provider_numeric_fingerprint: profile.provider_numeric_fingerprint,
+    hardware_driver_fingerprint: profile.hardware_driver_fingerprint,
+    onnx_runtime_version: profile.onnx_runtime_version,
+    search_core_configured: "v2",
+    threads_configured: profile.threads,
+    root_workers_configured: profile.root_workers,
+    split_depth_configured: profile.split_depth,
+    batch_size_configured: profile.batch_size,
+    batch_size_effective: profile.batch_size,
+    batch_wait_us_configured: profile.batch_wait_us,
+    batch_wait_us_effective: profile.batch_wait_us,
+    background_search: false,
+    last_search_available: true,
+    last_search_core: "v2",
+    last_search_threads: profile.threads,
+    last_search_root_workers: profile.root_workers,
+    actual_active_workers: 4,
+    root_workers_active: true,
+    worker_gate_active: true,
+    persistent_workers: true,
+    search_batch_coupling: true,
+    v2_cursor_admissions: 19,
+    v2_cursor_async_pending: 8,
+    v2_cursor_ready_resumes: 8,
+    v2_cursor_peak_waiting: 4,
+    evaluation_service_async_lease_completions: 8,
+    evaluation_service_stale_publications_discarded: 0,
+    evaluation_service_active_async_leases: 0,
+    evaluation_service_active_tickets: 0,
+    model_cache_eviction_deferrals: 0,
+    repetition_unbalanced_workers: 0,
+  };
+}
+
 test("runtime config is credential-free and resolves repository paths", () => {
   const config = loadRuntimeConfig({
     templatePath: DEFAULT_TEMPLATE,
@@ -162,46 +206,7 @@ test("profile-owned topology rejects a conflicting tracked option", () => {
 
 test("runtime status gate accepts active one-game cursor batching and rejects fallback", () => {
   const { profile } = qualifiedFixture();
-  const status = {
-    schema: "uci_runtime_status_v1",
-    model_loaded: true,
-    model_id: profile.model_id,
-    model_fingerprint: profile.model_fingerprint,
-    adapter_id: profile.adapter_id,
-    provider_requested: profile.provider,
-    provider_effective: profile.provider,
-    provider_numeric_fingerprint: profile.provider_numeric_fingerprint,
-    hardware_driver_fingerprint: profile.hardware_driver_fingerprint,
-    onnx_runtime_version: profile.onnx_runtime_version,
-    search_core_configured: "v2",
-    threads_configured: profile.threads,
-    root_workers_configured: profile.root_workers,
-    split_depth_configured: profile.split_depth,
-    batch_size_configured: profile.batch_size,
-    batch_size_effective: profile.batch_size,
-    batch_wait_us_configured: profile.batch_wait_us,
-    batch_wait_us_effective: profile.batch_wait_us,
-    background_search: false,
-    last_search_available: true,
-    last_search_core: "v2",
-    last_search_threads: profile.threads,
-    last_search_root_workers: profile.root_workers,
-    actual_active_workers: 4,
-    root_workers_active: true,
-    worker_gate_active: true,
-    persistent_workers: true,
-    search_batch_coupling: true,
-    v2_cursor_admissions: 19,
-    v2_cursor_async_pending: 8,
-    v2_cursor_ready_resumes: 8,
-    v2_cursor_peak_waiting: 4,
-    evaluation_service_async_lease_completions: 8,
-    evaluation_service_stale_publications_discarded: 0,
-    evaluation_service_active_async_leases: 0,
-    evaluation_service_active_tickets: 0,
-    model_cache_eviction_deferrals: 0,
-    repetition_unbalanced_workers: 0,
-  };
+  const status = qualifiedRuntimeStatus(profile);
   const line = `info string runtime_status_v1 ${JSON.stringify(status)}`;
   assert.deepEqual(parseRuntimeStatus(line), status);
   assert.equal(validateRuntimeStatus(profile, status), status);
@@ -209,6 +214,34 @@ test("runtime status gate accepts active one-game cursor batching and rejects fa
     () => validateRuntimeStatus(profile, { ...status, provider_effective: "cpu" }),
     /GPU provider fallback/,
   );
+});
+
+test("runtime qualification bypasses the book probe and restores live book play", async () => {
+  const { profile } = qualifiedFixture();
+  const engine = new UciEngine({ uci_options: {}, qualification_profile: profile });
+  engine.advertisedOptions.add("OwnBook");
+  const commands = [];
+  engine.send = (command) => commands.push(command);
+  engine.newGame = async () => commands.push("ucinewgame+isready");
+  engine.exchange = async (command) => {
+    commands.push(command);
+    if (command.startsWith("go depth ")) return "bestmove e2e4";
+    if (command === "isready") return "readyok";
+    throw new Error(`Unexpected command: ${command}`);
+  };
+  engine.runtimeStatus = async () => qualifiedRuntimeStatus(profile);
+
+  await engine.qualifyRuntime();
+
+  assert.deepEqual(commands, [
+    "setoption name OwnBook value false",
+    "isready",
+    "ucinewgame+isready",
+    "position startpos",
+    `go depth ${profile.qualification_probe.depth}`,
+    "setoption name OwnBook value true",
+    "isready",
+  ]);
 });
 
 test("NDJSON parser handles split chunks and keepalive lines", async () => {

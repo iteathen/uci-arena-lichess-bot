@@ -50,7 +50,9 @@ a fresh dedicated account if the intended account has already played.
    ```
 
    `UCI_ARENA_SINGLE_GAME_PROFILE` is the equivalent environment override.
-   Qualification does not contact Lichess or read a credential.
+   Qualification does not contact Lichess or read a credential. It temporarily
+   disables `OwnBook` for the required search-telemetry probe, then restores the
+   configured value (default `true`) before live play.
 
 4. Probe the authenticated BOT account. The adapter reads the token internally
    and never places it in config, argv, logs, or tracked files:

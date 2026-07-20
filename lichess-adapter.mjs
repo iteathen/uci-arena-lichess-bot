@@ -522,19 +522,32 @@ export class UciEngine {
 
   async qualifyRuntime() {
     const profile = this.config.qualification_profile;
-    await this.newGame();
-    this.send("position startpos");
-    const line = await this.exchange(
-      `go depth ${profile.qualification_probe.depth}`,
-      (candidate) => candidate.startsWith("bestmove "),
-      profile.qualification_probe.timeout_ms,
-    );
-    const bestmove = line.split(/\s+/)[1];
-    if (!/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(bestmove)) {
-      throw new Error(`Qualification search returned unusable bestmove: ${bestmove ?? "missing"}`);
+    if (!this.advertisedOptions.has("OwnBook")) {
+      throw new Error("Qualification requires the OwnBook UCI option");
     }
-    this.qualificationStatus = validateRuntimeStatus(profile, await this.runtimeStatus());
-    return this.qualificationStatus;
+    const restoredOwnBook = Object.hasOwn(this.config.uci_options, "OwnBook")
+      ? String(this.config.uci_options.OwnBook)
+      : "true";
+    this.send("setoption name OwnBook value false");
+    await this.exchange("isready", (line) => line === "readyok", 30_000);
+    try {
+      await this.newGame();
+      this.send("position startpos");
+      const line = await this.exchange(
+        `go depth ${profile.qualification_probe.depth}`,
+        (candidate) => candidate.startsWith("bestmove "),
+        profile.qualification_probe.timeout_ms,
+      );
+      const bestmove = line.split(/\s+/)[1];
+      if (!/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(bestmove)) {
+        throw new Error(`Qualification search returned unusable bestmove: ${bestmove ?? "missing"}`);
+      }
+      this.qualificationStatus = validateRuntimeStatus(profile, await this.runtimeStatus());
+      return this.qualificationStatus;
+    } finally {
+      this.send(`setoption name OwnBook value ${restoredOwnBook}`);
+      await this.exchange("isready", (line) => line === "readyok", 30_000);
+    }
   }
 
   async search({ moves, wtime, btime, winc, binc, color }) {
