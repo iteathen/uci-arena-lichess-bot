@@ -13,12 +13,14 @@ import {
   LichessClient,
   ROOT,
   UciEngine,
+  TransportProfileTracker,
   challengeFromSelf,
   challengeDeclineReason,
   applySingleGameProfile,
   loadCapacityProfile,
   loadRuntimeConfig,
   loadSingleGameProfile,
+  loadTransportProfile,
   parseNdjsonStream,
   parseArguments,
   parseRuntimeStatus,
@@ -367,12 +369,11 @@ test("runtime config is credential-free and resolves repository paths", () => {
   const serialized = JSON.stringify(config).toLowerCase();
   assert.equal(serialized.includes("test-token"), false);
   assert.equal(serialized.includes("oauth_token"), false);
-  assert.equal(config.schema, "uci_arena_lichess_adapter_v4");
-  assert.deepEqual(config.timing, {
-    opponent_turn_search: true,
-    foreground_preempts_ponder: true,
-    initial_transport_reserve_ms: 250,
-  });
+  assert.equal(config.schema, "uci_arena_lichess_adapter_v5");
+  assert.equal(config.timing.opponent_turn_search, true);
+  assert.equal(config.timing.foreground_preempts_ponder, true);
+  assert.equal(config.timing.initial_transport_reserve_ms, 650);
+  assert.equal(config.timing.bootstrap_transport_reserve_ms, 650);
   assert.equal(config.engine.uci_options.ModelRoot, "engine/runtime/models/example/engine");
   assert.equal(config.engine.executable.includes(ROOT.replaceAll("\\", "/")), true);
 });
@@ -405,6 +406,7 @@ test("timing profile has a distinct config, environment, and CLI path", () => {
   assert.equal(config.engine.time_profile, selected);
   assert.equal(config.engine.uci_options.IterativeTimeController, false);
   assert.equal(config.engine.uci_options.TimeProfileProviderReserveUs, 0);
+  assert.equal(config.engine.uci_options.TimeProfileIterationForecastScalePermille, 1000);
   assert.deepEqual(
     parseArguments(["run", "--profile", "single.json", "--time-profile", "time.json"]),
     { command: "run", profile: "single.json", time_profile: "time.json" },
@@ -415,6 +417,7 @@ test("v2 config migrates to one shared slot with automatic scheduling disabled",
   const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-v2-config-"));
   const template = JSON.parse(readFileSync(DEFAULT_TEMPLATE, "utf8"));
   template.schema = "uci_arena_lichess_adapter_v2";
+  delete template.timing;
   delete template.capacity;
   delete template.scheduler;
   template.challenges.concurrency = 1;
@@ -424,7 +427,7 @@ test("v2 config migrates to one shared slot with automatic scheduling disabled",
   assert.equal(config.capacity.total_slots, 1);
   assert.equal(config.capacity.legacy_shared, true);
   assert.equal(config.scheduler.enabled, false);
-  assert.equal(config.schema, "uci_arena_lichess_adapter_v4");
+  assert.equal(config.schema, "uci_arena_lichess_adapter_v5");
   assert.equal(config.timing.opponent_turn_search, true);
   assert.equal(config.timing.initial_transport_reserve_ms, 250);
 });
@@ -448,7 +451,7 @@ test("v3 accepts a configurable sixteen-slot layout and rejects invalid sums", (
   assert.throws(() => loadRuntimeConfig({ templatePath: configPath }), /must sum/);
 });
 
-test("v4 timing policy rejects conflicting UCI ownership and invalid reserves", () => {
+test("v5 timing policy rejects conflicting UCI ownership and invalid reserves", () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-v4-timing-"));
   const template = JSON.parse(readFileSync(DEFAULT_TEMPLATE, "utf8"));
   const configPath = path.join(directory, "v4.json");
@@ -468,6 +471,10 @@ test("v4 timing policy rejects conflicting UCI ownership and invalid reserves", 
   writeFileSync(configPath, JSON.stringify(template));
   assert.throws(() => loadRuntimeConfig({ templatePath: configPath }), /timing-profile-owned/);
   template.engine.uci_options.TimeProfileProviderReserveUs = 0;
+  template.engine.uci_options.TimeProfileIterationForecastScalePermille = 1001;
+  writeFileSync(configPath, JSON.stringify(template));
+  assert.throws(() => loadRuntimeConfig({ templatePath: configPath }), /timing-profile-owned/);
+  template.engine.uci_options.TimeProfileIterationForecastScalePermille = 1000;
   template.timing.initial_transport_reserve_ms = 5_001;
   writeFileSync(configPath, JSON.stringify(template));
   assert.throws(() => loadRuntimeConfig({ templatePath: configPath }), /0\.\.5000/);
@@ -597,11 +604,13 @@ test("UCI readiness requires explicit ponder and move-overhead support", () => {
   engine.advertisedOptions.add("Ponder");
   engine.advertisedOptions.add("IterativeTimeController");
   engine.advertisedOptions.add("TimeProfileProviderReserveUs");
+  engine.advertisedOptions.add("TimeProfileIterationForecastScalePermille");
   engine.configureUciOptions();
   assert.deepEqual(commands, [
     "setoption name Move Overhead value 250",
     "setoption name IterativeTimeController value false",
     "setoption name TimeProfileProviderReserveUs value 0",
+    "setoption name TimeProfileIterationForecastScalePermille value 1000",
     "setoption name Ponder value true",
   ]);
 });
@@ -623,9 +632,13 @@ test("missing timing profile remains observable with zero reserve and controller
       NNSpeculation: false,
       IterativeTimeController: false,
       TimeProfileProviderReserveUs: 0,
+      TimeProfileIterationForecastScalePermille: 1000,
     },
   });
-  engine.runtimeStatus = async () => ({ time_profile_provider_reserve_us: 0 });
+  engine.runtimeStatus = async () => ({
+    time_profile_provider_reserve_us: 0,
+    time_profile_iteration_forecast_scale_permille: 1000,
+  });
   const status = await engine.configureTimeProfile();
   assert.equal(status.status, "missing");
   assert.equal(status.applied, false);
@@ -643,6 +656,57 @@ test("UCI search telemetry retains identity across later info string lines", () 
     model_fingerprint: "1234",
     model_id: "model_v1",
   });
+});
+
+test("UCI book telemetry is structured without losing later search identity", () => {
+  const engine = new UciEngine({ uci_options: {} });
+  engine.onLine("info string book_probe_result hit book_miss_reason none book_lookup_us 9 book_evaluation_source neutral_fallback book_evaluation_us 0 book_decision_us 11 book_emit_us 1 book_snapshot_identity 12345 book_record_count 363");
+  engine.onLine("info depth 0 nodes 0 model_provider directml model_fingerprint 9876 model_id model_v1 string opening_book");
+  assert.equal(engine.latestInfo.book_probe_result, "hit");
+  assert.equal(engine.latestInfo.book_miss_reason, "none");
+  assert.equal(engine.latestInfo.book_lookup_us, 9);
+  assert.equal(engine.latestInfo.book_decision_us, 11);
+  assert.equal(engine.latestInfo.book_snapshot_identity, "12345");
+  assert.equal(engine.latestInfo.book_record_count, 363);
+  assert.equal(engine.latestInfo.model_provider, "directml");
+});
+
+test("terminal cancellation drain accepts null bestmove while foreground remains strict", async () => {
+  const engine = new UciEngine({ uci_options: {} });
+  engine.runtimeGeneration = 1;
+  engine.send = (command) => {
+    if (command === "stop") queueMicrotask(() => engine.onLine("bestmove 0000"));
+  };
+  engine.beginSearch("opponent_root", "go infinite", { rootMoves: [] });
+  const drained = await engine.stopAndDrain("terminal_state");
+  assert.equal(drained.drained, true);
+  assert.equal(drained.nullBestmove, true);
+  assert.equal(drained.staleBestmove, null);
+  assert.throws(() => engine.parseBestmove("bestmove 0000"), /unusable bestmove/);
+});
+
+test("transport profile publishes only after ten games and two hundred successful moves", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-transport-profile-"));
+  const profilePath = path.join(directory, "transport.json");
+  let clock = Date.parse("2026-07-20T00:00:00Z");
+  const tracker = new TransportProfileTracker({
+    profilePath,
+    bootstrapReserveMs: 650,
+    now: () => clock,
+  });
+  for (let game = 0; game < 10; game += 1) {
+    for (let move = 0; move < 20; move += 1) {
+      tracker.record(`game-${game}`, 500 + ((game * 20 + move) % 100));
+    }
+    tracker.finishGame(`game-${game}`);
+    clock += 1_000;
+  }
+  const loaded = loadTransportProfile(profilePath, clock);
+  assert.equal(loaded.qualified, true);
+  assert.equal(loaded.reserveMs, 650);
+  assert.equal(loaded.profile.sample_count, 200);
+  assert.equal(loaded.profile.game_count, 10);
+  assert.equal(loadTransportProfile(profilePath, clock + 8 * 24 * 60 * 60 * 1_000).status, "stale");
 });
 
 test("stopped ponder bestmove is drained before the foreground waiter starts", async () => {
@@ -1433,7 +1497,7 @@ test("outbound timeout cancels the remote challenge before releasing its slot", 
   }
 });
 
-test("failed timeout cancellation retains the slot for a racing gameStart", async () => {
+test("permanent timeout cancellation failure retains the slot and faults outbound scheduling", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-timeout-race-"));
   const store = new LichessStore(path.join(directory, "matches.sqlite"));
   let closes = 0;
@@ -1442,6 +1506,7 @@ test("failed timeout cancellation retains the slot for a racing gameStart", asyn
       post: async (endpoint) => {
         throw new LichessHttpError("POST", endpoint, 400);
       },
+      json: async () => ({ nowPlaying: [] }),
     },
     config: {
       capacity: {
@@ -1466,10 +1531,106 @@ test("failed timeout cancellation retains the slot for a racing gameStart", asyn
   controller.slots.pending(slot, "late-challenge");
   try {
     await controller.expirePending(25_001);
-    assert.equal(slot.state, "pending");
+    assert.equal(slot.state, "cancelling");
     assert.equal(slot.challengeId, "late-challenge");
-    assert.equal(slot.cancelRetryAt, 40_001);
-    assert.equal(controller.needsReconciliation, true);
+    assert.equal(slot.cancelRetryAt, Number.POSITIVE_INFINITY);
+    assert.equal(controller.schedulerFault.kind, "permanent_cancel_error");
+    assert.equal(closes, 0);
+  } finally {
+    await controller.slots.drainAll();
+    store.close();
+  }
+});
+
+test("timeout cancellation 404 reconciles once then releases after the late-event grace", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-timeout-404-"));
+  const store = new LichessStore(path.join(directory, "matches.sqlite"));
+  let posts = 0;
+  let closes = 0;
+  const controller = new BotController({
+    client: {
+      post: async (endpoint) => {
+        posts += 1;
+        throw new LichessHttpError("POST", endpoint, 404);
+      },
+      json: async () => ({ nowPlaying: [] }),
+    },
+    config: {
+      capacity: {
+        total_slots: 1,
+        startup_parallelism: 1,
+        human: { slots: 0, allow_borrowing: false, accept_public: true },
+        bot: { slots: 1, target_active: 1 },
+      },
+      scheduler: { challenge_timeout_seconds: 25, timeout_cooldown_minutes: 30 },
+    },
+    account: "self",
+    runtimeDir: directory,
+    signal: new AbortController().signal,
+    store,
+  });
+  const slot = controller.slots.acquire("bot", {
+    opponent: "gone-bot",
+    direction: "outbound",
+    createdAt: 1,
+  });
+  controller.slots.attachEngine(slot, { close: async () => { closes += 1; } });
+  controller.slots.pending(slot, "gone-challenge");
+  try {
+    await controller.expirePending(25_001);
+    assert.equal(slot.state, "cancelling");
+    assert.equal(posts, 1);
+    const releaseAt = slot.reconcileReleaseAt;
+    await controller.expirePending(releaseAt - 1);
+    assert.equal(posts, 1);
+    assert.equal(slot.state, "cancelling");
+    await controller.expirePending(releaseAt);
+    assert.equal(posts, 1);
+    assert.equal(slot.state, "empty");
+    assert.equal(closes, 1);
+  } finally {
+    await controller.slots.drainAll();
+    store.close();
+  }
+});
+
+test("timeout cancellation 404 recovers an already-started game without releasing its child", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-timeout-404-game-"));
+  const store = new LichessStore(path.join(directory, "matches.sqlite"));
+  let closes = 0;
+  const controller = new BotController({
+    client: {
+      post: async (endpoint) => { throw new LichessHttpError("POST", endpoint, 404); },
+      json: async () => ({ nowPlaying: [{ gameId: "accepted-challenge" }] }),
+    },
+    config: {
+      capacity: {
+        total_slots: 1,
+        startup_parallelism: 1,
+        human: { slots: 0, allow_borrowing: false, accept_public: true },
+        bot: { slots: 1, target_active: 1 },
+      },
+      scheduler: { challenge_timeout_seconds: 25, timeout_cooldown_minutes: 30 },
+    },
+    account: "self",
+    runtimeDir: directory,
+    signal: new AbortController().signal,
+    store,
+  });
+  const slot = controller.slots.acquire("bot", {
+    opponent: "accepted-bot",
+    direction: "outbound",
+    createdAt: 1,
+  });
+  controller.slots.attachEngine(slot, { close: async () => { closes += 1; } });
+  controller.slots.pending(slot, "accepted-challenge");
+  controller.startGame = async (game, recoveredSlot) => {
+    controller.slots.active(recoveredSlot, game.gameId);
+  };
+  try {
+    await controller.expirePending(25_001);
+    assert.equal(slot.state, "active");
+    assert.equal(slot.gameId, "accepted-challenge");
     assert.equal(closes, 0);
   } finally {
     await controller.slots.drainAll();

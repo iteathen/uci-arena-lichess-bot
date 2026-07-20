@@ -60,6 +60,9 @@ export class SlotPool {
     slot.gameId = null;
     slot.engine = null;
     slot.cancelRetryAt = null;
+    slot.cancelAttempts = 0;
+    slot.cancelInFlight = false;
+    slot.reconcileReleaseAt = null;
     return slot;
   }
 
@@ -76,8 +79,15 @@ export class SlotPool {
     return slot;
   }
 
+  cancelling(slot) {
+    this.requireOwned(slot, ["pending", "cancelling"]);
+    slot.state = "cancelling";
+    slot.cancelInFlight = true;
+    return slot;
+  }
+
   active(slot, gameId) {
-    this.requireOwned(slot, ["preparing", "pending", "active"]);
+    this.requireOwned(slot, ["preparing", "pending", "cancelling", "active"]);
     slot.gameId = String(gameId);
     slot.state = "active";
     return slot;
@@ -86,17 +96,18 @@ export class SlotPool {
   findPending(game) {
     const gameId = String(game?.gameId ?? game?.id ?? "");
     const challengeId = String(game?.challengeId ?? gameId);
-    const exact = this.slots.find((slot) => slot.state === "pending"
+    const exact = this.slots.find((slot) => ["pending", "cancelling"].includes(slot.state)
       && (slot.challengeId === challengeId || slot.challengeId === gameId));
     if (exact) return exact;
     const opponent = String(game?.opponent?.id ?? game?.opponent?.username
       ?? game?.opponent?.name ?? "").toLocaleLowerCase();
     if (opponent) {
       return this.slots
-        .filter((slot) => slot.state === "pending" && slot.opponent === opponent)
+        .filter((slot) => ["pending", "cancelling"].includes(slot.state)
+          && slot.opponent === opponent)
         .sort((left, right) => left.createdAt - right.createdAt)[0] ?? null;
     }
-    const pending = this.slots.filter((slot) => slot.state === "pending");
+    const pending = this.slots.filter((slot) => ["pending", "cancelling"].includes(slot.state));
     return pending.length === 1 ? pending[0] : null;
   }
 
@@ -110,7 +121,7 @@ export class SlotPool {
     return this.slots.find((slot) => slot.gameId === id && slot.state !== "empty") ?? null;
   }
 
-  occupied(audience, states = ["preparing", "pending", "active", "draining"]) {
+  occupied(audience, states = ["preparing", "pending", "cancelling", "active", "draining"]) {
     requireAudience(audience);
     return this.slots.filter((slot) => slot.audience === audience && states.includes(slot.state)).length;
   }
@@ -147,6 +158,9 @@ export class SlotPool {
       slot.challengeId = null;
       slot.gameId = null;
       slot.cancelRetryAt = null;
+      slot.cancelAttempts = null;
+      slot.cancelInFlight = null;
+      slot.reconcileReleaseAt = null;
     }
     return true;
   }
@@ -159,7 +173,7 @@ export class SlotPool {
     const byAudience = {};
     for (const audience of ["human", "bot"]) {
       byAudience[audience] = Object.fromEntries(
-        ["empty", "preparing", "pending", "active", "draining"].map((state) => [
+        ["empty", "preparing", "pending", "cancelling", "active", "draining"].map((state) => [
           state,
           this.slots.filter((slot) => slot.audience === audience && slot.state === state).length,
         ]),

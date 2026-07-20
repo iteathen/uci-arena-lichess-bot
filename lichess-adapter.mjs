@@ -58,23 +58,153 @@ const REQUIRED_PROFILE_EVIDENCE = Object.freeze([
   "topology",
   "complete_game",
 ]);
-const CURRENT_CONFIG_SCHEMA = "uci_arena_lichess_adapter_v4";
+const CURRENT_CONFIG_SCHEMA = "uci_arena_lichess_adapter_v5";
 const LEGACY_CONFIG_SCHEMAS = new Set([
   "uci_arena_lichess_adapter_v2",
   "uci_arena_lichess_adapter_v3",
+  "uci_arena_lichess_adapter_v4",
 ]);
 const DEFAULT_TIMING_CONFIG = Object.freeze({
   opponent_turn_search: true,
   foreground_preempts_ponder: true,
-  initial_transport_reserve_ms: 250,
+  initial_transport_reserve_ms: 650,
+  transport_profile_path: null,
 });
+const TRANSPORT_PROFILE_SCHEMA = "uci_arena_lichess_transport_profile_v1";
+const TRANSPORT_PROFILE_MINIMUM_SAMPLES = 200;
+const TRANSPORT_PROFILE_MINIMUM_GAMES = 10;
+const TRANSPORT_PROFILE_MAXIMUM_AGE_MS = 7 * 24 * 60 * 60 * 1_000;
+const TRANSPORT_PROFILE_MAXIMUM_SAMPLES = 2_000;
+const TRANSPORT_RESERVE_MINIMUM_MS = 250;
+const TRANSPORT_RESERVE_MAXIMUM_MS = 1_500;
 const UCI_MOVE_PATTERN = /^[a-h][1-8][a-h][1-8][qrbn]?$/;
 const TIME_PROFILE_RESERVED_OPTIONS = new Set([
   "SearchCore", "Threads", "RootWorkers", "V2SplitDepth", "BackgroundSearch",
   "NNSpeculation", "ModelRoot", "NNBatchSize", "NNBatchWaitUs", "OnnxProvider",
-  "IterativeTimeController", "TimeProfileProviderReserveUs", "Move Overhead", "Ponder",
+  "IterativeTimeController", "TimeProfileProviderReserveUs",
+  "TimeProfileIterationForecastScalePermille", "Move Overhead", "Ponder",
   "OwnBook",
 ]);
+
+function percentile(values, quantile) {
+  const sorted = values
+    .filter((value) => Number.isFinite(value) && value >= 0)
+    .toSorted((left, right) => left - right);
+  if (sorted.length === 0) return null;
+  const index = Math.max(0, Math.ceil(quantile * sorted.length) - 1);
+  return sorted[index];
+}
+
+function transportReserveFromP99(p99) {
+  if (!Number.isFinite(p99)) return null;
+  const rounded = Math.ceil((p99 + 50) / 50) * 50;
+  return Math.max(TRANSPORT_RESERVE_MINIMUM_MS, Math.min(TRANSPORT_RESERVE_MAXIMUM_MS, rounded));
+}
+
+export function loadTransportProfile(profilePath, now = Date.now()) {
+  if (!profilePath || !existsSync(profilePath)) {
+    return { status: "missing", qualified: false, reason: "transport profile is unavailable" };
+  }
+  try {
+    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+    if (profile.schema !== TRANSPORT_PROFILE_SCHEMA) throw new Error("unsupported schema");
+    const generatedAt = Date.parse(profile.generated_at);
+    if (!Number.isFinite(generatedAt)) throw new Error("generated_at is invalid");
+    const samples = Array.isArray(profile.samples) ? profile.samples : [];
+    const values = samples.map((sample) => Number(sample?.post_dispatch_to_ack_ms));
+    const gameCount = new Set(samples.map((sample) => String(sample?.game_id ?? "")).filter(Boolean)).size;
+    const p99 = percentile(values, 0.99);
+    const reserve = transportReserveFromP99(p99);
+    const qualified = profile.qualified === true
+      && samples.length >= TRANSPORT_PROFILE_MINIMUM_SAMPLES
+      && gameCount >= TRANSPORT_PROFILE_MINIMUM_GAMES
+      && reserve === Number(profile.effective_reserve_ms);
+    if (!qualified) {
+      return { status: "collecting", qualified: false, reason: "transport profile lacks qualified evidence", profile };
+    }
+    if (now - generatedAt > TRANSPORT_PROFILE_MAXIMUM_AGE_MS) {
+      return { status: "stale", qualified: false, reason: "transport profile is older than seven days", profile };
+    }
+    return { status: "accepted", qualified: true, reserveMs: reserve, profile };
+  } catch (error) {
+    return { status: "rejected", qualified: false, reason: error.message };
+  }
+}
+
+export class TransportProfileTracker {
+  constructor({ profilePath, bootstrapReserveMs = 650, now = Date.now, telemetry = () => {} }) {
+    this.profilePath = profilePath;
+    this.bootstrapReserveMs = bootstrapReserveMs;
+    this.now = now;
+    this.telemetry = telemetry;
+    this.samples = [];
+    this.pendingGames = new Set();
+    this.effectiveReserveMs = bootstrapReserveMs;
+    if (profilePath && existsSync(profilePath)) {
+      try {
+        const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+        if (profile.schema === TRANSPORT_PROFILE_SCHEMA && Array.isArray(profile.samples)) {
+          const cutoff = this.now() - TRANSPORT_PROFILE_MAXIMUM_AGE_MS;
+          this.samples = profile.samples.filter((sample) => Number(sample?.recorded_at_ms) >= cutoff)
+            .slice(-TRANSPORT_PROFILE_MAXIMUM_SAMPLES);
+        }
+      } catch {
+        this.samples = [];
+      }
+    }
+    const accepted = loadTransportProfile(profilePath, this.now());
+    if (accepted.qualified) this.effectiveReserveMs = accepted.reserveMs;
+  }
+
+  record(gameId, durationMs) {
+    if (!gameId || !Number.isFinite(durationMs) || durationMs < 0) return;
+    this.samples.push({
+      game_id: String(gameId),
+      post_dispatch_to_ack_ms: Math.round(durationMs * 1_000) / 1_000,
+      recorded_at_ms: this.now(),
+    });
+    this.samples = this.samples.slice(-TRANSPORT_PROFILE_MAXIMUM_SAMPLES);
+    this.pendingGames.add(String(gameId));
+  }
+
+  finishGame(gameId) {
+    if (!this.pendingGames.delete(String(gameId)) || !this.profilePath) return this.effectiveReserveMs;
+    const values = this.samples.map((sample) => sample.post_dispatch_to_ack_ms);
+    const gameCount = new Set(this.samples.map((sample) => sample.game_id)).size;
+    const p50 = percentile(values, 0.50);
+    const p95 = percentile(values, 0.95);
+    const p99 = percentile(values, 0.99);
+    const reserve = transportReserveFromP99(p99);
+    const qualified = this.samples.length >= TRANSPORT_PROFILE_MINIMUM_SAMPLES
+      && gameCount >= TRANSPORT_PROFILE_MINIMUM_GAMES
+      && reserve !== null;
+    if (qualified) this.effectiveReserveMs = reserve;
+    const profile = {
+      schema: TRANSPORT_PROFILE_SCHEMA,
+      generated_at: new Date(this.now()).toISOString(),
+      qualified,
+      sample_count: this.samples.length,
+      game_count: gameCount,
+      dispatch_to_ack_ms: { p50, p95, p99 },
+      effective_reserve_ms: qualified ? reserve : this.bootstrapReserveMs,
+      samples: this.samples,
+    };
+    mkdirSync(path.dirname(this.profilePath), { recursive: true });
+    const temporary = `${this.profilePath}.tmp-${process.pid}`;
+    writeFileSync(temporary, `${JSON.stringify(profile, null, 2)}\n`, "utf8");
+    renameSync(temporary, this.profilePath);
+    this.telemetry({
+      event: "transport_profile_status",
+      qualified,
+      sample_count: this.samples.length,
+      game_count: gameCount,
+      effective_reserve_ms: this.effectiveReserveMs,
+      p95_ms: p95,
+      p99_ms: p99,
+    });
+    return this.effectiveReserveMs;
+  }
+}
 
 class StaleAuthoritativeSearchError extends Error {
   constructor(gameId, reason) {
@@ -185,6 +315,11 @@ function normalizeTimingConfig(config) {
     0,
     5_000,
   );
+  if (config.timing.transport_profile_path !== null
+      && config.timing.transport_profile_path !== undefined
+      && typeof config.timing.transport_profile_path !== "string") {
+    throw new Error("timing.transport_profile_path must be a path or null");
+  }
   const configuredPonder = config.engine?.uci_options?.Ponder;
   if (config.timing.opponent_turn_search && configuredPonder !== undefined
       && String(configuredPonder).toLocaleLowerCase() !== "true") {
@@ -204,9 +339,18 @@ function normalizeTimingConfig(config) {
   if (configuredProviderReserve !== undefined && Number(configuredProviderReserve) !== 0) {
     throw new Error("TimeProfileProviderReserveUs is timing-profile-owned and must start at zero");
   }
+  const configuredForecastScale =
+    config.engine?.uci_options?.TimeProfileIterationForecastScalePermille;
+  if (configuredForecastScale !== undefined && Number(configuredForecastScale) !== 1000) {
+    throw new Error(
+      "TimeProfileIterationForecastScalePermille is timing-profile-owned and must start at 1000",
+    );
+  }
   config.engine.uci_options.IterativeTimeController = false;
   config.engine.uci_options.TimeProfileProviderReserveUs = 0;
+  config.engine.uci_options.TimeProfileIterationForecastScalePermille = 1000;
   config.schema = CURRENT_CONFIG_SCHEMA;
+  config.timing.bootstrap_transport_reserve_ms = config.timing.initial_transport_reserve_ms;
   config.engine.timing = config.timing;
   return config;
 }
@@ -253,6 +397,10 @@ export function loadRuntimeConfig({
   }
   const config = replaceRepoPlaceholder(parsed, path.resolve(repoRoot));
   if (config.schema === "uci_arena_lichess_adapter_v2") migrateV2Config(config);
+  if (config.schema !== CURRENT_CONFIG_SCHEMA) {
+    config.timing ??= {};
+    config.timing.initial_transport_reserve_ms ??= 250;
+  }
   if (!config.engine?.executable || !config.engine?.working_directory) {
     throw new Error("Lichess adapter config is missing engine paths");
   }
@@ -269,6 +417,16 @@ export function loadRuntimeConfig({
   const selectedTimeProfile = timeProfilePath || environment.UCI_ARENA_TIME_PROFILE?.trim();
   if (selectedTimeProfile) config.engine.time_profile = selectedTimeProfile;
   normalizeTimingConfig(config);
+  if (config.timing.transport_profile_path) {
+    config.timing.transport_profile_path = path.isAbsolute(config.timing.transport_profile_path)
+      ? config.timing.transport_profile_path
+      : path.resolve(config.engine.working_directory, config.timing.transport_profile_path);
+  }
+  const transportProfile = loadTransportProfile(config.timing.transport_profile_path);
+  config.timing.transport_profile_status = transportProfile;
+  if (transportProfile.qualified) {
+    config.timing.initial_transport_reserve_ms = transportProfile.reserveMs;
+  }
   return validateCapacityConfig(config);
 }
 
@@ -603,6 +761,25 @@ function parseInfo(line) {
     const match = line.match(new RegExp(`(?:^| )${key} (\\d+)`));
     if (match) telemetry[key] = Number(match[1]);
   }
+  for (const key of [
+    "book_lookup_us",
+    "book_evaluation_us",
+    "book_decision_us",
+    "book_emit_us",
+    "book_record_count",
+  ]) {
+    const match = line.match(new RegExp(`(?:^| )${key} (\\d+)`));
+    if (match) telemetry[key] = Number(match[1]);
+  }
+  for (const key of [
+    "book_probe_result",
+    "book_miss_reason",
+    "book_evaluation_source",
+    "book_snapshot_identity",
+  ]) {
+    const match = line.match(new RegExp(`(?:^| )${key} ([^ ]+)`));
+    if (match) telemetry[key] = match[1];
+  }
   const score = line.match(/(?:^| )score (cp|mate) (-?\d+)/);
   if (score) telemetry.score = { unit: score[1], value: Number(score[2]) };
   for (const key of [
@@ -773,6 +950,7 @@ export class UciEngine {
       "Move Overhead",
       "IterativeTimeController",
       "TimeProfileProviderReserveUs",
+      "TimeProfileIterationForecastScalePermille",
     ];
     if (this.timing.opponent_turn_search) requiredTimingOptions.push("Ponder");
     const missingTimingOptions = requiredTimingOptions
@@ -783,12 +961,14 @@ export class UciEngine {
     for (const [name, value] of Object.entries(this.config.uci_options)) {
       if (name === "Move Overhead" || name === "Ponder"
           || name === "IterativeTimeController"
-          || name === "TimeProfileProviderReserveUs") continue;
+          || name === "TimeProfileProviderReserveUs"
+          || name === "TimeProfileIterationForecastScalePermille") continue;
       this.send(`setoption name ${name} value ${String(value)}`);
     }
     this.send(`setoption name Move Overhead value ${this.timing.initial_transport_reserve_ms}`);
     this.send("setoption name IterativeTimeController value false");
     this.send("setoption name TimeProfileProviderReserveUs value 0");
+    this.send("setoption name TimeProfileIterationForecastScalePermille value 1000");
     if (this.timing.opponent_turn_search) this.send("setoption name Ponder value true");
   }
 
@@ -880,6 +1060,7 @@ export class UciEngine {
       moveOverheadMs: this.timing.initial_transport_reserve_ms,
       iterativeTimeController: false,
       appliedTimeProfileReserveUs,
+      iterationForecastScalePermille: 1000,
       modelRoot: options.ModelRoot,
       extraEngineOptions,
     };
@@ -889,6 +1070,9 @@ export class UciEngine {
     const initialStatus = await this.runtimeStatus();
     if (initialStatus.time_profile_provider_reserve_us !== 0) {
       throw new Error("UCI timing-profile provider reserve did not initialize to zero");
+    }
+    if (initialStatus.time_profile_iteration_forecast_scale_permille !== 1000) {
+      throw new Error("UCI timing-profile iteration forecast scale did not initialize to 1000");
     }
     const configuredPath = String(this.config.time_profile ?? "").trim();
     if (!configuredPath) {
@@ -926,7 +1110,9 @@ export class UciEngine {
         uciOptionLines: this.uciOptionLines,
         configuration,
       });
-      this.send(`setoption name ${accepted.uci_option.name} value ${accepted.uci_option.value}`);
+      for (const option of accepted.uci_options) {
+        this.send(`setoption name ${option.name} value ${option.value}`);
+      }
       reserveWasSet = true;
       await this.exchange("isready", (line) => line === "readyok", 30_000);
       const appliedStatus = await this.runtimeStatus();
@@ -938,16 +1124,23 @@ export class UciEngine {
         cwd: this.config.working_directory,
         uciIdLines: this.uciIdLines,
         uciOptionLines: this.uciOptionLines,
-        configuration: this.timeProfileConfiguration(accepted.provider_service_reserve_us),
+        configuration: {
+          ...this.timeProfileConfiguration(accepted.provider_service_reserve_us),
+          iterationForecastScalePermille: accepted.iteration_forecast_scale_permille,
+        },
       });
       this.timeProfileStatus = validateAppliedTimeProfileReserve(profile, appliedStatus);
     } catch (error) {
       if (reserveWasSet) {
         this.send("setoption name TimeProfileProviderReserveUs value 0");
+        this.send("setoption name TimeProfileIterationForecastScalePermille value 1000");
         await this.exchange("isready", (line) => line === "readyok", 30_000);
         const resetStatus = await this.runtimeStatus();
         if (resetStatus.time_profile_provider_reserve_us !== 0) {
           throw new Error(`Timing-profile rejection could not restore reserve zero: ${error.message}`);
+        }
+        if (resetStatus.time_profile_iteration_forecast_scale_permille !== 1000) {
+          throw new Error(`Timing-profile rejection could not restore forecast scale 1000: ${error.message}`);
         }
       }
       this.timeProfileStatus = timeProfileFallbackStatus("rejected", error.message);
@@ -986,9 +1179,12 @@ export class UciEngine {
     }
   }
 
-  parseBestmove(line) {
+  parseBestmove(line, { allowNullBestmove = false } = {}) {
     const parts = String(line).trim().split(/\s+/);
     const bestmove = parts[0] === "bestmove" ? parts[1] : null;
+    if (bestmove === "0000" && allowNullBestmove) {
+      return { bestmove: null, ponder: null, nullBestmove: true };
+    }
     if (!UCI_MOVE_PATTERN.test(bestmove ?? "")) {
       throw new Error(`UCI engine returned unusable bestmove: ${bestmove ?? "missing"}`);
     }
@@ -996,7 +1192,7 @@ export class UciEngine {
     const ponder = ponderIndex >= 0 && UCI_MOVE_PATTERN.test(parts[ponderIndex + 1] ?? "")
       ? parts[ponderIndex + 1]
       : null;
-    return { bestmove, ponder };
+    return { bestmove, ponder, nullBestmove: false };
   }
 
   formatPosition(moves) {
@@ -1038,7 +1234,7 @@ export class UciEngine {
     return active;
   }
 
-  async awaitSearch(active, timeoutMs) {
+  async awaitSearch(active, timeoutMs, { allowNullBestmove = false } = {}) {
     let timer;
     const timeout = Number.isFinite(timeoutMs)
       ? new Promise((resolve) => {
@@ -1056,7 +1252,7 @@ export class UciEngine {
       this.activeSearch = null;
       this.mode = "idle";
     }
-    const move = this.parseBestmove(outcome.line);
+    const move = this.parseBestmove(outcome.line, { allowNullBestmove });
     return {
       ...move,
       telemetry: outcome.telemetry,
@@ -1102,13 +1298,17 @@ export class UciEngine {
     if (!active) return { drained: false, reason };
     if (!active.settled) this.send("stop");
     const timeoutMs = Number(this.config.ponder_stop_timeout_ms ?? 5_000);
-    const result = await this.awaitSearch(active, timeoutMs);
+    const drainStartedAt = performance.now();
+    const result = await this.awaitSearch(active, timeoutMs, { allowNullBestmove: true });
+    const drainElapsedMs = performance.now() - drainStartedAt;
     this.telemetry({
       event: "stale_bestmove_drained",
       search_kind: active.kind,
       search_generation: active.generation,
       reason,
       move: result.bestmove,
+      null_bestmove: result.nullBestmove,
+      drain_elapsed_ms: drainElapsedMs,
     });
     return {
       drained: true,
@@ -1116,6 +1316,8 @@ export class UciEngine {
       searchKind: active.kind,
       searchGeneration: active.generation,
       staleBestmove: result.bestmove,
+      nullBestmove: result.nullBestmove,
+      elapsedMs: drainElapsedMs,
     };
   }
 
@@ -1384,7 +1586,17 @@ export class ForegroundSearchCoordinator {
 }
 
 export class GameSession {
-  constructor({ client, config, account, gameId, signal, slot, store, foregroundCoordinator }) {
+  constructor({
+    client,
+    config,
+    account,
+    gameId,
+    signal,
+    slot,
+    store,
+    foregroundCoordinator,
+    onMoveTransportSample = () => {},
+  }) {
     this.client = client;
     this.config = { ...config, timing: { ...DEFAULT_TIMING_CONFIG, ...(config.timing ?? {}) } };
     this.account = account.toLocaleLowerCase();
@@ -1406,6 +1618,8 @@ export class GameSession {
     this.lastClock = { wtime: 0, btime: 0, winc: 0, binc: 0 };
     this.lastPonderMissReason = null;
     this.staleBestmoveDrained = false;
+    this.opponentSearchDrainMs = 0;
+    this.onMoveTransportSample = onMoveTransportSample;
     this.reconnecting = false;
     this.opponentOperation = Promise.resolve();
   }
@@ -1584,6 +1798,7 @@ export class GameSession {
       }
       const drained = await engine.stopAndDrain(reason);
       this.staleBestmoveDrained ||= drained.drained;
+      this.opponentSearchDrainMs += Number(drained.elapsedMs ?? 0);
       if (reason === "foreground_preempted") this.lastPonderMissReason = reason;
       return drained;
     });
@@ -1769,6 +1984,8 @@ export class GameSession {
     observation.legalitySynchronization = this.legalityState.synchronize(moves, {
       forceRebuild: observation.reconciled,
     });
+    observation.authorityValidatedAt = performance.now();
+    observation.authorityValidationMs = observation.authorityValidatedAt - receivedAt;
     this.lastClock = observation.clock;
 
     if (transition.kind === "duplicate" && status === "started") {
@@ -1873,18 +2090,23 @@ export class GameSession {
   }) {
     const rootKey = movesKey(moves);
     const stateGeneration = observation.generation;
-    const stateValidatedAt = performance.now();
+    const stateValidatedAt = observation.authorityValidatedAt ?? performance.now();
     const controller = new AbortController();
     const foreground = { controller, rootKey, stateGeneration };
     this.foregroundSearch = foreground;
     let lease = null;
     let result;
     let legality = null;
+    let foregroundLeaseWaitMs = 0;
+    let bestmoveToLegalityMs = 0;
+    let moveQueueWaitMs = 0;
     try {
       if (!this.observationIsCurrent(observation)) {
         throw new StaleAuthoritativeSearchError(this.gameId, "superseded_before_search");
       }
+      const leaseWaitStartedAt = performance.now();
       lease = await this.foregroundCoordinator.begin(this.gameId);
+      foregroundLeaseWaitMs = performance.now() - leaseWaitStartedAt;
       if (controller.signal.aborted) throw searchCancellationError(controller.signal);
       if (ponderHit) {
         const ownTime = this.color === "white" ? this.lastClock.wtime : this.lastClock.btime;
@@ -1921,6 +2143,8 @@ export class GameSession {
         throw new Error(`UCI bestmove failed legal-root syntax validation: ${result.bestmove ?? "missing"}`);
       }
       legality = this.legalityState.validateCandidate(moves, result.bestmove);
+      const bestmoveAt = Number.isFinite(result.bestmoveAt) ? result.bestmoveAt : performance.now();
+      bestmoveToLegalityMs = performance.now() - bestmoveAt;
       if (!legality.legal) {
         throw new Error(
           `UCI bestmove is illegal at the exact authoritative root: ${result.bestmove}`,
@@ -1930,7 +2154,8 @@ export class GameSession {
         throw new StaleAuthoritativeSearchError(this.gameId, "superseded_during_legality_replay");
       }
 
-      let postDispatchedAt = performance.now();
+      const moveQueuedAt = performance.now();
+      let postDispatchedAt = moveQueuedAt;
       const postSignal = this.signal && typeof this.signal.addEventListener === "function"
         ? AbortSignal.any([this.signal, controller.signal])
         : controller.signal;
@@ -1945,9 +2170,11 @@ export class GameSession {
             throw new StaleAuthoritativeSearchError(this.gameId, "superseded_in_move_queue");
           }
           postDispatchedAt = performance.now();
+          moveQueueWaitMs = postDispatchedAt - moveQueuedAt;
         },
       );
       const postAcknowledgedAt = performance.now();
+      this.onMoveTransportSample(this.gameId, postAcknowledgedAt - postDispatchedAt);
       this.lastSubmittedRootKey = rootKey;
       const elapsedClockMs = Math.max(0, Math.ceil(postAcknowledgedAt - receivedAt));
       const estimatedClock = subtractLocalClockDelay(this.lastClock, this.color, elapsedClockMs);
@@ -1974,6 +2201,14 @@ export class GameSession {
         go_to_bestmove_ms: result.go_to_bestmove_ms,
         state_validated_to_post_ms: postDispatchedAt - stateValidatedAt,
         post_to_ack_ms: postAcknowledgedAt - postDispatchedAt,
+        authority_validation_ms: observation.authorityValidationMs ?? null,
+        foreground_lease_wait_ms: foregroundLeaseWaitMs,
+        opponent_search_drain_ms: this.opponentSearchDrainMs,
+        authoritative_state_to_bestmove_ms: Math.max(0, bestmoveAt - receivedAt),
+        bestmove_to_legality_ms: bestmoveToLegalityMs,
+        move_queue_wait_ms: moveQueueWaitMs,
+        state_received_to_dispatch_ms: postDispatchedAt - receivedAt,
+        post_dispatch_to_ack_ms: postAcknowledgedAt - postDispatchedAt,
         ponder_mode: ponderHit ? "ponder" : "foreground",
         ponder_hit: Boolean(ponderHit),
         ponder_miss_reason: ponderMissReason,
@@ -1983,8 +2218,10 @@ export class GameSession {
         root_legality_sync_ms: observation.legalitySynchronization?.elapsedMs ?? null,
         root_legality_applied_plies: observation.legalitySynchronization?.appliedPlies ?? null,
         root_legality_rebuilt: observation.legalitySynchronization?.rebuilt ?? null,
+        book_hit: result.telemetry?.book_probe_result === "hit",
         ...result.telemetry,
       });
+      this.opponentSearchDrainMs = 0;
     } catch (error) {
       this.lastSubmittedRootKey = null;
       this.pendingOwnMove = null;
@@ -2024,6 +2261,7 @@ export class BotController {
   constructor({ client, config, account, runtimeDir, signal, store, random = Math.random }) {
     this.client = client;
     this.config = { ...config, timing: { ...DEFAULT_TIMING_CONFIG, ...(config.timing ?? {}) } };
+    this.config.engine = { ...config.engine, timing: this.config.timing };
     this.account = normalizedUsername(account);
     this.runtimeDir = runtimeDir;
     this.signal = signal;
@@ -2044,6 +2282,16 @@ export class BotController {
     this.needsReconciliation = false;
     this.streamConnected = false;
     this.tickRunning = false;
+    this.schedulerFault = null;
+    const transportProfilePath = this.config.timing.transport_profile_path
+      || path.join(runtimeDir, "transport_profile_v1.json");
+    this.transportProfile = new TransportProfileTracker({
+      profilePath: transportProfilePath,
+      bootstrapReserveMs: this.config.timing.bootstrap_transport_reserve_ms
+        ?? this.config.timing.initial_transport_reserve_ms,
+      telemetry: (details) => log(details.event, details),
+    });
+    this.config.timing.initial_transport_reserve_ms = this.transportProfile.effectiveReserveMs;
   }
 
   async run(opponent) {
@@ -2140,6 +2388,25 @@ export class BotController {
     return recovered;
   }
 
+  async recoverTimedOutSlot(slot, expectedGeneration = slot?.generation) {
+    if (!slot || slot.generation !== expectedGeneration) return false;
+    const playing = await this.client.json("api/account/playing?nb=50", { signal: this.signal });
+    const challengeId = String(slot.challengeId ?? "");
+    const game = (playing.nowPlaying ?? []).find((candidate) => (
+      String(candidate.gameId ?? candidate.id ?? "") === challengeId
+    ));
+    this.lastReconciliationAt = Date.now();
+    if (!game || slot.generation !== expectedGeneration
+        || !["pending", "cancelling"].includes(slot.state)) return false;
+    await this.startGame(game, slot);
+    log("challenge_timeout_recovered_game", {
+      challenge_id: challengeId,
+      slot_id: slot.id,
+      slot_generation: expectedGeneration,
+    });
+    return true;
+  }
+
   async resolveAudience(opponent, knownTitle) {
     if (String(knownTitle ?? "").toUpperCase() === "BOT") return "bot";
     const stored = this.store.opponentAudience(opponent);
@@ -2230,7 +2497,7 @@ export class BotController {
         ? this.config.scheduler.decline_cooldown_minutes
         : 0,
     });
-    if (slot?.state === "pending" || slot?.state === "preparing") await this.slots.release(slot);
+    if (["pending", "cancelling", "preparing"].includes(slot?.state)) await this.slots.release(slot);
     log("challenge_terminal", { challenge_id: challengeId, status: declined ? "declined" : "canceled" });
   }
 
@@ -2257,6 +2524,7 @@ export class BotController {
       slot,
       store: this.store,
       foregroundCoordinator: this.foregroundCoordinator,
+      onMoveTransportSample: (id, durationMs) => this.transportProfile.record(id, durationMs),
     });
     this.gameSessions.set(gameId, session);
     const task = session.run().catch((error) => {
@@ -2265,6 +2533,9 @@ export class BotController {
       this.activeGames.delete(gameId);
       this.gameSessions.delete(gameId);
       await this.slots.release(slot);
+      const reserve = this.transportProfile.finishGame(gameId);
+      this.config.timing.initial_transport_reserve_ms = reserve;
+      this.config.engine.timing.initial_transport_reserve_ms = reserve;
       await this.writeStatus();
     });
     this.activeGames.set(gameId, task);
@@ -2345,6 +2616,7 @@ export class BotController {
         await this.recoverPlayingGames();
       }
       await this.expirePending(now);
+      if (this.schedulerFault) return;
       const control = this.store.control(now);
       if (control.paused) return;
       if (this.manualOpponent) {
@@ -2392,30 +2664,110 @@ export class BotController {
 
   async expirePending(now = Date.now()) {
     const timeout = this.config.scheduler.challenge_timeout_seconds * 1_000;
-    for (const slot of this.slots.slots.filter((candidate) => candidate.state === "pending"
+    for (const slot of this.slots.slots.filter((candidate) => candidate.state === "cancelling"
+      && candidate.reconcileReleaseAt != null
+      && now >= candidate.reconcileReleaseAt
+      && !candidate.cancelInFlight)) {
+      const generation = slot.generation;
+      if (await this.recoverTimedOutSlot(slot, generation)) continue;
+      if (slot.generation !== generation || slot.state !== "cancelling") continue;
+      this.store.updateChallenge(slot.challengeId, "timeout", {
+        cooldownMinutes: slot.audience === "bot" ? this.config.scheduler.timeout_cooldown_minutes : 0,
+      }, now);
+      log("challenge_timeout_not_found_released", {
+        challenge_id: slot.challengeId,
+        opponent: slot.opponent,
+        audience: slot.audience,
+        grace_ms: 2_000,
+      });
+      await this.slots.release(slot, generation);
+    }
+    for (const slot of this.slots.slots.filter((candidate) => ["pending", "cancelling"].includes(candidate.state)
       && candidate.direction === "outbound"
       && now - candidate.createdAt >= timeout
+      && candidate.reconcileReleaseAt == null
+      && !candidate.cancelInFlight
       && (candidate.cancelRetryAt == null || now >= candidate.cancelRetryAt))) {
       const challengeId = slot.challengeId;
       if (!challengeId) continue;
+      const generation = slot.generation;
+      this.slots.cancelling(slot);
       slot.cancelRetryAt = Number.POSITIVE_INFINITY;
       try {
         await this.client.post(`api/challenge/${encodeURIComponent(challengeId)}/cancel`, undefined, this.signal);
       } catch (error) {
-        const retryMs = error instanceof LichessHttpError && error.status === 429
-          ? Math.max(60_000, error.retryAfterMs)
-          : 15_000;
+        if (slot.generation !== generation || slot.state !== "cancelling") continue;
+        slot.cancelInFlight = false;
+        const status = error instanceof LichessHttpError ? error.status : null;
+        if (status === 404) {
+          if (await this.recoverTimedOutSlot(slot, generation)) continue;
+          if (slot.generation !== generation || slot.state !== "cancelling") continue;
+          slot.reconcileReleaseAt = Date.now() + 2_000;
+          slot.cancelRetryAt = Number.POSITIVE_INFINITY;
+          log("challenge_timeout_cancel_not_found", {
+            challenge_id: challengeId,
+            opponent: slot.opponent,
+            audience: slot.audience,
+            release_grace_ms: 2_000,
+          });
+          continue;
+        }
+        if (status === 429) {
+          const retryMs = Math.max(60_000, error.retryAfterMs);
+          slot.cancelRetryAt = now + retryMs;
+          log("challenge_timeout_cancel_rate_limited", {
+            challenge_id: challengeId,
+            retry_ms: retryMs,
+          });
+          continue;
+        }
+        if (status === 401 || status === 403) {
+          this.schedulerFault = {
+            kind: "authentication",
+            challenge_id: challengeId,
+            status,
+            message: error.message,
+          };
+          log("challenge_timeout_cancel_fatal", this.schedulerFault);
+          continue;
+        }
+        if (status !== null && status >= 400 && status < 500) {
+          if (await this.recoverTimedOutSlot(slot, generation)) continue;
+          this.schedulerFault = {
+            kind: "permanent_cancel_error",
+            challenge_id: challengeId,
+            status,
+            message: error.message,
+          };
+          log("challenge_timeout_cancel_fatal", this.schedulerFault);
+          continue;
+        }
+        const retrySchedule = [15_000, 30_000, 60_000, 120_000, 300_000];
+        slot.cancelAttempts += 1;
+        if (slot.cancelAttempts > retrySchedule.length) {
+          this.schedulerFault = {
+            kind: "cancel_retry_exhausted",
+            challenge_id: challengeId,
+            attempts: slot.cancelAttempts,
+            message: error.message,
+          };
+          log("challenge_timeout_cancel_fatal", this.schedulerFault);
+          continue;
+        }
+        const retryMs = retrySchedule[slot.cancelAttempts - 1];
         slot.cancelRetryAt = now + retryMs;
-        this.needsReconciliation = true;
         log("challenge_timeout_cancel_error", {
           challenge_id: challengeId,
           opponent: slot.opponent,
           audience: slot.audience,
           message: error.message,
+          attempt: slot.cancelAttempts,
           retry_ms: retryMs,
         });
         continue;
       }
+      if (slot.generation !== generation || slot.state !== "cancelling") continue;
+      slot.cancelInFlight = false;
       this.store.updateChallenge(challengeId, "timeout", {
         cooldownMinutes: slot.audience === "bot" ? this.config.scheduler.timeout_cooldown_minutes : 0,
       }, now);
@@ -2425,7 +2777,7 @@ export class BotController {
         audience: slot.audience,
         canceled: true,
       });
-      await this.slots.release(slot);
+      await this.slots.release(slot, generation);
     }
   }
 
@@ -2447,12 +2799,19 @@ export class BotController {
         last_owner_challenge_at: this.lastOwnerChallengeAt || null,
         last_reconciliation_at: this.lastReconciliationAt || null,
         reconciliation_pending: this.needsReconciliation,
+        fault: this.schedulerFault,
         ...this.store.control(),
       },
       timing: {
         opponent_turn_search: this.config.timing.opponent_turn_search,
         foreground_preempts_ponder: this.config.timing.foreground_preempts_ponder,
         transport_reserve_ms: this.config.timing.initial_transport_reserve_ms,
+        bootstrap_transport_reserve_ms: this.config.timing.bootstrap_transport_reserve_ms,
+        transport_profile_path: this.transportProfile.profilePath,
+        transport_profile_sample_count: this.transportProfile.samples.length,
+        transport_profile_game_count: new Set(
+          this.transportProfile.samples.map((sample) => sample.game_id),
+        ).size,
         active_foreground_games: Array.from(this.foregroundCoordinator.activeGames),
         games: Array.from(this.gameSessions.values(), (session) => ({
           game_id: session.gameId,

@@ -1,11 +1,11 @@
 {
-  "schema": "uci_arena_lichess_adapter_v4",
+  "schema": "uci_arena_lichess_adapter_v5",
   "url": "https://lichess.org/",
   "engine": {
     "executable": "<UCI_ARENA_REPO>/build/Release/flashfork_uci.exe",
     "working_directory": "<UCI_ARENA_REPO>",
     "single_game_profile": "<UCI_ARENA_REPO>/runtime_state/models/compact_chessformer_gab_v1/cache/uci_arena_single_game_profile_v1.json",
-    "time_profile": "<UCI_ARENA_REPO>/runtime_state/models/compact_chessformer_gab_v1/cache/uci_time_profile_v1.json",
+    "time_profile": "<UCI_ARENA_REPO>/runtime_state/models/compact_chessformer_gab_v1/cache/uci_time_profile_v2.json",
     "search_timeout_grace_ms": 10000,
     "shutdown_grace_ms": 5000,
     "uci_options": {
@@ -17,7 +17,8 @@
   "timing": {
     "opponent_turn_search": true,
     "foreground_preempts_ponder": true,
-    "initial_transport_reserve_ms": 250
+    "initial_transport_reserve_ms": 650,
+    "transport_profile_path": "<UCI_ARENA_REPO>/runtime_state/lichess/transport_profile_v1.json"
   },
   "capacity": {
     "total_slots": 2,

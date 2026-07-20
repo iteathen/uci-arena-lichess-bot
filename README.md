@@ -28,21 +28,24 @@ The tracked v4 template is enabled for two concurrent games:
 - explicit opponent-turn UCI search, with a predicted reply using `go ponder`
   and a no-prediction fallback using `go infinite`;
 - foreground search preemption of every other game’s ponder work;
-- a 250 ms initial Lichess transport reserve applied through the engine’s
+- a 650 ms bootstrap Lichess transport reserve applied through the engine’s
   `Move Overhead` option.
 
-Version 2 and 3 configurations load with those v4 timing defaults. Live
+Version 2 through 4 configurations retain their declared legacy reserve. Live
 readiness requires the engine to advertise `Ponder`, `Move Overhead`,
-`IterativeTimeController`, and `TimeProfileProviderReserveUs`; the
+`IterativeTimeController`, `TimeProfileProviderReserveUs`, and
+`TimeProfileIterationForecastScalePermille`; the
 adapter fails instead of silently disabling opponent-turn search or its clock
 reserve.
 
 The distinct `engine.time_profile` / `--time-profile` path may point at a
-qualified `uci_time_profile_v1.json`. Every engine child recomputes the exact
+qualified `uci_time_profile_v2.json`. Every engine child recomputes the exact
 engine/model/adapter/provider/hardware/search identity before applying that
-profile's conservative provider-service reserve. A missing, stale, or mismatched
-profile is observable in qualification/runtime status and safely retains reserve
-zero; it never enables `IterativeTimeController`.
+profile's conservative provider-service reserve and iteration-forecast scale.
+A valid v1 profile remains readable with scale 1000. A missing, stale, or
+mismatched profile is observable in qualification/runtime status and safely
+retains reserve zero and scale 1000; it never enables
+`IterativeTimeController`.
 
 Change `capacity.human.slots`, `capacity.bot.slots`, and
 `capacity.bot.target_active` to run a different layout. Their sum must equal
@@ -52,7 +55,7 @@ capacity profile qualified at that concurrency.
 
 ## Files
 
-- `config.uci_arena.template.yml`: credential-free v4 capacity, timing, and policy.
+- `config.uci_arena.template.yml`: credential-free v5 capacity, timing, and policy.
 - `lichess-adapter.mjs`: CLI, Bot API transport, engine sessions, and recovery.
 - `lichess-scheduler.mjs`: slot admission, weighted selection, and request queue.
 - `lichess-store.mjs`: WAL-mode SQLite reservations, attempts, games, and W/D/L.
@@ -76,7 +79,7 @@ the opening book, then restores the configured/default-on book for live play.
 ```powershell
 node deploy\lichess\lichess-adapter.mjs qualify `
   --profile runtime_state\models\<MODEL_ID>\cache\uci_arena_single_game_profile_v1.json `
-  --time-profile runtime_state\models\<MODEL_ID>\cache\uci_time_profile_v1.json
+  --time-profile runtime_state\models\<MODEL_ID>\cache\uci_time_profile_v2.json
 ```
 
 Qualify the configured concurrency. All requested children are started and
