@@ -6,3 +6,4 @@ runtime/
 games/
 logs/
 native/build/
+node_modules/

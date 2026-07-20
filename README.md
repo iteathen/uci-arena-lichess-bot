@@ -4,18 +4,45 @@ This credential-free Node module owns Lichess transport, capacity admission,
 bot discovery, owner reservations, per-opponent evidence, and one isolated UCI
 process per game. It does not add Lichess behavior to the chess engine.
 
-The module uses Node built-ins only. Node 24.15 or newer is required for the
-built-in SQLite store.
+Transport, process supervision, and SQLite use Node built-ins. Exact-root move
+legality uses the locked `chess.js` dependency. Node 24.15 or newer is required.
+
+Install the adapter dependency once after checkout (and after lockfile changes):
+
+```powershell
+npm ci --prefix deploy/lichess
+```
+
+Startup fails during module loading with a missing-package error if this step
+has not been completed; it never falls back to syntax-only move validation.
 
 ## Default behavior
 
-The tracked v3 template is enabled for two concurrent games:
+The tracked v4 template is enabled for two concurrent games:
 
 - one hard-reserved public-human slot, never loaned to automated bot play;
 - one bot slot which the scheduler tries to keep active;
 - casual standard `3+2` outbound games;
 - online bot discovery through `GET /api/bot/online?nb=512`;
 - a two-game-per-opponent rolling daily limit and decline/timeout cooldowns.
+- explicit opponent-turn UCI search, with a predicted reply using `go ponder`
+  and a no-prediction fallback using `go infinite`;
+- foreground search preemption of every other game’s ponder work;
+- a 250 ms initial Lichess transport reserve applied through the engine’s
+  `Move Overhead` option.
+
+Version 2 and 3 configurations load with those v4 timing defaults. Live
+readiness requires the engine to advertise `Ponder`, `Move Overhead`,
+`IterativeTimeController`, and `TimeProfileProviderReserveUs`; the
+adapter fails instead of silently disabling opponent-turn search or its clock
+reserve.
+
+The distinct `engine.time_profile` / `--time-profile` path may point at a
+qualified `uci_time_profile_v1.json`. Every engine child recomputes the exact
+engine/model/adapter/provider/hardware/search identity before applying that
+profile's conservative provider-service reserve. A missing, stale, or mismatched
+profile is observable in qualification/runtime status and safely retains reserve
+zero; it never enables `IterativeTimeController`.
 
 Change `capacity.human.slots`, `capacity.bot.slots`, and
 `capacity.bot.target_active` to run a different layout. Their sum must equal
@@ -25,7 +52,7 @@ capacity profile qualified at that concurrency.
 
 ## Files
 
-- `config.uci_arena.template.yml`: credential-free v3 capacity and policy.
+- `config.uci_arena.template.yml`: credential-free v4 capacity, timing, and policy.
 - `lichess-adapter.mjs`: CLI, Bot API transport, engine sessions, and recovery.
 - `lichess-scheduler.mjs`: slot admission, weighted selection, and request queue.
 - `lichess-store.mjs`: WAL-mode SQLite reservations, attempts, games, and W/D/L.
@@ -48,7 +75,8 @@ the opening book, then restores the configured/default-on book for live play.
 
 ```powershell
 node deploy\lichess\lichess-adapter.mjs qualify `
-  --profile runtime_state\models\<MODEL_ID>\cache\uci_arena_single_game_profile_v1.json
+  --profile runtime_state\models\<MODEL_ID>\cache\uci_arena_single_game_profile_v1.json `
+  --time-profile runtime_state\models\<MODEL_ID>\cache\uci_time_profile_v1.json
 ```
 
 Qualify the configured concurrency. All requested children are started and
@@ -80,8 +108,28 @@ starts scheduling. Active games are never preempted.
 
 Global event-stream reconnects use bounded exponential backoff and trigger a
 fresh ongoing-game reconciliation before scheduling resumes. Per-game stream
-reconnects rebuild the position from Lichess's authoritative move list. A whole
-process restart performs the same recovery before admitting new work.
+reconnects stop and drain stale UCI work, then rebuild the position from
+Lichess's authoritative move list. A whole process restart performs the same
+recovery before admitting new work.
+
+After a move POST is acknowledged, the adapter keeps Lichess’s streamed move
+list as canonical state and starts a separate projected ponder line. It sends
+`ponderhit` only when the next stream update exactly appends the predicted
+opponent move and the UCI runtime generation still matches. Misses, takebacks,
+reconnects, terminal states, and generation changes send `stop`, drain and
+discard that search’s `bestmove`, reconstruct the authoritative position, and
+start a normal timed search from the new root. Stream intake remains live while foreground search
+is awaited, so a terminal state, takeback, or root advance cancels that search
+before a stale POST. Immediately before every POST, the adapter independently
+replays the exact authoritative root with `chess.js`, proves the candidate is
+legal, and records replay latency; syntax-only validation is never sufficient.
+A move is never submitted before the stream says
+it is this bot’s turn.
+
+Per-move NDJSON telemetry separates `state_received_to_go_ms`,
+`go_to_bestmove_ms`, `state_validated_to_post_ms`, and `post_to_ack_ms`, and
+records ponder mode/hit/miss, stale-result draining, and the active transport
+reserve. The runtime snapshot also reports each game’s current UCI timing mode.
 
 ## Human priority and local controls
 
@@ -137,3 +185,5 @@ state.
   exactly once.
 - Move submissions have priority over discovery and challenge traffic. HTTP 429
   responses pause non-move traffic for at least 60 seconds.
+- Opponent-turn calculation is useful speculative work, not canonical game
+  state. Only the full Lichess stream can confirm a move or advance history.

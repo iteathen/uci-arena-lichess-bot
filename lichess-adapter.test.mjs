@@ -8,6 +8,8 @@ import test from "node:test";
 import {
   DEFAULT_TEMPLATE,
   BotController,
+  ForegroundSearchCoordinator,
+  GameSession,
   LichessClient,
   ROOT,
   UciEngine,
@@ -23,7 +25,12 @@ import {
   probeAccount,
   validateRuntimeStatus,
 } from "./lichess-adapter.mjs";
+import { LichessHttpError } from "./lichess-scheduler.mjs";
 import { LichessStore } from "./lichess-store.mjs";
+import {
+  AuthoritativeChessState,
+  validateLegalMoveAtAuthoritativeRoot,
+} from "./chess-legality.mjs";
 
 function temporaryToken() {
   const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-lichess-"));
@@ -140,6 +147,217 @@ function qualifiedRuntimeStatus(profile) {
   };
 }
 
+function gameConfig() {
+  return {
+    engine: {
+      search_timeout_grace_ms: 10_000,
+      uci_options: {},
+      qualification_profile: {
+        engine_build_fingerprint: "sha256:engine",
+        model_fingerprint: "model",
+        provider_numeric_fingerprint: "provider",
+      },
+    },
+    timing: {
+      opponent_turn_search: true,
+      foreground_preempts_ponder: true,
+      initial_transport_reserve_ms: 250,
+    },
+  };
+}
+
+function gameFull(state, account = "arena-bot") {
+  return {
+    type: "gameFull",
+    variant: { key: "standard" },
+    initialFen: "startpos",
+    white: { id: account },
+    black: { id: "opponent" },
+    rated: false,
+    speed: "blitz",
+    clock: { initial: 180_000, increment: 2_000 },
+    state,
+  };
+}
+
+function startedState(moves, overrides = {}) {
+  return {
+    type: "gameState",
+    moves,
+    status: "started",
+    wtime: 180_000,
+    btime: 180_000,
+    winc: 2_000,
+    binc: 2_000,
+    ...overrides,
+  };
+}
+
+class MockGameEngine {
+  constructor(results = []) {
+    this.results = [...results];
+    this.runtimeGeneration = 7;
+    this.searchGeneration = 0;
+    this.mode = "idle";
+    this.active = null;
+    this.searchCalls = [];
+    this.opponentCalls = [];
+    this.stopCalls = [];
+    this.ponderHitCalls = 0;
+  }
+
+  async newGame() {}
+
+  isOpponentTurnSearchActive() {
+    return this.active?.kind === "ponder" || this.active?.kind === "opponent_root";
+  }
+
+  opponentTurnSearchSnapshot() {
+    if (!this.active) return null;
+    return {
+      kind: this.active.kind,
+      runtimeGeneration: this.active.runtimeGeneration,
+      searchGeneration: this.active.generation,
+      rootKey: this.active.rootKey,
+      predictedMove: this.active.predictedMove,
+    };
+  }
+
+  nextResult(rootMoves) {
+    const value = this.results.shift();
+    assert.ok(value, "mock engine result queue is empty");
+    return {
+      bestmove: value.bestmove,
+      ponder: value.ponder ?? null,
+      telemetry: { nodes: value.nodes ?? 1, ...(value.telemetry ?? {}) },
+      rootMoves: [...rootMoves],
+      rootKey: rootMoves.join(" "),
+      runtimeGeneration: this.runtimeGeneration,
+      searchGeneration: ++this.searchGeneration,
+      goSentAt: performance.now() - 2,
+      bestmoveAt: performance.now(),
+      go_to_bestmove_ms: 2,
+      staleBestmoveDrained: false,
+    };
+  }
+
+  async search(request) {
+    this.searchCalls.push(structuredClone(request));
+    return this.nextResult(request.moves);
+  }
+
+  async startOpponentTurnSearch(request) {
+    this.opponentCalls.push(structuredClone(request));
+    const rootMoves = request.predictedMove
+      ? [...request.moves, request.predictedMove]
+      : [...request.moves];
+    this.active = {
+      kind: request.predictedMove ? "ponder" : "opponent_root",
+      generation: ++this.searchGeneration,
+      runtimeGeneration: this.runtimeGeneration,
+      rootKey: rootMoves.join(" "),
+      predictedMove: request.predictedMove ?? null,
+    };
+    this.mode = this.active.kind;
+    return this.active;
+  }
+
+  async ponderHit() {
+    this.ponderHitCalls += 1;
+    const active = this.active;
+    assert.equal(active?.kind, "ponder");
+    this.active = null;
+    this.mode = "idle";
+    return this.nextResult(active.rootKey.split(" ").filter(Boolean));
+  }
+
+  async stopAndDrain(reason) {
+    if (!this.active) return { drained: false, reason };
+    this.stopCalls.push({ reason, active: { ...this.active } });
+    this.active = null;
+    this.mode = "idle";
+    return { drained: true, reason, staleBestmove: "a7a6" };
+  }
+}
+
+class BlockingForegroundEngine extends MockGameEngine {
+  constructor() {
+    super();
+    this.searchStarted = new Promise((resolve) => { this.resolveSearchStarted = resolve; });
+  }
+
+  async search(request) {
+    this.searchCalls.push(structuredClone({ ...request, signal: undefined }));
+    this.active = {
+      kind: "foreground",
+      generation: ++this.searchGeneration,
+      runtimeGeneration: this.runtimeGeneration,
+      rootKey: request.moves.join(" "),
+      predictedMove: null,
+    };
+    this.mode = "foreground";
+    this.resolveSearchStarted();
+    return new Promise((resolve, reject) => {
+      request.signal.addEventListener("abort", () => {
+        this.stopCalls.push({
+          reason: request.signal.reason?.reason ?? "authoritative_state_changed",
+          active: { ...this.active },
+        });
+        this.active = null;
+        this.mode = "idle";
+        reject(request.signal.reason);
+      }, { once: true });
+    });
+  }
+}
+
+class ClockCorrectionEngine extends MockGameEngine {
+  constructor() {
+    super([{ bestmove: "e2e4" }]);
+    this.firstSearchStarted = new Promise((resolve) => { this.resolveFirstSearchStarted = resolve; });
+  }
+
+  async search(request) {
+    if (this.searchCalls.length > 0) return super.search(request);
+    this.searchCalls.push(structuredClone({ ...request, signal: undefined }));
+    this.mode = "foreground";
+    this.resolveFirstSearchStarted();
+    return new Promise((resolve, reject) => {
+      request.signal.addEventListener("abort", () => {
+        this.stopCalls.push({ reason: request.signal.reason?.reason });
+        this.mode = "idle";
+        reject(request.signal.reason);
+      }, { once: true });
+    });
+  }
+}
+
+function mockStore() {
+  return {
+    beginGame() {},
+    finishGame() {},
+  };
+}
+
+function createGameSession(engine, client) {
+  let sessions = [];
+  const foregroundCoordinator = new ForegroundSearchCoordinator({
+    sessions: () => sessions,
+  });
+  const session = new GameSession({
+    client,
+    config: gameConfig(),
+    account: "arena-bot",
+    gameId: "game-1",
+    signal: { aborted: false },
+    slot: { id: "human-1", audience: "human", engine },
+    store: mockStore(),
+    foregroundCoordinator,
+  });
+  sessions = [session];
+  return session;
+}
+
 test("runtime config is credential-free and resolves repository paths", () => {
   const config = loadRuntimeConfig({
     templatePath: DEFAULT_TEMPLATE,
@@ -149,6 +367,12 @@ test("runtime config is credential-free and resolves repository paths", () => {
   const serialized = JSON.stringify(config).toLowerCase();
   assert.equal(serialized.includes("test-token"), false);
   assert.equal(serialized.includes("oauth_token"), false);
+  assert.equal(config.schema, "uci_arena_lichess_adapter_v4");
+  assert.deepEqual(config.timing, {
+    opponent_turn_search: true,
+    foreground_preempts_ponder: true,
+    initial_transport_reserve_ms: 250,
+  });
   assert.equal(config.engine.uci_options.ModelRoot, "engine/runtime/models/example/engine");
   assert.equal(config.engine.executable.includes(ROOT.replaceAll("\\", "/")), true);
 });
@@ -171,6 +395,22 @@ test("runtime config accepts the shared active model environment override", () =
   assert.equal(explicit.engine.uci_options.ModelRoot, "engine/runtime/models/explicit/engine");
 });
 
+test("timing profile has a distinct config, environment, and CLI path", () => {
+  const selected = "runtime_state/models/model/cache/uci_time_profile_v1.json";
+  const config = loadRuntimeConfig({
+    templatePath: DEFAULT_TEMPLATE,
+    repoRoot: ROOT,
+    environment: { UCI_ARENA_TIME_PROFILE: selected },
+  });
+  assert.equal(config.engine.time_profile, selected);
+  assert.equal(config.engine.uci_options.IterativeTimeController, false);
+  assert.equal(config.engine.uci_options.TimeProfileProviderReserveUs, 0);
+  assert.deepEqual(
+    parseArguments(["run", "--profile", "single.json", "--time-profile", "time.json"]),
+    { command: "run", profile: "single.json", time_profile: "time.json" },
+  );
+});
+
 test("v2 config migrates to one shared slot with automatic scheduling disabled", () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-v2-config-"));
   const template = JSON.parse(readFileSync(DEFAULT_TEMPLATE, "utf8"));
@@ -184,6 +424,9 @@ test("v2 config migrates to one shared slot with automatic scheduling disabled",
   assert.equal(config.capacity.total_slots, 1);
   assert.equal(config.capacity.legacy_shared, true);
   assert.equal(config.scheduler.enabled, false);
+  assert.equal(config.schema, "uci_arena_lichess_adapter_v4");
+  assert.equal(config.timing.opponent_turn_search, true);
+  assert.equal(config.timing.initial_transport_reserve_ms, 250);
 });
 
 test("v3 accepts a configurable sixteen-slot layout and rejects invalid sums", () => {
@@ -203,6 +446,35 @@ test("v3 accepts a configurable sixteen-slot layout and rejects invalid sums", (
   template.capacity.bot.target_active = 13;
   writeFileSync(configPath, JSON.stringify(template));
   assert.throws(() => loadRuntimeConfig({ templatePath: configPath }), /must sum/);
+});
+
+test("v4 timing policy rejects conflicting UCI ownership and invalid reserves", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-v4-timing-"));
+  const template = JSON.parse(readFileSync(DEFAULT_TEMPLATE, "utf8"));
+  const configPath = path.join(directory, "v4.json");
+  template.engine.uci_options.Ponder = false;
+  writeFileSync(configPath, JSON.stringify(template));
+  assert.throws(() => loadRuntimeConfig({ templatePath: configPath }), /Ponder=true/);
+  delete template.engine.uci_options.Ponder;
+  template.engine.uci_options["Move Overhead"] = 100;
+  writeFileSync(configPath, JSON.stringify(template));
+  assert.throws(() => loadRuntimeConfig({ templatePath: configPath }), /Move Overhead conflicts/);
+  delete template.engine.uci_options["Move Overhead"];
+  template.engine.uci_options.IterativeTimeController = true;
+  writeFileSync(configPath, JSON.stringify(template));
+  assert.throws(() => loadRuntimeConfig({ templatePath: configPath }), /IterativeTimeController=false/);
+  template.engine.uci_options.IterativeTimeController = false;
+  template.engine.uci_options.TimeProfileProviderReserveUs = 1;
+  writeFileSync(configPath, JSON.stringify(template));
+  assert.throws(() => loadRuntimeConfig({ templatePath: configPath }), /timing-profile-owned/);
+  template.engine.uci_options.TimeProfileProviderReserveUs = 0;
+  template.timing.initial_transport_reserve_ms = 5_001;
+  writeFileSync(configPath, JSON.stringify(template));
+  assert.throws(() => loadRuntimeConfig({ templatePath: configPath }), /0\.\.5000/);
+  template.timing.initial_transport_reserve_ms = 250;
+  template.timing.foreground_preempts_ponder = false;
+  writeFileSync(configPath, JSON.stringify(template));
+  assert.throws(() => loadRuntimeConfig({ templatePath: configPath }), /no qualified capacity profile/);
 });
 
 test("qualified single-game profile is identity-bound and owns the parallel topology", () => {
@@ -307,6 +579,586 @@ test("runtime qualification bypasses the book probe and restores live book play"
     "setoption name OwnBook value true",
     "isready",
   ]);
+});
+
+test("UCI readiness requires explicit ponder and move-overhead support", () => {
+  const engine = new UciEngine({
+    uci_options: {},
+    timing: {
+      opponent_turn_search: true,
+      foreground_preempts_ponder: true,
+      initial_transport_reserve_ms: 250,
+    },
+  });
+  const commands = [];
+  engine.send = (command) => commands.push(command);
+  engine.advertisedOptions.add("Move Overhead");
+  assert.throws(() => engine.configureUciOptions(), /Ponder/);
+  engine.advertisedOptions.add("Ponder");
+  engine.advertisedOptions.add("IterativeTimeController");
+  engine.advertisedOptions.add("TimeProfileProviderReserveUs");
+  engine.configureUciOptions();
+  assert.deepEqual(commands, [
+    "setoption name Move Overhead value 250",
+    "setoption name IterativeTimeController value false",
+    "setoption name TimeProfileProviderReserveUs value 0",
+    "setoption name Ponder value true",
+  ]);
+});
+
+test("missing timing profile remains observable with zero reserve and controller disabled", async () => {
+  const engine = new UciEngine({
+    executable: "engine.exe",
+    working_directory: process.cwd(),
+    time_profile: path.join(os.tmpdir(), `missing-time-profile-${Date.now()}.json`),
+    uci_options: {
+      SearchCore: "v2",
+      Threads: 4,
+      RootWorkers: 4,
+      V2SplitDepth: 2,
+      NNBatchSize: 8,
+      NNBatchWaitUs: 150,
+      OnnxProvider: "directml",
+      BackgroundSearch: false,
+      NNSpeculation: false,
+      IterativeTimeController: false,
+      TimeProfileProviderReserveUs: 0,
+    },
+  });
+  engine.runtimeStatus = async () => ({ time_profile_provider_reserve_us: 0 });
+  const status = await engine.configureTimeProfile();
+  assert.equal(status.status, "missing");
+  assert.equal(status.applied, false);
+  assert.equal(status.provider_service_reserve_us, 0);
+  assert.equal(status.predictive_controller_enabled, false);
+});
+
+test("UCI search telemetry retains identity across later info string lines", () => {
+  const engine = new UciEngine({ uci_options: {} });
+  engine.onLine("info depth 8 model_provider directml model_fingerprint 1234 model_id model_v1");
+  engine.onLine("info string timing elapsed_ms 4");
+  assert.deepEqual(engine.latestInfo, {
+    depth: 8,
+    model_provider: "directml",
+    model_fingerprint: "1234",
+    model_id: "model_v1",
+  });
+});
+
+test("stopped ponder bestmove is drained before the foreground waiter starts", async () => {
+  const engine = new UciEngine({
+    uci_options: {},
+    timing: {
+      opponent_turn_search: true,
+      foreground_preempts_ponder: true,
+      initial_transport_reserve_ms: 250,
+    },
+  });
+  engine.runtimeGeneration = 3;
+  const commands = [];
+  engine.send = (command) => {
+    commands.push(command);
+    if (command === "stop") queueMicrotask(() => engine.onLine("bestmove g8f6 ponder b1c3"));
+    if (command.startsWith("go wtime")) queueMicrotask(() => engine.onLine("bestmove c2c4 ponder e7e5"));
+  };
+  await engine.startOpponentTurnSearch({
+    moves: ["e2e4"],
+    predictedMove: "e7e5",
+    wtime: 179_000,
+    btime: 180_000,
+    winc: 2_000,
+    binc: 2_000,
+  });
+  const result = await engine.search({
+    moves: ["e2e4", "c7c5"],
+    wtime: 178_000,
+    btime: 179_000,
+    winc: 2_000,
+    binc: 2_000,
+    color: "white",
+  });
+  assert.equal(result.bestmove, "c2c4");
+  assert.equal(result.ponder, "e7e5");
+  assert.equal(result.staleBestmoveDrained, true);
+  assert.deepEqual(commands.slice(0, 4), [
+    "position startpos moves e2e4 e7e5",
+    "go ponder wtime 179000 btime 180000 winc 2000 binc 2000",
+    "stop",
+    "position startpos moves e2e4 c7c5",
+  ]);
+});
+
+test("authoritative cancellation stops and drains the real UCI foreground waiter", async () => {
+  const engine = new UciEngine({
+    uci_options: {},
+    search_timeout_grace_ms: 1_000,
+  });
+  engine.runtimeGeneration = 3;
+  const commands = [];
+  let notifyGo;
+  const goSent = new Promise((resolve) => {
+    notifyGo = resolve;
+  });
+  engine.send = (command) => {
+    commands.push(command);
+    if (command.startsWith("go wtime")) {
+      notifyGo();
+    }
+    if (command === "stop") {
+      queueMicrotask(() => engine.onLine("bestmove e2e4"));
+    }
+  };
+
+  const controller = new AbortController();
+  const search = engine.search({
+    moves: [],
+    wtime: 180_000,
+    btime: 180_000,
+    winc: 2_000,
+    binc: 2_000,
+    color: "white",
+    signal: controller.signal,
+  });
+  await goSent;
+  controller.abort(new Error("authoritative root changed"));
+
+  await assert.rejects(search, /authoritative root changed/);
+  assert.equal(commands.filter((command) => command === "stop").length, 1);
+  assert.equal(engine.mode, "idle");
+  assert.equal(engine.activeSearch, null);
+});
+
+test("foreground coordinator preempts every other game and resumes only when foreground is idle", async () => {
+  const events = [];
+  const sessions = [
+    {
+      gameId: "a",
+      pauseOpponentSearch: async (reason) => events.push(`pause-a:${reason}`),
+      resumeOpponentSearch: async () => events.push("resume-a"),
+    },
+    {
+      gameId: "b",
+      pauseOpponentSearch: async (reason) => events.push(`pause-b:${reason}`),
+      resumeOpponentSearch: async () => events.push("resume-b"),
+    },
+  ];
+  const coordinator = new ForegroundSearchCoordinator({ sessions: () => sessions });
+  const leaseA = await coordinator.begin("a");
+  assert.deepEqual(events, ["pause-b:foreground_preempted"]);
+  const leaseB = await coordinator.begin("b");
+  assert.deepEqual(events, ["pause-b:foreground_preempted", "pause-a:foreground_preempted"]);
+  await leaseA.release();
+  assert.equal(events.includes("resume-a"), false);
+  await leaseB.release();
+  assert.deepEqual(events.slice(-2), ["resume-a", "resume-b"]);
+});
+
+test("game stream promotes an exact predicted reply and never posts before authoritative turn", async () => {
+  const posts = [];
+  const client = {
+    post: async (endpoint) => posts.push(endpoint),
+  };
+  const engine = new MockGameEngine([
+    { bestmove: "e2e4", ponder: "e7e5", nodes: 10 },
+    { bestmove: "g1f3", ponder: "b8c6", nodes: 20 },
+  ]);
+  const session = createGameSession(engine, client);
+  const initial = startedState("");
+  await session.initialize(gameFull(initial), engine);
+  await session.onState(initial, engine);
+  assert.equal(posts.length, 1);
+  assert.equal(engine.active?.kind, "ponder");
+  assert.equal(engine.active?.rootKey, "e2e4 e7e5");
+
+  await session.onState(startedState("e2e4"), engine);
+  assert.equal(posts.length, 1, "own-move acknowledgement is not another bot turn");
+  assert.equal(engine.ponderHitCalls, 0);
+
+  await session.onState(startedState("e2e4 e7e5"), engine);
+  assert.equal(engine.ponderHitCalls, 1);
+  assert.equal(posts.length, 2);
+  assert.match(posts[1], /\/move\/g1f3$/);
+  assert.equal(engine.searchCalls.length, 1, "ponder hit reuses the running search");
+});
+
+test("black starts opponent-root work from gameFull and searches only after White moves", async () => {
+  const posts = [];
+  const client = { post: async (endpoint) => posts.push(endpoint) };
+  const engine = new MockGameEngine([{ bestmove: "e7e5", ponder: "g1f3" }]);
+  const session = createGameSession(engine, client);
+  const initial = startedState("");
+  const full = gameFull(initial);
+  full.white = { id: "opponent" };
+  full.black = { id: "arena-bot" };
+  await session.initialize(full, engine);
+  await session.onState(initial, engine);
+  assert.equal(posts.length, 0);
+  assert.equal(engine.active?.kind, "opponent_root");
+
+  await session.onState(startedState("e2e4"), engine);
+  assert.equal(engine.stopCalls.at(-1).reason, "advance");
+  assert.deepEqual(engine.searchCalls[0].moves, ["e2e4"]);
+  assert.equal(posts.length, 1);
+  assert.match(posts[0], /\/move\/e7e5$/);
+});
+
+test("ponder miss drains stale output, reconstructs the authoritative root, and ignores duplicates", async () => {
+  const posts = [];
+  const client = { post: async (endpoint) => posts.push(endpoint) };
+  const engine = new MockGameEngine([
+    { bestmove: "e2e4", ponder: "e7e5" },
+    { bestmove: "d2d4", ponder: "d7d5" },
+  ]);
+  const session = createGameSession(engine, client);
+  const initial = startedState("");
+  await session.initialize(gameFull(initial), engine);
+  await session.onState(initial, engine);
+  await session.onState(startedState("e2e4"), engine);
+  await session.onState(startedState("e2e4 c7c5"), engine);
+
+  assert.equal(engine.ponderHitCalls, 0);
+  assert.equal(engine.stopCalls.length, 1);
+  assert.equal(engine.stopCalls[0].reason, "predicted_move_miss");
+  assert.deepEqual(engine.searchCalls[1].moves, ["e2e4", "c7c5"]);
+  assert.equal(posts.length, 2);
+
+  await session.onState(startedState("e2e4 c7c5"), engine);
+  assert.equal(posts.length, 2, "duplicate authoritative state cannot duplicate a POST");
+});
+
+test("reconnect invalidates the prediction and resumes opponent-root infinite search", async () => {
+  const client = { post: async () => {} };
+  const engine = new MockGameEngine([{ bestmove: "e2e4", ponder: "e7e5" }]);
+  const session = createGameSession(engine, client);
+  const initial = startedState("");
+  await session.initialize(gameFull(initial), engine);
+  await session.onState(initial, engine);
+  assert.equal(engine.active?.kind, "ponder");
+
+  await session.invalidateOpponentSearch("reconnect");
+  assert.equal(session.pendingOwnMove.predictedMove, null);
+  await session.onState(startedState("e2e4"), engine, { reconciled: true });
+  assert.equal(engine.active?.kind, "opponent_root");
+  assert.equal(engine.opponentCalls.at(-1).predictedMove, null);
+  assert.equal(engine.stopCalls.at(-1).reason, "reconnect");
+});
+
+test("runtime generation change rejects an otherwise matching ponder line", async () => {
+  const posts = [];
+  const client = { post: async (endpoint) => posts.push(endpoint) };
+  const engine = new MockGameEngine([
+    { bestmove: "e2e4", ponder: "e7e5" },
+    { bestmove: "g1f3", ponder: "b8c6" },
+  ]);
+  const session = createGameSession(engine, client);
+  const initial = startedState("");
+  await session.initialize(gameFull(initial), engine);
+  await session.onState(initial, engine);
+  await session.onState(startedState("e2e4"), engine);
+  engine.runtimeGeneration += 1;
+  await session.onState(startedState("e2e4 e7e5"), engine);
+  assert.equal(engine.ponderHitCalls, 0);
+  assert.equal(engine.stopCalls.at(-1).reason, "runtime_generation_changed");
+  assert.equal(engine.searchCalls.length, 2);
+  assert.equal(posts.length, 2);
+});
+
+test("search identity change rejects a move before submission", async () => {
+  const posts = [];
+  const client = { post: async (endpoint) => posts.push(endpoint) };
+  const engine = new MockGameEngine([{
+    bestmove: "e2e4",
+    ponder: "e7e5",
+    telemetry: { model_fingerprint: "unexpected-model" },
+  }]);
+  const session = createGameSession(engine, client);
+  const initial = startedState("");
+  await session.initialize(gameFull(initial), engine);
+
+  await assert.rejects(
+    session.onState(initial, engine),
+    /UCI search model_fingerprint mismatch/,
+  );
+  assert.equal(posts.length, 0);
+  assert.equal(session.pendingOwnMove, null);
+});
+
+test("syntactically valid illegal bestmove is rejected at the exact authoritative root", async () => {
+  const posts = [];
+  const client = { post: async (endpoint) => posts.push(endpoint) };
+  const engine = new MockGameEngine([{ bestmove: "e2e5", ponder: "e7e5" }]);
+  const session = createGameSession(engine, client);
+  const initial = startedState("");
+  await session.initialize(gameFull(initial), engine);
+
+  await assert.rejects(
+    session.onState(initial, engine),
+    /illegal at the exact authoritative root/,
+  );
+  assert.equal(posts.length, 0);
+  assert.equal(session.pendingOwnMove, null);
+});
+
+test("authoritative legality replay covers castling, en passant, promotion, and pins", () => {
+  assert.equal(validateLegalMoveAtAuthoritativeRoot({
+    initialFen: "startpos",
+    moves: ["e2e4", "e7e5", "g1f3", "b8c6", "f1e2", "g8f6"],
+    candidate: "e1g1",
+  }).legal, true);
+  assert.equal(validateLegalMoveAtAuthoritativeRoot({
+    initialFen: "startpos",
+    moves: ["e2e4", "a7a6", "e4e5", "d7d5"],
+    candidate: "e5d6",
+  }).legal, true);
+  assert.equal(validateLegalMoveAtAuthoritativeRoot({
+    initialFen: "8/P7/8/8/8/8/7p/4K2k w - - 0 1",
+    moves: [],
+    candidate: "a7a8q",
+  }).legal, true);
+  assert.equal(validateLegalMoveAtAuthoritativeRoot({
+    initialFen: "4r1k1/8/8/8/8/8/4R3/4K3 w - - 0 1",
+    moves: [],
+    candidate: "e2f2",
+  }).legal, false);
+});
+
+test("session legality state applies ordinary updates incrementally beyond one hundred plies", () => {
+  const legality = new AuthoritativeChessState("startpos");
+  const moves = [];
+  let maximumApplied = 0;
+  for (let cycle = 0; cycle < 30; cycle += 1) {
+    for (const move of ["g1f3", "g8f6", "f3g1", "f6g8"]) {
+      moves.push(move);
+      const synchronization = legality.synchronize(moves);
+      maximumApplied = Math.max(maximumApplied, synchronization.appliedPlies);
+      assert.equal(synchronization.rebuilt, false);
+    }
+  }
+  assert.equal(moves.length, 120);
+  assert.equal(maximumApplied, 1);
+  assert.equal(legality.validateCandidate(moves, "e2e4").legal, true);
+});
+
+test("unsupported from-position game fails closed before search or submission", async () => {
+  const posts = [];
+  const client = { post: async (endpoint) => posts.push(endpoint) };
+  const engine = new MockGameEngine([{ bestmove: "a7a8q" }]);
+  const session = createGameSession(engine, client);
+  const full = gameFull(startedState(""));
+  full.initialFen = "8/P7/8/8/8/8/7p/4K2k w - - 0 1";
+  await assert.rejects(session.initialize(full, engine), /Unsupported live game shape/);
+  assert.equal(engine.searchCalls.length, 0);
+  assert.equal(posts.length, 0);
+});
+
+test("takeback and terminal states stop opponent work without submitting stale moves", async () => {
+  const posts = [];
+  const client = { post: async (endpoint) => posts.push(endpoint) };
+  const engine = new MockGameEngine([{ bestmove: "e2e4", ponder: "e7e5" }]);
+  const session = createGameSession(engine, client);
+  const initial = startedState("");
+  await session.initialize(gameFull(initial), engine);
+  await session.onState(initial, engine);
+  await session.onState(startedState("e2e4"), engine);
+  await session.onState(startedState("", { status: "aborted" }), engine);
+  assert.equal(session.finished, true);
+  assert.equal(posts.length, 1);
+  assert.equal(engine.isOpponentTurnSearchActive(), false);
+  assert.ok(engine.stopCalls.some((entry) => entry.reason === "takeback"));
+});
+
+test("stream intake preempts an awaited foreground search on terminal authority before POST", async () => {
+  const posts = [];
+  const engine = new BlockingForegroundEngine();
+  const initial = startedState("");
+  const terminal = startedState("", { status: "aborted" });
+  const client = {
+    async *stream() {
+      yield gameFull(initial);
+      await engine.searchStarted;
+      yield terminal;
+    },
+    post: async (endpoint) => posts.push(endpoint),
+  };
+  const abort = new AbortController();
+  let sessions = [];
+  const session = new GameSession({
+    client,
+    config: gameConfig(),
+    account: "arena-bot",
+    gameId: "game-preempt",
+    signal: abort.signal,
+    slot: { id: "human-1", audience: "human", engine },
+    store: mockStore(),
+    foregroundCoordinator: new ForegroundSearchCoordinator({ sessions: () => sessions }),
+  });
+  sessions = [session];
+
+  await session.run();
+  assert.equal(session.finished, true);
+  assert.equal(posts.length, 0);
+  assert.equal(engine.searchCalls.length, 1);
+  assert.ok(engine.stopCalls.some((entry) => entry.reason === "terminal_state"));
+  assert.ok(session.observedGeneration > 1);
+});
+
+test("stream intake preempts an awaited foreground search on a takeback before POST", async () => {
+  const posts = [];
+  const engine = new BlockingForegroundEngine();
+  const root = startedState("e2e4 e7e5");
+  const takeback = startedState("e2e4");
+  const client = {
+    async *stream() {
+      yield gameFull(root);
+      await engine.searchStarted;
+      yield takeback;
+    },
+    post: async (endpoint) => posts.push(endpoint),
+  };
+  const abort = new AbortController();
+  let sessions = [];
+  const config = gameConfig();
+  config.timing.opponent_turn_search = false;
+  const session = new GameSession({
+    client,
+    config,
+    account: "arena-bot",
+    gameId: "game-takeback-preempt",
+    signal: abort.signal,
+    slot: { id: "human-1", audience: "human", engine },
+    store: mockStore(),
+    foregroundCoordinator: new ForegroundSearchCoordinator({ sessions: () => sessions }),
+  });
+  sessions = [session];
+
+  await session.consumeGameStream(engine);
+  assert.equal(posts.length, 0);
+  assert.equal(engine.searchCalls.length, 1);
+  assert.ok(engine.stopCalls.some((entry) => entry.reason === "takeback"));
+  assert.equal(session.authoritativeMoves.join(" "), "e2e4");
+});
+
+test("same-root authoritative clock correction cancels the old-clock search before POST", async () => {
+  const posts = [];
+  const engine = new ClockCorrectionEngine();
+  const initial = startedState("", { wtime: 180_000 });
+  const corrected = startedState("", { wtime: 170_000 });
+  const client = {
+    async *stream() {
+      yield gameFull(initial);
+      await engine.firstSearchStarted;
+      yield corrected;
+    },
+    post: async (endpoint) => posts.push(endpoint),
+  };
+  const abort = new AbortController();
+  let sessions = [];
+  const config = gameConfig();
+  config.timing.opponent_turn_search = false;
+  const session = new GameSession({
+    client,
+    config,
+    account: "arena-bot",
+    gameId: "game-clock-correction",
+    signal: abort.signal,
+    slot: { id: "human-1", audience: "human", engine },
+    store: mockStore(),
+    foregroundCoordinator: new ForegroundSearchCoordinator({ sessions: () => sessions }),
+  });
+  sessions = [session];
+
+  await session.consumeGameStream(engine);
+  assert.equal(engine.searchCalls.length, 2);
+  assert.ok(engine.stopCalls.some((entry) => entry.reason === "clock_correction"));
+  assert.deepEqual(posts, ["api/bot/game/game-clock-correction/move/e2e4"]);
+  assert.ok(engine.searchCalls[1].wtime <= 170_000 && engine.searchCalls[1].wtime >= 169_900);
+});
+
+test("terminal authority cancels a move blocked in the request queue before fetch dispatch", async () => {
+  const fetches = [];
+  let releaseBlocker;
+  const blockerReady = new Promise((resolve) => {
+    releaseBlocker = { ready: resolve, release: null };
+  });
+  const client = new LichessClient({
+    token: "test-token",
+    fetchImpl: async (url) => {
+      const endpoint = new URL(url).pathname;
+      fetches.push(endpoint);
+      if (endpoint.endsWith("/blocker")) {
+        return new Promise((resolve) => {
+          releaseBlocker.release = () => resolve({
+            ok: true,
+            status: 200,
+            json: async () => ({}),
+          });
+          releaseBlocker.ready();
+        });
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    },
+  });
+  const blocker = client.json("api/blocker");
+  await blockerReady;
+
+  const engine = new MockGameEngine([{ bestmove: "e2e4" }]);
+  const session = createGameSession(engine, client);
+  const initial = startedState("");
+  await session.initialize(gameFull(initial), engine);
+  const moveOperation = session.onState(initial, engine);
+  while (client.requestQueue.queue.length === 0) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  await session.onState(startedState("", { status: "aborted" }), engine);
+  releaseBlocker.release();
+  await blocker;
+  await moveOperation;
+
+  assert.equal(fetches.some((endpoint) => endpoint.includes("/move/")), false);
+  assert.equal(session.finished, true);
+});
+
+test("HTTP 400 move response requires an explicit authoritative reconciliation before retry", async () => {
+  let postAttempts = 0;
+  const client = {
+    post: async () => {
+      postAttempts += 1;
+      if (postAttempts === 1) throw new LichessHttpError("POST", "move", 400);
+    },
+  };
+  const engine = new MockGameEngine([
+    { bestmove: "e2e4", ponder: "e7e5" },
+    { bestmove: "d2d4", ponder: "d7d5" },
+  ]);
+  const session = createGameSession(engine, client);
+  const initial = startedState("");
+  await session.initialize(gameFull(initial), engine);
+  await assert.rejects(session.onState(initial, engine), /HTTP 400/);
+  assert.equal(postAttempts, 1);
+  assert.equal(session.pendingOwnMove, null);
+  assert.equal(engine.isOpponentTurnSearchActive(), false);
+
+  await session.onState(initial, engine, { reconciled: true });
+  assert.equal(postAttempts, 2);
+  assert.equal(engine.searchCalls.length, 2);
+});
+
+test("HTTP 429 move response does not start ponder or submit a blind retry", async () => {
+  let postAttempts = 0;
+  const client = {
+    post: async () => {
+      postAttempts += 1;
+      throw new LichessHttpError("POST", "move", 429, 60_000);
+    },
+  };
+  const engine = new MockGameEngine([{ bestmove: "e2e4", ponder: "e7e5" }]);
+  const session = createGameSession(engine, client);
+  const initial = startedState("");
+  await session.initialize(gameFull(initial), engine);
+  await assert.rejects(session.onState(initial, engine), /HTTP 429/);
+  assert.equal(postAttempts, 1);
+  assert.equal(session.pendingOwnMove, null);
+  assert.equal(engine.opponentCalls.length, 0);
 });
 
 test("NDJSON parser handles split chunks and keepalive lines", async () => {
