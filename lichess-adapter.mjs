@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { performance } from "node:perf_hooks";
@@ -10,8 +10,9 @@ import path from "node:path";
 
 import {
   AsyncSemaphore,
+  API_REQUEST_PRIORITY,
+  ApiSafetyCoordinator,
   LichessHttpError,
-  PriorityRequestQueue,
   SlotPool,
   reservationBlocksPublicHuman,
   selectWeightedCandidate,
@@ -77,6 +78,7 @@ const TRANSPORT_PROFILE_MAXIMUM_AGE_MS = 7 * 24 * 60 * 60 * 1_000;
 const TRANSPORT_PROFILE_MAXIMUM_SAMPLES = 2_000;
 const TRANSPORT_RESERVE_MINIMUM_MS = 250;
 const TRANSPORT_RESERVE_MAXIMUM_MS = 1_500;
+const CHALLENGE_RESPONSE_MAX_AGE_MS = 20_000;
 const UCI_MOVE_PATTERN = /^[a-h][1-8][a-h][1-8][qrbn]?$/;
 const TIME_PROFILE_RESERVED_OPTIONS = new Set([
   "SearchCore", "Threads", "RootWorkers", "V2SplitDepth", "BackgroundSearch",
@@ -210,6 +212,15 @@ class StaleAuthoritativeSearchError extends Error {
   constructor(gameId, reason) {
     super(`Authoritative Lichess state changed during search for ${gameId}: ${reason}`);
     this.name = "StaleAuthoritativeSearchError";
+    this.reason = reason;
+  }
+}
+
+class StaleApiOperationError extends Error {
+  constructor(operation, reason) {
+    super(`Stale Lichess ${operation} operation: ${reason}`);
+    this.name = "StaleApiOperationError";
+    this.operation = operation;
     this.reason = reason;
   }
 }
@@ -643,15 +654,68 @@ function readTokenForRuntime(tokenFile) {
   return token;
 }
 
+async function discardResponseBody(response) {
+  if (typeof response?.arrayBuffer === "function") {
+    await response.arrayBuffer();
+    return;
+  }
+  if (typeof response?.text === "function") {
+    await response.text();
+    return;
+  }
+  if (typeof response?.body?.cancel === "function") await response.body.cancel();
+}
+
+function apiRequestClass(endpoint, method = "GET") {
+  const normalized = String(endpoint).replace(/^\/+/, "");
+  if (normalized.includes("/move/")) return "move";
+  if (normalized.startsWith("api/bot/game/stream/")) return "game_stream";
+  if (normalized === "api/stream/event") return "event_stream";
+  if (normalized.startsWith("api/account/playing")) return "reconciliation";
+  if (normalized === "api/account") return "identity";
+  if (normalized.startsWith("api/bot/online") || normalized.startsWith("api/user/")) {
+    return "discovery";
+  }
+  if (normalized.startsWith("api/challenge/")) {
+    if (method === "POST" && !/\/(?:accept|decline|cancel)$/.test(normalized)) {
+      return "challenge_create";
+    }
+    return "challenge_control";
+  }
+  return "ordinary";
+}
+
+function streamKey(endpoint) {
+  const normalized = String(endpoint).replace(/^\/+/, "");
+  if (normalized === "api/stream/event") return "event";
+  if (normalized.startsWith("api/bot/game/stream/")) {
+    return `game:${normalized.slice("api/bot/game/stream/".length)}`;
+  }
+  return `stream:${normalized}`;
+}
+
 export class LichessClient {
-  constructor({ token, baseUrl = "https://lichess.org/", fetchImpl = globalThis.fetch, requestQueue }) {
+  constructor({
+    token,
+    baseUrl = "https://lichess.org/",
+    fetchImpl = globalThis.fetch,
+    requestQueue,
+    safetyCoordinator,
+  }) {
     this.token = token;
     this.baseUrl = baseUrl;
     this.fetchImpl = fetchImpl;
-    this.requestQueue = requestQueue ?? new PriorityRequestQueue();
+    this.requestQueue = safetyCoordinator ?? requestQueue ?? new ApiSafetyCoordinator();
+    this.activeStreamKeys = new Set();
   }
 
-  async requestDirect(endpoint, { method = "GET", form, stream = false, signal } = {}) {
+  async requestDirect(endpoint, {
+    method = "GET",
+    form,
+    stream = false,
+    signal,
+    requestClass = apiRequestClass(endpoint, method),
+  } = {}) {
     const headers = {
       Accept: stream ? "application/x-ndjson" : "application/json",
       Authorization: `Bearer ${this.token}`,
@@ -671,49 +735,112 @@ export class LichessClient {
     if (!response.ok) {
       let retryAfterMs = 0;
       if (response.status === 429) {
-        const retryAfter = Number(response.headers?.get?.("retry-after"));
-        retryAfterMs = Math.max(60_000, Number.isFinite(retryAfter) ? retryAfter * 1_000 : 0);
-        this.requestQueue.blockNonMove(retryAfterMs);
+        retryAfterMs = await this.requestQueue.registerRateLimit(
+          response.headers?.get?.("retry-after"),
+          requestClass,
+        );
       }
-      throw new LichessHttpError(method, endpoint, response.status, retryAfterMs);
+      await discardResponseBody(response);
+      throw new LichessHttpError(method, endpoint, response.status, retryAfterMs, requestClass);
     }
     return response;
   }
 
-  request(endpoint, options = {}) {
-    if (options.stream) return this.requestDirect(endpoint, options);
-    const priority = options.priority ?? 20;
-    return this.requestQueue.enqueue(() => {
+  dispatch(endpoint, options, consume) {
+    const method = options.method ?? "GET";
+    const requestClass = options.requestClass ?? apiRequestClass(endpoint, method);
+    const priority = options.priority ?? API_REQUEST_PRIORITY[requestClass]
+      ?? API_REQUEST_PRIORITY.ordinary;
+    return this.requestQueue.enqueue(async () => {
       options.beforeDispatch?.();
       if (options.signal?.aborted) {
         throw options.signal.reason ?? new Error("Lichess request was cancelled before dispatch");
       }
-      return this.requestDirect(endpoint, options);
-    }, priority);
+      const response = await this.requestDirect(endpoint, { ...options, method, requestClass });
+      return consume(response);
+    }, { priority, requestClass, signal: options.signal });
   }
 
-  async json(endpoint, options) {
-    return (await this.request(endpoint, options)).json();
+  json(endpoint, options = {}) {
+    return this.dispatch(endpoint, options, (response) => response.json());
   }
 
   async post(endpoint, form, signal, priority, beforeDispatch) {
-    const requestPriority = priority ?? (endpoint.includes("/move/") ? 0 : 10);
-    return this.request(endpoint, {
+    return this.dispatch(endpoint, {
       method: "POST",
       form,
       signal,
-      priority: requestPriority,
+      priority,
       beforeDispatch,
+    }, async (response) => {
+      await discardResponseBody(response);
+      return undefined;
     });
   }
 
+  async postJson(endpoint, form, signal, priority, beforeDispatch) {
+    return this.dispatch(endpoint, {
+      method: "POST",
+      form,
+      signal,
+      priority,
+      beforeDispatch,
+      requestClass: "challenge_create",
+    }, (response) => response.json());
+  }
+
   async openStream(endpoint, signal) {
-    const response = await this.request(endpoint, { stream: true, signal });
-    return parseNdjsonStream(response.body);
+    const key = streamKey(endpoint);
+    if (this.activeStreamKeys.has(key)) {
+      throw new Error(`Lichess stream is already pending or active: ${key}`);
+    }
+    this.activeStreamKeys.add(key);
+    try {
+      const requestClass = apiRequestClass(endpoint);
+      const response = await this.dispatch(endpoint, {
+        stream: true,
+        signal,
+        requestClass,
+      }, (opened) => opened);
+      return this.trackedStream(response.body, key);
+    } catch (error) {
+      this.activeStreamKeys.delete(key);
+      throw error;
+    }
+  }
+
+  async *trackedStream(body, key) {
+    try {
+      yield* parseNdjsonStream(body);
+    } finally {
+      this.activeStreamKeys.delete(key);
+    }
   }
 
   async *stream(endpoint, signal) {
     yield* await this.openStream(endpoint, signal);
+  }
+
+  collectNdjson(endpoint, signal) {
+    return this.dispatch(endpoint, {
+      signal,
+      requestClass: "discovery",
+    }, async (response) => {
+      const items = [];
+      for await (const item of parseNdjsonStream(response.body)) items.push(item);
+      return items;
+    });
+  }
+
+  safetySnapshot() {
+    return {
+      ...this.requestQueue.snapshot(),
+      active_streams: Array.from(this.activeStreamKeys).sort(),
+    };
+  }
+
+  isCoolingDown() {
+    return this.requestQueue.isCoolingDown();
   }
 }
 
@@ -722,13 +849,15 @@ export async function probeAccount({
   expectedAccount,
   url = "https://lichess.org/",
   fetchImpl = globalThis.fetch,
+  client,
+  signal,
 }) {
-  const client = new LichessClient({
+  const apiClient = client ?? new LichessClient({
     token: readTokenForRuntime(tokenFile),
     baseUrl: url,
     fetchImpl,
   });
-  const profile = await client.json("api/account");
+  const profile = await apiClient.json("api/account", { signal });
   const username = String(profile.username ?? profile.id ?? "");
   if (username.toLocaleLowerCase() !== expectedAccount.toLocaleLowerCase()) {
     throw new Error(`Authenticated Lichess account mismatch: ${username}`);
@@ -739,6 +868,10 @@ export async function probeAccount({
     throw new Error(`Authenticated Lichess account is not a BOT account: ${username}${eligibility}`);
   }
   return { username, title: "BOT", is_bot: true, games };
+}
+
+export function apiAuthorityKey(url, expectedAccount) {
+  return `${new URL(url).origin.toLocaleLowerCase()}|${normalizedUsername(expectedAccount)}`;
 }
 
 function parseInfo(line) {
@@ -2258,7 +2391,7 @@ export class GameSession {
 }
 
 export class BotController {
-  constructor({ client, config, account, runtimeDir, signal, store, random = Math.random }) {
+  constructor({ client, config, account, runtimeDir, signal, store, random = Math.random, now = Date.now }) {
     this.client = client;
     this.config = { ...config, timing: { ...DEFAULT_TIMING_CONFIG, ...(config.timing ?? {}) } };
     this.config.engine = { ...config.engine, timing: this.config.timing };
@@ -2267,6 +2400,7 @@ export class BotController {
     this.signal = signal;
     this.store = store;
     this.random = random;
+    this.now = now;
     this.slots = new SlotPool(config.capacity);
     this.engineStarts = new AsyncSemaphore(config.capacity.startup_parallelism);
     this.activeGames = new Map();
@@ -2440,8 +2574,10 @@ export class BotController {
     const opponent = normalizedUsername(
       challenge.challenger?.id ?? challenge.challenger?.name,
     );
+    const receivedAt = this.now();
     const audience = String(challenge.challenger?.title ?? "").toUpperCase() === "BOT" ? "bot" : "human";
     let reason = challengeDeclineReason(challenge, this.config.challenges, 0);
+    if (!reason && this.client.isCoolingDown?.()) reason = "later";
     const owner = audience === "human" && this.store.isOwner(opponent);
     if (!reason && audience === "human" && !owner && !this.config.capacity.human.accept_public) reason = "later";
     const reservation = this.store.getReservation();
@@ -2462,13 +2598,35 @@ export class BotController {
     }
     const endpoint = `api/challenge/${encodeURIComponent(challenge.id)}`;
     if (reason) {
-      await this.client.post(`${endpoint}/decline`, { reason }, this.signal);
+      try {
+        await this.client.post(`${endpoint}/decline`, { reason }, this.signal, undefined, () => {
+          if (this.now() - receivedAt >= CHALLENGE_RESPONSE_MAX_AGE_MS) {
+            throw new StaleApiOperationError("decline", "challenge response window expired");
+          }
+        });
+      } catch (error) {
+        if (error instanceof StaleApiOperationError) {
+          log("stale_challenge_response_skipped", {
+            challenge_id: challenge.id,
+            operation: error.operation,
+            reason: error.reason,
+          });
+          return;
+        }
+        throw error;
+      }
       log("challenge_declined", { challenge_id: challenge.id, opponent, audience, reason });
       return;
     }
+    const slotGeneration = slot.generation;
     try {
       await this.prepareSlot(slot);
-      await this.client.post(`${endpoint}/accept`, undefined, this.signal);
+      await this.client.post(`${endpoint}/accept`, undefined, this.signal, undefined, () => {
+        this.slots.requireOwned(slot, "preparing", slotGeneration);
+        if (this.now() - receivedAt >= CHALLENGE_RESPONSE_MAX_AGE_MS) {
+          throw new StaleApiOperationError("accept", "challenge response window expired");
+        }
+      });
       this.slots.pending(slot, challenge.id);
       this.store.recordChallenge({
         id: challenge.id,
@@ -2483,6 +2641,14 @@ export class BotController {
       log("challenge_accepted", { challenge_id: challenge.id, opponent, audience, slot_id: slot.id });
     } catch (error) {
       await this.slots.release(slot);
+      if (error instanceof StaleApiOperationError) {
+        log("stale_challenge_response_skipped", {
+          challenge_id: challenge.id,
+          operation: error.operation,
+          reason: error.reason,
+        });
+        return;
+      }
       throw error;
     }
   }
@@ -2547,20 +2713,25 @@ export class BotController {
     if (normalized === this.account || this.slots.hasOpponent(normalized)) return false;
     const slot = this.slots.acquire(audience, { opponent: normalized, direction: "outbound" });
     if (!slot) return false;
+    const slotGeneration = slot.generation;
     try {
       await this.prepareSlot(slot);
       const outbound = this.config.outbound_challenge;
       if (audience === "bot") this.lastBotChallengeAt = Date.now();
       else this.lastOwnerChallengeAt = Date.now();
-      const response = await this.client.post(`api/challenge/${encodeURIComponent(normalized)}`, {
+      const challenge = await this.client.postJson(`api/challenge/${encodeURIComponent(normalized)}`, {
         rated: outbound.rated,
         color: outbound.color,
         variant: "standard",
         "clock.limit": outbound.clock_limit,
         "clock.increment": outbound.clock_increment,
         keepAliveStream: false,
-      }, this.signal);
-      const challenge = await response.json();
+      }, this.signal, undefined, () => {
+        this.slots.requireOwned(slot, "preparing", slotGeneration);
+        if (!this.streamConnected || this.store.control().paused) {
+          throw new StaleApiOperationError("challenge_create", "scheduler authority changed");
+        }
+      });
       const challengeId = challenge.id ?? challenge.challenge?.id;
       if (!challengeId) throw new Error(`Lichess challenge response for ${normalized} has no id`);
       this.slots.pending(slot, challengeId);
@@ -2585,6 +2756,7 @@ export class BotController {
       return true;
     } catch (error) {
       await this.slots.release(slot);
+      if (error instanceof StaleApiOperationError) return false;
       if (!(error instanceof LichessHttpError && error.status === 429) && audience === "bot") {
         this.store.setOpponentCooldown(normalized, this.config.scheduler.timeout_cooldown_minutes);
       }
@@ -2611,6 +2783,7 @@ export class BotController {
     if (this.tickRunning || !this.streamConnected) return;
     this.tickRunning = true;
     try {
+      if (this.client.isCoolingDown?.()) return;
       if (this.needsReconciliation) {
         if (now - this.lastReconciliationAt < 15_000) return;
         await this.recoverPlayingGames();
@@ -2655,8 +2828,7 @@ export class BotController {
   }
 
   async discoverBots(now = Date.now()) {
-    const bots = [];
-    for await (const bot of this.client.stream("api/bot/online?nb=512", this.signal)) bots.push(bot);
+    const bots = await this.client.collectNdjson("api/bot/online?nb=512", this.signal);
     this.store.replaceOnlineBots(bots, now);
     this.lastDiscoveryAt = now;
     log("bot_discovery_complete", { online_bots: bots.length });
@@ -2694,10 +2866,17 @@ export class BotController {
       this.slots.cancelling(slot);
       slot.cancelRetryAt = Number.POSITIVE_INFINITY;
       try {
-        await this.client.post(`api/challenge/${encodeURIComponent(challengeId)}/cancel`, undefined, this.signal);
+        await this.client.post(
+          `api/challenge/${encodeURIComponent(challengeId)}/cancel`,
+          undefined,
+          this.signal,
+          undefined,
+          () => this.slots.requireOwned(slot, "cancelling", generation),
+        );
       } catch (error) {
         if (slot.generation !== generation || slot.state !== "cancelling") continue;
         slot.cancelInFlight = false;
+        if (error instanceof StaleApiOperationError) continue;
         const status = error instanceof LichessHttpError ? error.status : null;
         if (status === 404) {
           if (await this.recoverTimedOutSlot(slot, generation)) continue;
@@ -2783,7 +2962,7 @@ export class BotController {
 
   async writeStatus() {
     writeRuntimeMetadata(this.runtimeDir, {
-      schema: "uci_arena_lichess_runtime_v2",
+      schema: "uci_arena_lichess_runtime_v3",
       adapter_id: "lichess_node_adapter_v2",
       pid: process.pid,
       account: this.account,
@@ -2801,6 +2980,10 @@ export class BotController {
         reconciliation_pending: this.needsReconciliation,
         fault: this.schedulerFault,
         ...this.store.control(),
+      },
+      api_safety: {
+        ...this.client.safetySnapshot(),
+        active_client_leases: this.store.activeApiLeases().length,
       },
       timing: {
         opponent_turn_search: this.config.timing.opponent_turn_search,
@@ -3042,27 +3225,58 @@ export async function main(argv = process.argv.slice(2)) {
   const expectedAccount = options.expected_account;
   if (!expectedAccount) throw new Error("--expected-account is required");
   const tokenFile = path.resolve(options.token_file ?? DEFAULT_TOKEN_FILE);
-  const profile = await probeAccount({ tokenFile, expectedAccount, url: config.url });
-  if (options.command === "probe") {
-    console.log(JSON.stringify({ status: "ready", account: profile.username, is_bot: true, games: profile.games }));
-    return 0;
-  }
-
   const controller = new AbortController();
   for (const signal of ["SIGINT", "SIGTERM"]) {
     process.once(signal, () => controller.abort(new Error(`Received ${signal}`)));
   }
-  log("adapter_started", {
-    account: profile.username,
-    opponent: options.opponent ?? null,
-    configured_capacity: config.capacity.total_slots,
-    qualified_capacity: config.capacity_profile?.maximum_concurrency ?? 1,
-    provider: qualificationStatus.provider_effective,
-    time_profile: config.engine.time_profile_status,
-  });
-  const client = new LichessClient({ token: readTokenForRuntime(tokenFile), baseUrl: config.url });
   const store = new LichessStore(path.resolve(options.store ?? path.join(runtimeDir, "matches.sqlite")));
+  const authority = apiAuthorityKey(config.url, expectedAccount);
+  const leaseOwner = randomUUID();
+  let leaseHeartbeat = null;
   try {
+    store.acquireApiLease(authority, leaseOwner, process.pid);
+    const safetyCoordinator = new ApiSafetyCoordinator({
+      initialState: store.apiSafetyState(authority),
+      persistSafetyState: (state) => store.saveApiSafetyState(authority, state),
+      onStateChange: (state) => log(state.event, {
+        request_class: state.requestClass ?? null,
+        cooldown_until: state.cooldownUntil || null,
+        strike_count: state.strikeCount,
+        last_retry_after_ms: state.lastRetryAfterMs,
+      }),
+    });
+    if (options.command === "probe" && safetyCoordinator.isCoolingDown()) {
+      throw new Error(
+        `Lichess API cooldown is active until ${new Date(safetyCoordinator.cooldownUntil).toISOString()}`,
+      );
+    }
+    if (options.command === "run") {
+      leaseHeartbeat = setInterval(() => {
+        try {
+          store.heartbeatApiLease(authority, leaseOwner, process.pid);
+        } catch (error) {
+          controller.abort(error);
+        }
+      }, 10_000);
+    }
+    const client = new LichessClient({
+      token: readTokenForRuntime(tokenFile),
+      baseUrl: config.url,
+      safetyCoordinator,
+    });
+    const profile = await probeAccount({ client, expectedAccount, url: config.url, signal: controller.signal });
+    if (options.command === "probe") {
+      console.log(JSON.stringify({ status: "ready", account: profile.username, is_bot: true, games: profile.games }));
+      return 0;
+    }
+    log("adapter_started", {
+      account: profile.username,
+      opponent: options.opponent ?? null,
+      configured_capacity: config.capacity.total_slots,
+      qualified_capacity: config.capacity_profile?.maximum_concurrency ?? 1,
+      provider: qualificationStatus.provider_effective,
+      time_profile: config.engine.time_profile_status,
+    });
     await new BotController({
       client,
       config,
@@ -3072,6 +3286,8 @@ export async function main(argv = process.argv.slice(2)) {
       store,
     }).run(options.opponent);
   } finally {
+    if (leaseHeartbeat) clearInterval(leaseHeartbeat);
+    store.releaseApiLease(authority, leaseOwner);
     store.close();
   }
   return 0;

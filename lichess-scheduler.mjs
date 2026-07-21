@@ -275,60 +275,243 @@ export function reservationBlocksPublicHuman({ reservation, opponent, reservatio
 }
 
 export class LichessHttpError extends Error {
-  constructor(method, endpoint, status, retryAfterMs = 0) {
+  constructor(method, endpoint, status, retryAfterMs = 0, requestClass = "ordinary") {
     super(`Lichess ${method} ${endpoint} failed with HTTP ${status}`);
     this.name = "LichessHttpError";
     this.status = status;
     this.retryAfterMs = retryAfterMs;
+    this.requestClass = requestClass;
   }
 }
 
-export class PriorityRequestQueue {
-  constructor({ now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
+export const API_REQUEST_PRIORITY = Object.freeze({
+  move: 0,
+  game_stream: 5,
+  event_stream: 10,
+  reconciliation: 15,
+  challenge_control: 20,
+  identity: 20,
+  challenge_create: 30,
+  discovery: 40,
+  ordinary: 50,
+});
+
+export const API_RATE_LIMIT_BACKOFF_MS = Object.freeze([
+  60_000,
+  120_000,
+  300_000,
+  900_000,
+  3_600_000,
+]);
+export const API_RATE_LIMIT_STRIKE_RESET_MS = 6 * 60 * 60 * 1_000;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+export function retryAfterMilliseconds(value, now = Date.now()) {
+  if (value === null || value === undefined) return 0;
+  const text = String(value).trim();
+  if (!text) return 0;
+  if (/^\d+(?:\.\d+)?$/.test(text)) {
+    const seconds = Number(text);
+    return Number.isFinite(seconds) ? Math.max(0, Math.ceil(seconds * 1_000)) : 0;
+  }
+  const timestamp = Date.parse(text);
+  return Number.isFinite(timestamp) ? Math.max(0, timestamp - now) : 0;
+}
+
+function abortReason(signal) {
+  return signal?.reason instanceof Error ? signal.reason : new Error("Lichess request was cancelled");
+}
+
+export class ApiSafetyCoordinator {
+  constructor({
+    now = Date.now,
+    setTimer = setTimeout,
+    clearTimer = clearTimeout,
+    initialState = {},
+    persistSafetyState = null,
+    onStateChange = null,
+  } = {}) {
     this.now = now;
     this.setTimer = setTimer;
     this.clearTimer = clearTimer;
+    this.persistSafetyState = persistSafetyState;
+    this.onStateChange = onStateChange;
     this.queue = [];
     this.sequence = 0;
     this.running = false;
-    this.nonMoveBlockedUntil = 0;
+    this.inFlightClass = null;
+    this.cooldownUntil = Number(initialState.cooldownUntil ?? initialState.cooldown_until) || 0;
+    this.strikeCount = Number(initialState.strikeCount ?? initialState.strike_count) || 0;
+    this.last429At = Number(initialState.last429At ?? initialState.last_429_at) || 0;
+    this.lastRetryAfterMs = Number(
+      initialState.lastRetryAfterMs ?? initialState.last_retry_after_ms,
+    ) || 0;
     this.timer = null;
+    this.timerDeadline = 0;
+    this.counters = {
+      dispatched: 0,
+      succeeded: 0,
+      failed: 0,
+      rateLimited: 0,
+    };
   }
 
-  enqueue(task, priority = 20) {
+  enqueue(task, options = {}) {
+    const normalized = typeof options === "number" ? { priority: options } : options;
+    const requestClass = normalized.requestClass ?? "ordinary";
+    const priority = normalized.priority ?? API_REQUEST_PRIORITY[requestClass]
+      ?? API_REQUEST_PRIORITY.ordinary;
+    const signal = normalized.signal;
     return new Promise((resolve, reject) => {
-      this.queue.push({ task, priority, sequence: this.sequence++, resolve, reject });
-      this.queue.sort((left, right) => left.priority - right.priority || left.sequence - right.sequence);
-      if (priority === 0 && this.timer) {
-        this.clearTimer(this.timer);
-        this.timer = null;
+      if (signal?.aborted) {
+        reject(abortReason(signal));
+        return;
       }
+      const entry = {
+        task,
+        priority,
+        requestClass,
+        signal,
+        sequence: this.sequence++,
+        resolve,
+        reject,
+        abortListener: null,
+      };
+      if (signal?.addEventListener) {
+        entry.abortListener = () => {
+          const index = this.queue.indexOf(entry);
+          if (index < 0) return;
+          this.queue.splice(index, 1);
+          reject(abortReason(signal));
+          this.pump();
+        };
+        signal.addEventListener("abort", entry.abortListener, { once: true });
+      }
+      this.queue.push(entry);
+      this.queue.sort((left, right) => left.priority - right.priority || left.sequence - right.sequence);
       this.pump();
     });
   }
 
-  blockNonMove(milliseconds) {
-    this.nonMoveBlockedUntil = Math.max(this.nonMoveBlockedUntil, this.now() + milliseconds);
+  async registerRateLimit(retryAfter, requestClass = "ordinary") {
+    const now = this.now();
+    const retryAfterMs = typeof retryAfter === "number"
+      ? Math.max(0, Math.ceil(retryAfter))
+      : retryAfterMilliseconds(retryAfter, now);
+    const recent = this.last429At > 0 && now - this.last429At < API_RATE_LIMIT_STRIKE_RESET_MS;
+    this.strikeCount = recent
+      ? Math.min(API_RATE_LIMIT_BACKOFF_MS.length, this.strikeCount + 1)
+      : 1;
+    const scheduled = API_RATE_LIMIT_BACKOFF_MS[this.strikeCount - 1];
+    const delayMs = Math.max(scheduled, retryAfterMs);
+    this.last429At = now;
+    this.lastRetryAfterMs = retryAfterMs;
+    this.cooldownUntil = Math.max(this.cooldownUntil, now + delayMs);
+    this.counters.rateLimited += 1;
+    this.rescheduleCooldownTimer();
+    const state = this.safetyState();
+    if (this.persistSafetyState) await this.persistSafetyState(state);
+    this.onStateChange?.({ event: "api_rate_limit_entered", requestClass, ...state });
+    return Math.max(0, this.cooldownUntil - now);
+  }
+
+  safetyState() {
+    return {
+      cooldownUntil: this.cooldownUntil,
+      strikeCount: this.effectiveStrikeCount(),
+      last429At: this.last429At,
+      lastRetryAfterMs: this.lastRetryAfterMs,
+    };
+  }
+
+  effectiveStrikeCount() {
+    if (!this.last429At || this.now() - this.last429At >= API_RATE_LIMIT_STRIKE_RESET_MS) return 0;
+    return this.strikeCount;
+  }
+
+  cooldownRemainingMs() {
+    return Math.max(0, this.cooldownUntil - this.now());
+  }
+
+  isCoolingDown() {
+    return this.cooldownRemainingMs() > 0;
+  }
+
+  snapshot() {
+    const queueDepthByClass = {};
+    for (const entry of this.queue) {
+      queueDepthByClass[entry.requestClass] = (queueDepthByClass[entry.requestClass] ?? 0) + 1;
+    }
+    return {
+      state: this.isCoolingDown() ? "cooldown" : "ready",
+      cooldown_until: this.cooldownUntil || null,
+      cooldown_remaining_ms: this.cooldownRemainingMs(),
+      strike_count: this.effectiveStrikeCount(),
+      last_429_at: this.last429At || null,
+      last_retry_after_ms: this.lastRetryAfterMs,
+      in_flight_class: this.inFlightClass,
+      queue_depth: this.queue.length,
+      queue_depth_by_class: queueDepthByClass,
+      counters: {
+        dispatched: this.counters.dispatched,
+        succeeded: this.counters.succeeded,
+        failed: this.counters.failed,
+        rate_limited: this.counters.rateLimited,
+      },
+    };
+  }
+
+  rescheduleCooldownTimer() {
+    const remaining = this.cooldownRemainingMs();
+    if (remaining <= 0 || !this.queue.length) {
+      if (this.timer) this.clearTimer(this.timer);
+      this.timer = null;
+      this.timerDeadline = 0;
+      return;
+    }
+    if (this.timer && this.timerDeadline === this.cooldownUntil) return;
+    if (this.timer) this.clearTimer(this.timer);
+    this.timerDeadline = this.cooldownUntil;
+    this.timer = this.setTimer(() => {
+      this.timer = null;
+      this.timerDeadline = 0;
+      if (this.isCoolingDown()) {
+        this.rescheduleCooldownTimer();
+        return;
+      }
+      this.onStateChange?.({ event: "api_rate_limit_cleared", ...this.safetyState() });
+      this.pump();
+    }, Math.min(remaining, MAX_TIMER_DELAY_MS));
   }
 
   pump() {
     if (this.running || !this.queue.length) return;
-    const next = this.queue[0];
-    const remaining = this.nonMoveBlockedUntil - this.now();
-    if (next.priority > 0 && remaining > 0) {
-      if (!this.timer) {
-        this.timer = this.setTimer(() => {
-          this.timer = null;
-          this.pump();
-        }, remaining);
-      }
+    if (this.isCoolingDown()) {
+      this.rescheduleCooldownTimer();
       return;
     }
-    this.queue.shift();
+    const next = this.queue.shift();
+    if (next.abortListener) next.signal.removeEventListener("abort", next.abortListener);
+    if (next.signal?.aborted) {
+      next.reject(abortReason(next.signal));
+      this.pump();
+      return;
+    }
     this.running = true;
-    Promise.resolve().then(next.task).then(next.resolve, next.reject).finally(() => {
+    this.inFlightClass = next.requestClass;
+    this.counters.dispatched += 1;
+    Promise.resolve().then(next.task).then((value) => {
+      this.counters.succeeded += 1;
+      next.resolve(value);
+    }, (error) => {
+      this.counters.failed += 1;
+      next.reject(error);
+    }).finally(() => {
       this.running = false;
+      this.inFlightClass = null;
       this.pump();
     });
   }
 }
+
+export class PriorityRequestQueue extends ApiSafetyCoordinator {}

@@ -186,7 +186,16 @@ state.
 - A pending accept/challenge owns a slot and qualified engine before any API
   action. Decline, cancellation, timeout, terminal game, or failure releases it
   exactly once.
-- Move submissions have priority over discovery and challenge traffic. HTTP 429
-  responses pause non-move traffic for at least 60 seconds.
+- Move submissions have priority over discovery and challenge traffic, but no
+  request bypasses an HTTP 429 cooldown.
+- All finite API exchanges and stream handshakes are started one at a time.
+  Established event/game streams stay open while finite move and control calls
+  use the same serialized dispatcher.
+- Any HTTP 429 pauses every new API request for at least 60 seconds. Consecutive
+  responses back off through 60 seconds, 2 minutes, 5 minutes, 15 minutes, and
+  60 minutes; a longer valid `Retry-After` wins. The cooldown survives restart,
+  cannot be shortened by configuration, and never blindly replays a write.
+- A SQLite heartbeat lease rejects a second adapter for the same API origin and
+  expected account before credentials are read or Lichess is contacted.
 - Opponent-turn calculation is useful speculative work, not canonical game
   state. Only the full Lichess stream can confirm a move or advance history.

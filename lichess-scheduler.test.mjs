@@ -2,11 +2,15 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  API_RATE_LIMIT_BACKOFF_MS,
+  API_RATE_LIMIT_STRIKE_RESET_MS,
+  ApiSafetyCoordinator,
   AsyncSemaphore,
   PriorityRequestQueue,
   SlotPool,
   candidateWeight,
   reservationBlocksPublicHuman,
+  retryAfterMilliseconds,
   selectWeightedCandidate,
 } from "./lichess-scheduler.mjs";
 
@@ -126,6 +130,84 @@ test("serialized request queue admits a waiting move before ordinary API work", 
   release();
   await Promise.all([first, ordinary, move]);
   assert.deepEqual(order, ["running", "move", "ordinary"]);
+});
+
+test("HTTP 429 cooldown blocks moves and every other request class", async () => {
+  let now = 1_000;
+  let scheduled = null;
+  const queue = new ApiSafetyCoordinator({
+    now: () => now,
+    setTimer: (callback, milliseconds) => {
+      scheduled = { callback, milliseconds };
+      return 1;
+    },
+    clearTimer: () => { scheduled = null; },
+  });
+  assert.equal(await queue.registerRateLimit("1", "discovery"), 60_000);
+  const order = [];
+  const move = queue.enqueue(() => order.push("move"), { requestClass: "move", priority: 0 });
+  const stream = queue.enqueue(() => order.push("stream"), { requestClass: "game_stream", priority: 5 });
+  await Promise.resolve();
+  assert.deepEqual(order, []);
+  assert.equal(scheduled.milliseconds, 60_000);
+  now += 59_999;
+  scheduled.callback();
+  await Promise.resolve();
+  assert.deepEqual(order, []);
+  now += 1;
+  queue.pump();
+  await Promise.all([move, stream]);
+  assert.deepEqual(order, ["move", "stream"]);
+});
+
+test("rate-limit cooldown escalates and resets after six quiet hours", async () => {
+  let now = 10_000;
+  const queue = new ApiSafetyCoordinator({
+    now: () => now,
+    setTimer: () => 1,
+    clearTimer: () => {},
+  });
+  for (const expected of API_RATE_LIMIT_BACKOFF_MS) {
+    assert.equal(await queue.registerRateLimit(null), expected);
+    now = queue.cooldownUntil;
+  }
+  now += API_RATE_LIMIT_STRIKE_RESET_MS;
+  assert.equal(await queue.registerRateLimit(null), API_RATE_LIMIT_BACKOFF_MS[0]);
+  assert.equal(queue.snapshot().strike_count, 1);
+});
+
+test("Retry-After accepts delta seconds and HTTP dates without weakening the minimum", () => {
+  const now = Date.parse("2026-07-21T20:00:00Z");
+  assert.equal(retryAfterMilliseconds("90", now), 90_000);
+  assert.equal(
+    retryAfterMilliseconds("Tue, 21 Jul 2026 20:03:00 GMT", now),
+    180_000,
+  );
+  assert.equal(retryAfterMilliseconds("invalid", now), 0);
+});
+
+test("long Retry-After deadlines use bounded timer slices without shortening cooldown", async () => {
+  let now = 1_000;
+  let scheduled = null;
+  const queue = new ApiSafetyCoordinator({
+    now: () => now,
+    setTimer: (callback, milliseconds) => {
+      scheduled = { callback, milliseconds };
+      return 1;
+    },
+    clearTimer: () => { scheduled = null; },
+  });
+  const delay = 3_000_000_000;
+  await queue.registerRateLimit(delay);
+  const pending = queue.enqueue(() => "ready");
+  assert.equal(queue.cooldownRemainingMs(), delay);
+  assert.equal(scheduled.milliseconds, 2_147_483_647);
+  now += 2_147_483_647;
+  scheduled.callback();
+  assert.equal(scheduled.milliseconds, delay - 2_147_483_647);
+  now = queue.cooldownUntil;
+  scheduled.callback();
+  assert.equal(await pending, "ready");
 });
 
 test("engine-start semaphore never exceeds its configured parallelism", async () => {

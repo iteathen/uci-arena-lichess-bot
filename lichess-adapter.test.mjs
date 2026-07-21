@@ -27,7 +27,7 @@ import {
   probeAccount,
   validateRuntimeStatus,
 } from "./lichess-adapter.mjs";
-import { LichessHttpError } from "./lichess-scheduler.mjs";
+import { ApiSafetyCoordinator, LichessHttpError } from "./lichess-scheduler.mjs";
 import { LichessStore } from "./lichess-store.mjs";
 import {
   AuthoritativeChessState,
@@ -361,8 +361,13 @@ function createGameSession(engine, client) {
 }
 
 test("runtime config is credential-free and resolves repository paths", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-lichess-config-"));
+  const isolatedTemplate = path.join(directory, "config.json");
+  const template = JSON.parse(readFileSync(DEFAULT_TEMPLATE, "utf8"));
+  template.timing.transport_profile_path = null;
+  writeFileSync(isolatedTemplate, JSON.stringify(template), "utf8");
   const config = loadRuntimeConfig({
-    templatePath: DEFAULT_TEMPLATE,
+    templatePath: isolatedTemplate,
     repoRoot: ROOT,
     modelRoot: "engine/runtime/models/example/engine",
   });
@@ -1252,7 +1257,7 @@ test("API client keeps credentials in the authorization header", async () => {
   assert.equal(JSON.stringify(request.options).includes("test-token"), true);
 });
 
-test("API client applies at least sixty seconds of non-move backoff after 429", async () => {
+test("API client applies at least sixty seconds of global backoff after 429", async () => {
   const client = new LichessClient({
     token: "test-token",
     fetchImpl: async () => ({
@@ -1263,7 +1268,118 @@ test("API client applies at least sixty seconds of non-move backoff after 429", 
   });
   const before = Date.now();
   await assert.rejects(client.json("api/account"), /HTTP 429/);
-  assert.ok(client.requestQueue.nonMoveBlockedUntil >= before + 60_000);
+  assert.ok(client.requestQueue.cooldownUntil >= before + 60_000);
+});
+
+test("API client holds the single-flight permit through finite response consumption", async () => {
+  let releaseFirst;
+  const firstBody = new Promise((resolve) => { releaseFirst = resolve; });
+  const started = [];
+  const client = new LichessClient({
+    token: "test-token",
+    fetchImpl: async (url) => {
+      started.push(String(url));
+      if (started.length === 1) {
+        return { ok: true, status: 200, json: async () => firstBody };
+      }
+      return { ok: true, status: 200, json: async () => ({ second: true }) };
+    },
+  });
+  const first = client.json("api/account");
+  const second = client.json("api/account/playing");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(started.length, 1);
+  releaseFirst({ first: true });
+  assert.deepEqual(await first, { first: true });
+  assert.deepEqual(await second, { second: true });
+  assert.equal(started.length, 2);
+});
+
+test("finite online-bot NDJSON blocks later requests until its body is complete", async () => {
+  const encoder = new TextEncoder();
+  let closeDiscovery;
+  let calls = 0;
+  const discoveryBody = new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode('{"username":"bot-one"}\n'));
+      closeDiscovery = () => controller.close();
+    },
+  });
+  const client = new LichessClient({
+    token: "test-token",
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls === 1) return { ok: true, status: 200, body: discoveryBody };
+      return { ok: true, status: 200, arrayBuffer: async () => new ArrayBuffer(0) };
+    },
+  });
+  const discovery = client.collectNdjson("api/bot/online?nb=512");
+  const move = client.post("api/bot/game/game-1/move/e2e4");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls, 1);
+  closeDiscovery();
+  assert.deepEqual(await discovery, [{ username: "bot-one" }]);
+  await move;
+  assert.equal(calls, 2);
+});
+
+test("a 429 from discovery blocks move and stream handshakes until the global deadline", async () => {
+  let now = 5_000;
+  const timers = [];
+  const coordinator = new ApiSafetyCoordinator({
+    now: () => now,
+    setTimer: (callback, milliseconds) => {
+      timers.push({ callback, milliseconds });
+      return timers.length;
+    },
+    clearTimer: () => {},
+  });
+  let calls = 0;
+  const client = new LichessClient({
+    token: "test-token",
+    safetyCoordinator: coordinator,
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls === 1) {
+        return { ok: false, status: 429, headers: { get: () => null } };
+      }
+      return {
+        ok: true,
+        status: 200,
+        body: new ReadableStream({ start(controller) { controller.close(); } }),
+        arrayBuffer: async () => new ArrayBuffer(0),
+      };
+    },
+  });
+  await assert.rejects(client.collectNdjson("api/bot/online?nb=512"), /HTTP 429/);
+  const move = client.post("api/bot/game/game-1/move/e2e4");
+  const stream = client.openStream("api/stream/event");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls, 1);
+  now = coordinator.cooldownUntil;
+  coordinator.pump();
+  await move;
+  const events = await stream;
+  for await (const _event of events) assert.fail("empty stream emitted an event");
+  assert.equal(calls, 3);
+});
+
+test("established streams coexist but duplicate stream ownership is rejected", async () => {
+  const streams = [];
+  const client = new LichessClient({
+    token: "test-token",
+    fetchImpl: async () => {
+      const body = new ReadableStream({ start(controller) { controller.close(); } });
+      streams.push(body);
+      return { ok: true, status: 200, body };
+    },
+  });
+  const eventStream = await client.openStream("api/stream/event");
+  await assert.rejects(client.openStream("api/stream/event"), /already pending or active/);
+  for await (const _event of eventStream) assert.fail("empty stream emitted an event");
+  const reopened = await client.openStream("api/stream/event");
+  for await (const _event of reopened) assert.fail("empty stream emitted an event");
+  assert.equal(streams.length, 2);
 });
 
 test("account probe rejects a mismatched account", async () => {
@@ -1386,6 +1502,67 @@ test("concurrent inbound events cannot overbook one bot slot", async () => {
     assert.equal(posts.filter((entry) => entry.endpoint.endsWith("/decline")
       && entry.form.reason === "later").length, 1);
     assert.equal(controller.slots.snapshot().byAudience.bot.pending, 1);
+  } finally {
+    await controller.slots.drainAll();
+    store.close();
+  }
+});
+
+test("cooldown-delayed inbound acceptance expires before fetch dispatch", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-stale-challenge-"));
+  const store = new LichessStore(path.join(directory, "matches.sqlite"));
+  let now = 1_000;
+  let fetches = 0;
+  const client = {
+    post: async (_endpoint, _form, _signal, _priority, beforeDispatch) => {
+      now += 20_000;
+      beforeDispatch();
+      fetches += 1;
+    },
+  };
+  const config = {
+    capacity: {
+      total_slots: 1,
+      startup_parallelism: 1,
+      legacy_shared: false,
+      human: { slots: 0, allow_borrowing: false, accept_public: true },
+      bot: { slots: 1, target_active: 0 },
+    },
+    challenges: {
+      accept_bots: true,
+      min_base: 180,
+      max_base: 1800,
+      min_increment: 0,
+      max_increment: 10,
+      speeds: ["blitz", "rapid", "classical"],
+      modes: ["casual"],
+    },
+    scheduler: { decline_cooldown_minutes: 360 },
+  };
+  const controller = new BotController({
+    client,
+    config,
+    account: "self",
+    runtimeDir: directory,
+    signal: new AbortController().signal,
+    store,
+    now: () => now,
+  });
+  controller.prepareSlot = async (slot) => {
+    controller.slots.attachEngine(slot, { close: async () => {} });
+    return slot;
+  };
+  try {
+    await controller.onChallenge({
+      id: "stale",
+      rated: false,
+      speed: "blitz",
+      variant: { key: "standard" },
+      timeControl: { type: "clock", limit: 180, increment: 2 },
+      challenger: { id: "bot-one", title: "BOT" },
+    });
+    assert.equal(fetches, 0);
+    assert.equal(controller.slots.snapshot().byAudience.bot.empty, 1);
   } finally {
     await controller.slots.drainAll();
     store.close();

@@ -13,6 +13,12 @@ function integer(value, fallback = 0) {
   return Number.isSafeInteger(parsed) ? parsed : fallback;
 }
 
+function authorityKey(value) {
+  const key = String(value ?? "").trim().toLocaleLowerCase();
+  if (!key || key.length > 512) throw new Error("Invalid Lichess API authority key");
+  return key;
+}
+
 function botRating(bot) {
   for (const key of ["blitz", "rapid", "classical", "bullet"]) {
     const rating = Number(bot?.perfs?.[key]?.rating);
@@ -98,8 +104,36 @@ export class LichessStore {
       CREATE INDEX IF NOT EXISTS games_opponent_finished ON games(opponent, finished_at);
       CREATE INDEX IF NOT EXISTS challenges_opponent_created ON challenge_attempts(opponent, created_at);
     `);
-    const version = this.db.prepare("SELECT version FROM schema_meta LIMIT 1").get()?.version;
-    if (version !== 1) throw new Error(`Unsupported Lichess store schema version: ${version}`);
+    let version = this.db.prepare("SELECT version FROM schema_meta LIMIT 1").get()?.version;
+    if (version === 1) {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS api_safety_state(
+            authority_key TEXT PRIMARY KEY,
+            cooldown_until INTEGER NOT NULL DEFAULT 0,
+            strike_count INTEGER NOT NULL DEFAULT 0,
+            last_429_at INTEGER NOT NULL DEFAULT 0,
+            last_retry_after_ms INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL
+          );
+          CREATE TABLE IF NOT EXISTS api_client_leases(
+            authority_key TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL,
+            pid INTEGER NOT NULL,
+            heartbeat_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL
+          );
+          UPDATE schema_meta SET version=2;
+        `);
+        this.db.exec("COMMIT");
+      } catch (error) {
+        this.db.exec("ROLLBACK");
+        throw error;
+      }
+      version = 2;
+    }
+    if (version !== 2) throw new Error(`Unsupported Lichess store schema version: ${version}`);
   }
 
   close() {
@@ -169,6 +203,122 @@ export class LichessStore {
       paused: Boolean(this.db.prepare("SELECT paused FROM scheduler_control WHERE id=1").get()?.paused),
       reservation: this.getReservation(now),
     };
+  }
+
+  apiSafetyState(key) {
+    const normalized = authorityKey(key);
+    const row = this.db.prepare(`
+      SELECT cooldown_until, strike_count, last_429_at, last_retry_after_ms
+      FROM api_safety_state WHERE authority_key=?
+    `).get(normalized);
+    return row ? {
+      cooldownUntil: Number(row.cooldown_until),
+      strikeCount: Number(row.strike_count),
+      last429At: Number(row.last_429_at),
+      lastRetryAfterMs: Number(row.last_retry_after_ms),
+    } : {
+      cooldownUntil: 0,
+      strikeCount: 0,
+      last429At: 0,
+      lastRetryAfterMs: 0,
+    };
+  }
+
+  saveApiSafetyState(key, state, now = Date.now()) {
+    const normalized = authorityKey(key);
+    this.db.prepare(`
+      INSERT INTO api_safety_state(authority_key, cooldown_until, strike_count,
+        last_429_at, last_retry_after_ms, updated_at)
+      VALUES(?, ?, ?, ?, ?, ?)
+      ON CONFLICT(authority_key) DO UPDATE SET
+        cooldown_until=MAX(api_safety_state.cooldown_until, excluded.cooldown_until),
+        strike_count=excluded.strike_count,
+        last_429_at=excluded.last_429_at,
+        last_retry_after_ms=excluded.last_retry_after_ms,
+        updated_at=excluded.updated_at
+    `).run(
+      normalized,
+      integer(state.cooldownUntil),
+      integer(state.strikeCount),
+      integer(state.last429At),
+      integer(state.lastRetryAfterMs),
+      now,
+    );
+    return this.apiSafetyState(normalized);
+  }
+
+  listApiSafetyState() {
+    return this.db.prepare(`
+      SELECT authority_key, cooldown_until, strike_count, last_429_at,
+        last_retry_after_ms, updated_at
+      FROM api_safety_state ORDER BY authority_key
+    `).all();
+  }
+
+  acquireApiLease(key, ownerId, pid, now = Date.now(), ttlMs = 60_000) {
+    const normalized = authorityKey(key);
+    const owner = String(ownerId ?? "").trim();
+    if (!owner) throw new Error("Lichess API lease owner id is required");
+    const expiresAt = now + integer(ttlMs, 60_000);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const active = this.db.prepare(`
+        SELECT owner_id, pid, heartbeat_at, expires_at
+        FROM api_client_leases WHERE authority_key=?
+      `).get(normalized);
+      if (active && active.owner_id !== owner && Number(active.expires_at) > now) {
+        const error = new Error(
+          `Lichess API authority ${normalized} is already leased by process ${active.pid}`,
+        );
+        error.code = "LICHESS_API_LEASE_HELD";
+        error.expiresAt = Number(active.expires_at);
+        throw error;
+      }
+      this.db.prepare(`
+        INSERT INTO api_client_leases(authority_key, owner_id, pid, heartbeat_at, expires_at)
+        VALUES(?, ?, ?, ?, ?)
+        ON CONFLICT(authority_key) DO UPDATE SET owner_id=excluded.owner_id,
+          pid=excluded.pid, heartbeat_at=excluded.heartbeat_at, expires_at=excluded.expires_at
+      `).run(normalized, owner, integer(pid), now, expiresAt);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    return this.apiLease(normalized);
+  }
+
+  heartbeatApiLease(key, ownerId, pid, now = Date.now(), ttlMs = 60_000) {
+    const normalized = authorityKey(key);
+    const result = this.db.prepare(`
+      UPDATE api_client_leases SET pid=?, heartbeat_at=?, expires_at=?
+      WHERE authority_key=? AND owner_id=?
+    `).run(integer(pid), now, now + integer(ttlMs, 60_000), normalized, String(ownerId));
+    if (result.changes !== 1) {
+      const error = new Error(`Lichess API lease ownership was lost for ${normalized}`);
+      error.code = "LICHESS_API_LEASE_LOST";
+      throw error;
+    }
+    return this.apiLease(normalized);
+  }
+
+  releaseApiLease(key, ownerId) {
+    return this.db.prepare("DELETE FROM api_client_leases WHERE authority_key=? AND owner_id=?")
+      .run(authorityKey(key), String(ownerId)).changes > 0;
+  }
+
+  apiLease(key) {
+    return this.db.prepare(`
+      SELECT authority_key, owner_id, pid, heartbeat_at, expires_at
+      FROM api_client_leases WHERE authority_key=?
+    `).get(authorityKey(key)) ?? null;
+  }
+
+  activeApiLeases(now = Date.now()) {
+    return this.db.prepare(`
+      SELECT authority_key, pid, heartbeat_at, expires_at
+      FROM api_client_leases WHERE expires_at>? ORDER BY authority_key
+    `).all(now);
   }
 
   replaceOnlineBots(bots, now = Date.now()) {
@@ -289,13 +439,15 @@ export class LichessStore {
 
   status(now = Date.now()) {
     return {
-      schemaVersion: 1,
+      schemaVersion: 2,
       control: this.control(now),
       owners: this.listOwners(),
       opponents: this.db.prepare("SELECT COUNT(*) AS count FROM opponents").get().count,
       challenges: this.db.prepare("SELECT COUNT(*) AS count FROM challenge_attempts").get().count,
       games: this.db.prepare("SELECT COUNT(*) AS count FROM games").get().count,
       opponentStats: this.opponentStats(),
+      apiSafety: this.listApiSafetyState(),
+      apiLeases: this.activeApiLeases(now),
     };
   }
 }
