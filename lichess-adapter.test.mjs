@@ -16,6 +16,7 @@ import {
   TransportProfileTracker,
   challengeFromSelf,
   challengeDeclineReason,
+  activateFallbackBundle,
   applySingleGameProfile,
   loadCapacityProfile,
   loadRuntimeConfig,
@@ -369,7 +370,7 @@ test("runtime config is credential-free and resolves repository paths", () => {
   const serialized = JSON.stringify(config).toLowerCase();
   assert.equal(serialized.includes("test-token"), false);
   assert.equal(serialized.includes("oauth_token"), false);
-  assert.equal(config.schema, "uci_arena_lichess_adapter_v5");
+  assert.equal(config.schema, "uci_arena_lichess_adapter_v6");
   assert.equal(config.timing.opponent_turn_search, true);
   assert.equal(config.timing.foreground_preempts_ponder, true);
   assert.equal(config.timing.initial_transport_reserve_ms, 650);
@@ -427,7 +428,7 @@ test("v2 config migrates to one shared slot with automatic scheduling disabled",
   assert.equal(config.capacity.total_slots, 1);
   assert.equal(config.capacity.legacy_shared, true);
   assert.equal(config.scheduler.enabled, false);
-  assert.equal(config.schema, "uci_arena_lichess_adapter_v5");
+  assert.equal(config.schema, "uci_arena_lichess_adapter_v6");
   assert.equal(config.timing.opponent_turn_search, true);
   assert.equal(config.timing.initial_transport_reserve_ms, 250);
 });
@@ -451,7 +452,7 @@ test("v3 accepts a configurable sixteen-slot layout and rejects invalid sums", (
   assert.throws(() => loadRuntimeConfig({ templatePath: configPath }), /must sum/);
 });
 
-test("v5 timing policy rejects conflicting UCI ownership and invalid reserves", () => {
+test("v6 timing policy rejects conflicting UCI ownership and invalid reserves", () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-v4-timing-"));
   const template = JSON.parse(readFileSync(DEFAULT_TEMPLATE, "utf8"));
   const configPath = path.join(directory, "v4.json");
@@ -471,6 +472,10 @@ test("v5 timing policy rejects conflicting UCI ownership and invalid reserves", 
   writeFileSync(configPath, JSON.stringify(template));
   assert.throws(() => loadRuntimeConfig({ templatePath: configPath }), /timing-profile-owned/);
   template.engine.uci_options.TimeProfileProviderReserveUs = 0;
+  template.engine.uci_options.TimeProfileBackupEmitReserveUs = 1001;
+  writeFileSync(configPath, JSON.stringify(template));
+  assert.throws(() => loadRuntimeConfig({ templatePath: configPath }), /timing-profile-owned/);
+  template.engine.uci_options.TimeProfileBackupEmitReserveUs = 1000;
   template.engine.uci_options.TimeProfileIterationForecastScalePermille = 1001;
   writeFileSync(configPath, JSON.stringify(template));
   assert.throws(() => loadRuntimeConfig({ templatePath: configPath }), /timing-profile-owned/);
@@ -513,6 +518,29 @@ test("qualified single-game profile is identity-bound and owns the parallel topo
       BackgroundSearch: false,
     },
   );
+});
+
+test("rejected primary timing activates a complete fallback bundle globally", () => {
+  const config = loadRuntimeConfig({ templatePath: DEFAULT_TEMPLATE, repoRoot: ROOT });
+  config.engine.fallback_bundle = {
+    executable: config.engine.executable,
+    working_directory: config.engine.working_directory,
+    single_game_profile: "fallback-single.json",
+    time_profile: "fallback-time.json",
+    capacity_profile: "fallback-capacity.json",
+    uci_options: {
+      ModelBackend: "native",
+      ModelRoot: "fallback-model",
+    },
+  };
+  activateFallbackBundle(config, { reason: "primary profile identity mismatch" });
+  assert.equal(config.engine.selected_bundle, "fallback");
+  assert.equal(config.engine.single_game_profile, "fallback-single.json");
+  assert.equal(config.engine.time_profile, "fallback-time.json");
+  assert.equal(config.capacity.capacity_profile, "fallback-capacity.json");
+  assert.equal(config.engine.uci_options.TimeProfileProviderReserveUs, 0);
+  assert.equal(config.engine.uci_options.TimeProfileBackupEmitReserveUs, 1000);
+  assert.equal(config.engine.fallback_reason, "primary profile identity mismatch");
 });
 
 test("qualified MCGS profile owns graph and batching topology", () => {
@@ -575,6 +603,47 @@ test("runtime status gate accepts active one-game cursor batching and rejects fa
   assert.throws(
     () => validateRuntimeStatus(profile, { ...status, provider_effective: "cpu" }),
     /GPU provider fallback/,
+  );
+});
+
+test("MCGS capacity profile v2 binds the accepted timing profile", () => {
+  const fixture = qualifiedFixture();
+  const single = { ...loadSingleGameProfile(fixture.profilePath), search_core: "mcgs" };
+  fixture.config.capacity = { total_slots: 2, legacy_shared: false };
+  const directory = path.dirname(fixture.profilePath);
+  const capacityPath = path.join(directory, "capacity-v2.json");
+  const timeProfilePath = path.join(directory, "time-v3.json");
+  writeFileSync(timeProfilePath, JSON.stringify({ schema: "uci_time_profile_v3" }));
+  fixture.config.engine.time_profile = timeProfilePath;
+  fixture.config.engine.time_profile_status = {
+    accepted: true,
+    applied: true,
+    profile_path: timeProfilePath,
+    identity_sha256: "sha256:time-identity",
+  };
+  const capacity = {
+    schema: "uci_arena_lichess_capacity_profile_v2",
+    qualified: true,
+    published_at: "2026-07-20T00:00:00Z",
+    maximum_concurrency: 2,
+    engine_build_fingerprint: fixture.profile.engine_build_fingerprint,
+    single_game_profile_sha256: sha256(readFileSync(fixture.profilePath)),
+    model_fingerprint: fixture.profile.model_fingerprint,
+    provider_numeric_fingerprint: fixture.profile.provider_numeric_fingerprint,
+    hardware_driver_fingerprint: fixture.profile.hardware_driver_fingerprint,
+    time_profile_sha256: sha256(readFileSync(timeProfilePath)),
+    time_profile_identity_sha256: "sha256:time-identity",
+    search_core: "mcgs",
+    evidence: [{ child: 1, qualified: true }, { child: 2, qualified: true }],
+  };
+  writeFileSync(capacityPath, JSON.stringify(capacity));
+  assert.equal(loadCapacityProfile(capacityPath, fixture.config, single).schema,
+    "uci_arena_lichess_capacity_profile_v2");
+  capacity.time_profile_identity_sha256 = "sha256:stale";
+  writeFileSync(capacityPath, JSON.stringify(capacity));
+  assert.throws(
+    () => loadCapacityProfile(capacityPath, fixture.config, single),
+    /time_profile_identity_sha256 mismatch/,
   );
 });
 
@@ -653,12 +722,14 @@ test("UCI readiness requires explicit ponder and move-overhead support", () => {
   engine.advertisedOptions.add("Ponder");
   engine.advertisedOptions.add("IterativeTimeController");
   engine.advertisedOptions.add("TimeProfileProviderReserveUs");
+  engine.advertisedOptions.add("TimeProfileBackupEmitReserveUs");
   engine.advertisedOptions.add("TimeProfileIterationForecastScalePermille");
   engine.configureUciOptions();
   assert.deepEqual(commands, [
     "setoption name Move Overhead value 250",
     "setoption name IterativeTimeController value false",
     "setoption name TimeProfileProviderReserveUs value 0",
+    "setoption name TimeProfileBackupEmitReserveUs value 1000",
     "setoption name TimeProfileIterationForecastScalePermille value 1000",
     "setoption name Ponder value true",
   ]);
@@ -681,17 +752,20 @@ test("missing timing profile remains observable with zero reserve and controller
       NNSpeculation: false,
       IterativeTimeController: false,
       TimeProfileProviderReserveUs: 0,
+      TimeProfileBackupEmitReserveUs: 1000,
       TimeProfileIterationForecastScalePermille: 1000,
     },
   });
   engine.runtimeStatus = async () => ({
     time_profile_provider_reserve_us: 0,
+    time_profile_backup_emit_reserve_us: 1000,
     time_profile_iteration_forecast_scale_permille: 1000,
   });
   const status = await engine.configureTimeProfile();
   assert.equal(status.status, "missing");
   assert.equal(status.applied, false);
   assert.equal(status.provider_service_reserve_us, 0);
+  assert.equal(status.backup_emit_reserve_us, 1000);
   assert.equal(status.predictive_controller_enabled, false);
 });
 
@@ -1343,6 +1417,56 @@ test("API client applies at least sixty seconds of non-move backoff after 429", 
   assert.ok(client.requestQueue.nonMoveBlockedUntil >= before + 60_000);
 });
 
+test("API client persists non-move 429 state for restart-safe backoff", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-rate-limit-"));
+  const store = new LichessStore(path.join(directory, "matches.sqlite"));
+  try {
+    const client = new LichessClient({
+      token: "test-token",
+      rateLimitStore: store,
+      random: () => 0,
+      fetchImpl: async () => ({
+        ok: false,
+        status: 429,
+        headers: { get: () => "1" },
+      }),
+    });
+    await assert.rejects(client.json("api/account"), /HTTP 429/);
+    const state = store.apiRateLimitState();
+    assert.equal(state.consecutive429, 1);
+    assert.equal(state.blocked, true);
+    assert.equal(client.requestQueue.nonMoveBlockedUntil, state.blockedUntil);
+  } finally {
+    store.close();
+  }
+});
+
+test("expired circuit breaker permits only one outbound challenge half-open probe", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-half-open-"));
+  const store = new LichessStore(path.join(directory, "matches.sqlite"));
+  try {
+    store.recordApiRateLimit429({ random: () => 0 }, Date.now() - 61_000);
+    let dispatches = 0;
+    const client = new LichessClient({
+      token: "test-token",
+      rateLimitStore: store,
+      fetchImpl: async () => {
+        dispatches += 1;
+        return { ok: true, json: async () => ({ id: "challenge-id" }) };
+      },
+    });
+    await assert.rejects(client.json("api/account"), /HTTP 429/);
+    assert.equal(dispatches, 0);
+    assert.equal(store.apiRateLimitState().halfOpen, false);
+
+    await client.post("api/challenge/EligibleBot", { rated: false });
+    assert.equal(dispatches, 1);
+    assert.equal(store.apiRateLimitState().consecutive429, 0);
+  } finally {
+    store.close();
+  }
+});
+
 test("account probe rejects a mismatched account", async () => {
   const fetchImpl = async () => ({
     ok: true,
@@ -1375,7 +1499,7 @@ test("challenge policy accepts only the configured clean standard shape", () => 
     rated: false,
     speed: "rapid",
     variant: { key: "standard" },
-    timeControl: { type: "clock", limit: 300, increment: 2 },
+    timeControl: { type: "clock", limit: 600, increment: 2 },
     challenger: { title: "BOT" },
   };
   assert.equal(challengeDeclineReason(challenge, policy), null);

@@ -11,13 +11,48 @@ function storeFixture() {
   return new LichessStore(path.join(directory, "matches.sqlite"));
 }
 
-test("store migrates to schema one and uses WAL", () => {
+test("store migrates to schema two and uses WAL", () => {
   const store = storeFixture();
   try {
-    assert.equal(store.status().schemaVersion, 1);
+    assert.equal(store.status().schemaVersion, 2);
     assert.equal(store.db.prepare("PRAGMA journal_mode").get().journal_mode, "wal");
   } finally {
     store.close();
+  }
+});
+
+test("rate-limit circuit breaker persists stepped backoff and admits one half-open request", () => {
+  const store = storeFixture();
+  const filePath = store.filePath;
+  try {
+    const first = store.recordApiRateLimit429({ random: () => 0 }, 1_000);
+    assert.equal(first.consecutive429, 1);
+    assert.equal(first.blockedUntil, 61_000);
+  } finally {
+    store.close();
+  }
+
+  const reopened = new LichessStore(filePath);
+  try {
+    assert.equal(reopened.apiRateLimitState(2_000).blocked, true);
+    assert.equal(reopened.beginApiRateLimitRequest(60_999), false);
+    assert.equal(reopened.beginApiRateLimitRequest(61_000), true);
+    assert.equal(reopened.beginApiRateLimitRequest(61_000), false);
+    const second = reopened.recordApiRateLimit429({ random: () => 0 }, 61_000);
+    assert.equal(second.consecutive429, 2);
+    assert.equal(second.blockedUntil, 181_000);
+    const retryAfter = reopened.recordApiRateLimit429({ retryAfterMs: 1_000_000, random: () => 0 }, 181_000);
+    assert.equal(retryAfter.blockedUntil, 1_181_000);
+    reopened.clearApiRateLimit();
+    assert.deepEqual(reopened.apiRateLimitState(1_181_000), {
+      consecutive429: 0,
+      blockedUntil: 0,
+      last429At: 0,
+      halfOpen: false,
+      blocked: false,
+    });
+  } finally {
+    reopened.close();
   }
 });
 

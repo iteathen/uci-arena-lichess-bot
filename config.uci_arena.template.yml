@@ -1,11 +1,12 @@
 {
-  "schema": "uci_arena_lichess_adapter_v5",
+  "schema": "uci_arena_lichess_adapter_v6",
   "url": "https://lichess.org/",
   "engine": {
     "executable": "<UCI_ARENA_REPO>/build/Release/uci_arena.exe",
     "working_directory": "<UCI_ARENA_REPO>",
     "single_game_profile": "<UCI_ARENA_REPO>/runtime_state/models/compact_chessformer_gab_v1/cache/uci_arena_single_game_profile_v1.json",
     "time_profile": "<UCI_ARENA_REPO>/runtime_state/models/compact_chessformer_gab_v1/cache/uci_time_profile_v2.json",
+    "fallback_bundle": null,
     "search_timeout_grace_ms": 10000,
     "shutdown_grace_ms": 5000,
     "uci_options": {
@@ -36,17 +37,17 @@
   },
   "challenges": {
     "accept_bots": true,
-    "min_base": 180,
+    "min_base": 600,
     "max_base": 1800,
     "min_increment": 0,
     "max_increment": 10,
-    "speeds": ["blitz", "rapid", "classical"],
+    "speeds": ["rapid", "classical"],
     "modes": ["casual"]
   },
   "outbound_challenge": {
     "rated": false,
     "color": "random",
-    "clock_limit": 180,
+    "clock_limit": 600,
     "clock_increment": 2
   },
   "scheduler": {
@@ -55,7 +56,7 @@
     "challenge_interval_seconds": 5,
     "reservation_retry_seconds": 30,
     "challenge_timeout_seconds": 25,
-    "max_games_per_opponent_per_day": 2,
+    "max_games_per_opponent_per_day": 1,
     "timeout_cooldown_minutes": 30,
     "decline_cooldown_minutes": 360,
     "rating_target": 2200,

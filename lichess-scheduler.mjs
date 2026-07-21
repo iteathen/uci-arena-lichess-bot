@@ -311,6 +311,20 @@ export class PriorityRequestQueue {
     this.nonMoveBlockedUntil = Math.max(this.nonMoveBlockedUntil, this.now() + milliseconds);
   }
 
+  blockNonMoveUntil(timestamp) {
+    this.nonMoveBlockedUntil = Math.max(this.nonMoveBlockedUntil, Number(timestamp) || 0);
+    this.pump();
+  }
+
+  snapshot() {
+    return {
+      nonMoveBlockedUntil: this.nonMoveBlockedUntil,
+      nonMoveRemainingMs: Math.max(0, this.nonMoveBlockedUntil - this.now()),
+      queued: this.queue.length,
+      running: this.running,
+    };
+  }
+
   pump() {
     if (this.running || !this.queue.length) return;
     const next = this.queue[0];

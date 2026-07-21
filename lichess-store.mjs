@@ -21,6 +21,8 @@ function botRating(bot) {
   return 0;
 }
 
+const RATE_LIMIT_BACKOFF_MS = Object.freeze([60_000, 120_000, 300_000, 900_000, 1_800_000]);
+
 export class LichessStore {
   constructor(filePath) {
     this.filePath = path.resolve(filePath);
@@ -98,8 +100,23 @@ export class LichessStore {
       CREATE INDEX IF NOT EXISTS games_opponent_finished ON games(opponent, finished_at);
       CREATE INDEX IF NOT EXISTS challenges_opponent_created ON challenge_attempts(opponent, created_at);
     `);
-    const version = this.db.prepare("SELECT version FROM schema_meta LIMIT 1").get()?.version;
-    if (version !== 1) throw new Error(`Unsupported Lichess store schema version: ${version}`);
+    let version = this.db.prepare("SELECT version FROM schema_meta LIMIT 1").get()?.version;
+    if (version === 1) {
+      this.db.exec(`
+        CREATE TABLE api_rate_limit(
+          id INTEGER PRIMARY KEY CHECK(id=1),
+          consecutive_429 INTEGER NOT NULL DEFAULT 0,
+          blocked_until INTEGER NOT NULL DEFAULT 0,
+          last_429_at INTEGER NOT NULL DEFAULT 0,
+          half_open INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO api_rate_limit(id, consecutive_429, blocked_until, last_429_at, half_open)
+          VALUES(1, 0, 0, 0, 0);
+        UPDATE schema_meta SET version=2;
+      `);
+      version = 2;
+    }
+    if (version !== 2) throw new Error(`Unsupported Lichess store schema version: ${version}`);
   }
 
   close() {
@@ -169,6 +186,65 @@ export class LichessStore {
       paused: Boolean(this.db.prepare("SELECT paused FROM scheduler_control WHERE id=1").get()?.paused),
       reservation: this.getReservation(now),
     };
+  }
+
+  apiRateLimitState(now = Date.now()) {
+    const row = this.db.prepare(`
+      SELECT consecutive_429, blocked_until, last_429_at, half_open
+      FROM api_rate_limit WHERE id=1
+    `).get();
+    return {
+      consecutive429: integer(row?.consecutive_429),
+      blockedUntil: integer(row?.blocked_until),
+      last429At: integer(row?.last_429_at),
+      halfOpen: Boolean(row?.half_open),
+      blocked: integer(row?.blocked_until) > now,
+    };
+  }
+
+  beginApiRateLimitRequest(now = Date.now()) {
+    const state = this.apiRateLimitState(now);
+    if (state.blocked) return false;
+    if (state.consecutive429 === 0) return true;
+    if (state.halfOpen) return false;
+    return this.db.prepare(`
+      UPDATE api_rate_limit SET half_open=1
+      WHERE id=1 AND consecutive_429>0 AND half_open=0 AND blocked_until<=?
+    `).run(now).changes === 1;
+  }
+
+  recordApiRateLimit429({ retryAfterMs = 0, random = Math.random } = {}, now = Date.now()) {
+    const state = this.apiRateLimitState(now);
+    const consecutive429 = state.consecutive429 + 1;
+    const base = RATE_LIMIT_BACKOFF_MS[Math.min(consecutive429, RATE_LIMIT_BACKOFF_MS.length) - 1];
+    const sample = Math.max(0, Math.min(1, Number(random()) || 0));
+    const scheduled = Math.ceil(base * (1 + 0.1 * sample));
+    const duration = Math.max(scheduled, integer(retryAfterMs));
+    const blockedUntil = now + duration;
+    this.db.prepare(`
+      UPDATE api_rate_limit
+      SET consecutive_429=?, blocked_until=?, last_429_at=?, half_open=0
+      WHERE id=1
+    `).run(consecutive429, blockedUntil, now);
+    return this.apiRateLimitState(now);
+  }
+
+  deferApiRateLimitHalfOpen(milliseconds = 60_000, now = Date.now()) {
+    const state = this.apiRateLimitState(now);
+    if (state.consecutive429 === 0) return state;
+    this.db.prepare(`
+      UPDATE api_rate_limit SET blocked_until=MAX(blocked_until, ?), half_open=0 WHERE id=1
+    `).run(now + Math.max(1, integer(milliseconds, 60_000)));
+    return this.apiRateLimitState(now);
+  }
+
+  clearApiRateLimit() {
+    this.db.prepare(`
+      UPDATE api_rate_limit
+      SET consecutive_429=0, blocked_until=0, last_429_at=0, half_open=0
+      WHERE id=1
+    `).run();
+    return this.apiRateLimitState();
   }
 
   replaceOnlineBots(bots, now = Date.now()) {
@@ -289,8 +365,9 @@ export class LichessStore {
 
   status(now = Date.now()) {
     return {
-      schemaVersion: 1,
+      schemaVersion: 2,
       control: this.control(now),
+      apiRateLimit: this.apiRateLimitState(now),
       owners: this.listOwners(),
       opponents: this.db.prepare("SELECT COUNT(*) AS count FROM opponents").get().count,
       challenges: this.db.prepare("SELECT COUNT(*) AS count FROM challenge_attempts").get().count,
