@@ -34,15 +34,17 @@ The tracked v4 template is enabled for two concurrent games:
 Version 2 through 4 configurations retain their declared legacy reserve. Live
 readiness requires the engine to advertise `Ponder`, `Move Overhead`,
 `IterativeTimeController`, `TimeProfileProviderReserveUs`, and
-`TimeProfileIterationForecastScalePermille`; the
+`TimeProfileIterationForecastScalePermille`, and
+`TimeProfileIterationTransitionP95Ms`; the
 adapter fails instead of silently disabling opponent-turn search or its clock
 reserve.
 
 The distinct `engine.time_profile` / `--time-profile` path may point at a
-qualified `uci_time_profile_v2.json`. Every engine child recomputes the exact
+qualified `uci_time_profile_v3.json`. Every engine child recomputes the exact
 engine/model/adapter/provider/hardware/search identity before applying that
-profile's conservative provider-service reserve and iteration-forecast scale.
-A valid v1 profile remains readable with scale 1000. A missing, stale, or
+profile's separately qualified provider-service reserve, iteration forecast,
+and adaptive permission. Valid v1/v2 profiles remain readable in conservative
+compatibility mode. A missing, stale, or
 mismatched profile is observable in qualification/runtime status and safely
 retains reserve zero and scale 1000; it never enables
 `IterativeTimeController`.
@@ -79,7 +81,7 @@ the opening book, then restores the configured/default-on book for live play.
 ```powershell
 node deploy\lichess\lichess-adapter.mjs qualify `
   --profile runtime_state\models\<MODEL_ID>\cache\uci_arena_single_game_profile_v1.json `
-  --time-profile runtime_state\models\<MODEL_ID>\cache\uci_time_profile_v2.json
+  --time-profile runtime_state\models\<MODEL_ID>\cache\uci_time_profile_v3.json
 ```
 
 Qualify the configured concurrency. All requested children are started and

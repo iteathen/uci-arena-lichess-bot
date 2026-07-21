@@ -71,7 +71,8 @@ const DEFAULT_TIMING_CONFIG = Object.freeze({
   initial_transport_reserve_ms: 650,
   transport_profile_path: null,
 });
-const TRANSPORT_PROFILE_SCHEMA = "uci_arena_lichess_transport_profile_v1";
+const TRANSPORT_PROFILE_SCHEMA = "uci_arena_lichess_transport_profile_v2";
+const LEGACY_TRANSPORT_PROFILE_SCHEMA = "uci_arena_lichess_transport_profile_v1";
 const TRANSPORT_PROFILE_MINIMUM_SAMPLES = 200;
 const TRANSPORT_PROFILE_MINIMUM_GAMES = 10;
 const TRANSPORT_PROFILE_MAXIMUM_AGE_MS = 7 * 24 * 60 * 60 * 1_000;
@@ -84,7 +85,8 @@ const TIME_PROFILE_RESERVED_OPTIONS = new Set([
   "SearchCore", "Threads", "RootWorkers", "V2SplitDepth", "BackgroundSearch",
   "NNSpeculation", "ModelRoot", "NNBatchSize", "NNBatchWaitUs", "OnnxProvider",
   "IterativeTimeController", "TimeProfileProviderReserveUs",
-  "TimeProfileIterationForecastScalePermille", "Move Overhead", "Ponder",
+  "TimeProfileIterationForecastScalePermille", "TimeProfileIterationTransitionP95Ms",
+  "Move Overhead", "Ponder",
   "OwnBook",
 ]);
 
@@ -109,11 +111,16 @@ export function loadTransportProfile(profilePath, now = Date.now()) {
   }
   try {
     const profile = JSON.parse(readFileSync(profilePath, "utf8"));
-    if (profile.schema !== TRANSPORT_PROFILE_SCHEMA) throw new Error("unsupported schema");
+    if (![TRANSPORT_PROFILE_SCHEMA, LEGACY_TRANSPORT_PROFILE_SCHEMA].includes(profile.schema)) {
+      throw new Error("unsupported schema");
+    }
     const generatedAt = Date.parse(profile.generated_at);
     if (!Number.isFinite(generatedAt)) throw new Error("generated_at is invalid");
     const samples = Array.isArray(profile.samples) ? profile.samples : [];
-    const values = samples.map((sample) => Number(sample?.post_dispatch_to_ack_ms));
+    const sampleField = profile.schema === TRANSPORT_PROFILE_SCHEMA
+      ? "bestmove_to_ack_ms"
+      : "post_dispatch_to_ack_ms";
+    const values = samples.map((sample) => Number(sample?.[sampleField]));
     const gameCount = new Set(samples.map((sample) => String(sample?.game_id ?? "")).filter(Boolean)).size;
     const p99 = percentile(values, 0.99);
     const reserve = transportReserveFromP99(p99);
@@ -127,7 +134,15 @@ export function loadTransportProfile(profilePath, now = Date.now()) {
     if (now - generatedAt > TRANSPORT_PROFILE_MAXIMUM_AGE_MS) {
       return { status: "stale", qualified: false, reason: "transport profile is older than seven days", profile };
     }
-    return { status: "accepted", qualified: true, reserveMs: reserve, profile };
+    return {
+      status: "accepted",
+      qualified: true,
+      reserveMs: reserve,
+      coverage: profile.schema === TRANSPORT_PROFILE_SCHEMA
+        ? "bestmove_to_ack"
+        : "dispatch_to_ack_legacy",
+      profile,
+    };
   } catch (error) {
     return { status: "rejected", qualified: false, reason: error.message };
   }
@@ -158,11 +173,22 @@ export class TransportProfileTracker {
     if (accepted.qualified) this.effectiveReserveMs = accepted.reserveMs;
   }
 
-  record(gameId, durationMs) {
+  record(gameId, timing) {
+    const sample = typeof timing === "number" ? { bestmove_to_ack_ms: timing } : timing;
+    const durationMs = Number(sample?.bestmove_to_ack_ms);
     if (!gameId || !Number.isFinite(durationMs) || durationMs < 0) return;
     this.samples.push({
       game_id: String(gameId),
-      post_dispatch_to_ack_ms: Math.round(durationMs * 1_000) / 1_000,
+      bestmove_to_ack_ms: Math.round(durationMs * 1_000) / 1_000,
+      bestmove_to_legality_ms: Number.isFinite(sample?.bestmove_to_legality_ms)
+        ? Math.round(sample.bestmove_to_legality_ms * 1_000) / 1_000
+        : null,
+      move_queue_wait_ms: Number.isFinite(sample?.move_queue_wait_ms)
+        ? Math.round(sample.move_queue_wait_ms * 1_000) / 1_000
+        : null,
+      post_dispatch_to_ack_ms: Number.isFinite(sample?.post_dispatch_to_ack_ms)
+        ? Math.round(sample.post_dispatch_to_ack_ms * 1_000) / 1_000
+        : null,
       recorded_at_ms: this.now(),
     });
     this.samples = this.samples.slice(-TRANSPORT_PROFILE_MAXIMUM_SAMPLES);
@@ -171,7 +197,7 @@ export class TransportProfileTracker {
 
   finishGame(gameId) {
     if (!this.pendingGames.delete(String(gameId)) || !this.profilePath) return this.effectiveReserveMs;
-    const values = this.samples.map((sample) => sample.post_dispatch_to_ack_ms);
+    const values = this.samples.map((sample) => sample.bestmove_to_ack_ms);
     const gameCount = new Set(this.samples.map((sample) => sample.game_id)).size;
     const p50 = percentile(values, 0.50);
     const p95 = percentile(values, 0.95);
@@ -187,7 +213,7 @@ export class TransportProfileTracker {
       qualified,
       sample_count: this.samples.length,
       game_count: gameCount,
-      dispatch_to_ack_ms: { p50, p95, p99 },
+      bestmove_to_ack_ms: { p50, p95, p99 },
       effective_reserve_ms: qualified ? reserve : this.bootstrapReserveMs,
       samples: this.samples,
     };
@@ -357,9 +383,20 @@ function normalizeTimingConfig(config) {
       "TimeProfileIterationForecastScalePermille is timing-profile-owned and must start at 1000",
     );
   }
+  const configuredTransitions =
+    config.engine?.uci_options?.TimeProfileIterationTransitionP95Ms;
+  const zeroTransitions = Array(48).fill(0).join(",");
+  if (configuredTransitions !== undefined
+      && String(configuredTransitions) !== zeroTransitions
+      && String(configuredTransitions) !== "0") {
+    throw new Error(
+      "TimeProfileIterationTransitionP95Ms is timing-profile-owned and must start at zero",
+    );
+  }
   config.engine.uci_options.IterativeTimeController = false;
   config.engine.uci_options.TimeProfileProviderReserveUs = 0;
   config.engine.uci_options.TimeProfileIterationForecastScalePermille = 1000;
+  config.engine.uci_options.TimeProfileIterationTransitionP95Ms = zeroTransitions;
   config.schema = CURRENT_CONFIG_SCHEMA;
   config.timing.bootstrap_transport_reserve_ms = config.timing.initial_transport_reserve_ms;
   config.engine.timing = config.timing;
@@ -890,8 +927,44 @@ function parseInfo(line) {
     "v2_cursor_capacity_deferrals",
     "v2_cursor_readiness_waits",
     "v2_cursor_peak_waiting",
+    "time_deadline_budget_ms",
+    "time_limit_ms",
+    "time_command_elapsed_ms",
+    "time_deadline_overshoot_ms",
+    "iterative_time_controller_configured",
+    "iterative_time_controller_active",
+    "iterative_time_controller_stopped",
+    "iterative_time_forecast_shadow_stop",
+    "iterative_time_hard_admission_stopped",
+    "iterative_time_optimum_ms",
+    "iterative_time_maximum_ms",
+    "iterative_time_elapsed_ms",
+    "iterative_time_last_iteration_elapsed_ms",
+    "iterative_time_discarded_tail_ms",
+    "iterative_time_next_iteration_forecast_ms",
+    "iterative_time_forecast_ratio_permille",
+    "iterative_time_discarded_tail_ratio_lower_bound_permille",
+    "iterative_time_forecast_ratio_observations",
+    "iterative_time_last_depth",
+    "iterative_time_stability_score",
+    "iterative_time_best_effort_permyriad",
+    "iterative_time_iteration_nodes",
+    "iterative_time_admitted_iterations",
+    "iterative_time_completed_iterations",
+    "iterative_time_root_breadth_bucket",
+    "iterative_time_profile_transition_p95_ms",
+    "iterative_time_forecast_source",
+    "iterative_time_forecast_confidence_permyriad",
+    "iterative_time_stop_reason",
+    "iterative_time_emission_reserve_ms",
+    "evaluation_service_provider_batches",
+    "evaluation_service_provider_rows",
   ]) {
     const match = line.match(new RegExp(`(?:^| )${key} (\\d+)`));
+    if (match) telemetry[key] = Number(match[1]);
+  }
+  for (const key of ["iterative_time_forecast_error_ms"]) {
+    const match = line.match(new RegExp(`(?:^| )${key} (-?\\d+)`));
     if (match) telemetry[key] = Number(match[1]);
   }
   for (const key of [
@@ -1084,6 +1157,7 @@ export class UciEngine {
       "IterativeTimeController",
       "TimeProfileProviderReserveUs",
       "TimeProfileIterationForecastScalePermille",
+      "TimeProfileIterationTransitionP95Ms",
     ];
     if (this.timing.opponent_turn_search) requiredTimingOptions.push("Ponder");
     const missingTimingOptions = requiredTimingOptions
@@ -1095,13 +1169,15 @@ export class UciEngine {
       if (name === "Move Overhead" || name === "Ponder"
           || name === "IterativeTimeController"
           || name === "TimeProfileProviderReserveUs"
-          || name === "TimeProfileIterationForecastScalePermille") continue;
+          || name === "TimeProfileIterationForecastScalePermille"
+          || name === "TimeProfileIterationTransitionP95Ms") continue;
       this.send(`setoption name ${name} value ${String(value)}`);
     }
     this.send(`setoption name Move Overhead value ${this.timing.initial_transport_reserve_ms}`);
     this.send("setoption name IterativeTimeController value false");
     this.send("setoption name TimeProfileProviderReserveUs value 0");
     this.send("setoption name TimeProfileIterationForecastScalePermille value 1000");
+    this.send(`setoption name TimeProfileIterationTransitionP95Ms value ${Array(48).fill(0).join(",")}`);
     if (this.timing.opponent_turn_search) this.send("setoption name Ponder value true");
   }
 
@@ -1194,6 +1270,7 @@ export class UciEngine {
       iterativeTimeController: false,
       appliedTimeProfileReserveUs,
       iterationForecastScalePermille: 1000,
+      iterationTransitionP95Ms: Array(48).fill(0),
       modelRoot: options.ModelRoot,
       extraEngineOptions,
     };
@@ -1206,6 +1283,13 @@ export class UciEngine {
     }
     if (initialStatus.time_profile_iteration_forecast_scale_permille !== 1000) {
       throw new Error("UCI timing-profile iteration forecast scale did not initialize to 1000");
+    }
+    if (initialStatus.time_profile_iteration_transition_p95_ms
+        !== Array(48).fill(0).join(",")) {
+      throw new Error("UCI timing-profile transition p95 values did not initialize to zero");
+    }
+    if (initialStatus.iterative_time_controller_enabled !== false) {
+      throw new Error("UCI iterative time controller did not initialize disabled");
     }
     const configuredPath = String(this.config.time_profile ?? "").trim();
     if (!configuredPath) {
@@ -1260,6 +1344,8 @@ export class UciEngine {
         configuration: {
           ...this.timeProfileConfiguration(accepted.provider_service_reserve_us),
           iterationForecastScalePermille: accepted.iteration_forecast_scale_permille,
+          iterationTransitionP95Ms: accepted.iteration_transition_p95_ms,
+          iterativeTimeController: accepted.predictive_controller_enabled,
         },
       });
       this.timeProfileStatus = validateAppliedTimeProfileReserve(profile, appliedStatus);
@@ -1267,6 +1353,8 @@ export class UciEngine {
       if (reserveWasSet) {
         this.send("setoption name TimeProfileProviderReserveUs value 0");
         this.send("setoption name TimeProfileIterationForecastScalePermille value 1000");
+        this.send(`setoption name TimeProfileIterationTransitionP95Ms value ${Array(48).fill(0).join(",")}`);
+        this.send("setoption name IterativeTimeController value false");
         await this.exchange("isready", (line) => line === "readyok", 30_000);
         const resetStatus = await this.runtimeStatus();
         if (resetStatus.time_profile_provider_reserve_us !== 0) {
@@ -1274,6 +1362,11 @@ export class UciEngine {
         }
         if (resetStatus.time_profile_iteration_forecast_scale_permille !== 1000) {
           throw new Error(`Timing-profile rejection could not restore forecast scale 1000: ${error.message}`);
+        }
+        if (resetStatus.time_profile_iteration_transition_p95_ms
+            !== Array(48).fill(0).join(",")
+            || resetStatus.iterative_time_controller_enabled !== false) {
+          throw new Error(`Timing-profile rejection could not restore shadow-only defaults: ${error.message}`);
         }
       }
       this.timeProfileStatus = timeProfileFallbackStatus("rejected", error.message);
@@ -2233,6 +2326,7 @@ export class GameSession {
     let foregroundLeaseWaitMs = 0;
     let bestmoveToLegalityMs = 0;
     let moveQueueWaitMs = 0;
+    let goClock = null;
     try {
       if (!this.observationIsCurrent(observation)) {
         throw new StaleAuthoritativeSearchError(this.gameId, "superseded_before_search");
@@ -2256,6 +2350,7 @@ export class GameSession {
           this.color,
           performance.now() - receivedAt,
         );
+        goClock = clocks;
         result = await engine.search({
           moves,
           ...clocks,
@@ -2307,7 +2402,12 @@ export class GameSession {
         },
       );
       const postAcknowledgedAt = performance.now();
-      this.onMoveTransportSample(this.gameId, postAcknowledgedAt - postDispatchedAt);
+      this.onMoveTransportSample(this.gameId, {
+        bestmove_to_ack_ms: postAcknowledgedAt - bestmoveAt,
+        bestmove_to_legality_ms: bestmoveToLegalityMs,
+        move_queue_wait_ms: moveQueueWaitMs,
+        post_dispatch_to_ack_ms: postAcknowledgedAt - postDispatchedAt,
+      });
       this.lastSubmittedRootKey = rootKey;
       const elapsedClockMs = Math.max(0, Math.ceil(postAcknowledgedAt - receivedAt));
       const estimatedClock = subtractLocalClockDelay(this.lastClock, this.color, elapsedClockMs);
@@ -2342,11 +2442,27 @@ export class GameSession {
         move_queue_wait_ms: moveQueueWaitMs,
         state_received_to_dispatch_ms: postDispatchedAt - receivedAt,
         post_dispatch_to_ack_ms: postAcknowledgedAt - postDispatchedAt,
+        bestmove_to_ack_ms: postAcknowledgedAt - bestmoveAt,
+        authoritative_wtime_ms: this.lastClock.wtime,
+        authoritative_btime_ms: this.lastClock.btime,
+        authoritative_winc_ms: this.lastClock.winc,
+        authoritative_binc_ms: this.lastClock.binc,
+        go_wtime_ms: goClock?.wtime ?? null,
+        go_btime_ms: goClock?.btime ?? null,
+        go_winc_ms: goClock?.winc ?? null,
+        go_binc_ms: goClock?.binc ?? null,
         ponder_mode: ponderHit ? "ponder" : "foreground",
         ponder_hit: Boolean(ponderHit),
         ponder_miss_reason: ponderMissReason,
         stale_bestmove_drained: Boolean(staleBestmoveDrained),
         transport_reserve_ms: this.config.timing.initial_transport_reserve_ms,
+        timing_profile_status: engine.timeProfileStatus?.status ?? "unavailable",
+        timing_profile_provider_safety_qualified:
+          engine.timeProfileStatus?.permissions?.provider_safety_qualified ?? false,
+        timing_profile_forecast_shadow_qualified:
+          engine.timeProfileStatus?.permissions?.forecast_shadow_qualified ?? false,
+        timing_profile_adaptive_play_qualified:
+          engine.timeProfileStatus?.permissions?.adaptive_play_qualified ?? false,
         root_legality_validation_ms: legality.elapsedMs,
         root_legality_sync_ms: observation.legalitySynchronization?.elapsedMs ?? null,
         root_legality_applied_plies: observation.legalitySynchronization?.appliedPlies ?? null,
@@ -2418,7 +2534,7 @@ export class BotController {
     this.tickRunning = false;
     this.schedulerFault = null;
     const transportProfilePath = this.config.timing.transport_profile_path
-      || path.join(runtimeDir, "transport_profile_v1.json");
+      || path.join(runtimeDir, "transport_profile_v2.json");
     this.transportProfile = new TransportProfileTracker({
       profilePath: transportProfilePath,
       bootstrapReserveMs: this.config.timing.bootstrap_transport_reserve_ms
@@ -2690,7 +2806,7 @@ export class BotController {
       slot,
       store: this.store,
       foregroundCoordinator: this.foregroundCoordinator,
-      onMoveTransportSample: (id, durationMs) => this.transportProfile.record(id, durationMs),
+      onMoveTransportSample: (id, timing) => this.transportProfile.record(id, timing),
     });
     this.gameSessions.set(gameId, session);
     const task = session.run().catch((error) => {

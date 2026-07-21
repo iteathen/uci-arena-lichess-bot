@@ -412,6 +412,10 @@ test("timing profile has a distinct config, environment, and CLI path", () => {
   assert.equal(config.engine.uci_options.IterativeTimeController, false);
   assert.equal(config.engine.uci_options.TimeProfileProviderReserveUs, 0);
   assert.equal(config.engine.uci_options.TimeProfileIterationForecastScalePermille, 1000);
+  assert.equal(
+    config.engine.uci_options.TimeProfileIterationTransitionP95Ms,
+    Array(48).fill(0).join(","),
+  );
   assert.deepEqual(
     parseArguments(["run", "--profile", "single.json", "--time-profile", "time.json"]),
     { command: "run", profile: "single.json", time_profile: "time.json" },
@@ -610,12 +614,14 @@ test("UCI readiness requires explicit ponder and move-overhead support", () => {
   engine.advertisedOptions.add("IterativeTimeController");
   engine.advertisedOptions.add("TimeProfileProviderReserveUs");
   engine.advertisedOptions.add("TimeProfileIterationForecastScalePermille");
+  engine.advertisedOptions.add("TimeProfileIterationTransitionP95Ms");
   engine.configureUciOptions();
   assert.deepEqual(commands, [
     "setoption name Move Overhead value 250",
     "setoption name IterativeTimeController value false",
     "setoption name TimeProfileProviderReserveUs value 0",
     "setoption name TimeProfileIterationForecastScalePermille value 1000",
+    `setoption name TimeProfileIterationTransitionP95Ms value ${Array(48).fill(0).join(",")}`,
     "setoption name Ponder value true",
   ]);
 });
@@ -638,11 +644,14 @@ test("missing timing profile remains observable with zero reserve and controller
       IterativeTimeController: false,
       TimeProfileProviderReserveUs: 0,
       TimeProfileIterationForecastScalePermille: 1000,
+      TimeProfileIterationTransitionP95Ms: Array(48).fill(0).join(","),
     },
   });
   engine.runtimeStatus = async () => ({
     time_profile_provider_reserve_us: 0,
     time_profile_iteration_forecast_scale_permille: 1000,
+    time_profile_iteration_transition_p95_ms: Array(48).fill(0).join(","),
+    iterative_time_controller_enabled: false,
   });
   const status = await engine.configureTimeProfile();
   assert.equal(status.status, "missing");
@@ -661,6 +670,24 @@ test("UCI search telemetry retains identity across later info string lines", () 
     model_fingerprint: "1234",
     model_id: "model_v1",
   });
+});
+
+test("UCI iterative timing telemetry is retained as structured move evidence", () => {
+  const engine = new UciEngine({ uci_options: {} });
+  engine.onLine(
+    "info depth 4 time_deadline_budget_ms 900 iterative_time_optimum_ms 616"
+    + " iterative_time_maximum_ms 880 iterative_time_emission_reserve_ms 20"
+    + " iterative_time_admitted_iterations 4 iterative_time_completed_iterations 4"
+    + " iterative_time_forecast_source 3 iterative_time_forecast_confidence_permyriad 9500"
+    + " iterative_time_forecast_error_ms -7 iterative_time_stop_reason 3"
+    + " evaluation_service_provider_batches 9 evaluation_service_provider_rows 72",
+  );
+  assert.equal(engine.latestInfo.iterative_time_optimum_ms, 616);
+  assert.equal(engine.latestInfo.iterative_time_emission_reserve_ms, 20);
+  assert.equal(engine.latestInfo.iterative_time_completed_iterations, 4);
+  assert.equal(engine.latestInfo.iterative_time_forecast_source, 3);
+  assert.equal(engine.latestInfo.iterative_time_forecast_error_ms, -7);
+  assert.equal(engine.latestInfo.evaluation_service_provider_rows, 72);
 });
 
 test("UCI book telemetry is structured without losing later search identity", () => {
@@ -701,7 +728,13 @@ test("transport profile publishes only after ten games and two hundred successfu
   });
   for (let game = 0; game < 10; game += 1) {
     for (let move = 0; move < 20; move += 1) {
-      tracker.record(`game-${game}`, 500 + ((game * 20 + move) % 100));
+      const dispatchMs = 350 + ((game * 20 + move) % 100);
+      tracker.record(`game-${game}`, {
+        bestmove_to_ack_ms: dispatchMs + 150,
+        bestmove_to_legality_ms: 25,
+        move_queue_wait_ms: 125,
+        post_dispatch_to_ack_ms: dispatchMs,
+      });
     }
     tracker.finishGame(`game-${game}`);
     clock += 1_000;
@@ -711,7 +744,31 @@ test("transport profile publishes only after ten games and two hundred successfu
   assert.equal(loaded.reserveMs, 650);
   assert.equal(loaded.profile.sample_count, 200);
   assert.equal(loaded.profile.game_count, 10);
+  assert.equal(loaded.coverage, "bestmove_to_ack");
+  assert.equal(loaded.profile.samples[0].bestmove_to_legality_ms, 25);
   assert.equal(loadTransportProfile(profilePath, clock + 8 * 24 * 60 * 60 * 1_000).status, "stale");
+});
+
+test("qualified v1 transport profiles remain readable with legacy coverage", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-transport-v1-"));
+  const profilePath = path.join(directory, "transport-v1.json");
+  const generatedAt = Date.parse("2026-07-20T00:00:00Z");
+  const samples = Array.from({ length: 200 }, (_, index) => ({
+    game_id: `game-${Math.floor(index / 20)}`,
+    post_dispatch_to_ack_ms: 500 + (index % 100),
+    recorded_at_ms: generatedAt,
+  }));
+  writeFileSync(profilePath, JSON.stringify({
+    schema: "uci_arena_lichess_transport_profile_v1",
+    generated_at: new Date(generatedAt).toISOString(),
+    qualified: true,
+    effective_reserve_ms: 650,
+    samples,
+  }));
+  const loaded = loadTransportProfile(profilePath, generatedAt + 1_000);
+  assert.equal(loaded.qualified, true);
+  assert.equal(loaded.coverage, "dispatch_to_ack_legacy");
+  assert.equal(loaded.reserveMs, 650);
 });
 
 test("stopped ponder bestmove is drained before the foreground waiter starts", async () => {
