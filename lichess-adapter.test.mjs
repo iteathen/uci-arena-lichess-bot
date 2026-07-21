@@ -561,6 +561,46 @@ test("qualified MCGS profile owns graph and batching topology", () => {
   assert.equal(fixture.config.engine.uci_options.McgsOutstandingBatches, 3);
 });
 
+test("MCGS timing identity includes graph and outstanding-work topology", () => {
+  const engine = Object.create(UciEngine.prototype);
+  engine.config = {
+    uci_options: {
+      SearchCore: "mcgs",
+      Threads: 10,
+      RootWorkers: 4,
+      V2SplitDepth: 2,
+      SearchGraphMB: 64,
+      McgsCpuctPermille: 1500,
+      McgsOutstandingBatches: 2,
+      NNBatchSize: 32,
+      NNBatchWaitUs: 150,
+      OnnxProvider: "directml",
+      BackgroundSearch: false,
+      NNSpeculation: false,
+      ModelRoot: "model",
+    },
+  };
+  engine.timing = { initial_transport_reserve_ms: 650 };
+
+  const configuration = engine.timeProfileConfiguration();
+  assert.equal(configuration.searchGraphMb, 64);
+  assert.equal(configuration.mcgsCpuctPermille, 1500);
+  assert.equal(configuration.mcgsOutstandingBatches, 2);
+});
+
+test("runtime qualification waits for detached provider tickets to drain", async () => {
+  const engine = Object.create(UciEngine.prototype);
+  const statuses = [
+    { evaluation_service_active_async_leases: 0, evaluation_service_active_tickets: 1 },
+    { evaluation_service_active_async_leases: 0, evaluation_service_active_tickets: 0 },
+  ];
+  engine.runtimeStatus = async () => statuses.shift();
+
+  const status = await engine.runtimeStatusAfterInferenceDrain(1_000);
+  assert.equal(status.evaluation_service_active_tickets, 0);
+  assert.equal(statuses.length, 0);
+});
+
 test("profile-owned topology rejects a conflicting tracked option", () => {
   const fixture = qualifiedFixture();
   fixture.config.engine.uci_options.SearchCore = "legacy";

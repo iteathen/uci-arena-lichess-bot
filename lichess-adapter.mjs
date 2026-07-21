@@ -1217,6 +1217,20 @@ export class UciEngine {
     return parseRuntimeStatus(line);
   }
 
+  async runtimeStatusAfterInferenceDrain(timeoutMs = 30_000) {
+    const deadline = performance.now() + timeoutMs;
+    let status;
+    do {
+      status = await this.runtimeStatus();
+      if (status.evaluation_service_active_async_leases === 0
+          && status.evaluation_service_active_tickets === 0) {
+        return status;
+      }
+      if (performance.now() >= deadline) return status;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    } while (true);
+  }
+
   timeProfileConfiguration(appliedTimeProfileReserveUs = 0, appliedBackupEmitReserveUs = 1000) {
     const options = this.config.uci_options;
     const extraEngineOptions = Object.fromEntries(
@@ -1234,6 +1248,9 @@ export class UciEngine {
       threads: Number(options.Threads),
       rootWorkers: Number(options.RootWorkers),
       splitDepth: Number(options.V2SplitDepth),
+      searchGraphMb: Number(options.SearchGraphMB),
+      mcgsCpuctPermille: Number(options.McgsCpuctPermille),
+      mcgsOutstandingBatches: Number(options.McgsOutstandingBatches),
       batchSize: Number(options.NNBatchSize),
       batchWaitUs: Number(options.NNBatchWaitUs),
       provider: String(options.OnnxProvider),
@@ -1364,7 +1381,10 @@ export class UciEngine {
       if (!/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(bestmove)) {
         throw new Error(`Qualification search returned unusable bestmove: ${bestmove ?? "missing"}`);
       }
-      this.qualificationStatus = validateRuntimeStatus(profile, await this.runtimeStatus());
+      this.qualificationStatus = validateRuntimeStatus(
+        profile,
+        await this.runtimeStatusAfterInferenceDrain(),
+      );
       return this.qualificationStatus;
     } finally {
       this.send(`setoption name OwnBook value ${restoredOwnBook}`);
