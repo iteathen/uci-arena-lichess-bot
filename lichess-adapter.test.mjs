@@ -1075,6 +1075,37 @@ test("missing timing profile remains observable with zero reserve and controller
   assert.equal(status.predictive_controller_enabled, false);
 });
 
+test("timing profile identity owns the configured MCGS book-prior blend", () => {
+  const engine = new UciEngine({
+    uci_options: {
+      SearchCore: "mcgs",
+      Threads: 3,
+      RootWorkers: 1,
+      V2SplitDepth: 2,
+      SearchGraphMB: 64,
+      McgsCpuctPermille: 1500,
+      McgsOutstandingBatches: 2,
+      McgsBookPriorBlendPermille: 0,
+      McgsTimePolicy: "RelativeClockTemporalV1",
+      NNBatchSize: 32,
+      NNBatchWaitUs: 150,
+      OnnxProvider: "directml",
+      BackgroundSearch: false,
+      NNSpeculation: false,
+      SyzygyProbeLimit: 6,
+      SyzygyInternalProbe: true,
+    },
+  });
+  const configuration = engine.timeProfileConfiguration();
+  assert.equal(configuration.mcgsBookPriorBlendPermille, 0);
+  assert.equal(
+    Object.hasOwn(configuration.extraEngineOptions, "McgsBookPriorBlendPermille"),
+    false,
+  );
+  assert.equal(configuration.extraEngineOptions.SyzygyProbeLimit, "6");
+  assert.equal(configuration.extraEngineOptions.SyzygyInternalProbe, "true");
+});
+
 test("UCI search telemetry retains identity across later info string lines", () => {
   const engine = new UciEngine({ uci_options: {} });
   engine.onLine("info depth 8 model_provider directml model_fingerprint 1234 model_id model_v1");

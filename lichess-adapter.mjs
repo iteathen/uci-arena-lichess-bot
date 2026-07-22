@@ -102,7 +102,8 @@ const CHALLENGE_RESPONSE_MAX_AGE_MS = 20_000;
 const UCI_MOVE_PATTERN = /^[a-h][1-8][a-h][1-8][qrbn]?$/;
 const TIME_PROFILE_RESERVED_OPTIONS = new Set([
   "SearchCore", "Threads", "RootWorkers", "V2SplitDepth", "BackgroundSearch",
-  "SearchGraphMB", "McgsCpuctPermille", "McgsOutstandingBatches", "McgsTimePolicy",
+  "SearchGraphMB", "McgsCpuctPermille", "McgsOutstandingBatches",
+  "McgsBookPriorBlendPermille", "McgsTimePolicy",
   "NNSpeculation", "ModelRoot", "NNBatchSize", "NNBatchWaitUs", "OnnxProvider",
   "IterativeTimeController", "TimeProfileProviderReserveUs", "TimeProfileBackupEmitReserveUs",
   "TimeProfileIterationForecastScalePermille", "Move Overhead", "Ponder",
@@ -1516,7 +1517,8 @@ export class UciEngine {
     const extraEngineOptions = Object.fromEntries(
       Object.entries(options)
         .filter(([name]) => !TIME_PROFILE_RESERVED_OPTIONS.has(name))
-        .sort(([left], [right]) => left.localeCompare(right)),
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([name, value]) => [name, String(value)]),
     );
     const booleanOption = (name, fallback = false) => (
       options[name] === undefined
@@ -1531,6 +1533,7 @@ export class UciEngine {
       searchGraphMb: Number(options.SearchGraphMB),
       mcgsCpuctPermille: Number(options.McgsCpuctPermille),
       mcgsOutstandingBatches: Number(options.McgsOutstandingBatches),
+      mcgsBookPriorBlendPermille: Number(options.McgsBookPriorBlendPermille),
       mcgsTimePolicy: String(options.McgsTimePolicy),
       batchSize: Number(options.NNBatchSize),
       batchWaitUs: Number(options.NNBatchWaitUs),
