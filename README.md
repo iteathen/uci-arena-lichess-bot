@@ -110,10 +110,10 @@ Syzygy options; tablebase-disabled worker evidence is not deployment evidence.
 node engine\tools\benchmark_mcgs_workers.mjs `
   --engine build\Release\uci_arena.exe `
   --model-root engine\runtime\models\<MODEL_ID>\engine `
-  --workers 3,4,6,8,10 `
+  --workers 3,4,6,8 `
   --movetimes 250,500,1000 `
   --trials 3 `
-  --mcgs-book-prior-blend-permille 250 `
+  --mcgs-book-prior-blend-permille 0 `
   --performance-cores 6 `
   --efficiency-cores 4 `
   --engine-option BehaviorProfile=balanced `
@@ -129,14 +129,16 @@ node engine\tools\benchmark_mcgs_workers.mjs `
 ```
 
 The current exact-model operating choice is `Threads=3` with
-`RootWorkers=1` retained only as compatibility metadata. Four workers improved
-several warm throughput samples, but scored 7/16 against the three-worker
-control in 16 equal-wall-time paired-color games. Six and ten workers were
-throughput-dominated; eight was mixed and adverse against four. This selects a
-current operating point, not a permanent default: repeat the entire matrix when
-the executable, model, provider/runtime, batching, graph policy, or hardware
-identity changes. No result in this matrix authorizes switching live search away
-from MCGS.
+`RootWorkers=1` retained only as compatibility metadata. The final blend-zero,
+six-piece-Syzygy matrix completed 432/432 legal samples with no deadline,
+reservation, or stale-backup failure. Three workers led the complete matrix;
+eight gained a small opening-only mean at one second, but its paired confidence
+interval crossed zero and its complete-matrix result was lower. Prior paired
+play also scored four workers 7/16 against three. This selects a current
+operating point, not a permanent default: repeat the entire matrix when the
+executable, model, provider/runtime, batching, graph policy, tablebase, book
+blend, or hardware identity changes. No result authorizes switching live search
+away from MCGS.
 
 Select the bounded opponent-root book blend before repeating the worker matrix.
 The corpus is held-out runtime evidence, grouped by game, with each transition
@@ -166,10 +168,10 @@ node engine\tools\benchmark_mcgs_book_prior.mjs `
   --corpus runtime_state\lichess\mcgs_book_prior_corpus.json `
   --blends 0,125,250,375,500 `
   --threads 3 `
-  --engine-option BookFile=E:/book-forge/published/integration/strong_rare_v1.bin `
-  --engine-option BookStatsFile=E:/book-forge/published/integration/strong_rare_v1.ffstats `
-  --engine-option BookPolicyFile=E:/book-forge/published/integration/strong_rare_v1.policy `
-  --output runtime_state\lichess\mcgs_book_prior_replay.json
+  --engine-option BookFile=E:/book-forge/snapshots/integration-0370e907b4d6ba7df3d7/strong_rare_v1.bin `
+  --engine-option BookStatsFile=E:/book-forge/snapshots/integration-0370e907b4d6ba7df3d7/strong_rare_v1.ffstats `
+  --engine-option BookPolicyFile=E:/book-forge/snapshots/integration-0370e907b4d6ba7df3d7/strong_rare_v1.policy `
+  --output runtime_state\models\<MODEL_ID>\cache\mcgs_book_prior_replay.json
 ```
 
 The corpus schema is `uci_arena_opponent_root_replay_corpus_v1` with `games[]`;
@@ -178,6 +180,13 @@ each game has `id`, `initial_fen` (`startpos` is accepted), and ordered
 `think_ms`. The artifact records the exact engine, model, provider, hardware,
 book snapshot, corpus hash, correctness results, paired comparisons, and the
 selected blend.
+
+The 2026-07-22 replay used 20 games and 40 transitions. All 200 searches
+passed; the 37 comparable book hits selected blend `0`. Blend `250` changed
+completed work at the actual reply child by only +0.054 edges versus zero, with
+a 95% interval of -0.076 to +0.184, so it did not earn production authority.
+The UCI option retains its bounded experimental range, while the qualified live
+profile uses neural-only opponent-root priors.
 
 Qualify the configured concurrency. All requested children are started and
 searched concurrently, must retain the selected GPU provider and MCGS telemetry,
