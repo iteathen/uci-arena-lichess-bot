@@ -22,7 +22,7 @@ V2 or another search core.
 
 ## Default behavior
 
-The tracked v4 template is enabled for two concurrent games:
+The tracked v5 template is enabled for two concurrent games:
 
 - one hard-reserved public-human slot, never loaned to automated bot play;
 - one bot slot which the scheduler tries to keep active;
@@ -79,6 +79,8 @@ node deploy\lichess\smoke-uci-startup.mjs --config deploy\lichess\config.uci_are
 Validate the existing `uci_arena_single_game_profile_v1`. This local command
 does not read a Lichess credential. Its telemetry probe temporarily disables
 the opening book, then restores the configured/default-on book for live play.
+Qualification fails unless the restored runtime reports the book enabled and
+active; a successful search with a disabled or unloaded book is not deployable.
 
 ```powershell
 node deploy\lichess\lichess-adapter.mjs qualify `
@@ -137,6 +139,35 @@ Per-move NDJSON telemetry separates `state_received_to_go_ms`,
 `go_to_bestmove_ms`, `state_validated_to_post_ms`, and `post_to_ack_ms`, and
 records ponder mode/hit/miss, stale-result draining, and the active transport
 reserve. The runtime snapshot also reports each game’s current UCI timing mode.
+
+## Per-game runtime provenance
+
+SQLite schema v3 binds every new game to immutable, queryable model and runtime
+identity: model id and fingerprint, checkpoint hash, adapter id, engine build,
+provider/runtime/hardware fingerprints, search core, threads, root workers,
+split depth, batch size/wait, timing-profile identity, and book configuration.
+The `runtime_provenance_json` document additionally records every UCI option the
+adapter applied, effective timing permissions/reserves, and the book state
+observed after qualification. Its SHA-256 is logged with `game_ready`.
+Idempotent game recovery cannot replace this identity.
+
+Legacy rows remain blank after schema migration unless an explicit historical
+evidence manifest can bind an existing engine/model/provider/book fingerprint,
+bounded UTC interval, and expected game count. Backfill is dry-run-first,
+transactional, refuses an active adapter lease, preserves a timestamped SQLite
+backup, never overwrites non-empty identity, and records evidence plus unknown
+fields instead of guessing:
+
+```powershell
+node deploy\lichess\backfill-game-provenance.mjs `
+  --database runtime_state\lichess\matches.sqlite `
+  --manifest deploy\lichess\provenance-history.2026-07-20.json
+
+node deploy\lichess\backfill-game-provenance.mjs `
+  --database runtime_state\lichess\matches.sqlite `
+  --manifest deploy\lichess\provenance-history.2026-07-20.json `
+  --apply
+```
 
 ## Human priority and local controls
 

@@ -1444,7 +1444,22 @@ export class UciEngine {
     } finally {
       this.send(`setoption name OwnBook value ${restoredOwnBook}`);
       await this.exchange("isready", (line) => line === "readyok", 30_000);
+      if (this.qualificationStatus) {
+        const liveRuntimeStatus = await this.runtimeStatus();
+        const bookExpected = String(restoredOwnBook).trim().toLocaleLowerCase() === "true";
+        if (liveRuntimeStatus.opening_book_enabled !== bookExpected) {
+          throw new Error("Restored OwnBook setting does not match runtime status");
+        }
+        if (bookExpected && liveRuntimeStatus.opening_book_active !== true) {
+          throw new Error(`Opening book failed to activate: ${liveRuntimeStatus.opening_book_message}`);
+        }
+        this.qualificationStatus = {
+          ...this.qualificationStatus,
+          live_runtime_status: liveRuntimeStatus,
+        };
+      }
     }
+    return this.qualificationStatus;
   }
 
   parseBestmove(line, { allowNullBestmove = false } = {}) {
@@ -1759,6 +1774,111 @@ function bookConfigurationIdentity(config) {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
 }
 
+function optionalFileFingerprint(filePath, workingDirectory) {
+  const configured = String(filePath ?? "").trim();
+  if (!configured) return "";
+  const resolved = path.isAbsolute(configured)
+    ? configured
+    : path.resolve(workingDirectory ?? ROOT, configured);
+  return existsSync(resolved) ? sha256File(resolved) : "";
+}
+
+export function gameRuntimeProvenance(config, engine) {
+  const profile = config.engine.qualification_profile ?? {};
+  const liveRuntime = engine.qualificationStatus?.live_runtime_status ?? {};
+  const timeProfile = engine.timeProfileStatus ?? config.engine.time_profile_status ?? {};
+  const configuredBook = String(config.engine.uci_options?.OwnBook ?? "true").toLocaleLowerCase() === "true";
+  const transitionProfile = timeProfile.iteration_transition_p95_ms ?? Array(48).fill(0);
+  const appliedOptions = {
+    ...(config.engine.uci_options ?? {}),
+    "Move Overhead": config.timing?.initial_transport_reserve_ms ?? 0,
+    Ponder: config.timing?.opponent_turn_search ?? false,
+    OwnBook: configuredBook,
+    IterativeTimeController: timeProfile.predictive_controller_enabled ?? false,
+    TimeProfileProviderReserveUs: timeProfile.provider_service_reserve_us ?? 0,
+    TimeProfileIterationForecastScalePermille:
+      timeProfile.iteration_forecast_scale_permille ?? 1000,
+    TimeProfileIterationTransitionP95Ms:
+      Array.isArray(transitionProfile) ? transitionProfile.join(",") : String(transitionProfile),
+  };
+  const uciOptions = Object.fromEntries(
+    Object.entries(appliedOptions)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([name, value]) => [name, String(value)]),
+  );
+  const provenance = {
+    schema: "uci_arena_game_runtime_provenance_v1",
+    engine: {
+      build_fingerprint: profile.engine_build_fingerprint ?? "",
+    },
+    model: {
+      id: profile.model_id ?? "",
+      fingerprint: profile.model_fingerprint ?? "",
+      checkpoint_hash: profile.checkpoint_hash ?? "",
+      adapter_id: profile.adapter_id ?? "",
+    },
+    provider: {
+      name: profile.provider ?? "",
+      numeric_fingerprint: profile.provider_numeric_fingerprint ?? "",
+      hardware_driver_fingerprint: profile.hardware_driver_fingerprint ?? "",
+      onnx_runtime_version: profile.onnx_runtime_version ?? "",
+    },
+    search: {
+      core: profile.search_core ?? "",
+      threads: profile.threads ?? 0,
+      root_workers: profile.root_workers ?? 0,
+      split_depth: profile.split_depth ?? 0,
+      batch_size: profile.batch_size ?? 0,
+      batch_wait_us: profile.batch_wait_us ?? 0,
+      speculation: profile.speculation ?? false,
+      background_search: profile.background_search ?? false,
+      applied_uci_options: uciOptions,
+    },
+    timing: {
+      profile_identity_sha256: timeProfile.identity_sha256 ?? "",
+      profile_file_sha256: optionalFileFingerprint(
+        config.engine.time_profile,
+        config.engine.working_directory,
+      ),
+      status: timeProfile.status ?? "",
+      accepted: timeProfile.accepted ?? false,
+      applied: timeProfile.applied ?? false,
+      permissions: timeProfile.permissions ?? {},
+      provider_service_reserve_us: timeProfile.provider_service_reserve_us ?? 0,
+      iteration_forecast_scale_permille:
+        timeProfile.iteration_forecast_scale_permille ?? 1000,
+      iteration_transition_p95_ms: transitionProfile,
+      predictive_controller_enabled: timeProfile.predictive_controller_enabled ?? false,
+      transport_reserve_ms: config.timing?.initial_transport_reserve_ms ?? 0,
+      fallback_policy: timeProfile.fallback_policy ?? "",
+      reason: timeProfile.reason ?? "",
+    },
+    book: {
+      configuration_identity: bookConfigurationIdentity(config),
+      configured_enabled: configuredBook,
+      observed_enabled: liveRuntime.opening_book_enabled ?? null,
+      observed_active: liveRuntime.opening_book_active ?? null,
+      observed_entries: liveRuntime.opening_book_entries ?? null,
+      observed_message: liveRuntime.opening_book_message ?? "",
+    },
+    profiles: {
+      single_game_sha256: optionalFileFingerprint(
+        profile.profile_path,
+        config.engine.working_directory,
+      ),
+      capacity_sha256: optionalFileFingerprint(
+        config.capacity_profile?.profile_path,
+        config.engine.working_directory,
+      ),
+    },
+  };
+  const serialized = JSON.stringify(provenance);
+  return {
+    provenance,
+    sha256: `sha256:${createHash("sha256").update(serialized).digest("hex")}`,
+  };
+}
+
 function normalizedMoves(value) {
   const moves = String(value ?? "").trim().split(/\s+/).filter(Boolean);
   const invalid = moves.find((move) => !UCI_MOVE_PATTERN.test(move));
@@ -2031,6 +2151,7 @@ export class GameSession {
     this.defaultIncrementMs = clockMilliseconds(event.clock?.increment);
     await engine.newGame();
     const profile = this.config.engine.qualification_profile;
+    const runtimeProvenance = gameRuntimeProvenance(this.config, engine);
     this.store.beginGame({
       id: this.gameId,
       opponent: this.opponent,
@@ -2041,9 +2162,24 @@ export class GameSession {
       clockLimit: event.clock?.initial,
       clockIncrement: event.clock?.increment,
       engineBuildFingerprint: profile.engine_build_fingerprint,
+      modelId: profile.model_id,
       modelFingerprint: profile.model_fingerprint,
+      checkpointHash: profile.checkpoint_hash,
+      adapterId: profile.adapter_id,
+      provider: profile.provider,
       providerFingerprint: profile.provider_numeric_fingerprint,
+      hardwareDriverFingerprint: profile.hardware_driver_fingerprint,
+      onnxRuntimeVersion: profile.onnx_runtime_version,
+      searchCore: profile.search_core,
+      threads: profile.threads,
+      rootWorkers: profile.root_workers,
+      splitDepth: profile.split_depth,
+      batchSize: profile.batch_size,
+      batchWaitUs: profile.batch_wait_us,
+      timeProfileIdentity: engine.timeProfileStatus?.identity_sha256 ?? "",
       bookIdentity: bookConfigurationIdentity(this.config),
+      runtimeProvenanceSha256: runtimeProvenance.sha256,
+      runtimeProvenance: runtimeProvenance.provenance,
     });
     this.initialized = true;
     log("game_ready", {
@@ -2051,6 +2187,7 @@ export class GameSession {
       audience: this.slot.audience,
       opponent: this.opponent,
       color: this.color,
+      runtime_provenance_sha256: runtimeProvenance.sha256,
     });
   }
 

@@ -17,6 +17,7 @@ import {
   challengeFromSelf,
   challengeDeclineReason,
   applySingleGameProfile,
+  gameRuntimeProvenance,
   loadCapacityProfile,
   loadRuntimeConfig,
   loadSingleGameProfile,
@@ -146,6 +147,10 @@ function qualifiedRuntimeStatus(profile) {
     evaluation_service_active_tickets: 0,
     model_cache_eviction_deferrals: 0,
     repetition_unbalanced_workers: 0,
+    opening_book_enabled: true,
+    opening_book_active: true,
+    opening_book_entries: 1259,
+    opening_book_message: "loaded",
   };
 }
 
@@ -747,6 +752,70 @@ test("runtime qualification bypasses the book probe and restores live book play"
     "setoption name OwnBook value true",
     "isready",
   ]);
+});
+
+test("runtime qualification rejects a configured book that did not reactivate", async () => {
+  const { profile } = qualifiedFixture();
+  const engine = new UciEngine({ uci_options: {}, qualification_profile: profile });
+  engine.advertisedOptions.add("OwnBook");
+  engine.send = () => {};
+  engine.newGame = async () => {};
+  engine.exchange = async (command) => command.startsWith("go depth ") ? "bestmove e2e4" : "readyok";
+  let statusCalls = 0;
+  engine.runtimeStatus = async () => {
+    statusCalls += 1;
+    return statusCalls === 1
+      ? qualifiedRuntimeStatus(profile)
+      : { ...qualifiedRuntimeStatus(profile), opening_book_active: false, opening_book_message: "missing" };
+  };
+
+  await assert.rejects(() => engine.qualifyRuntime(), /Opening book failed to activate: missing/);
+});
+
+test("game provenance captures exact model, effective timing options, and observed book state", () => {
+  const { config, profile } = qualifiedFixture();
+  config.engine.qualification_profile = { ...profile, profile_path: config.engine.single_game_profile };
+  config.engine.uci_options = {
+    ...config.engine.uci_options,
+    SearchCore: "v2",
+    Threads: 4,
+    RootWorkers: 4,
+    V2SplitDepth: 2,
+    OnnxProvider: "directml",
+    NNBatchSize: 8,
+    NNBatchWaitUs: 150,
+    NNSpeculation: false,
+    BackgroundSearch: false,
+  };
+  config.timing = { initial_transport_reserve_ms: 650, opponent_turn_search: true };
+  const engine = {
+    qualificationStatus: { live_runtime_status: qualifiedRuntimeStatus(profile) },
+    timeProfileStatus: {
+      status: "accepted",
+      accepted: true,
+      applied: true,
+      identity_sha256: "sha256:time-profile",
+      provider_service_reserve_us: 231000,
+      iteration_forecast_scale_permille: 1050,
+      iteration_transition_p95_ms: [1, 2, 3],
+      predictive_controller_enabled: false,
+      permissions: { provider_safety_qualified: true },
+    },
+  };
+
+  const first = gameRuntimeProvenance(config, engine);
+  const second = gameRuntimeProvenance(config, engine);
+  assert.deepEqual(first, second);
+  assert.equal(first.provenance.model.id, "model_v1");
+  assert.equal(first.provenance.model.checkpoint_hash, "a".repeat(64));
+  assert.equal(first.provenance.search.threads, 4);
+  assert.equal(first.provenance.search.applied_uci_options["Move Overhead"], "650");
+  assert.equal(first.provenance.search.applied_uci_options.OwnBook, "true");
+  assert.equal(first.provenance.search.applied_uci_options.TimeProfileProviderReserveUs, "231000");
+  assert.equal(first.provenance.timing.transport_reserve_ms, 650);
+  assert.equal(first.provenance.book.observed_active, true);
+  assert.equal(first.provenance.book.observed_entries, 1259);
+  assert.match(first.sha256, /^sha256:[0-9a-f]{64}$/);
 });
 
 test("UCI readiness requires explicit ponder and move-overhead support", () => {

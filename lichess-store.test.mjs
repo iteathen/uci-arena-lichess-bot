@@ -12,12 +12,12 @@ function storeFixture() {
   return new LichessStore(path.join(directory, "matches.sqlite"));
 }
 
-test("store migrates to schema two and uses WAL", () => {
+test("store migrates to schema three and uses WAL", () => {
   const store = storeFixture();
   try {
-    assert.equal(store.status().schemaVersion, 2);
+    assert.equal(store.status().schemaVersion, 3);
     assert.equal(store.db.prepare("PRAGMA journal_mode").get().journal_mode, "wal");
-    assert.equal(store.db.prepare("SELECT version FROM schema_meta").get().version, 2);
+    assert.equal(store.db.prepare("SELECT version FROM schema_meta").get().version, 3);
   } finally {
     store.close();
   }
@@ -40,7 +40,7 @@ test("schema-one stores migrate without losing existing control state", () => {
   legacy.close();
   const store = new LichessStore(file);
   try {
-    assert.equal(store.status().schemaVersion, 2);
+    assert.equal(store.status().schemaVersion, 3);
     assert.equal(store.control().paused, true);
     assert.deepEqual(store.apiSafetyState("https://lichess.org|arena-bot"), {
       cooldownUntil: 0,
@@ -154,6 +154,18 @@ test("challenge and game completion writes are idempotent", () => {
     store.beginGame({
       id: "game", opponent: "opponent", audience: "bot", color: "black", startedAt: 500,
       engineBuildFingerprint: "engine-a", modelFingerprint: "model-a", providerFingerprint: "provider-a",
+      modelId: "model-id-a", checkpointHash: "checkpoint-a", adapterId: "adapter-a",
+      provider: "directml", hardwareDriverFingerprint: "hardware-a",
+      onnxRuntimeVersion: "1.2.3", searchCore: "v2", threads: 6, rootWorkers: 6,
+      splitDepth: 2, batchSize: 64, batchWaitUs: 0, timeProfileIdentity: "time-a",
+      runtimeProvenanceSha256: "sha256:provenance-a",
+      runtimeProvenance: { schema: "uci_arena_game_runtime_provenance_v1", version: "a" },
+    });
+    store.beginGame({
+      id: "game", opponent: "opponent", audience: "bot", color: "black", startedAt: 501,
+      engineBuildFingerprint: "engine-b", modelFingerprint: "model-b",
+      runtimeProvenanceSha256: "sha256:provenance-b",
+      runtimeProvenance: { schema: "uci_arena_game_runtime_provenance_v1", version: "b" },
     });
     store.finishGame({ id: "game", status: "mate", result: "win", winner: "black", plies: 42, finishedAt: 600 });
     store.finishGame({ id: "game", status: "resign", result: "loss", winner: "white", plies: 43, finishedAt: 700 });
@@ -163,8 +175,121 @@ test("challenge and game completion writes are idempotent", () => {
         accepts: 1, declines: 0, timeouts: 0, last_game_at: 600,
       },
     ]);
-    const row = store.db.prepare("SELECT result, engine_build_fingerprint FROM games WHERE game_id='game'").get();
-    assert.deepEqual({ ...row }, { result: "win", engine_build_fingerprint: "engine-a" });
+    const row = store.db.prepare(`
+      SELECT result, engine_build_fingerprint, model_id, model_fingerprint,
+        checkpoint_hash, adapter_id, provider, provider_fingerprint,
+        hardware_driver_fingerprint, onnx_runtime_version, search_core, threads,
+        root_workers, split_depth, batch_size, batch_wait_us, time_profile_identity,
+        runtime_provenance_sha256, runtime_provenance_json
+      FROM games WHERE game_id='game'
+    `).get();
+    assert.deepEqual({ ...row }, {
+      result: "win",
+      engine_build_fingerprint: "engine-a",
+      model_id: "model-id-a",
+      model_fingerprint: "model-a",
+      checkpoint_hash: "checkpoint-a",
+      adapter_id: "adapter-a",
+      provider: "directml",
+      provider_fingerprint: "provider-a",
+      hardware_driver_fingerprint: "hardware-a",
+      onnx_runtime_version: "1.2.3",
+      search_core: "v2",
+      threads: 6,
+      root_workers: 6,
+      split_depth: 2,
+      batch_size: 64,
+      batch_wait_us: 0,
+      time_profile_identity: "time-a",
+      runtime_provenance_sha256: "sha256:provenance-a",
+      runtime_provenance_json:
+        '{"schema":"uci_arena_game_runtime_provenance_v1","version":"a"}',
+    });
+  } finally {
+    store.close();
+  }
+});
+
+test("historical provenance backfill is dry-run-first, idempotent, and never overwrites identity", () => {
+  const store = storeFixture();
+  const startedAt = Date.parse("2026-07-20T12:00:00Z");
+  const baseGame = {
+    id: "historical-game",
+    opponent: "opponent",
+    audience: "bot",
+    color: "white",
+    startedAt,
+    engineBuildFingerprint: "sha256:historical-engine",
+    modelFingerprint: "historical-model-fingerprint",
+    providerFingerprint: "historical-provider-fingerprint",
+    bookIdentity: "sha256:historical-book",
+  };
+  const entry = {
+    deployment_id: "historical-deployment",
+    started_at_or_after: "2026-07-20T11:59:00Z",
+    started_before: "2026-07-20T12:01:00Z",
+    expected_game_count: 1,
+    match: {
+      engine_build_fingerprint: baseGame.engineBuildFingerprint,
+      model_fingerprint: baseGame.modelFingerprint,
+      provider_fingerprint: baseGame.providerFingerprint,
+      book_identity: baseGame.bookIdentity,
+    },
+    values: {
+      model_id: "historical-model",
+      checkpoint_hash: "historical-checkpoint",
+      adapter_id: "historical-adapter",
+      provider: "directml",
+      hardware_driver_fingerprint: "historical-hardware",
+      onnx_runtime_version: "1.2.3",
+      search_core: "v2",
+      threads: 6,
+      root_workers: 6,
+      split_depth: 2,
+      batch_size: 64,
+      batch_wait_us: 0,
+      time_profile_identity: "sha256:historical-time-profile",
+    },
+    provenance: {
+      schema: "uci_arena_game_runtime_provenance_v1",
+      engine: { build_fingerprint: baseGame.engineBuildFingerprint },
+      model: { id: "historical-model", fingerprint: baseGame.modelFingerprint },
+      provider: { name: "directml", numeric_fingerprint: baseGame.providerFingerprint },
+      search: { threads: 6, root_workers: 6 },
+      timing: { profile_identity_sha256: "sha256:historical-time-profile" },
+      book: { configuration_identity: baseGame.bookIdentity, observed_active: null },
+    },
+    evidence_sources: [{ path: "runtime.log", sha256: "sha256:evidence" }],
+    unknown_fields: ["book.observed_active"],
+  };
+  try {
+    store.beginGame(baseGame);
+    const dryRun = store.backfillGameProvenance([entry]);
+    assert.equal(dryRun[0].would_update, 1);
+    assert.equal(store.db.prepare("SELECT model_id FROM games WHERE game_id=?").get(baseGame.id).model_id, "");
+
+    const applied = store.backfillGameProvenance([entry], { apply: true });
+    assert.equal(applied[0].updated, 1);
+    const row = store.db.prepare(`SELECT model_id, checkpoint_hash, threads, root_workers,
+      runtime_provenance_sha256, runtime_provenance_json FROM games WHERE game_id=?`).get(baseGame.id);
+    assert.equal(row.model_id, "historical-model");
+    assert.equal(row.checkpoint_hash, "historical-checkpoint");
+    assert.equal(row.threads, 6);
+    assert.equal(row.root_workers, 6);
+    assert.match(row.runtime_provenance_sha256, /^sha256:[0-9a-f]{64}$/);
+    assert.deepEqual(JSON.parse(row.runtime_provenance_json).historical_backfill.unknown_fields,
+      ["book.observed_active"]);
+
+    const replay = store.backfillGameProvenance([entry], { apply: true });
+    assert.equal(replay[0].skipped_existing, 1);
+    const conflicting = structuredClone(entry);
+    conflicting.values.model_id = "invented-model";
+    assert.throws(
+      () => store.backfillGameProvenance([conflicting], { apply: true }),
+      /conflicting rows/,
+    );
+    assert.equal(store.db.prepare("SELECT model_id FROM games WHERE game_id=?").get(baseGame.id).model_id,
+      "historical-model");
   } finally {
     store.close();
   }

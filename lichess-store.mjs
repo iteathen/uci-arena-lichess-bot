@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -25,6 +26,34 @@ function botRating(bot) {
     if (Number.isFinite(rating)) return Math.round(rating);
   }
   return 0;
+}
+
+const GAME_PROVENANCE_BACKFILL_COLUMNS = Object.freeze({
+  model_id: "text",
+  checkpoint_hash: "text",
+  adapter_id: "text",
+  provider: "text",
+  hardware_driver_fingerprint: "text",
+  onnx_runtime_version: "text",
+  search_core: "text",
+  threads: "integer",
+  root_workers: "integer",
+  split_depth: "integer",
+  batch_size: "integer",
+  batch_wait_us: "integer",
+  time_profile_identity: "text",
+});
+
+function timestamp(value, label) {
+  const parsed = typeof value === "number" ? value : Date.parse(String(value ?? ""));
+  if (!Number.isSafeInteger(parsed) || parsed < 0) throw new Error(`Invalid ${label}: ${value}`);
+  return parsed;
+}
+
+function exactIdentity(value, label) {
+  const normalized = String(value ?? "").trim();
+  if (!normalized) throw new Error(`Historical provenance requires ${label}`);
+  return normalized;
 }
 
 export class LichessStore {
@@ -133,7 +162,35 @@ export class LichessStore {
       }
       version = 2;
     }
-    if (version !== 2) throw new Error(`Unsupported Lichess store schema version: ${version}`);
+    if (version === 2) {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        this.db.exec(`
+          ALTER TABLE games ADD COLUMN model_id TEXT NOT NULL DEFAULT '';
+          ALTER TABLE games ADD COLUMN checkpoint_hash TEXT NOT NULL DEFAULT '';
+          ALTER TABLE games ADD COLUMN adapter_id TEXT NOT NULL DEFAULT '';
+          ALTER TABLE games ADD COLUMN provider TEXT NOT NULL DEFAULT '';
+          ALTER TABLE games ADD COLUMN hardware_driver_fingerprint TEXT NOT NULL DEFAULT '';
+          ALTER TABLE games ADD COLUMN onnx_runtime_version TEXT NOT NULL DEFAULT '';
+          ALTER TABLE games ADD COLUMN search_core TEXT NOT NULL DEFAULT '';
+          ALTER TABLE games ADD COLUMN threads INTEGER NOT NULL DEFAULT 0;
+          ALTER TABLE games ADD COLUMN root_workers INTEGER NOT NULL DEFAULT 0;
+          ALTER TABLE games ADD COLUMN split_depth INTEGER NOT NULL DEFAULT 0;
+          ALTER TABLE games ADD COLUMN batch_size INTEGER NOT NULL DEFAULT 0;
+          ALTER TABLE games ADD COLUMN batch_wait_us INTEGER NOT NULL DEFAULT 0;
+          ALTER TABLE games ADD COLUMN time_profile_identity TEXT NOT NULL DEFAULT '';
+          ALTER TABLE games ADD COLUMN runtime_provenance_sha256 TEXT NOT NULL DEFAULT '';
+          ALTER TABLE games ADD COLUMN runtime_provenance_json TEXT NOT NULL DEFAULT '{}';
+          UPDATE schema_meta SET version=3;
+        `);
+        this.db.exec("COMMIT");
+      } catch (error) {
+        this.db.exec("ROLLBACK");
+        throw error;
+      }
+      version = 3;
+    }
+    if (version !== 3) throw new Error(`Unsupported Lichess store schema version: ${version}`);
   }
 
   close() {
@@ -393,11 +450,17 @@ export class LichessStore {
 
   beginGame(game) {
     const now = game.startedAt ?? Date.now();
+    const runtimeProvenanceJson = JSON.stringify(game.runtimeProvenance ?? {});
     this.db.prepare(`
       INSERT INTO games(game_id, opponent, audience, color, rated, speed, clock_limit,
         clock_increment, status, started_at, engine_build_fingerprint, model_fingerprint,
-        provider_fingerprint, book_identity)
-      VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'started', ?, ?, ?, ?, ?)
+        provider_fingerprint, book_identity, model_id, checkpoint_hash, adapter_id,
+        provider, hardware_driver_fingerprint, onnx_runtime_version, search_core, threads,
+        root_workers, split_depth, batch_size, batch_wait_us, time_profile_identity,
+        runtime_provenance_sha256, runtime_provenance_json)
+      VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'started', ?9, ?10, ?11, ?12,
+        ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26,
+        ?27, ?28)
       ON CONFLICT(game_id) DO UPDATE SET opponent=excluded.opponent,
         audience=excluded.audience, color=excluded.color, rated=excluded.rated,
         speed=excluded.speed, clock_limit=excluded.clock_limit,
@@ -405,7 +468,152 @@ export class LichessStore {
     `).run(String(game.id), normalizedUsername(game.opponent), game.audience, game.color,
       game.rated ? 1 : 0, game.speed ?? "", integer(game.clockLimit), integer(game.clockIncrement),
       now, game.engineBuildFingerprint ?? "", game.modelFingerprint ?? "",
-      game.providerFingerprint ?? "", game.bookIdentity ?? "");
+      game.providerFingerprint ?? "", game.bookIdentity ?? "", game.modelId ?? "",
+      game.checkpointHash ?? "", game.adapterId ?? "", game.provider ?? "",
+      game.hardwareDriverFingerprint ?? "", game.onnxRuntimeVersion ?? "",
+      game.searchCore ?? "", integer(game.threads), integer(game.rootWorkers),
+      integer(game.splitDepth), integer(game.batchSize), integer(game.batchWaitUs),
+      game.timeProfileIdentity ?? "", game.runtimeProvenanceSha256 ?? "",
+      runtimeProvenanceJson);
+  }
+
+  backfillGameProvenance(entries, { apply = false } = {}) {
+    if (!Array.isArray(entries) || entries.length === 0) {
+      throw new Error("Historical provenance backfill requires at least one evidence entry");
+    }
+    const reports = [];
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const entry of entries) {
+        const deploymentId = exactIdentity(entry.deployment_id, "deployment_id");
+        const from = timestamp(entry.started_at_or_after, "started_at_or_after");
+        const before = timestamp(entry.started_before, "started_before");
+        if (from >= before) throw new Error(`Invalid historical interval for ${deploymentId}`);
+        const match = entry.match ?? {};
+        const engineBuild = exactIdentity(match.engine_build_fingerprint, "engine_build_fingerprint");
+        const modelFingerprint = exactIdentity(match.model_fingerprint, "model_fingerprint");
+        const providerFingerprint = exactIdentity(match.provider_fingerprint, "provider_fingerprint");
+        const bookIdentity = exactIdentity(match.book_identity, "book_identity");
+        if (!Array.isArray(match.game_ids ?? [])) {
+          throw new Error(`Invalid historical game_ids selector for ${deploymentId}`);
+        }
+        const gameIds = (match.game_ids ?? []).map((gameId) => String(gameId));
+        if (new Set(gameIds).size !== gameIds.length
+            || gameIds.some((gameId) => !/^[A-Za-z0-9]{8}$/.test(gameId))) {
+          throw new Error(`Invalid historical game_ids selector for ${deploymentId}`);
+        }
+        const expectedGames = integer(entry.expected_game_count, -1);
+        if (expectedGames < 1) throw new Error(`Invalid expected_game_count for ${deploymentId}`);
+        const values = entry.values ?? {};
+        for (const field of Object.keys(values)) {
+          if (!Object.hasOwn(GAME_PROVENANCE_BACKFILL_COLUMNS, field)) {
+            throw new Error(`Unsupported historical provenance field for ${deploymentId}: ${field}`);
+          }
+        }
+        const provenance = {
+          ...(entry.provenance ?? {}),
+          historical_backfill: {
+            deployment_id: deploymentId,
+            interval: {
+              started_at_or_after: new Date(from).toISOString(),
+              started_before: new Date(before).toISOString(),
+            },
+            matched_identity: {
+              engine_build_fingerprint: engineBuild,
+              model_fingerprint: modelFingerprint,
+              provider_fingerprint: providerFingerprint,
+              book_identity: bookIdentity,
+              game_ids: gameIds,
+            },
+            evidence_sources: entry.evidence_sources ?? [],
+            unknown_fields: entry.unknown_fields ?? [],
+          },
+        };
+        if (provenance.schema !== "uci_arena_game_runtime_provenance_v1") {
+          throw new Error(`Invalid provenance schema for ${deploymentId}`);
+        }
+        if (provenance.engine?.build_fingerprint !== engineBuild
+            || provenance.model?.fingerprint !== modelFingerprint
+            || provenance.provider?.numeric_fingerprint !== providerFingerprint
+            || provenance.book?.configuration_identity !== bookIdentity) {
+          throw new Error(`Historical provenance identity does not match evidence selector for ${deploymentId}`);
+        }
+        const serialized = JSON.stringify(provenance);
+        const provenanceSha256 = `sha256:${createHash("sha256").update(serialized).digest("hex")}`;
+        const gameSelector = gameIds.length > 0
+          ? ` AND game_id IN (${gameIds.map(() => "?").join(", ")})`
+          : "";
+        const rows = this.db.prepare(`
+          SELECT game_id, model_id, checkpoint_hash, adapter_id, provider,
+            hardware_driver_fingerprint, onnx_runtime_version, search_core, threads,
+            root_workers, split_depth, batch_size, batch_wait_us, time_profile_identity,
+            runtime_provenance_sha256
+          FROM games
+          WHERE started_at>=? AND started_at<? AND engine_build_fingerprint=?
+            AND model_fingerprint=? AND provider_fingerprint=? AND book_identity=?
+            ${gameSelector}
+          ORDER BY started_at, game_id
+        `).all(from, before, engineBuild, modelFingerprint, providerFingerprint, bookIdentity, ...gameIds);
+        if (rows.length !== expectedGames) {
+          throw new Error(
+            `Historical provenance match count mismatch for ${deploymentId}: expected ${expectedGames}, got ${rows.length}`,
+          );
+        }
+        const report = {
+          deployment_id: deploymentId,
+          matched: rows.length,
+          updated: 0,
+          would_update: 0,
+          skipped_existing: 0,
+          conflicts: [],
+          runtime_provenance_sha256: provenanceSha256,
+        };
+        const columns = Object.keys(values);
+        for (const row of rows) {
+          const conflicts = columns.filter((field) => {
+            const existing = row[field];
+            const kind = GAME_PROVENANCE_BACKFILL_COLUMNS[field];
+            const populated = kind === "integer" ? Number(existing) !== 0 : String(existing ?? "") !== "";
+            return populated && existing !== values[field];
+          });
+          if (row.runtime_provenance_sha256) {
+            if (row.runtime_provenance_sha256 === provenanceSha256 && conflicts.length === 0) {
+              report.skipped_existing += 1;
+            } else {
+              report.conflicts.push({ game_id: row.game_id, fields: ["runtime_provenance_sha256", ...conflicts] });
+            }
+            continue;
+          }
+          if (conflicts.length > 0) {
+            report.conflicts.push({ game_id: row.game_id, fields: conflicts });
+            continue;
+          }
+          report.would_update += 1;
+          if (!apply) continue;
+          const assignments = columns.map((field) => {
+            const blank = GAME_PROVENANCE_BACKFILL_COLUMNS[field] === "integer" ? "0" : "''";
+            return `${field}=CASE WHEN ${field}=${blank} THEN ? ELSE ${field} END`;
+          });
+          this.db.prepare(`UPDATE games SET ${assignments.join(", ")},
+            runtime_provenance_sha256=?, runtime_provenance_json=?
+            WHERE game_id=? AND runtime_provenance_sha256=''`)
+            .run(...columns.map((field) => values[field]), provenanceSha256, serialized, row.game_id);
+          report.updated += 1;
+        }
+        reports.push(report);
+      }
+      const conflicts = reports.flatMap((report) => report.conflicts);
+      if (conflicts.length > 0) {
+        const error = new Error(`Historical provenance backfill found ${conflicts.length} conflicting rows`);
+        error.reports = reports;
+        throw error;
+      }
+      this.db.exec(apply ? "COMMIT" : "ROLLBACK");
+      return reports;
+    } catch (error) {
+      if (this.db.isTransaction) this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   finishGame({ id, status, result, winner, plies, finishedAt = Date.now() }) {
@@ -439,7 +647,7 @@ export class LichessStore {
 
   status(now = Date.now()) {
     return {
-      schemaVersion: 2,
+      schemaVersion: 3,
       control: this.control(now),
       owners: this.listOwners(),
       opponents: this.db.prepare("SELECT COUNT(*) AS count FROM opponents").get().count,
