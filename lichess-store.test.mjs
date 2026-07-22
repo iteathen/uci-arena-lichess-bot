@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import { LichessStore } from "./lichess-store.mjs";
@@ -16,43 +17,90 @@ test("store migrates to schema two and uses WAL", () => {
   try {
     assert.equal(store.status().schemaVersion, 2);
     assert.equal(store.db.prepare("PRAGMA journal_mode").get().journal_mode, "wal");
+    assert.equal(store.db.prepare("SELECT version FROM schema_meta").get().version, 2);
   } finally {
     store.close();
   }
 });
 
-test("rate-limit circuit breaker persists stepped backoff and admits one half-open request", () => {
-  const store = storeFixture();
-  const filePath = store.filePath;
+test("schema-one stores migrate without losing existing control state", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-lichess-store-v1-"));
+  const file = path.join(directory, "matches.sqlite");
+  const legacy = new DatabaseSync(file);
+  legacy.exec(`
+    CREATE TABLE schema_meta(version INTEGER NOT NULL);
+    INSERT INTO schema_meta(version) VALUES(1);
+    CREATE TABLE scheduler_control(
+      id INTEGER PRIMARY KEY CHECK(id=1),
+      paused INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL
+    );
+    INSERT INTO scheduler_control(id, paused, updated_at) VALUES(1, 1, 123);
+  `);
+  legacy.close();
+  const store = new LichessStore(file);
   try {
-    const first = store.recordApiRateLimit429({ random: () => 0 }, 1_000);
-    assert.equal(first.consecutive429, 1);
-    assert.equal(first.blockedUntil, 61_000);
+    assert.equal(store.status().schemaVersion, 2);
+    assert.equal(store.control().paused, true);
+    assert.deepEqual(store.apiSafetyState("https://lichess.org|arena-bot"), {
+      cooldownUntil: 0,
+      strikeCount: 0,
+      last429At: 0,
+      lastRetryAfterMs: 0,
+    });
   } finally {
     store.close();
   }
+});
 
-  const reopened = new LichessStore(filePath);
+test("API cooldown state is durable and never shortened", () => {
+  const store = storeFixture();
+  const key = "https://lichess.org|arena-bot";
   try {
-    assert.equal(reopened.apiRateLimitState(2_000).blocked, true);
-    assert.equal(reopened.beginApiRateLimitRequest(60_999), false);
-    assert.equal(reopened.beginApiRateLimitRequest(61_000), true);
-    assert.equal(reopened.beginApiRateLimitRequest(61_000), false);
-    const second = reopened.recordApiRateLimit429({ random: () => 0 }, 61_000);
-    assert.equal(second.consecutive429, 2);
-    assert.equal(second.blockedUntil, 181_000);
-    const retryAfter = reopened.recordApiRateLimit429({ retryAfterMs: 1_000_000, random: () => 0 }, 181_000);
-    assert.equal(retryAfter.blockedUntil, 1_181_000);
-    reopened.clearApiRateLimit();
-    assert.deepEqual(reopened.apiRateLimitState(1_181_000), {
-      consecutive429: 0,
-      blockedUntil: 0,
-      last429At: 0,
-      halfOpen: false,
-      blocked: false,
+    store.saveApiSafetyState(key, {
+      cooldownUntil: 100_000,
+      strikeCount: 1,
+      last429At: 40_000,
+      lastRetryAfterMs: 60_000,
+    }, 40_000);
+    store.saveApiSafetyState(key, {
+      cooldownUntil: 90_000,
+      strikeCount: 2,
+      last429At: 50_000,
+      lastRetryAfterMs: 1_000,
+    }, 50_000);
+    assert.deepEqual(store.apiSafetyState(key), {
+      cooldownUntil: 100_000,
+      strikeCount: 2,
+      last429At: 50_000,
+      lastRetryAfterMs: 1_000,
     });
   } finally {
-    reopened.close();
+    store.close();
+  }
+});
+
+test("API client lease excludes a second process and permits stale takeover", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-lichess-lease-"));
+  const file = path.join(directory, "matches.sqlite");
+  const first = new LichessStore(file);
+  const second = new LichessStore(file);
+  const key = "https://lichess.org|arena-bot";
+  try {
+    first.acquireApiLease(key, "owner-one", 101, 1_000, 60_000);
+    assert.throws(
+      () => second.acquireApiLease(key, "owner-two", 202, 2_000, 60_000),
+      (error) => error.code === "LICHESS_API_LEASE_HELD",
+    );
+    first.heartbeatApiLease(key, "owner-one", 101, 10_000, 60_000);
+    assert.equal(first.apiLease(key).expires_at, 70_000);
+    second.acquireApiLease(key, "owner-two", 202, 70_001, 60_000);
+    assert.equal(second.apiLease(key).owner_id, "owner-two");
+    assert.equal(first.releaseApiLease(key, "owner-one"), false);
+    assert.equal(second.releaseApiLease(key, "owner-two"), true);
+  } finally {
+    first.close();
+    second.close();
   }
 });
 
