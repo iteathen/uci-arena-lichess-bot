@@ -89,6 +89,22 @@ node deploy\lichess\lichess-adapter.mjs qualify `
   --time-profile runtime_state\models\<MODEL_ID>\cache\uci_time_profile_v3.json
 ```
 
+Measure MCGS simulation-worker scaling before selecting the single-game
+topology. `Threads` is the MCGS worker control; `RootWorkers` is compatibility
+metadata and is held fixed. The benchmark uses a fresh process per
+worker-count trial, tests cold and rerooted warm graphs, verifies every move,
+and only writes evidence—it does not edit or deploy a profile.
+
+```powershell
+node engine\tools\benchmark_mcgs_workers.mjs `
+  --workers 3,4,6,8,10 `
+  --movetimes 250,500,1000 `
+  --trials 3 `
+  --performance-cores 6 `
+  --efficiency-cores 4 `
+  --output runtime_state\models\<MODEL_ID>\cache\mcgs_worker_scaling.json
+```
+
 Qualify the configured concurrency. All requested children are started and
 searched concurrently, must retain the selected GPU provider and MCGS telemetry,
 and are then closed cleanly. The resulting profile is bound to the executable,
