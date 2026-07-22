@@ -107,6 +107,8 @@ Syzygy options; tablebase-disabled worker evidence is not deployment evidence.
 
 ```powershell
 node engine\tools\benchmark_mcgs_workers.mjs `
+  --engine build\Release\uci_arena.exe `
+  --model-root engine\runtime\models\<MODEL_ID>\engine `
   --workers 3,4,6,8,10 `
   --movetimes 250,500,1000 `
   --trials 3 `
