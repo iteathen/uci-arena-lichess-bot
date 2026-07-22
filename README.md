@@ -26,9 +26,9 @@ The tracked v6 template is enabled for two concurrent games:
 
 - one hard-reserved public-human slot, never loaned to automated bot play;
 - one bot slot which the scheduler tries to keep active;
-- casual standard `3+2` outbound games;
+- casual standard `10+2` outbound games;
 - online bot discovery through `GET /api/bot/online?nb=512`;
-- a two-game-per-opponent rolling daily limit and decline/timeout cooldowns.
+- a one-game-per-opponent rolling daily limit and decline/timeout cooldowns.
 - explicit opponent-turn UCI search, with a predicted reply using `go ponder`
   and a no-prediction fallback using `go infinite`;
 - foreground search preemption of every other game’s ponder work;
@@ -104,6 +104,16 @@ node engine\tools\benchmark_mcgs_workers.mjs `
   --efficiency-cores 4 `
   --output runtime_state\models\<MODEL_ID>\cache\mcgs_worker_scaling.json
 ```
+
+The current exact-model operating choice is `Threads=3` with
+`RootWorkers=1` retained only as compatibility metadata. Four workers improved
+several warm throughput samples, but scored 7/16 against the three-worker
+control in 16 equal-wall-time paired-color games. Six and ten workers were
+throughput-dominated; eight was mixed and adverse against four. This selects a
+current operating point, not a permanent default: repeat the entire matrix when
+the executable, model, provider/runtime, batching, graph policy, or hardware
+identity changes. No result in this matrix authorizes switching live search away
+from MCGS.
 
 Qualify the configured concurrency. All requested children are started and
 searched concurrently, must retain the selected GPU provider and MCGS telemetry,
