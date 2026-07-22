@@ -147,6 +147,18 @@ paired completed-edge gain at the actual reply root has a positive 95% lower
 bound. Statistical ties and no demonstrated gain select the smaller value,
 including the neural-only `0` control.
 
+Build the replay corpus from one previously downloaded Lichess PGN export; the
+builder makes no API calls and validates every actual reply at its exact root:
+
+```powershell
+node engine\tools\build_mcgs_book_prior_corpus.mjs `
+  --input runtime_state\lichess\mcgs_recent_games.pgn `
+  --account UCI_Arena_Bot `
+  --max-root-ply 16 `
+  --max-transitions-per-game 2 `
+  --output runtime_state\lichess\mcgs_book_prior_corpus.json
+```
+
 ```powershell
 node engine\tools\benchmark_mcgs_book_prior.mjs `
   --engine build\Release\uci_arena.exe `
