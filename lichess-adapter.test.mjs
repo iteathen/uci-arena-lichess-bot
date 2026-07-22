@@ -84,7 +84,10 @@ function qualifiedFixture() {
     hardware_driver_fingerprint: "5678",
     onnx_runtime_version: "1.22.0",
     provider_numeric_fingerprint: "9012",
-    search_core: "v2",
+    search_core: "mcgs",
+    search_graph_mb: 384,
+    mcgs_cpuct_permille: 1750,
+    mcgs_outstanding_batches: 3,
     provider: "directml",
     threads: 4,
     root_workers: 4,
@@ -119,7 +122,8 @@ function qualifiedRuntimeStatus(profile) {
     provider_numeric_fingerprint: profile.provider_numeric_fingerprint,
     hardware_driver_fingerprint: profile.hardware_driver_fingerprint,
     onnx_runtime_version: profile.onnx_runtime_version,
-    search_core_configured: "v2",
+    search_core_configured: "mcgs",
+    mcgs_time_policy_configured: "RelativeClockTemporalV1",
     threads_configured: profile.threads,
     root_workers_configured: profile.root_workers,
     split_depth_configured: profile.split_depth,
@@ -129,18 +133,27 @@ function qualifiedRuntimeStatus(profile) {
     batch_wait_us_effective: profile.batch_wait_us,
     background_search: false,
     last_search_available: true,
-    last_search_core: "v2",
+    last_search_core: "mcgs",
     last_search_threads: profile.threads,
     last_search_root_workers: profile.root_workers,
     actual_active_workers: 4,
     root_workers_active: true,
     worker_gate_active: true,
-    persistent_workers: true,
+    persistent_workers: false,
     search_batch_coupling: true,
-    v2_cursor_admissions: 19,
-    v2_cursor_async_pending: 8,
-    v2_cursor_ready_resumes: 8,
-    v2_cursor_peak_waiting: 4,
+    mcgs_graph_nodes: 73,
+    mcgs_graph_edges: 411,
+    mcgs_completed_simulations: 96,
+    mcgs_async_admissions: 88,
+    mcgs_outstanding_peak: 16,
+    mcgs_root_seeded_moves: 20,
+    mcgs_root_legal_moves: 20,
+    mcgs_neural_admission_closed: false,
+    mcgs_provider_admission_denials: 0,
+    mcgs_cache_completions_after_admission_close: 0,
+    mcgs_nonprovider_backups_after_admission_close: 0,
+    mcgs_stale_backups_discarded: 0,
+    mcgs_reservation_leaks: 0,
     evaluation_service_async_lease_completions: 8,
     evaluation_service_stale_publications_discarded: 0,
     evaluation_service_active_async_leases: 0,
@@ -163,6 +176,7 @@ function gameConfig() {
         engine_build_fingerprint: "sha256:engine",
         model_fingerprint: "model",
         provider_numeric_fingerprint: "provider",
+        search_core: "mcgs",
       },
     },
     timing: {
@@ -236,7 +250,19 @@ class MockGameEngine {
     return {
       bestmove: value.bestmove,
       ponder: value.ponder ?? null,
-      telemetry: { nodes: value.nodes ?? 1, ...(value.telemetry ?? {}) },
+      telemetry: {
+        nodes: value.nodes ?? 1,
+        time_policy: "RelativeClockTemporalV1",
+        time_opponent_remaining_ms: 180_000,
+        time_opponent_increment_ms: 2_000,
+        time_temporal_weight_permille: 2_000,
+        time_relative_surplus_ms: 0,
+        time_relative_credit_ms: 0,
+        time_relative_scheduled_ms: 0,
+        time_completion_kind: "searched_decision",
+        time_completion_applied: 1,
+        ...(value.telemetry ?? {}),
+      },
       rootMoves: [...rootMoves],
       rootKey: rootMoves.join(" "),
       runtimeGeneration: this.runtimeGeneration,
@@ -385,6 +411,8 @@ test("runtime config is credential-free and resolves repository paths", () => {
   assert.equal(config.timing.initial_transport_reserve_ms, 650);
   assert.equal(config.timing.bootstrap_transport_reserve_ms, 650);
   assert.equal(config.engine.uci_options.ModelRoot, "engine/runtime/models/example/engine");
+  assert.equal(config.engine.uci_options.McgsTimePolicy, "RelativeClockTemporalV1");
+  assert.equal(config.engine.uci_options.OwnBook, true);
   assert.equal(config.engine.executable.includes(ROOT.replaceAll("\\", "/")), true);
 });
 
@@ -489,6 +517,10 @@ test("v6 timing policy rejects conflicting UCI ownership and invalid reserves", 
   writeFileSync(configPath, JSON.stringify(template));
   assert.throws(() => loadRuntimeConfig({ templatePath: configPath }), /timing-profile-owned/);
   template.engine.uci_options.TimeProfileIterationForecastScalePermille = 1000;
+  template.engine.uci_options.McgsTimePolicy = "Legacy";
+  writeFileSync(configPath, JSON.stringify(template));
+  assert.throws(() => loadRuntimeConfig({ templatePath: configPath }), /RelativeClockTemporalV1/);
+  template.engine.uci_options.McgsTimePolicy = "RelativeClockTemporalV1";
   template.timing.initial_transport_reserve_ms = 5_001;
   writeFileSync(configPath, JSON.stringify(template));
   assert.throws(() => loadRuntimeConfig({ templatePath: configPath }), /0\.\.5000/);
@@ -498,7 +530,7 @@ test("v6 timing policy rejects conflicting UCI ownership and invalid reserves", 
   assert.throws(() => loadRuntimeConfig({ templatePath: configPath }), /no qualified capacity profile/);
 });
 
-test("qualified single-game profile is identity-bound and owns the parallel topology", () => {
+test("qualified MCGS single-game profile is identity-bound and owns the parallel topology", () => {
   const fixture = qualifiedFixture();
   const loaded = loadSingleGameProfile(fixture.profilePath);
   assert.equal(loaded.model_id, fixture.profile.model_id);
@@ -514,9 +546,12 @@ test("qualified single-game profile is identity-bound and owns the parallel topo
       "NNBatchWaitUs",
       "NNSpeculation",
       "BackgroundSearch",
+      "SearchGraphMB",
+      "McgsCpuctPermille",
+      "McgsOutstandingBatches",
     ].includes(name))),
     {
-      SearchCore: "v2",
+      SearchCore: "mcgs",
       Threads: 4,
       RootWorkers: 4,
       V2SplitDepth: 2,
@@ -525,7 +560,23 @@ test("qualified single-game profile is identity-bound and owns the parallel topo
       NNBatchWaitUs: 150,
       NNSpeculation: false,
       BackgroundSearch: false,
+      SearchGraphMB: 384,
+      McgsCpuctPermille: 1750,
+      McgsOutstandingBatches: 3,
     },
+  );
+});
+
+test("live profile application rejects V2 search authority", () => {
+  const fixture = qualifiedFixture();
+  fixture.profile.search_core = "v2";
+  delete fixture.profile.search_graph_mb;
+  delete fixture.profile.mcgs_cpuct_permille;
+  delete fixture.profile.mcgs_outstanding_batches;
+  writeFileSync(fixture.profilePath, JSON.stringify(fixture.profile));
+  assert.throws(
+    () => applySingleGameProfile(fixture.config),
+    /requires a qualified MCGS single-game profile/,
   );
 });
 
@@ -580,6 +631,7 @@ test("MCGS timing identity includes graph and outstanding-work topology", () => 
       SearchGraphMB: 64,
       McgsCpuctPermille: 1500,
       McgsOutstandingBatches: 2,
+      McgsTimePolicy: "RelativeClockTemporalV1",
       NNBatchSize: 32,
       NNBatchWaitUs: 150,
       OnnxProvider: "directml",
@@ -594,6 +646,7 @@ test("MCGS timing identity includes graph and outstanding-work topology", () => 
   assert.equal(configuration.searchGraphMb, 64);
   assert.equal(configuration.mcgsCpuctPermille, 1500);
   assert.equal(configuration.mcgsOutstandingBatches, 2);
+  assert.equal(configuration.mcgsTimePolicy, "RelativeClockTemporalV1");
 });
 
 test("runtime qualification waits for detached provider tickets to drain", async () => {
@@ -615,7 +668,7 @@ test("profile-owned topology rejects a conflicting tracked option", () => {
   assert.throws(() => applySingleGameProfile(fixture.config), /conflicts.*SearchCore/);
 });
 
-test("capacity profile is exact-identity-bound and may qualify a larger configured pool", () => {
+test("MCGS rejects a capacity profile without timing-profile identity", () => {
   const fixture = qualifiedFixture();
   const single = loadSingleGameProfile(fixture.profilePath);
   fixture.config.capacity = { total_slots: 2, legacy_shared: false };
@@ -633,16 +686,16 @@ test("capacity profile is exact-identity-bound and may qualify a larger configur
     evidence: Array.from({ length: 4 }, (_, index) => ({ child: index + 1, qualified: true })),
   };
   writeFileSync(capacityPath, JSON.stringify(capacity));
-  assert.equal(loadCapacityProfile(capacityPath, fixture.config, single).maximum_concurrency, 4);
-  fixture.config.capacity.total_slots = 5;
-  assert.throws(() => loadCapacityProfile(capacityPath, fixture.config, single), /exceeds qualified/);
-  fixture.config.capacity.total_slots = 2;
+  assert.throws(
+    () => loadCapacityProfile(capacityPath, fixture.config, single),
+    /requires a timing-bound Lichess capacity profile v2/,
+  );
   capacity.model_fingerprint = "different";
   writeFileSync(capacityPath, JSON.stringify(capacity));
   assert.throws(() => loadCapacityProfile(capacityPath, fixture.config, single), /model_fingerprint mismatch/);
 });
 
-test("runtime status gate accepts active one-game cursor batching and rejects fallback", () => {
+test("runtime status gate accepts active one-game MCGS batching and rejects fallback", () => {
   const { profile } = qualifiedFixture();
   const status = qualifiedRuntimeStatus(profile);
   const line = `info string runtime_status_v1 ${JSON.stringify(status)}`;
@@ -673,7 +726,7 @@ test("MCGS capacity profile v2 binds the accepted timing profile", () => {
     schema: "uci_arena_lichess_capacity_profile_v2",
     qualified: true,
     published_at: "2026-07-20T00:00:00Z",
-    maximum_concurrency: 2,
+    maximum_concurrency: 4,
     engine_build_fingerprint: fixture.profile.engine_build_fingerprint,
     single_game_profile_sha256: sha256(readFileSync(fixture.profilePath)),
     model_fingerprint: fixture.profile.model_fingerprint,
@@ -682,11 +735,14 @@ test("MCGS capacity profile v2 binds the accepted timing profile", () => {
     time_profile_sha256: sha256(readFileSync(timeProfilePath)),
     time_profile_identity_sha256: "sha256:time-identity",
     search_core: "mcgs",
-    evidence: [{ child: 1, qualified: true }, { child: 2, qualified: true }],
+    evidence: Array.from({ length: 4 }, (_, index) => ({ child: index + 1, qualified: true })),
   };
   writeFileSync(capacityPath, JSON.stringify(capacity));
   assert.equal(loadCapacityProfile(capacityPath, fixture.config, single).schema,
     "uci_arena_lichess_capacity_profile_v2");
+  fixture.config.capacity.total_slots = 5;
+  assert.throws(() => loadCapacityProfile(capacityPath, fixture.config, single), /exceeds qualified/);
+  fixture.config.capacity.total_slots = 2;
   capacity.time_profile_identity_sha256 = "sha256:stale";
   writeFileSync(capacityPath, JSON.stringify(capacity));
   assert.throws(
@@ -777,7 +833,7 @@ test("game provenance captures exact model, effective timing options, and observ
   config.engine.qualification_profile = { ...profile, profile_path: config.engine.single_game_profile };
   config.engine.uci_options = {
     ...config.engine.uci_options,
-    SearchCore: "v2",
+    SearchCore: "mcgs",
     Threads: 4,
     RootWorkers: 4,
     V2SplitDepth: 2,
@@ -786,6 +842,10 @@ test("game provenance captures exact model, effective timing options, and observ
     NNBatchWaitUs: 150,
     NNSpeculation: false,
     BackgroundSearch: false,
+    SearchGraphMB: 384,
+    McgsCpuctPermille: 1750,
+    McgsOutstandingBatches: 3,
+    McgsTimePolicy: "RelativeClockTemporalV1",
   };
   config.timing = { initial_transport_reserve_ms: 650, opponent_turn_search: true };
   const engine = {

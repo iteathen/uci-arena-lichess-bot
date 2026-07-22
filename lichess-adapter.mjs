@@ -86,7 +86,7 @@ const CHALLENGE_RESPONSE_MAX_AGE_MS = 20_000;
 const UCI_MOVE_PATTERN = /^[a-h][1-8][a-h][1-8][qrbn]?$/;
 const TIME_PROFILE_RESERVED_OPTIONS = new Set([
   "SearchCore", "Threads", "RootWorkers", "V2SplitDepth", "BackgroundSearch",
-  "SearchGraphMB", "McgsCpuctPermille", "McgsOutstandingBatches",
+  "SearchGraphMB", "McgsCpuctPermille", "McgsOutstandingBatches", "McgsTimePolicy",
   "NNSpeculation", "ModelRoot", "NNBatchSize", "NNBatchWaitUs", "OnnxProvider",
   "IterativeTimeController", "TimeProfileProviderReserveUs", "TimeProfileBackupEmitReserveUs",
   "TimeProfileIterationForecastScalePermille", "Move Overhead", "Ponder",
@@ -366,6 +366,12 @@ function normalizeTimingConfig(config) {
       "TimeProfileIterationForecastScalePermille is timing-profile-owned and must start at 1000",
     );
   }
+  const configuredMcgsTimePolicy = config.engine?.uci_options?.McgsTimePolicy;
+  if (configuredMcgsTimePolicy !== undefined
+      && String(configuredMcgsTimePolicy) !== "RelativeClockTemporalV1") {
+    throw new Error("Live MCGS requires McgsTimePolicy=RelativeClockTemporalV1");
+  }
+  config.engine.uci_options.McgsTimePolicy = "RelativeClockTemporalV1";
   config.engine.uci_options.IterativeTimeController = false;
   config.engine.uci_options.TimeProfileProviderReserveUs = 0;
   config.engine.uci_options.TimeProfileBackupEmitReserveUs = 1000;
@@ -527,6 +533,9 @@ export function loadSingleGameProfile(profilePath) {
 
 export function applySingleGameProfile(config) {
   const profile = loadSingleGameProfile(config.engine.single_game_profile);
+  if (profile.search_core !== "mcgs") {
+    throw new Error("Live deployment requires a qualified MCGS single-game profile");
+  }
   const engineFingerprint = sha256File(config.engine.executable);
   if (engineFingerprint !== profile.engine_build_fingerprint) {
     throw new Error("Single-game profile engine build fingerprint mismatch");
@@ -963,9 +972,30 @@ function parseInfo(line) {
     "mcgs_async_capacity_deferrals",
     "mcgs_root_seeded_moves",
     "mcgs_root_legal_moves",
+    "mcgs_provider_admission_denials",
+    "mcgs_cache_completions_after_admission_close",
+    "mcgs_nonprovider_backups_after_admission_close",
     "mcgs_stale_backups_discarded",
     "mcgs_reservation_leaks",
     "mcgs_snapshot_sequence",
+    "time_opponent_remaining_ms",
+    "time_opponent_increment_ms",
+    "time_horizon_moves",
+    "time_safety_reserve_ms",
+    "time_safe_ms",
+    "time_decision_index",
+    "time_temporal_weight_permille",
+    "time_temporal_weight_sum_permille",
+    "time_unweighted_optimum_ms",
+    "time_phase_optimum_ms",
+    "time_relative_surplus_ms",
+    "time_relative_credit_ms",
+    "time_relative_scheduled_ms",
+    "time_book_credit_before_ms",
+    "time_book_credit_scheduled_ms",
+    "time_book_credit_after_ms",
+    "time_searched_decisions_completed",
+    "time_completion_applied",
   ]) {
     const match = line.match(new RegExp(`(?:^| )${key} (\\d+)`));
     if (match) telemetry[key] = Number(match[1]);
@@ -985,6 +1015,8 @@ function parseInfo(line) {
     "book_miss_reason",
     "book_evaluation_source",
     "book_snapshot_identity",
+    "time_policy",
+    "time_completion_kind",
   ]) {
     const match = line.match(new RegExp(`(?:^| )${key} ([^ ]+)`));
     if (match) telemetry[key] = match[1];
@@ -1020,6 +1052,34 @@ function requireQualifiedSearchIdentity(profile, telemetry) {
       );
     }
   }
+}
+
+function requireQualifiedMcgsTimeTelemetry(profile, telemetry) {
+  if (profile.search_core !== "mcgs") {
+    throw new Error("Live move authority is not MCGS");
+  }
+  if (telemetry.time_policy !== "RelativeClockTemporalV1") {
+    throw new Error(
+      `UCI move did not use RelativeClockTemporalV1: ${telemetry.time_policy ?? "missing"}`,
+    );
+  }
+  for (const field of [
+    "time_opponent_remaining_ms",
+    "time_opponent_increment_ms",
+    "time_temporal_weight_permille",
+    "time_relative_surplus_ms",
+    "time_relative_credit_ms",
+    "time_relative_scheduled_ms",
+    "time_completion_applied",
+  ]) {
+    if (!Number.isSafeInteger(telemetry[field]) || telemetry[field] < 0) {
+      throw new Error(`UCI move timing telemetry is missing ${field}`);
+    }
+  }
+  if (typeof telemetry.time_completion_kind !== "string") {
+    throw new Error("UCI move timing telemetry is missing completion authority");
+  }
+  return telemetry;
 }
 
 export function parseRuntimeStatus(line) {
@@ -1096,6 +1156,10 @@ export function validateRuntimeStatus(profile, status) {
     requireRuntimeStatus(status.v2_cursor_ready_resumes > 0, "no ready root cursor resumed");
     requireRuntimeStatus(status.v2_cursor_peak_waiting > 0, "no concurrent cursor wait was observed");
   } else {
+    requireRuntimeStatus(
+      status.mcgs_time_policy_configured === "RelativeClockTemporalV1",
+      "MCGS relative-clock temporal policy was inactive",
+    );
     requireRuntimeStatus(status.mcgs_graph_nodes > 0, "MCGS graph contains no nodes");
     requireRuntimeStatus(status.mcgs_graph_edges > 0, "MCGS graph contains no edges");
     requireRuntimeStatus(status.mcgs_completed_simulations > 0, "MCGS completed no simulations");
@@ -1110,6 +1174,23 @@ export function validateRuntimeStatus(profile, status) {
       "MCGS discarded a stale backup during qualification",
     );
     requireRuntimeStatus(status.mcgs_reservation_leaks === 0, "MCGS leaked reservations");
+    for (const field of [
+      "mcgs_provider_admission_denials",
+      "mcgs_cache_completions_after_admission_close",
+      "mcgs_nonprovider_backups_after_admission_close",
+    ]) {
+      requireRuntimeStatus(
+        Number.isSafeInteger(status[field]) && status[field] >= 0,
+        `MCGS deadline-tail telemetry ${field} is missing`,
+      );
+    }
+    requireRuntimeStatus(
+      (status.mcgs_provider_admission_denials === 0
+        && status.mcgs_cache_completions_after_admission_close === 0
+        && status.mcgs_nonprovider_backups_after_admission_close === 0)
+        || status.mcgs_neural_admission_closed === true,
+      "MCGS reported post-admission-close work without closing admission",
+    );
   }
   requireRuntimeStatus(
     status.evaluation_service_async_lease_completions > 0,
@@ -1187,6 +1268,10 @@ export class UciEngine {
       "TimeProfileBackupEmitReserveUs",
       "TimeProfileIterationForecastScalePermille",
     ];
+    if (String(this.config.uci_options.SearchCore) === "mcgs"
+        || this.config.qualification_profile?.search_core === "mcgs") {
+      requiredTimingOptions.push("McgsTimePolicy");
+    }
     if (this.timing.opponent_turn_search) requiredTimingOptions.push("Ponder");
     const missingTimingOptions = requiredTimingOptions
       .filter((name) => !this.advertisedOptions.has(name));
@@ -1306,6 +1391,7 @@ export class UciEngine {
       searchGraphMb: Number(options.SearchGraphMB),
       mcgsCpuctPermille: Number(options.McgsCpuctPermille),
       mcgsOutstandingBatches: Number(options.McgsOutstandingBatches),
+      mcgsTimePolicy: String(options.McgsTimePolicy),
       batchSize: Number(options.NNBatchSize),
       batchWaitUs: Number(options.NNBatchWaitUs),
       provider: String(options.OnnxProvider),
@@ -2550,6 +2636,10 @@ export class GameSession {
         throw new Error(`UCI bestmove belongs to a stale root or runtime generation for ${this.gameId}`);
       }
       requireQualifiedSearchIdentity(this.config.engine.qualification_profile, result.telemetry ?? {});
+      requireQualifiedMcgsTimeTelemetry(
+        this.config.engine.qualification_profile,
+        result.telemetry ?? {},
+      );
       if (!UCI_MOVE_PATTERN.test(result.bestmove)) {
         throw new Error(`UCI bestmove failed legal-root syntax validation: ${result.bestmove ?? "missing"}`);
       }
