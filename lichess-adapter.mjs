@@ -57,6 +57,7 @@ const PROFILE_OWNED_UCI_OPTIONS = Object.freeze({
   search_graph_mb: "SearchGraphMB",
   mcgs_cpuct_permille: "McgsCpuctPermille",
   mcgs_outstanding_batches: "McgsOutstandingBatches",
+  mcgs_book_prior_blend_permille: "McgsBookPriorBlendPermille",
   provider: "OnnxProvider",
   batch_size: "NNBatchSize",
   batch_wait_us: "NNBatchWaitUs",
@@ -508,6 +509,12 @@ export function loadSingleGameProfile(profilePath) {
     requireInteger(profile.search_graph_mb, "search_graph_mb", 64, 4_096);
     requireInteger(profile.mcgs_cpuct_permille, "mcgs_cpuct_permille", 100, 10_000);
     requireInteger(profile.mcgs_outstanding_batches, "mcgs_outstanding_batches", 1, 4);
+    requireInteger(
+      profile.mcgs_book_prior_blend_permille,
+      "mcgs_book_prior_blend_permille",
+      0,
+      500,
+    );
   }
   requireInteger(profile.batch_size, "batch_size", 2, 256);
   requireInteger(profile.batch_wait_us, "batch_wait_us", 0, 2_000);
@@ -655,6 +662,7 @@ export function applySingleGameProfile(config) {
     profileValues.SearchGraphMB = profile.search_graph_mb;
     profileValues.McgsCpuctPermille = profile.mcgs_cpuct_permille;
     profileValues.McgsOutstandingBatches = profile.mcgs_outstanding_batches;
+    profileValues.McgsBookPriorBlendPermille = profile.mcgs_book_prior_blend_permille;
   }
   if (profile.tablebase) {
     Object.assign(profileValues, {
@@ -1070,6 +1078,14 @@ function parseInfo(line) {
     "mcgs_async_capacity_deferrals",
     "mcgs_root_seeded_moves",
     "mcgs_root_legal_moves",
+    "mcgs_book_hint_active",
+    "mcgs_book_hint_candidates",
+    "mcgs_book_prior_blend_permille",
+    "mcgs_book_top_frequency_ppm",
+    "mcgs_book_top_neural_prior_ppm",
+    "mcgs_book_top_effective_prior_ppm",
+    "mcgs_root_completed_edges_at_start",
+    "mcgs_root_visited_edges_at_start",
     "mcgs_provider_admission_denials",
     "mcgs_cache_completions_after_admission_close",
     "mcgs_nonprovider_backups_after_admission_close",
@@ -1113,6 +1129,10 @@ function parseInfo(line) {
     "book_miss_reason",
     "book_evaluation_source",
     "book_snapshot_identity",
+    "mcgs_search_intent",
+    "mcgs_book_hint_result",
+    "mcgs_book_hint_identity",
+    "mcgs_book_top_move",
     "time_policy",
     "time_completion_kind",
   ]) {
@@ -1233,6 +1253,13 @@ export function validateRuntimeStatus(profile, status) {
     );
   }
   requireRuntimeStatus(status.threads_configured === profile.threads, "thread topology mismatch");
+  if (profile.search_core === "mcgs") {
+    requireRuntimeStatus(
+      status.mcgs_book_prior_blend_permille_configured
+        === profile.mcgs_book_prior_blend_permille,
+      "MCGS book-prior blend mismatch",
+    );
+  }
   requireRuntimeStatus(
     status.root_workers_configured === profile.root_workers,
     "root-worker topology mismatch",
@@ -1836,7 +1863,7 @@ export class UciEngine {
       );
     }
     this.send(this.formatPosition(moves));
-    return this.beginSearch("opponent_root", "go infinite", { rootMoves: moves });
+    return this.beginSearch("opponent_root", "go infinite opponentroot", { rootMoves: moves });
   }
 
   async ponderHit({ timeoutMs, signal }) {
@@ -2060,6 +2087,9 @@ export function gameRuntimeProvenance(config, engine) {
       observed_enabled: liveRuntime.opening_book_enabled ?? null,
       observed_active: liveRuntime.opening_book_active ?? null,
       observed_entries: liveRuntime.opening_book_entries ?? null,
+      observed_identity: liveRuntime.opening_book_identity ?? "",
+      mcgs_prior_blend_permille:
+        Number(config.engine.uci_options?.McgsBookPriorBlendPermille ?? 0),
       observed_message: liveRuntime.opening_book_message ?? "",
     },
     tablebase: {
@@ -2441,7 +2471,7 @@ export class GameSession {
   async invalidateOpponentSearch(reason) {
     const drained = await this.pauseOpponentSearch(reason);
     if (this.pendingOwnMove) this.pendingOwnMove.predictedMove = null;
-    this.lastPonderMissReason = reason;
+    this.lastPonderMissReason = reason === "opponent_root_reroot" ? null : reason;
     return drained;
   }
 
@@ -2583,7 +2613,22 @@ export class GameSession {
   preparedPonderHit(moves, engine) {
     const pending = this.pendingOwnMove;
     const active = engine.opponentTurnSearchSnapshot();
-    if (!pending?.predictedMove) return { hit: false, reason: "no_predicted_move" };
+    if (!pending?.predictedMove) {
+      const opponentRootReroot = Boolean(
+        pending
+        && active?.kind === "opponent_root"
+        && startsWithMoves(moves, pending.projectedMoves)
+        && moves.length === pending.projectedMoves.length + 1
+        && active.rootKey === movesKey(pending.projectedMoves)
+        && active.runtimeGeneration === pending.runtimeGeneration
+        && engine.runtimeGeneration === pending.runtimeGeneration
+      );
+      return {
+        hit: false,
+        reason: opponentRootReroot ? null : "no_predicted_move",
+        opponentRootReroot,
+      };
+    }
     if (!startsWithMoves(moves, pending.projectedMoves)
         || moves.length !== pending.projectedMoves.length + 1
         || moves.at(-1) !== pending.predictedMove) {
@@ -2657,7 +2702,7 @@ export class GameSession {
       if (!ownMoveAcknowledged && !ponder.hit && !stillWaitingForOwnAck) {
         const reason = transition.kind === "takeback" || transition.kind === "divergence"
           ? transition.kind
-          : ponder.reason;
+          : ponder.opponentRootReroot ? "opponent_root_reroot" : ponder.reason;
         const stopped = await this.invalidateOpponentSearch(reason ?? "authoritative_state_miss");
         drained ||= stopped.drained;
         this.pendingOwnMove = null;
@@ -2711,7 +2756,10 @@ export class GameSession {
       receivedAt,
       observation,
       ponderHit: ponder.hit,
-      ponderMissReason: ponder.hit ? null : ponder.reason ?? this.lastPonderMissReason,
+      opponentRootReroot: Boolean(ponder.opponentRootReroot),
+      ponderMissReason: ponder.hit || ponder.opponentRootReroot
+        ? null
+        : ponder.reason ?? this.lastPonderMissReason,
       staleBestmoveDrained: drained || this.staleBestmoveDrained,
     });
   }
@@ -2721,6 +2769,7 @@ export class GameSession {
     receivedAt,
     observation,
     ponderHit,
+    opponentRootReroot = false,
     ponderMissReason,
     staleBestmoveDrained,
   }) {
@@ -2812,7 +2861,9 @@ export class GameSession {
         this.pendingOwnMove = {
           baseRootKey: rootKey,
           projectedMoves: [...moves, result.bestmove],
-          predictedMove: result.ponder,
+          predictedMove: String(this.config.engine.uci_options.SearchCore).toLowerCase() === "mcgs"
+            ? null
+            : result.ponder,
           runtimeGeneration: result.runtimeGeneration,
           ponderSearchGeneration: null,
           estimatedClock,
@@ -2862,8 +2913,11 @@ export class GameSession {
         move_queue_wait_ms: moveQueueWaitMs,
         state_received_to_dispatch_ms: postDispatchedAt - receivedAt,
         post_dispatch_to_ack_ms: postAcknowledgedAt - postDispatchedAt,
-        ponder_mode: ponderHit ? "ponder" : "foreground",
+        ponder_mode: ponderHit
+          ? "ponder"
+          : opponentRootReroot ? "opponent_root_reroot" : "foreground",
         ponder_hit: Boolean(ponderHit),
+        opponent_root_reroot: Boolean(opponentRootReroot),
         ponder_miss_reason: ponderMissReason,
         stale_bestmove_drained: Boolean(staleBestmoveDrained),
         transport_reserve_ms: this.config.timing.initial_transport_reserve_ms,

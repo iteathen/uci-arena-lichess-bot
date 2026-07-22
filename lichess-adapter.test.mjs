@@ -88,6 +88,7 @@ function qualifiedFixture() {
     search_graph_mb: 384,
     mcgs_cpuct_permille: 1750,
     mcgs_outstanding_batches: 3,
+    mcgs_book_prior_blend_permille: 250,
     provider: "directml",
     threads: 4,
     root_workers: 4,
@@ -124,6 +125,8 @@ function qualifiedRuntimeStatus(profile) {
     onnx_runtime_version: profile.onnx_runtime_version,
     search_core_configured: "mcgs",
     mcgs_time_policy_configured: "RelativeClockTemporalV1",
+    mcgs_book_prior_blend_permille_configured:
+      profile.mcgs_book_prior_blend_permille,
     threads_configured: profile.threads,
     root_workers_configured: profile.root_workers,
     split_depth_configured: profile.split_depth,
@@ -163,6 +166,7 @@ function qualifiedRuntimeStatus(profile) {
     opening_book_enabled: true,
     opening_book_active: true,
     opening_book_entries: 1259,
+    opening_book_identity: "123456789",
     opening_book_message: "loaded",
     ...(profile.tablebase ? {
       syzygy_active: true,
@@ -646,6 +650,7 @@ test("live profile application rejects V2 search authority", () => {
   delete fixture.profile.search_graph_mb;
   delete fixture.profile.mcgs_cpuct_permille;
   delete fixture.profile.mcgs_outstanding_batches;
+  delete fixture.profile.mcgs_book_prior_blend_permille;
   writeFileSync(fixture.profilePath, JSON.stringify(fixture.profile));
   assert.throws(
     () => applySingleGameProfile(fixture.config),
@@ -682,6 +687,7 @@ test("qualified MCGS profile owns graph and batching topology", () => {
     search_graph_mb: 384,
     mcgs_cpuct_permille: 1750,
     mcgs_outstanding_batches: 3,
+    mcgs_book_prior_blend_permille: 250,
   });
   writeFileSync(fixture.profilePath, JSON.stringify(fixture.profile));
   const loaded = loadSingleGameProfile(fixture.profilePath);
@@ -691,6 +697,7 @@ test("qualified MCGS profile owns graph and batching topology", () => {
   assert.equal(fixture.config.engine.uci_options.SearchGraphMB, 384);
   assert.equal(fixture.config.engine.uci_options.McgsCpuctPermille, 1750);
   assert.equal(fixture.config.engine.uci_options.McgsOutstandingBatches, 3);
+  assert.equal(fixture.config.engine.uci_options.McgsBookPriorBlendPermille, 250);
 });
 
 test("MCGS timing identity includes graph and outstanding-work topology", () => {
@@ -856,6 +863,7 @@ test("runtime status gate accepts qualified batched MCGS and rejects incomplete 
     search_graph_mb: 384,
     mcgs_cpuct_permille: 1750,
     mcgs_outstanding_batches: 3,
+    mcgs_book_prior_blend_permille: 250,
   });
   const status = {
     ...qualifiedRuntimeStatus(profile),
@@ -943,6 +951,7 @@ test("game provenance captures exact model, effective timing options, and observ
     SearchGraphMB: 384,
     McgsCpuctPermille: 1750,
     McgsOutstandingBatches: 3,
+    McgsBookPriorBlendPermille: 250,
     McgsTimePolicy: "RelativeClockTemporalV1",
     SyzygyPath: "E:/syzygy/standard/6",
     SyzygyManifest: "E:/syzygy/standard/6/syzygy_manifest_v1.json",
@@ -994,6 +1003,8 @@ test("game provenance captures exact model, effective timing options, and observ
   assert.equal(first.provenance.timing.transport_reserve_ms, 650);
   assert.equal(first.provenance.book.observed_active, true);
   assert.equal(first.provenance.book.observed_entries, 1259);
+  assert.equal(first.provenance.book.observed_identity, "123456789");
+  assert.equal(first.provenance.book.mcgs_prior_blend_permille, 250);
   assert.equal(first.provenance.tablebase.configured_probe_limit, 6);
   assert.equal(first.provenance.tablebase.observed_active, true);
   assert.equal(first.provenance.tablebase.observed_loaded_cardinality, 6);
@@ -1087,6 +1098,43 @@ test("UCI book telemetry is structured without losing later search identity", ()
   assert.equal(engine.latestInfo.book_snapshot_identity, "12345");
   assert.equal(engine.latestInfo.book_record_count, 363);
   assert.equal(engine.latestInfo.model_provider, "directml");
+  engine.onLine("info depth 3 mcgs_search_intent opponent_root mcgs_book_hint_result hit mcgs_book_hint_active 1 mcgs_book_hint_identity 18446744073709551615 mcgs_book_hint_candidates 2 mcgs_book_prior_blend_permille 250 mcgs_book_top_move e7e5 mcgs_book_top_frequency_ppm 700000 mcgs_book_top_neural_prior_ppm 100000 mcgs_book_top_effective_prior_ppm 250000 mcgs_root_completed_edges_at_start 4 mcgs_root_visited_edges_at_start 5");
+  assert.equal(engine.latestInfo.mcgs_search_intent, "opponent_root");
+  assert.equal(engine.latestInfo.mcgs_book_hint_identity, "18446744073709551615");
+  assert.equal(engine.latestInfo.mcgs_book_top_move, "e7e5");
+  assert.equal(engine.latestInfo.mcgs_book_top_effective_prior_ppm, 250000);
+  assert.equal(engine.latestInfo.mcgs_root_completed_edges_at_start, 4);
+});
+
+test("UCI MCGS opponent-root search uses the explicit opponentroot intent", async () => {
+  const engine = new UciEngine({
+    uci_options: {},
+    timing: {
+      opponent_turn_search: true,
+      foreground_preempts_ponder: true,
+      initial_transport_reserve_ms: 250,
+    },
+  });
+  engine.runtimeGeneration = 1;
+  const commands = [];
+  engine.send = (command) => {
+    commands.push(command);
+    if (command === "stop") queueMicrotask(() => engine.onLine("bestmove e7e5"));
+  };
+  const active = await engine.startOpponentTurnSearch({
+    moves: ["e2e4"],
+    predictedMove: null,
+    wtime: 180_000,
+    btime: 180_000,
+    winc: 0,
+    binc: 0,
+  });
+  assert.equal(active.kind, "opponent_root");
+  assert.deepEqual(commands.slice(0, 2), [
+    "position startpos moves e2e4",
+    "go infinite opponentroot",
+  ]);
+  await engine.stopAndDrain("test_complete");
 });
 
 test("terminal cancellation drain accepts null bestmove while foreground remains strict", async () => {
@@ -1289,6 +1337,26 @@ test("MCGS starts full opponent-root search at move POST dispatch before acknowl
   assert.equal(engine.active?.kind, "opponent_root");
   acknowledgePost();
   await move;
+});
+
+test("MCGS actual reply is an opponent-root reroot, not a ponder miss", async () => {
+  const posts = [];
+  const client = { post: async (endpoint) => posts.push(endpoint) };
+  const engine = new MockGameEngine([
+    { bestmove: "e2e4", ponder: "e7e5" },
+    { bestmove: "g1f3", ponder: "b8c6" },
+  ]);
+  const session = createGameSession(engine, client);
+  session.config.engine.uci_options.SearchCore = "mcgs";
+  const initial = startedState("");
+  await session.initialize(gameFull(initial), engine);
+  await session.onState(initial, engine);
+  await session.onState(startedState("e2e4"), engine);
+  await session.onState(startedState("e2e4 c7c5"), engine);
+  assert.equal(engine.stopCalls.at(-1).reason, "opponent_root_reroot");
+  assert.equal(session.lastPonderMissReason, null);
+  assert.equal(posts.length, 2);
+  assert.match(posts[1], /\/move\/g1f3$/);
 });
 
 test("black starts opponent-root work from gameFull and searches only after White moves", async () => {

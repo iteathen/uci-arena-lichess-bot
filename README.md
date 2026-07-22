@@ -37,8 +37,8 @@ The tracked v6 template is enabled for two concurrent games:
 - casual standard `10+2` outbound games;
 - online bot discovery through `GET /api/bot/online?nb=512`;
 - a one-game-per-opponent rolling daily limit and decline/timeout cooldowns.
-- explicit opponent-turn UCI search, with a predicted reply using `go ponder`
-  and a no-prediction fallback using `go infinite`;
+- explicit opponent-turn UCI search: MCGS sends `go infinite opponentroot`
+  without a predicted line, while legacy search retains predicted `go ponder`;
 - foreground search preemption of every other game’s ponder work;
 - a 650 ms bootstrap Lichess transport reserve applied through the engine’s
   `Move Overhead` option.
@@ -47,7 +47,7 @@ Version 2 through 4 configurations retain their declared legacy reserve. Live
 readiness requires the engine to advertise `Ponder`, `Move Overhead`,
 `IterativeTimeController`, `TimeProfileProviderReserveUs`, and
 `TimeProfileBackupEmitReserveUs`, `TimeProfileIterationForecastScalePermille`,
-and `McgsTimePolicy`; the
+`McgsTimePolicy`, and `McgsBookPriorBlendPermille`; the
 adapter fails instead of silently disabling opponent-turn search or its clock
 reserve.
 
@@ -55,7 +55,8 @@ The distinct `engine.time_profile` / `--time-profile` path may point at a
 qualified `uci_time_profile_v3.json`. Every engine child recomputes the exact
 engine/model/adapter/provider/hardware/search identity before applying that
 profile's provider-batch, backup/emission, and iteration-forecast reserves. The
-identity binds `McgsTimePolicy=RelativeClockTemporalV1`; qualification includes
+identity binds `McgsTimePolicy=RelativeClockTemporalV1` and the configured
+opponent-root book-prior blend; qualification includes
 a real two-clock sample proving that opponent-clock surplus and early searched
 decision weighting are active. A missing, stale, mismatched, or legacy-policy
 profile fails live startup before credential access and never selects V2.
@@ -112,6 +113,7 @@ node engine\tools\benchmark_mcgs_workers.mjs `
   --workers 3,4,6,8,10 `
   --movetimes 250,500,1000 `
   --trials 3 `
+  --mcgs-book-prior-blend-permille 250 `
   --performance-cores 6 `
   --efficiency-cores 4 `
   --engine-option BehaviorProfile=balanced `
@@ -135,6 +137,35 @@ current operating point, not a permanent default: repeat the entire matrix when
 the executable, model, provider/runtime, batching, graph policy, or hardware
 identity changes. No result in this matrix authorizes switching live search away
 from MCGS.
+
+Select the bounded opponent-root book blend before repeating the worker matrix.
+The corpus is held-out runtime evidence, grouped by game, with each transition
+containing the full legal UCI move prefix before the opponent reply, that actual
+reply, and its observed think time in milliseconds. The replay preserves MCGS,
+uses a fresh process for every blend, and selects a nonzero value only when its
+paired completed-edge gain at the actual reply root has a positive 95% lower
+bound. Statistical ties and no demonstrated gain select the smaller value,
+including the neural-only `0` control.
+
+```powershell
+node engine\tools\benchmark_mcgs_book_prior.mjs `
+  --engine build\Release\uci_arena.exe `
+  --model-root engine\runtime\models\<MODEL_ID>\engine `
+  --corpus runtime_state\lichess\mcgs_book_prior_corpus.json `
+  --blends 0,125,250,375,500 `
+  --threads 3 `
+  --engine-option BookFile=E:/book-forge/published/integration/strong_rare_v1.bin `
+  --engine-option BookStatsFile=E:/book-forge/published/integration/strong_rare_v1.ffstats `
+  --engine-option BookPolicyFile=E:/book-forge/published/integration/strong_rare_v1.policy `
+  --output runtime_state\lichess\mcgs_book_prior_replay.json
+```
+
+The corpus schema is `uci_arena_opponent_root_replay_corpus_v1` with `games[]`;
+each game has `id`, `initial_fen` (`startpos` is accepted), and ordered
+`transitions[]` containing `moves_before_reply[]`, `actual_reply`, and
+`think_ms`. The artifact records the exact engine, model, provider, hardware,
+book snapshot, corpus hash, correctness results, paired comparisons, and the
+selected blend.
 
 Qualify the configured concurrency. All requested children are started and
 searched concurrently, must retain the selected GPU provider and MCGS telemetry,
@@ -170,10 +201,16 @@ reconnects stop and drain stale UCI work, then rebuild the position from
 Lichess's authoritative move list. A whole process restart performs the same
 recovery before admitting new work.
 
-After a move POST is acknowledged, the adapter keeps Lichess’s streamed move
-list as canonical state and starts a separate projected ponder line. It sends
-`ponderhit` only when the next stream update exactly appends the predicted
-opponent move and the UCI runtime generation still matches. Misses, takebacks,
+At move POST dispatch, the adapter keeps Lichess's streamed move list as
+canonical state and starts projected opponent-turn work. MCGS searches every
+legal reply at the projected position with `go infinite opponentroot`; an
+opening-book hit may blend bounded raw-frequency guidance into only that
+session root's PUCT priors. It never fabricates visits or values, removes legal
+replies, mutates canonical neural edge priors, or carries the blend into the
+rerooted foreground search. The actual reply is drained and classified as
+`opponent_root_reroot`, not as a ponder miss. Legacy search sends `ponderhit`
+only when the next stream update exactly appends the predicted opponent move
+and the UCI runtime generation still matches. Misses, takebacks,
 reconnects, terminal states, and generation changes send `stop`, drain and
 discard that search’s `bestmove`, reconstruct the authoritative position, and
 start a normal timed search from the new root. Stream intake remains live while foreground search
@@ -194,7 +231,8 @@ reserve. The runtime snapshot also reports each game’s current UCI timing mode
 SQLite schema v3 binds every new game to immutable, queryable model and runtime
 identity: model id and fingerprint, checkpoint hash, adapter id, engine build,
 provider/runtime/hardware fingerprints, search core, threads, root workers,
-split depth, batch size/wait, timing-profile identity, book configuration, and
+split depth, batch size/wait, timing-profile identity, book configuration,
+the exact observed book snapshot identity and MCGS book-prior blend, and
 the configured plus observed Syzygy manifest/cardinality/worker identity.
 The `runtime_provenance_json` document additionally records every effective UCI
 option after timing-profile application, including provider and backup/emission
