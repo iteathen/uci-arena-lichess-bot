@@ -174,9 +174,10 @@ SQLite schema v3 binds every new game to immutable, queryable model and runtime
 identity: model id and fingerprint, checkpoint hash, adapter id, engine build,
 provider/runtime/hardware fingerprints, search core, threads, root workers,
 split depth, batch size/wait, timing-profile identity, and book configuration.
-The `runtime_provenance_json` document additionally records every UCI option the
-adapter applied, effective timing permissions/reserves, and the book state
-observed after qualification. Its SHA-256 is logged with `game_ready`.
+The `runtime_provenance_json` document additionally records every effective UCI
+option after timing-profile application, including provider and backup/emission
+reserves, effective timing permissions/reserves, and the book state observed
+after qualification. Its SHA-256 is logged with `game_ready`.
 Idempotent game recovery cannot replace this identity.
 
 Legacy rows remain blank after schema migration unless an explicit historical

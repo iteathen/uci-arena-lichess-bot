@@ -1882,6 +1882,7 @@ export function gameRuntimeProvenance(config, engine) {
     OwnBook: configuredBook,
     IterativeTimeController: timeProfile.predictive_controller_enabled ?? false,
     TimeProfileProviderReserveUs: timeProfile.provider_service_reserve_us ?? 0,
+    TimeProfileBackupEmitReserveUs: timeProfile.backup_emit_reserve_us ?? 1000,
     TimeProfileIterationForecastScalePermille:
       timeProfile.iteration_forecast_scale_permille ?? 1000,
     TimeProfileIterationTransitionP95Ms:
@@ -1931,6 +1932,7 @@ export function gameRuntimeProvenance(config, engine) {
       applied: timeProfile.applied ?? false,
       permissions: timeProfile.permissions ?? {},
       provider_service_reserve_us: timeProfile.provider_service_reserve_us ?? 0,
+      backup_emit_reserve_us: timeProfile.backup_emit_reserve_us ?? 1000,
       iteration_forecast_scale_permille:
         timeProfile.iteration_forecast_scale_permille ?? 1000,
       iteration_transition_p95_ms: transitionProfile,

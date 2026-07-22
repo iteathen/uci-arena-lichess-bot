@@ -856,6 +856,7 @@ test("game provenance captures exact model, effective timing options, and observ
       applied: true,
       identity_sha256: "sha256:time-profile",
       provider_service_reserve_us: 231000,
+      backup_emit_reserve_us: 2000,
       iteration_forecast_scale_permille: 1050,
       iteration_transition_p95_ms: [1, 2, 3],
       predictive_controller_enabled: false,
@@ -872,6 +873,9 @@ test("game provenance captures exact model, effective timing options, and observ
   assert.equal(first.provenance.search.applied_uci_options["Move Overhead"], "650");
   assert.equal(first.provenance.search.applied_uci_options.OwnBook, "true");
   assert.equal(first.provenance.search.applied_uci_options.TimeProfileProviderReserveUs, "231000");
+  assert.equal(first.provenance.search.applied_uci_options.TimeProfileBackupEmitReserveUs, "2000");
+  assert.equal(first.provenance.timing.provider_service_reserve_us, 231000);
+  assert.equal(first.provenance.timing.backup_emit_reserve_us, 2000);
   assert.equal(first.provenance.timing.transport_reserve_ms, 650);
   assert.equal(first.provenance.book.observed_active, true);
   assert.equal(first.provenance.book.observed_entries, 1259);
