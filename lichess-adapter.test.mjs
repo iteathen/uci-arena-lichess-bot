@@ -164,6 +164,14 @@ function qualifiedRuntimeStatus(profile) {
     opening_book_active: true,
     opening_book_entries: 1259,
     opening_book_message: "loaded",
+    ...(profile.tablebase ? {
+      syzygy_active: true,
+      syzygy_loaded_cardinality: profile.tablebase.loaded_cardinality,
+      syzygy_identity: "123456789",
+      syzygy_manifest_identity: profile.tablebase.manifest_identity,
+      syzygy_probe_threads: profile.tablebase.probe_threads,
+      syzygy_message: "active",
+    } : {}),
   };
 }
 
@@ -567,6 +575,64 @@ test("qualified MCGS single-game profile is identity-bound and owns the parallel
   );
 });
 
+test("profile application verifies and owns the complete Syzygy asset identity", () => {
+  const fixture = qualifiedFixture();
+  const directory = path.dirname(fixture.profilePath);
+  const tablebasePath = path.join(directory, "syzygy");
+  mkdirSync(tablebasePath);
+  const wdl = Buffer.from("wdl");
+  const dtz = Buffer.from("dtz");
+  writeFileSync(path.join(tablebasePath, "KQvK.rtbw"), wdl);
+  writeFileSync(path.join(tablebasePath, "KQvK.rtbz"), dtz);
+  const manifest = {
+    schema: "uci_arena_syzygy_manifest_v1",
+    cardinality: 6,
+    identity_sha256: `sha256:${"c".repeat(64)}`,
+    files: [
+      {
+        name: "KQvK.rtbw",
+        directory: "6-wdl",
+        bytes: wdl.length,
+        sha256: createHash("sha256").update(wdl).digest("hex"),
+      },
+      {
+        name: "KQvK.rtbz",
+        directory: "6-dtz",
+        bytes: dtz.length,
+        sha256: createHash("sha256").update(dtz).digest("hex"),
+      },
+    ],
+  };
+  const manifestPath = path.join(tablebasePath, "syzygy_manifest_v1.json");
+  const manifestBytes = Buffer.from(JSON.stringify(manifest));
+  writeFileSync(manifestPath, manifestBytes);
+  fixture.profile.tablebase = {
+    path: tablebasePath,
+    manifest: manifestPath,
+    manifest_identity: manifest.identity_sha256,
+    manifest_file_sha256: sha256(manifestBytes),
+    loaded_cardinality: 6,
+    probe_limit: 6,
+    probe_threads: 4,
+    rule50: true,
+    root_probe: true,
+    internal_probe: true,
+  };
+  writeFileSync(fixture.profilePath, JSON.stringify(fixture.profile));
+
+  applySingleGameProfile(fixture.config);
+  assert.equal(fixture.config.engine.uci_options.SyzygyPath, tablebasePath);
+  assert.equal(fixture.config.engine.uci_options.SyzygyManifest, manifestPath);
+  assert.equal(fixture.config.engine.uci_options.SyzygyProbeThreads, 4);
+  assert.equal(fixture.config.engine.uci_options.SyzygyInternalProbe, true);
+
+  writeFileSync(manifestPath, `${JSON.stringify(manifest)}\n`);
+  assert.throws(
+    () => applySingleGameProfile(fixture.config),
+    /Syzygy manifest file hash mismatch/,
+  );
+});
+
 test("live profile application rejects V2 search authority", () => {
   const fixture = qualifiedFixture();
   fixture.profile.search_core = "v2";
@@ -704,6 +770,31 @@ test("runtime status gate accepts active one-game MCGS batching and rejects fall
   assert.throws(
     () => validateRuntimeStatus(profile, { ...status, provider_effective: "cpu" }),
     /GPU provider fallback/,
+  );
+});
+
+test("runtime status gate binds the complete Syzygy manifest and worker topology", () => {
+  const { profile } = qualifiedFixture();
+  profile.tablebase = {
+    path: "E:/syzygy/standard/6",
+    manifest: "E:/syzygy/standard/6/syzygy_manifest_v1.json",
+    manifest_identity: `sha256:${"c".repeat(64)}`,
+    loaded_cardinality: 6,
+    probe_limit: 6,
+    probe_threads: 2,
+    rule50: true,
+    root_probe: true,
+    internal_probe: true,
+  };
+  const status = qualifiedRuntimeStatus(profile);
+  assert.equal(validateRuntimeStatus(profile, status), status);
+  assert.throws(
+    () => validateRuntimeStatus(profile, { ...status, syzygy_loaded_cardinality: 5 }),
+    /Syzygy cardinality mismatch/,
+  );
+  assert.throws(
+    () => validateRuntimeStatus(profile, { ...status, syzygy_manifest_identity: `sha256:${"d".repeat(64)}` }),
+    /Syzygy manifest identity mismatch/,
   );
 });
 
@@ -846,10 +937,27 @@ test("game provenance captures exact model, effective timing options, and observ
     McgsCpuctPermille: 1750,
     McgsOutstandingBatches: 3,
     McgsTimePolicy: "RelativeClockTemporalV1",
+    SyzygyPath: "E:/syzygy/standard/6",
+    SyzygyManifest: "E:/syzygy/standard/6/syzygy_manifest_v1.json",
+    SyzygyProbeLimit: 6,
+    SyzygyProbeThreads: 2,
+    Syzygy50MoveRule: true,
+    SyzygyRootProbe: true,
+    SyzygyInternalProbe: true,
   };
   config.timing = { initial_transport_reserve_ms: 650, opponent_turn_search: true };
   const engine = {
-    qualificationStatus: { live_runtime_status: qualifiedRuntimeStatus(profile) },
+    qualificationStatus: {
+      live_runtime_status: {
+        ...qualifiedRuntimeStatus(profile),
+        syzygy_active: true,
+        syzygy_loaded_cardinality: 6,
+        syzygy_identity: "123456789",
+        syzygy_manifest_identity: `sha256:${"b".repeat(64)}`,
+        syzygy_probe_threads: 2,
+        syzygy_message: "active",
+      },
+    },
     timeProfileStatus: {
       status: "accepted",
       accepted: true,
@@ -879,6 +987,10 @@ test("game provenance captures exact model, effective timing options, and observ
   assert.equal(first.provenance.timing.transport_reserve_ms, 650);
   assert.equal(first.provenance.book.observed_active, true);
   assert.equal(first.provenance.book.observed_entries, 1259);
+  assert.equal(first.provenance.tablebase.configured_probe_limit, 6);
+  assert.equal(first.provenance.tablebase.observed_active, true);
+  assert.equal(first.provenance.tablebase.observed_loaded_cardinality, 6);
+  assert.equal(first.provenance.tablebase.observed_manifest_identity, `sha256:${"b".repeat(64)}`);
   assert.match(first.sha256, /^sha256:[0-9a-f]{64}$/);
 });
 

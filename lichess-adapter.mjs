@@ -2,7 +2,15 @@
 
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { createInterface } from "node:readline";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
@@ -54,6 +62,13 @@ const PROFILE_OWNED_UCI_OPTIONS = Object.freeze({
   batch_wait_us: "NNBatchWaitUs",
   speculation: "NNSpeculation",
   background_search: "BackgroundSearch",
+  syzygy_path: "SyzygyPath",
+  syzygy_manifest: "SyzygyManifest",
+  syzygy_probe_limit: "SyzygyProbeLimit",
+  syzygy_probe_threads: "SyzygyProbeThreads",
+  syzygy_rule50: "Syzygy50MoveRule",
+  syzygy_root_probe: "SyzygyRootProbe",
+  syzygy_internal_probe: "SyzygyInternalProbe",
 });
 const REQUIRED_PROFILE_EVIDENCE = Object.freeze([
   "cursor_correctness",
@@ -536,6 +551,78 @@ export function applySingleGameProfile(config) {
   if (profile.search_core !== "mcgs") {
     throw new Error("Live deployment requires a qualified MCGS single-game profile");
   }
+  if (profile.tablebase !== undefined) {
+    if (!profile.tablebase || typeof profile.tablebase !== "object") {
+      throw new Error("Single-game profile tablebase must be an object");
+    }
+    requireString(profile.tablebase.path, "tablebase.path");
+    requireString(profile.tablebase.manifest, "tablebase.manifest");
+    requireString(
+      profile.tablebase.manifest_identity,
+      "tablebase.manifest_identity",
+      /^sha256:[0-9a-f]{64}$/,
+    );
+    requireString(
+      profile.tablebase.manifest_file_sha256,
+      "tablebase.manifest_file_sha256",
+      /^sha256:[0-9a-f]{64}$/,
+    );
+    requireInteger(profile.tablebase.loaded_cardinality, "tablebase.loaded_cardinality", 3, 7);
+    requireInteger(profile.tablebase.probe_limit, "tablebase.probe_limit", 3, 7);
+    requireInteger(profile.tablebase.probe_threads, "tablebase.probe_threads", 2, 8);
+    for (const field of ["rule50", "root_probe", "internal_probe"]) {
+      if (typeof profile.tablebase[field] !== "boolean") {
+        throw new Error(`Single-game profile tablebase.${field} must be boolean`);
+      }
+    }
+    const manifestPath = path.isAbsolute(profile.tablebase.manifest)
+      ? profile.tablebase.manifest
+      : path.resolve(config.engine.working_directory, profile.tablebase.manifest);
+    if (!existsSync(manifestPath)) {
+      throw new Error("Single-game profile Syzygy manifest is missing");
+    }
+    if (sha256File(manifestPath) !== profile.tablebase.manifest_file_sha256) {
+      throw new Error("Single-game profile Syzygy manifest file hash mismatch");
+    }
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    if (manifest.identity_sha256 !== profile.tablebase.manifest_identity) {
+      throw new Error("Single-game profile Syzygy manifest content identity mismatch");
+    }
+    if (manifest.schema !== "uci_arena_syzygy_manifest_v1"
+        || manifest.cardinality !== profile.tablebase.loaded_cardinality
+        || !Array.isArray(manifest.files)
+        || manifest.files.length === 0) {
+      throw new Error("Single-game profile Syzygy manifest contract mismatch");
+    }
+    const tablebasePath = path.isAbsolute(profile.tablebase.path)
+      ? profile.tablebase.path
+      : path.resolve(config.engine.working_directory, profile.tablebase.path);
+    let hasMaximumWdl = false;
+    let hasMaximumDtz = false;
+    for (const entry of manifest.files) {
+      if (!entry || typeof entry !== "object"
+          || typeof entry.name !== "string"
+          || path.basename(entry.name) !== entry.name
+          || !Number.isSafeInteger(entry.bytes)
+          || entry.bytes <= 0
+          || !/^[0-9a-f]{64}$/.test(entry.sha256 ?? "")) {
+        throw new Error("Single-game profile Syzygy manifest file entry is invalid");
+      }
+      hasMaximumWdl ||= entry.directory === `${profile.tablebase.loaded_cardinality}-wdl`
+        && entry.name.endsWith(".rtbw");
+      hasMaximumDtz ||= entry.directory === `${profile.tablebase.loaded_cardinality}-dtz`
+        && entry.name.endsWith(".rtbz");
+      const tableFile = path.join(tablebasePath, entry.name);
+      const tableMetadata = existsSync(tableFile) ? statSync(tableFile) : null;
+      if (tableMetadata === null || !tableMetadata.isFile()
+          || tableMetadata.size !== entry.bytes) {
+        throw new Error(`Single-game profile Syzygy table file is missing or partial: ${entry.name}`);
+      }
+    }
+    if (!hasMaximumWdl || !hasMaximumDtz) {
+      throw new Error("Single-game profile Syzygy manifest lacks maximum-cardinality WDL or DTZ files");
+    }
+  }
   const engineFingerprint = sha256File(config.engine.executable);
   if (engineFingerprint !== profile.engine_build_fingerprint) {
     throw new Error("Single-game profile engine build fingerprint mismatch");
@@ -568,6 +655,17 @@ export function applySingleGameProfile(config) {
     profileValues.SearchGraphMB = profile.search_graph_mb;
     profileValues.McgsCpuctPermille = profile.mcgs_cpuct_permille;
     profileValues.McgsOutstandingBatches = profile.mcgs_outstanding_batches;
+  }
+  if (profile.tablebase) {
+    Object.assign(profileValues, {
+      SyzygyPath: profile.tablebase.path,
+      SyzygyManifest: profile.tablebase.manifest,
+      SyzygyProbeLimit: profile.tablebase.probe_limit,
+      SyzygyProbeThreads: profile.tablebase.probe_threads,
+      Syzygy50MoveRule: profile.tablebase.rule50,
+      SyzygyRootProbe: profile.tablebase.root_probe,
+      SyzygyInternalProbe: profile.tablebase.internal_probe,
+    });
   }
   for (const optionName of Object.values(PROFILE_OWNED_UCI_OPTIONS)
     .filter((name) => Object.hasOwn(profileValues, name))) {
@@ -1119,6 +1217,21 @@ export function validateRuntimeStatus(profile, status) {
     status.search_core_configured === profile.search_core,
     `SearchCore ${profile.search_core} is not configured`,
   );
+  if (profile.tablebase) {
+    requireRuntimeStatus(status.syzygy_active === true, "Syzygy provider is inactive");
+    requireRuntimeStatus(
+      status.syzygy_loaded_cardinality === profile.tablebase.loaded_cardinality,
+      "Syzygy cardinality mismatch",
+    );
+    requireRuntimeStatus(
+      status.syzygy_manifest_identity === profile.tablebase.manifest_identity,
+      "Syzygy manifest identity mismatch",
+    );
+    requireRuntimeStatus(
+      status.syzygy_probe_threads === profile.tablebase.probe_threads,
+      "Syzygy worker topology mismatch",
+    );
+  }
   requireRuntimeStatus(status.threads_configured === profile.threads, "thread topology mismatch");
   requireRuntimeStatus(
     status.root_workers_configured === profile.root_workers,
@@ -1948,6 +2061,31 @@ export function gameRuntimeProvenance(config, engine) {
       observed_active: liveRuntime.opening_book_active ?? null,
       observed_entries: liveRuntime.opening_book_entries ?? null,
       observed_message: liveRuntime.opening_book_message ?? "",
+    },
+    tablebase: {
+      configured_path: config.engine.uci_options?.SyzygyPath ?? "",
+      configured_manifest: config.engine.uci_options?.SyzygyManifest ?? "",
+      configured_manifest_file_sha256: optionalFileFingerprint(
+        config.engine.uci_options?.SyzygyManifest,
+        config.engine.working_directory,
+      ),
+      configured_probe_limit: Number(config.engine.uci_options?.SyzygyProbeLimit ?? 0),
+      configured_probe_threads: Number(config.engine.uci_options?.SyzygyProbeThreads ?? 0),
+      configured_rule50: String(
+        config.engine.uci_options?.Syzygy50MoveRule ?? false,
+      ).toLocaleLowerCase() === "true",
+      configured_root_probe: String(
+        config.engine.uci_options?.SyzygyRootProbe ?? false,
+      ).toLocaleLowerCase() === "true",
+      configured_internal_probe: String(
+        config.engine.uci_options?.SyzygyInternalProbe ?? false,
+      ).toLocaleLowerCase() === "true",
+      observed_active: liveRuntime.syzygy_active ?? null,
+      observed_loaded_cardinality: liveRuntime.syzygy_loaded_cardinality ?? null,
+      observed_identity: liveRuntime.syzygy_identity ?? "",
+      observed_manifest_identity: liveRuntime.syzygy_manifest_identity ?? "",
+      observed_probe_threads: liveRuntime.syzygy_probe_threads ?? null,
+      observed_message: liveRuntime.syzygy_message ?? "",
     },
     profiles: {
       single_game_sha256: optionalFileFingerprint(

@@ -20,6 +20,14 @@ Live search authority is MCGS-only. A missing or rejected exact MCGS timing or
 capacity profile fails startup before credential access; it never switches to
 V2 or another search core.
 
+The live endgame provider is the complete local 3-6-piece Syzygy WDL+DTZ set.
+Provision it resumably with `node tools/syzygy/manage.mjs download`; inspect it
+with the `status` command and run the full published-set hash pass with
+`verify`. Only the checksum-verified, atomically published directory may be configured. The
+single-game profile binds `SyzygyPath`, `SyzygyManifest`, probe cardinality,
+worker topology, and the manifest SHA-256. Qualification fails before
+credential access if any of those values is inactive or mismatched.
+
 ## Default behavior
 
 The tracked v6 template is enabled for two concurrent games:
@@ -173,7 +181,8 @@ reserve. The runtime snapshot also reports each game’s current UCI timing mode
 SQLite schema v3 binds every new game to immutable, queryable model and runtime
 identity: model id and fingerprint, checkpoint hash, adapter id, engine build,
 provider/runtime/hardware fingerprints, search core, threads, root workers,
-split depth, batch size/wait, timing-profile identity, and book configuration.
+split depth, batch size/wait, timing-profile identity, book configuration, and
+the configured plus observed Syzygy manifest/cardinality/worker identity.
 The `runtime_provenance_json` document additionally records every effective UCI
 option after timing-profile application, including provider and backup/emission
 reserves, effective timing permissions/reserves, and the book state observed
