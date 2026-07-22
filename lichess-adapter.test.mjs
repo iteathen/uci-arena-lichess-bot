@@ -631,6 +631,13 @@ test("profile application verifies and owns the complete Syzygy asset identity",
     () => applySingleGameProfile(fixture.config),
     /Syzygy manifest file hash mismatch/,
   );
+
+  writeFileSync(manifestPath, manifestBytes);
+  writeFileSync(path.join(tablebasePath, "KQvK.rtbw"), Buffer.from("partial"));
+  assert.throws(
+    () => applySingleGameProfile(fixture.config),
+    /Syzygy table file is missing or partial: KQvK\.rtbw/,
+  );
 });
 
 test("live profile application rejects V2 search authority", () => {
