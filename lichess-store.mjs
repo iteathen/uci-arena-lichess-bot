@@ -133,6 +133,47 @@ export class LichessStore {
       CREATE INDEX IF NOT EXISTS games_opponent_finished ON games(opponent, finished_at);
       CREATE INDEX IF NOT EXISTS challenges_opponent_created ON challenge_attempts(opponent, created_at);
     `);
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS api_safety_state(
+        authority_key TEXT PRIMARY KEY,
+        cooldown_until INTEGER NOT NULL DEFAULT 0,
+        strike_count INTEGER NOT NULL DEFAULT 0,
+        last_429_at INTEGER NOT NULL DEFAULT 0,
+        last_retry_after_ms INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS api_client_leases(
+        authority_key TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL,
+        pid INTEGER NOT NULL,
+        heartbeat_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL
+      );
+    `);
+    const legacyRateLimit = this.db.prepare(`
+      SELECT 1 AS present FROM sqlite_master
+      WHERE type='table' AND name='api_rate_limit'
+    `).get();
+    if (legacyRateLimit) {
+      this.db.exec(`
+        INSERT INTO api_safety_state(
+          authority_key, cooldown_until, strike_count, last_429_at,
+          last_retry_after_ms, updated_at
+        )
+        SELECT '*', blocked_until, consecutive_429, last_429_at, 0,
+          MAX(last_429_at, blocked_until)
+        FROM api_rate_limit WHERE id=1
+        ON CONFLICT(authority_key) DO UPDATE SET
+          cooldown_until=MAX(api_safety_state.cooldown_until, excluded.cooldown_until),
+          strike_count=CASE
+            WHEN excluded.last_429_at >= api_safety_state.last_429_at
+              THEN excluded.strike_count
+            ELSE api_safety_state.strike_count
+          END,
+          last_429_at=MAX(api_safety_state.last_429_at, excluded.last_429_at),
+          updated_at=MAX(api_safety_state.updated_at, excluded.updated_at);
+      `);
+    }
     let version = this.db.prepare("SELECT version FROM schema_meta LIMIT 1").get()?.version;
     if (version === 1) {
       this.db.exec("BEGIN IMMEDIATE");
@@ -264,15 +305,23 @@ export class LichessStore {
 
   apiSafetyState(key) {
     const normalized = authorityKey(key);
-    const row = this.db.prepare(`
-      SELECT cooldown_until, strike_count, last_429_at, last_retry_after_ms
-      FROM api_safety_state WHERE authority_key=?
-    `).get(normalized);
-    return row ? {
-      cooldownUntil: Number(row.cooldown_until),
-      strikeCount: Number(row.strike_count),
-      last429At: Number(row.last_429_at),
-      lastRetryAfterMs: Number(row.last_retry_after_ms),
+    const rows = this.db.prepare(`
+      SELECT authority_key, cooldown_until, strike_count, last_429_at,
+        last_retry_after_ms
+      FROM api_safety_state WHERE authority_key=? OR authority_key='*'
+    `).all(normalized);
+    const latest = rows.reduce((selected, row) => {
+      if (!selected || row.last_429_at > selected.last_429_at) return row;
+      if (row.last_429_at === selected.last_429_at && row.authority_key === normalized) {
+        return row;
+      }
+      return selected;
+    }, null);
+    return latest ? {
+      cooldownUntil: Math.max(...rows.map((row) => Number(row.cooldown_until))),
+      strikeCount: Number(latest.strike_count),
+      last429At: Number(latest.last_429_at),
+      lastRetryAfterMs: Number(latest.last_retry_after_ms),
     } : {
       cooldownUntil: 0,
       strikeCount: 0,

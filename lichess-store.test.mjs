@@ -53,6 +53,54 @@ test("schema-one stores migrate without losing existing control state", () => {
   }
 });
 
+test("schema-three stores repair API safety tables without shortening legacy cooldown", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-lichess-store-v3-repair-"));
+  const file = path.join(directory, "matches.sqlite");
+  const seed = new LichessStore(file);
+  seed.db.exec(`
+    DROP TABLE api_safety_state;
+    DROP TABLE api_client_leases;
+    CREATE TABLE api_rate_limit(
+      id INTEGER PRIMARY KEY,
+      consecutive_429 INTEGER NOT NULL DEFAULT 0,
+      blocked_until INTEGER NOT NULL DEFAULT 0,
+      last_429_at INTEGER NOT NULL DEFAULT 0,
+      half_open INTEGER NOT NULL DEFAULT 0
+    );
+    INSERT INTO api_rate_limit(id, consecutive_429, blocked_until, last_429_at, half_open)
+    VALUES(1, 3, 100000, 40000, 0);
+  `);
+  seed.close();
+
+  const store = new LichessStore(file);
+  const key = "https://lichess.org|arena-bot";
+  try {
+    assert.deepEqual(store.apiSafetyState(key), {
+      cooldownUntil: 100_000,
+      strikeCount: 3,
+      last429At: 40_000,
+      lastRetryAfterMs: 0,
+    });
+    store.saveApiSafetyState(key, {
+      cooldownUntil: 90_000,
+      strikeCount: 1,
+      last429At: 50_000,
+      lastRetryAfterMs: 60_000,
+    }, 50_000);
+    assert.deepEqual(store.apiSafetyState(key), {
+      cooldownUntil: 100_000,
+      strikeCount: 1,
+      last429At: 50_000,
+      lastRetryAfterMs: 60_000,
+    });
+    assert.equal(store.acquireApiLease(key, "repair-owner", 101, 50_000, 60_000).owner_id, "repair-owner");
+    assert.equal(store.releaseApiLease(key, "repair-owner"), true);
+    assert.equal(store.status().schemaVersion, 3);
+  } finally {
+    store.close();
+  }
+});
+
 test("API cooldown state is durable and never shortened", () => {
   const store = storeFixture();
   const key = "https://lichess.org|arena-bot";
