@@ -136,7 +136,12 @@ it is this bot’s turn.
 Per-move NDJSON telemetry separates `state_received_to_go_ms`,
 `go_to_bestmove_ms`, `state_validated_to_post_ms`, and `post_to_ack_ms`, and
 records ponder mode/hit/miss, stale-result draining, and the active transport
-reserve. The runtime snapshot also reports each game’s current UCI timing mode.
+reserve. When `TimePolicy=RelativeClockV2` is configured, the engine also emits
+both clock inputs, the phase horizon, optimum and elastic maximum, effective
+relative surplus, surplus credit, saved credit before/spent/after, uncertainty,
+and the active completed-iteration target. The adapter retains these fields as
+structured move evidence. The runtime snapshot reports the configured policy
+and current saved-time account.
 
 ## Per-game runtime provenance
 

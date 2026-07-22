@@ -11,7 +11,8 @@
     "uci_options": {
       "BehaviorProfile": "balanced",
       "ModelBackend": "flashfork",
-      "ModelRoot": "engine/runtime/models/compact_chessformer_gab_v1/engine"
+      "ModelRoot": "engine/runtime/models/compact_chessformer_gab_v1/engine",
+      "TimePolicy": "RelativeClockV2"
     }
   },
   "timing": {

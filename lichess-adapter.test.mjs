@@ -746,9 +746,16 @@ test("UCI iterative timing telemetry is retained as structured move evidence", (
   engine.onLine(
     "info depth 4 time_deadline_budget_ms 900 iterative_time_optimum_ms 616"
     + " iterative_time_maximum_ms 880 iterative_time_emission_reserve_ms 20"
+    + " iterative_time_uncertainty_permyriad 6250 iterative_time_active_target_ms 781"
     + " iterative_time_admitted_iterations 4 iterative_time_completed_iterations 4"
     + " iterative_time_forecast_source 3 iterative_time_forecast_confidence_permyriad 9500"
     + " iterative_time_forecast_error_ms -7 iterative_time_stop_reason 3"
+    + " time_policy RelativeClockV2 time_opponent_remaining_ms 12000"
+    + " time_opponent_increment_ms 2000 time_horizon_moves 21 time_safety_reserve_ms 650"
+    + " time_safe_ms 89350 time_optimum_ms 4200 time_base_maximum_ms 10500"
+    + " time_relative_surplus_ms 60000 time_relative_credit_ms 8400"
+    + " time_saved_credit_before_ms 1000 time_saved_credit_spend_ms 1000"
+    + " time_saved_credit_after_ms 400"
     + " evaluation_service_provider_batches 9 evaluation_service_provider_rows 72",
   );
   assert.equal(engine.latestInfo.iterative_time_optimum_ms, 616);
@@ -756,6 +763,13 @@ test("UCI iterative timing telemetry is retained as structured move evidence", (
   assert.equal(engine.latestInfo.iterative_time_completed_iterations, 4);
   assert.equal(engine.latestInfo.iterative_time_forecast_source, 3);
   assert.equal(engine.latestInfo.iterative_time_forecast_error_ms, -7);
+  assert.equal(engine.latestInfo.iterative_time_uncertainty_permyriad, 6250);
+  assert.equal(engine.latestInfo.iterative_time_active_target_ms, 781);
+  assert.equal(engine.latestInfo.time_policy, "RelativeClockV2");
+  assert.equal(engine.latestInfo.time_opponent_remaining_ms, 12000);
+  assert.equal(engine.latestInfo.time_relative_surplus_ms, 60000);
+  assert.equal(engine.latestInfo.time_relative_credit_ms, 8400);
+  assert.equal(engine.latestInfo.time_saved_credit_after_ms, 400);
   assert.equal(engine.latestInfo.evaluation_service_provider_rows, 72);
 });
 

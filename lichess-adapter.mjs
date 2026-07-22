@@ -947,6 +947,8 @@ function parseInfo(line) {
     "iterative_time_forecast_ratio_observations",
     "iterative_time_last_depth",
     "iterative_time_stability_score",
+    "iterative_time_uncertainty_permyriad",
+    "iterative_time_active_target_ms",
     "iterative_time_best_effort_permyriad",
     "iterative_time_iteration_nodes",
     "iterative_time_admitted_iterations",
@@ -957,13 +959,27 @@ function parseInfo(line) {
     "iterative_time_forecast_confidence_permyriad",
     "iterative_time_stop_reason",
     "iterative_time_emission_reserve_ms",
+    "time_horizon_moves",
+    "time_safety_reserve_ms",
+    "time_safe_ms",
+    "time_optimum_ms",
+    "time_base_maximum_ms",
+    "time_relative_surplus_ms",
+    "time_relative_credit_ms",
+    "time_saved_credit_before_ms",
+    "time_saved_credit_spend_ms",
+    "time_saved_credit_after_ms",
     "evaluation_service_provider_batches",
     "evaluation_service_provider_rows",
   ]) {
     const match = line.match(new RegExp(`(?:^| )${key} (\\d+)`));
     if (match) telemetry[key] = Number(match[1]);
   }
-  for (const key of ["iterative_time_forecast_error_ms"]) {
+  for (const key of [
+    "iterative_time_forecast_error_ms",
+    "time_opponent_remaining_ms",
+    "time_opponent_increment_ms",
+  ]) {
     const match = line.match(new RegExp(`(?:^| )${key} (-?\\d+)`));
     if (match) telemetry[key] = Number(match[1]);
   }
@@ -982,6 +998,7 @@ function parseInfo(line) {
     "book_miss_reason",
     "book_evaluation_source",
     "book_snapshot_identity",
+    "time_policy",
   ]) {
     const match = line.match(new RegExp(`(?:^| )${key} ([^ ]+)`));
     if (match) telemetry[key] = match[1];
