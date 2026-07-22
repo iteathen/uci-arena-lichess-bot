@@ -101,7 +101,9 @@ Measure MCGS simulation-worker scaling before selecting the single-game
 topology. `Threads` is the MCGS worker control; `RootWorkers` is compatibility
 metadata and is held fixed. The benchmark uses a fresh process per
 worker-count trial, tests cold and rerooted warm graphs, verifies every move,
-and only writes evidence—it does not edit or deploy a profile.
+and only writes evidence—it does not edit or deploy a profile. Because the
+corpus includes tablebase-eligible positions, pass the exact intended live
+Syzygy options; tablebase-disabled worker evidence is not deployment evidence.
 
 ```powershell
 node engine\tools\benchmark_mcgs_workers.mjs `
@@ -110,6 +112,15 @@ node engine\tools\benchmark_mcgs_workers.mjs `
   --trials 3 `
   --performance-cores 6 `
   --efficiency-cores 4 `
+  --engine-option BehaviorProfile=balanced `
+  --engine-option ModelBackend=native `
+  --engine-option SyzygyPath=E:/syzygy/standard/6 `
+  --engine-option SyzygyManifest=E:/syzygy/standard/6/syzygy_manifest_v1.json `
+  --engine-option SyzygyProbeLimit=6 `
+  --engine-option SyzygyProbeThreads=4 `
+  --engine-option Syzygy50MoveRule=true `
+  --engine-option SyzygyRootProbe=true `
+  --engine-option SyzygyInternalProbe=true `
   --output runtime_state\models\<MODEL_ID>\cache\mcgs_worker_scaling.json
 ```
 
