@@ -71,6 +71,79 @@ const PROFILE_OWNED_UCI_OPTIONS = Object.freeze({
   syzygy_root_probe: "SyzygyRootProbe",
   syzygy_internal_probe: "SyzygyInternalProbe",
 });
+const ADAPTIVE_CURVE_SCHEMA = "uci_arena_mcgs_adaptive_temporal_curve_v1";
+const ADAPTIVE_CURVE_FORMULA = "adaptive_curve_v1_fixed_point";
+const ADAPTIVE_CURVE_STATUS = new Set([
+  "provisional_live_authority",
+  "qualified_live_authority",
+]);
+const ADAPTIVE_CURVE_FIELDS = Object.freeze({
+  reference_pool_ms: {
+    option: "McgsTemporalCurveReferencePoolMs",
+    minimum: 1_000,
+    maximum: 3_600_000,
+  },
+  amplitude_base_permille: {
+    option: "McgsTemporalCurveAmplitudePermille",
+    minimum: 0,
+    maximum: 16_000,
+  },
+  amplitude_log_pool_slope_permille: {
+    option: "McgsTemporalCurveAmplitudeLogPoolSlopePermille",
+    minimum: -16_000,
+    maximum: 16_000,
+  },
+  amplitude_increment_fraction_slope_permille: {
+    option: "McgsTemporalCurveAmplitudeIncrementFractionSlopePermille",
+    minimum: -16_000,
+    maximum: 16_000,
+  },
+  span_base_moves: {
+    option: "McgsTemporalCurveSpan",
+    minimum: 4,
+    maximum: 20,
+  },
+  span_log_pool_slope_millimoves: {
+    option: "McgsTemporalCurveSpanLogPoolSlopeMillimoves",
+    minimum: -20_000,
+    maximum: 20_000,
+  },
+  span_increment_fraction_slope_millimoves: {
+    option: "McgsTemporalCurveSpanIncrementFractionSlopeMillimoves",
+    minimum: -20_000,
+    maximum: 20_000,
+  },
+  span_min_moves: {
+    option: "McgsTemporalCurveSpanMinMoves",
+    minimum: 4,
+    maximum: 20,
+  },
+  span_max_moves: {
+    option: "McgsTemporalCurveSpanMaxMoves",
+    minimum: 4,
+    maximum: 20,
+  },
+  power: {
+    option: "McgsTemporalCurvePower",
+    minimum: 1,
+    maximum: 5,
+  },
+  work_block_batches: {
+    option: "McgsTemporalWorkBlockBatches",
+    minimum: 0,
+    maximum: 64,
+  },
+  material_horizon_base_moves: {
+    option: "McgsTemporalMaterialHorizonBaseMoves",
+    minimum: 0,
+    maximum: 20,
+  },
+  material_horizon_slope_permille: {
+    option: "McgsTemporalMaterialHorizonSlopePermille",
+    minimum: 0,
+    maximum: 4_000,
+  },
+});
 const REQUIRED_PROFILE_EVIDENCE = Object.freeze([
   "cursor_correctness",
   "provider_parity",
@@ -262,6 +335,10 @@ function sha256File(filePath) {
   return `sha256:${createHash("sha256").update(readFileSync(filePath)).digest("hex")}`;
 }
 
+function sha256Json(value) {
+  return `sha256:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`;
+}
+
 function requireString(value, label, pattern) {
   if (typeof value !== "string" || !value || (pattern && !pattern.test(value))) {
     throw new Error(`Single-game profile ${label} is invalid`);
@@ -429,6 +506,7 @@ export function loadRuntimeConfig({
   modelRoot,
   profilePath,
   timeProfilePath,
+  temporalCurvePath,
   environment = process.env,
 } = {}) {
   const parsed = JSON.parse(readFileSync(templatePath, "utf8"));
@@ -463,6 +541,22 @@ export function loadRuntimeConfig({
   }
   const selectedTimeProfile = timeProfilePath || environment.UCI_ARENA_TIME_PROFILE?.trim();
   if (selectedTimeProfile) config.engine.time_profile = selectedTimeProfile;
+  const selectedTemporalCurve = temporalCurvePath
+    || environment.UCI_ARENA_TEMPORAL_CURVE_PROFILE?.trim();
+  if (selectedTemporalCurve) {
+    config.engine.temporal_curve_profile = selectedTemporalCurve;
+  }
+  if (!config.engine.temporal_curve_profile) {
+    throw new Error("Lichess adapter config is missing engine.temporal_curve_profile");
+  }
+  config.engine.temporal_curve_profile = path.isAbsolute(
+    config.engine.temporal_curve_profile,
+  )
+    ? config.engine.temporal_curve_profile
+    : path.resolve(
+      config.engine.working_directory,
+      config.engine.temporal_curve_profile,
+    );
   config.engine.selected_bundle = "mcgs";
   normalizeTimingConfig(config);
   if (config.timing.transport_profile_path) {
@@ -552,6 +646,113 @@ export function loadSingleGameProfile(profilePath) {
     }
   }
   return { ...profile, profile_path: resolvedPath };
+}
+
+export function loadAdaptiveTemporalCurveProfile(profilePath) {
+  const resolvedPath = path.resolve(profilePath);
+  const artifact = JSON.parse(readFileSync(resolvedPath, "utf8"));
+  if (artifact.schema !== ADAPTIVE_CURVE_SCHEMA) {
+    throw new Error(
+      `Unsupported adaptive temporal-curve schema: ${artifact.schema ?? "missing"}`,
+    );
+  }
+  requireInteger(artifact.revision, "temporal curve revision", 1);
+  requireString(artifact.generated_at, "temporal curve generated_at");
+  if (!Number.isFinite(Date.parse(artifact.generated_at))) {
+    throw new Error("Adaptive temporal-curve generated_at is not RFC3339");
+  }
+  if (!ADAPTIVE_CURVE_STATUS.has(artifact.status) || artifact.deployable !== true) {
+    throw new Error("Adaptive temporal-curve artifact is not deployable");
+  }
+  if (artifact.formula !== ADAPTIVE_CURVE_FORMULA) {
+    throw new Error("Adaptive temporal-curve formula identity mismatch");
+  }
+  if (!artifact.coefficients || typeof artifact.coefficients !== "object") {
+    throw new Error("Adaptive temporal-curve coefficients are missing");
+  }
+  if (!artifact.coefficient_bounds || typeof artifact.coefficient_bounds !== "object") {
+    throw new Error("Adaptive temporal-curve coefficient bounds are missing");
+  }
+  const options = {
+    McgsTemporalWeightProfile: "AdaptiveCurveV1",
+    McgsTemporalCurveRevision: artifact.revision,
+  };
+  for (const [field, contract] of Object.entries(ADAPTIVE_CURVE_FIELDS)) {
+    const declaredBounds = artifact.coefficient_bounds[field];
+    if (!Array.isArray(declaredBounds)
+        || declaredBounds.length !== 2
+        || declaredBounds[0] !== contract.minimum
+        || declaredBounds[1] !== contract.maximum) {
+      throw new Error(`Adaptive temporal-curve coefficient bounds mismatch: ${field}`);
+    }
+    options[contract.option] = requireInteger(
+      artifact.coefficients[field],
+      `temporal curve coefficients.${field}`,
+      contract.minimum,
+      contract.maximum,
+    );
+  }
+  if (artifact.coefficients.span_min_moves > artifact.coefficients.span_max_moves) {
+    throw new Error("Adaptive temporal-curve span bounds are inverted");
+  }
+  if (!artifact.evidence_manifest || typeof artifact.evidence_manifest !== "object") {
+    throw new Error("Adaptive temporal-curve evidence manifest is missing");
+  }
+  requireString(
+    artifact.evidence_manifest_sha256,
+    "temporal curve evidence_manifest_sha256",
+    /^sha256:[0-9a-f]{64}$/,
+  );
+  if (sha256Json(artifact.evidence_manifest) !== artifact.evidence_manifest_sha256) {
+    throw new Error("Adaptive temporal-curve evidence manifest hash mismatch");
+  }
+  if (!artifact.promotion || typeof artifact.promotion !== "object"
+      || artifact.promotion.ready !== true
+      || !Array.isArray(artifact.promotion.reasons)) {
+    throw new Error("Adaptive temporal-curve promotion authority is invalid");
+  }
+  const projectedEntries = artifact.uci_options
+      && typeof artifact.uci_options === "object"
+    ? Object.entries(artifact.uci_options).toSorted(([left], [right]) => (
+      left.localeCompare(right)
+    ))
+    : [];
+  const expectedEntries = Object.entries(options).toSorted(([left], [right]) => (
+    left.localeCompare(right)
+  ));
+  if (projectedEntries.length !== expectedEntries.length
+      || projectedEntries.some(([name, value], index) => (
+        name !== expectedEntries[index][0] || value !== expectedEntries[index][1]
+      ))) {
+    throw new Error("Adaptive temporal-curve UCI option projection mismatch");
+  }
+  return {
+    ...artifact,
+    profile_path: resolvedPath,
+    artifact_sha256: sha256File(resolvedPath),
+    applied_uci_options: options,
+  };
+}
+
+export function applyAdaptiveTemporalCurveProfile(config) {
+  if (!config.engine.temporal_curve_profile) {
+    throw new Error("Live MCGS config is missing an adaptive temporal-curve profile");
+  }
+  const artifact = loadAdaptiveTemporalCurveProfile(
+    config.engine.temporal_curve_profile,
+  );
+  for (const [name, value] of Object.entries(artifact.applied_uci_options)) {
+    if (Object.hasOwn(config.engine.uci_options, name)
+        && String(config.engine.uci_options[name]) !== String(value)) {
+      throw new Error(`Tracked config conflicts with adaptive-curve UCI option ${name}`);
+    }
+  }
+  config.engine.uci_options = {
+    ...config.engine.uci_options,
+    ...artifact.applied_uci_options,
+  };
+  config.engine.temporal_curve_profile_status = artifact;
+  return artifact;
 }
 
 export function applySingleGameProfile(config) {
@@ -684,6 +885,7 @@ export function applySingleGameProfile(config) {
     }
   }
   config.engine.uci_options = { ...config.engine.uci_options, ...profileValues };
+  profile.temporal_curve = applyAdaptiveTemporalCurveProfile(config);
   config.engine.qualification_profile = profile;
   return profile;
 }
@@ -1301,6 +1503,45 @@ export function validateRuntimeStatus(profile, status) {
       status.mcgs_time_policy_configured === "RelativeClockTemporalV1",
       "MCGS relative-clock temporal policy was inactive",
     );
+    if (profile.temporal_curve) {
+      requireRuntimeStatus(
+        status.mcgs_temporal_weight_profile_configured === "AdaptiveCurveV1",
+        "AdaptiveCurveV1 was inactive",
+      );
+      const coefficientStatusFields = {
+        McgsTemporalCurveRevision: "mcgs_temporal_curve_revision_configured",
+        McgsTemporalCurveAmplitudePermille:
+          "mcgs_temporal_curve_amplitude_permille_configured",
+        McgsTemporalCurveSpan: "mcgs_temporal_curve_span_configured",
+        McgsTemporalCurvePower: "mcgs_temporal_curve_power_configured",
+        McgsTemporalWorkBlockBatches:
+          "mcgs_temporal_work_block_batches_configured",
+        McgsTemporalMaterialHorizonBaseMoves:
+          "mcgs_temporal_material_horizon_base_moves_configured",
+        McgsTemporalMaterialHorizonSlopePermille:
+          "mcgs_temporal_material_horizon_slope_permille_configured",
+        McgsTemporalCurveReferencePoolMs:
+          "mcgs_temporal_curve_reference_pool_ms_configured",
+        McgsTemporalCurveAmplitudeLogPoolSlopePermille:
+          "mcgs_temporal_curve_amplitude_log_pool_slope_permille_configured",
+        McgsTemporalCurveAmplitudeIncrementFractionSlopePermille:
+          "mcgs_temporal_curve_amplitude_increment_fraction_slope_permille_configured",
+        McgsTemporalCurveSpanLogPoolSlopeMillimoves:
+          "mcgs_temporal_curve_span_log_pool_slope_millimoves_configured",
+        McgsTemporalCurveSpanIncrementFractionSlopeMillimoves:
+          "mcgs_temporal_curve_span_increment_fraction_slope_millimoves_configured",
+        McgsTemporalCurveSpanMinMoves:
+          "mcgs_temporal_curve_span_min_moves_configured",
+        McgsTemporalCurveSpanMaxMoves:
+          "mcgs_temporal_curve_span_max_moves_configured",
+      };
+      for (const [option, statusField] of Object.entries(coefficientStatusFields)) {
+        requireRuntimeStatus(
+          status[statusField] === profile.temporal_curve.applied_uci_options[option],
+          `adaptive temporal-curve option ${option} mismatch`,
+        );
+      }
+    }
     requireRuntimeStatus(status.mcgs_graph_nodes > 0, "MCGS graph contains no nodes");
     requireRuntimeStatus(status.mcgs_graph_edges > 0, "MCGS graph contains no edges");
     requireRuntimeStatus(status.mcgs_completed_simulations > 0, "MCGS completed no simulations");
@@ -2083,6 +2324,14 @@ export function gameRuntimeProvenance(config, engine) {
       transport_reserve_ms: config.timing?.initial_transport_reserve_ms ?? 0,
       fallback_policy: timeProfile.fallback_policy ?? "",
       reason: timeProfile.reason ?? "",
+      adaptive_curve: {
+        revision: profile.temporal_curve?.revision ?? 0,
+        status: profile.temporal_curve?.status ?? "",
+        formula: profile.temporal_curve?.formula ?? "",
+        artifact_sha256: profile.temporal_curve?.artifact_sha256 ?? "",
+        evidence_manifest_sha256:
+          profile.temporal_curve?.evidence_manifest_sha256 ?? "",
+      },
     },
     book: {
       configuration_identity: bookConfigurationIdentity(config),
@@ -2127,6 +2376,10 @@ export function gameRuntimeProvenance(config, engine) {
       ),
       capacity_sha256: optionalFileFingerprint(
         config.capacity_profile?.profile_path,
+        config.engine.working_directory,
+      ),
+      temporal_curve_sha256: optionalFileFingerprint(
+        profile.temporal_curve?.profile_path,
         config.engine.working_directory,
       ),
     },
@@ -3733,6 +3986,7 @@ export async function main(argv = process.argv.slice(2)) {
     modelRoot: options.model_root,
     profilePath: options.profile,
     timeProfilePath: options.time_profile,
+    temporalCurvePath: options.temporal_curve_profile,
   });
   if (options.command === "config") {
     console.log(JSON.stringify({
@@ -3740,6 +3994,7 @@ export async function main(argv = process.argv.slice(2)) {
       schema: config.schema,
       engine: config.engine.executable,
       time_profile: config.engine.time_profile ?? null,
+      temporal_curve_profile: config.engine.temporal_curve_profile ?? null,
       capacity: config.capacity,
       scheduler: config.scheduler,
     }));

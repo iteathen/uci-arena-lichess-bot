@@ -16,8 +16,10 @@ import {
   TransportProfileTracker,
   challengeFromSelf,
   challengeDeclineReason,
+  applyAdaptiveTemporalCurveProfile,
   applySingleGameProfile,
   gameRuntimeProvenance,
+  loadAdaptiveTemporalCurveProfile,
   loadCapacityProfile,
   loadRuntimeConfig,
   loadSingleGameProfile,
@@ -28,6 +30,11 @@ import {
   probeAccount,
   validateRuntimeStatus,
 } from "./lichess-adapter.mjs";
+import {
+  BOUNDS,
+  BOOTSTRAP_COEFFICIENTS,
+  coefficientOptions,
+} from "../../arena/update_mcgs_adaptive_curve.mjs";
 import { ApiSafetyCoordinator, LichessHttpError } from "./lichess-scheduler.mjs";
 import { LichessStore } from "./lichess-store.mjs";
 import {
@@ -100,18 +107,46 @@ function qualifiedFixture() {
     evidence,
   };
   writeFileSync(profilePath, JSON.stringify(profile));
+  const temporalCurvePath = path.join(directory, "temporal-curve.json");
+  const evidenceManifest = {
+    bootstrap_authority: "test_fixture",
+    eligible_cells: 48,
+  };
+  const temporalCurve = {
+    schema: "uci_arena_mcgs_adaptive_temporal_curve_v1",
+    revision: 1,
+    generated_at: "2026-07-25T00:00:00.000Z",
+    status: "provisional_live_authority",
+    deployable: true,
+    formula: "adaptive_curve_v1_fixed_point",
+    coefficients: BOOTSTRAP_COEFFICIENTS,
+    coefficient_bounds: BOUNDS,
+    evidence_manifest: evidenceManifest,
+    evidence_manifest_sha256: sha256(JSON.stringify(evidenceManifest)),
+    promotion: { ready: true, reasons: ["test_fixture"] },
+    uci_options: coefficientOptions(1, BOOTSTRAP_COEFFICIENTS),
+  };
+  writeFileSync(temporalCurvePath, JSON.stringify(temporalCurve));
   const config = {
     engine: {
       executable,
       working_directory: directory,
       single_game_profile: profilePath,
+      temporal_curve_profile: temporalCurvePath,
       uci_options: { ModelRoot: "model", BehaviorProfile: "balanced" },
     },
   };
-  return { config, profile, profilePath };
+  return {
+    config,
+    profile,
+    profilePath,
+    temporalCurve,
+    temporalCurvePath,
+  };
 }
 
 function qualifiedRuntimeStatus(profile) {
+  const curveOptions = profile.temporal_curve?.applied_uci_options ?? {};
   return {
     schema: "uci_runtime_status_v1",
     model_loaded: true,
@@ -125,6 +160,36 @@ function qualifiedRuntimeStatus(profile) {
     onnx_runtime_version: profile.onnx_runtime_version,
     search_core_configured: "mcgs",
     mcgs_time_policy_configured: "RelativeClockTemporalV1",
+    mcgs_temporal_weight_profile_configured:
+      curveOptions.McgsTemporalWeightProfile ?? "EarlyCurrent",
+    mcgs_temporal_curve_revision_configured:
+      curveOptions.McgsTemporalCurveRevision ?? 1,
+    mcgs_temporal_curve_amplitude_permille_configured:
+      curveOptions.McgsTemporalCurveAmplitudePermille ?? 8_000,
+    mcgs_temporal_curve_span_configured:
+      curveOptions.McgsTemporalCurveSpan ?? 10,
+    mcgs_temporal_curve_power_configured:
+      curveOptions.McgsTemporalCurvePower ?? 3,
+    mcgs_temporal_work_block_batches_configured:
+      curveOptions.McgsTemporalWorkBlockBatches ?? 8,
+    mcgs_temporal_material_horizon_base_moves_configured:
+      curveOptions.McgsTemporalMaterialHorizonBaseMoves ?? 0,
+    mcgs_temporal_material_horizon_slope_permille_configured:
+      curveOptions.McgsTemporalMaterialHorizonSlopePermille ?? 0,
+    mcgs_temporal_curve_reference_pool_ms_configured:
+      curveOptions.McgsTemporalCurveReferencePoolMs ?? 30_000,
+    mcgs_temporal_curve_amplitude_log_pool_slope_permille_configured:
+      curveOptions.McgsTemporalCurveAmplitudeLogPoolSlopePermille ?? 0,
+    mcgs_temporal_curve_amplitude_increment_fraction_slope_permille_configured:
+      curveOptions.McgsTemporalCurveAmplitudeIncrementFractionSlopePermille ?? 0,
+    mcgs_temporal_curve_span_log_pool_slope_millimoves_configured:
+      curveOptions.McgsTemporalCurveSpanLogPoolSlopeMillimoves ?? 3_000,
+    mcgs_temporal_curve_span_increment_fraction_slope_millimoves_configured:
+      curveOptions.McgsTemporalCurveSpanIncrementFractionSlopeMillimoves ?? -16_000,
+    mcgs_temporal_curve_span_min_moves_configured:
+      curveOptions.McgsTemporalCurveSpanMinMoves ?? 10,
+    mcgs_temporal_curve_span_max_moves_configured:
+      curveOptions.McgsTemporalCurveSpanMaxMoves ?? 16,
     mcgs_book_prior_blend_permille_configured:
       profile.mcgs_book_prior_blend_permille,
     threads_configured: profile.threads,
@@ -178,6 +243,41 @@ function qualifiedRuntimeStatus(profile) {
     } : {}),
   };
 }
+
+test("adaptive temporal-curve artifact is validated, applied, and conflict-safe", () => {
+  const fixture = qualifiedFixture();
+  const loaded = loadAdaptiveTemporalCurveProfile(fixture.temporalCurvePath);
+  assert.equal(loaded.revision, 1);
+  assert.match(loaded.artifact_sha256, /^sha256:[0-9a-f]{64}$/);
+  const applied = applyAdaptiveTemporalCurveProfile(fixture.config);
+  assert.equal(applied.formula, "adaptive_curve_v1_fixed_point");
+  assert.equal(
+    fixture.config.engine.uci_options.McgsTemporalWeightProfile,
+    "AdaptiveCurveV1",
+  );
+  const conflicting = qualifiedFixture();
+  conflicting.config.engine.uci_options.McgsTemporalCurveSpan = 12;
+  assert.throws(
+    () => applyAdaptiveTemporalCurveProfile(conflicting.config),
+    /conflicts with adaptive-curve UCI option McgsTemporalCurveSpan/,
+  );
+});
+
+test("adaptive temporal-curve manifest tampering fails closed", () => {
+  const fixture = qualifiedFixture();
+  const tampered = {
+    ...fixture.temporalCurve,
+    evidence_manifest: {
+      ...fixture.temporalCurve.evidence_manifest,
+      eligible_cells: 49,
+    },
+  };
+  writeFileSync(fixture.temporalCurvePath, JSON.stringify(tampered));
+  assert.throws(
+    () => loadAdaptiveTemporalCurveProfile(fixture.temporalCurvePath),
+    /evidence manifest hash mismatch/,
+  );
+});
 
 function gameConfig() {
   return {
