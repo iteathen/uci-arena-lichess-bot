@@ -36,6 +36,11 @@ function mockApi(routes) {
       if (!(endpoint in routes)) throw new Error(`unexpected mock API endpoint: ${endpoint}`);
       return structuredClone(routes[endpoint]);
     },
+    async collectNdjson(endpoint) {
+      requests.push(endpoint);
+      if (!(endpoint in routes)) throw new Error(`unexpected mock API endpoint: ${endpoint}`);
+      return structuredClone(routes[endpoint]);
+    },
   };
 }
 
@@ -44,8 +49,8 @@ test("mock API accepts only the named online public BOT and no unrelated game", 
     "api/user/publicbot": {
       id: "publicbot",
       title: "BOT",
-      online: true,
     },
+    "api/bot/online?nb=512": [{ id: "publicbot", title: "BOT" }],
     "api/account/playing?nb=50": { nowPlaying: [] },
   });
   const result = await validateLiveAcceptanceParticipants({
@@ -62,18 +67,20 @@ test("mock API accepts only the named online public BOT and no unrelated game", 
   });
   assert.deepEqual(client.requests, [
     "api/user/publicbot",
+    "api/bot/online?nb=512",
     "api/account/playing?nb=50",
   ]);
 });
 
 test("mock API fails closed for non-BOT, offline, and unrelated active games", async () => {
   for (const profile of [
-    { id: "publicbot", title: null, online: true },
-    { id: "publicbot", title: "BOT", online: false },
-    { id: "publicbot", title: "BOT", online: true, disabled: true },
+    { id: "publicbot", title: null },
+    { id: "publicbot", title: "BOT" },
+    { id: "publicbot", title: "BOT", disabled: true },
   ]) {
     const client = mockApi({
       "api/user/publicbot": profile,
+      "api/bot/online?nb=512": [],
       "api/account/playing?nb=50": { nowPlaying: [] },
     });
     await assert.rejects(
@@ -86,7 +93,8 @@ test("mock API fails closed for non-BOT, offline, and unrelated active games", a
     );
   }
   const client = mockApi({
-    "api/user/publicbot": { id: "publicbot", title: "BOT", online: true },
+    "api/user/publicbot": { id: "publicbot", title: "BOT" },
+    "api/bot/online?nb=512": [{ id: "publicbot", title: "BOT" }],
     "api/account/playing?nb=50": {
       nowPlaying: [{ gameId: "other-game", opponent: { id: "otherbot" } }],
     },

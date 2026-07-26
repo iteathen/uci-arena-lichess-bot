@@ -1312,7 +1312,13 @@ export async function validateLiveAcceptanceParticipants({
   if (targetProfile.disabled === true || targetProfile.tosViolation === true) {
     throw new Error(`Live acceptance target is not a public usable account: ${resolvedTarget}`);
   }
-  if (targetProfile.online !== true) {
+  const onlineBots = await client.collectNdjson("api/bot/online?nb=512", signal);
+  const targetIsOnline = onlineBots.some((candidate) =>
+    normalizedUsername(candidate.username ?? candidate.id) === expectedTarget
+      && String(candidate.title ?? "").toUpperCase() === "BOT"
+      && candidate.disabled !== true
+      && candidate.tosViolation !== true);
+  if (!targetIsOnline) {
     throw new Error(`Live acceptance target is not online: ${resolvedTarget}`);
   }
   const playing = await client.json("api/account/playing?nb=50", { signal });
