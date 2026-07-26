@@ -121,7 +121,9 @@ export function buildAcceptanceConfig(sourceConfig) {
 
 export function observeAcceptanceEvent(state, event, target) {
   const expectedTarget = normalizedUsername(target);
-  const opponent = normalizedUsername(event?.opponent);
+  const opponent = event?.opponent === undefined
+    ? null
+    : normalizedUsername(event.opponent);
   if (opponent && opponent !== expectedTarget
       && new Set(["challenge_created", "game_started", "game_finished"]).has(event.event)) {
     return {

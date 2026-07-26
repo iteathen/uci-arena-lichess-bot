@@ -169,6 +169,22 @@ test("event evidence requires a completed game against the named opponent", () =
   assert.equal(aborted.terminal.status, "inconclusive");
 });
 
+test("fatal evidence without an opponent preserves the provider diagnostic", () => {
+  const observed = observeAcceptanceEvent({
+    challengeCreated: false,
+    gameStarted: false,
+    gameId: null,
+    terminal: null,
+  }, {
+    event: "adapter_fatal",
+    message: "profile evidence is missing",
+  }, "publicbot");
+  assert.deepEqual(observed.terminal, {
+    status: "inconclusive",
+    reason: "profile evidence is missing",
+  });
+});
+
 test("attempt plan retries bounded challenge failures and requires completion", async () => {
   const outcomes = [
     { status: "retryable", reason: "declined", challengeAttempted: true },
