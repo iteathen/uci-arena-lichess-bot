@@ -7,7 +7,9 @@ process per game. It does not add Lichess behavior to the chess engine.
 Transport, process supervision, and SQLite use Node built-ins. Exact-root move
 legality uses the locked `chess.js` dependency. Node 24.15 or newer is required.
 
-Install the adapter dependency once after checkout (and after lockfile changes):
+Install the adapter dependency once after checkout (and after lockfile changes).
+The immutable `lichess.adapter` provider component already contains this locked
+production dependency:
 
 ```powershell
 npm ci --prefix deploy/lichess
@@ -74,6 +76,8 @@ capacity profile qualified at that concurrency.
 - `lichess-scheduler.mjs`: slot admission, weighted selection, and request queue.
 - `lichess-store.mjs`: WAL-mode SQLite reservations, attempts, games, and W/D/L.
 - `windows-startup.mjs`: hidden Task Scheduler supervision.
+- `linux-startup.mjs`: per-user systemd supervision.
+- `live-acceptance.mjs`: explicitly confirmed staging BOT acceptance harness.
 - `native/`: independent Windows GUI-subsystem launcher.
 - `smoke-uci-startup.mjs`: local startup smoke; it never contacts Lichess.
 
@@ -222,6 +226,30 @@ reconnects stop and drain stale UCI work, then rebuild the position from
 Lichess's authoritative move list. A whole process restart performs the same
 recovery before admitting new work.
 
+## Protected live acceptance
+
+The live acceptance harness is disabled unless the exact confirmation phrase is
+provided. It verifies the authenticated staging identity, requires the named
+opponent to be a distinct public online BOT-titled account, disables automatic
+discovery and inbound public play, and asks only that opponent for a casual
+standard game. It makes at most three challenge attempts in twenty minutes and
+passes only after the authoritative game stream reports one completed game.
+
+The token is supplied only as an opaque file path. Unit/package tests use mock
+API and process boundaries and never run this command.
+
+```powershell
+node deploy\lichess\live-acceptance.mjs `
+  --confirm I_ACCEPT_ONE_STAGING_BOT_GAME `
+  --token-file secrets\lichess_bot_token.txt `
+  --expected-account <STAGING_BOT_ACCOUNT> `
+  --opponent <PUBLIC_ONLINE_BOT_ACCOUNT>
+```
+
+Failure or an inconclusive result is non-success and leaves token-free evidence
+under `runtime_state/lichess/live-acceptance`. Rerunning the same command can
+recover an in-progress game against the named target.
+
 At move POST dispatch, the adapter keeps Lichess's streamed move list as
 canonical state and starts projected opponent-turn work. MCGS searches every
 legal reply at the projected position with `go infinite opponentroot`; an
@@ -315,6 +343,34 @@ node deploy\lichess\lichess-adapter.mjs startup install `
 node deploy\lichess\lichess-adapter.mjs startup status
 node deploy\lichess\lichess-adapter.mjs startup uninstall
 ```
+
+## Background service on Linux
+
+The same startup commands install, query, and remove
+`~/.config/systemd/user/uci-arena-lichess.service`. The unit runs as the current
+user, waits for the user network-online target, restarts on failure, and never
+requires root:
+
+```bash
+node deploy/lichess/lichess-adapter.mjs startup install \
+  --token-file secrets/lichess_bot_token.txt \
+  --expected-account <LICHESS_ACCOUNT>
+
+node deploy/lichess/lichess-adapter.mjs startup status
+node deploy/lichess/lichess-adapter.mjs startup uninstall
+```
+
+Set `XDG_CONFIG_HOME` before installation when the user unit must live outside
+the default `~/.config` root.
+
+## Provider component
+
+Provider CI builds `lichess.adapter` for `windows-x86_64` and `linux-x86_64`.
+The payload preserves the `deploy`, `engine/tools`, and `arena/lib` import
+topology, contains locked production Node modules, and declares immutable
+dependencies on UCI Arena Engine and Node 24.15.0. The suite Manager remains
+the only authority that resolves installed engine/model/data roots, assembles
+installers, signs them, or promotes a release channel.
 
 Operational state is under `runtime_state/lichess`: `runtime.json`,
 `adapter.ndjson`, `matches.sqlite`, and startup evidence. SQLite is the durable

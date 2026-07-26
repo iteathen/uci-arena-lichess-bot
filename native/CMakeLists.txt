@@ -11,6 +11,10 @@ target_compile_definitions(lichess_adapter_launcher PRIVATE WIN32_LEAN_AND_MEAN 
 target_link_libraries(lichess_adapter_launcher PRIVATE Shell32)
 
 if(MSVC)
+    set_property(
+        TARGET lichess_adapter_launcher
+        PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+    )
     target_compile_options(lichess_adapter_launcher PRIVATE /W4 /permissive- /EHsc)
 else()
     target_compile_options(lichess_adapter_launcher PRIVATE -Wall -Wextra -Wpedantic)

@@ -32,6 +32,11 @@ import {
   uninstallWindowsStartup,
 } from "./windows-startup.mjs";
 import {
+  installLinuxStartup,
+  queryLinuxStartup,
+  uninstallLinuxStartup,
+} from "./linux-startup.mjs";
+import {
   AuthoritativeChessState,
 } from "./chess-legality.mjs";
 import {
@@ -48,6 +53,7 @@ export const DEFAULT_TEMPLATE = path.join(HERE, "config.uci_arena.template.yml")
 export const DEFAULT_TOKEN_FILE = path.join(ROOT, "secrets", "lichess_bot_token.txt");
 export const DEFAULT_RUNTIME_DIR = path.join(ROOT, "runtime_state", "lichess");
 export const DEFAULT_STORE_FILE = path.join(DEFAULT_RUNTIME_DIR, "matches.sqlite");
+export const LIVE_ACCEPTANCE_CONFIRMATION = "I_ACCEPT_ONE_STAGING_BOT_GAME";
 
 const PROFILE_OWNED_UCI_OPTIONS = Object.freeze({
   search_core: "SearchCore",
@@ -1272,6 +1278,60 @@ export async function probeAccount({
     throw new Error(`Authenticated Lichess account is not a BOT account: ${username}${eligibility}`);
   }
   return { username, title: "BOT", is_bot: true, games };
+}
+
+export async function validateLiveAcceptanceParticipants({
+  client,
+  account,
+  target,
+  signal,
+}) {
+  const expectedAccount = normalizedUsername(account);
+  const expectedTarget = normalizedUsername(target);
+  if (!expectedAccount || !expectedTarget) {
+    throw new Error("Live acceptance requires both staging and target account names");
+  }
+  if (expectedAccount === expectedTarget) {
+    throw new Error("Live acceptance target must be distinct from the staging account");
+  }
+  const targetProfile = await client.json(
+    `api/user/${encodeURIComponent(expectedTarget)}`,
+    { signal },
+  );
+  const resolvedTarget = normalizedUsername(targetProfile.username ?? targetProfile.id);
+  if (resolvedTarget !== expectedTarget) {
+    throw new Error(`Live acceptance target identity mismatch: ${resolvedTarget || "missing"}`);
+  }
+  if (String(targetProfile.title ?? "").toUpperCase() !== "BOT") {
+    throw new Error(`Live acceptance target is not BOT-titled: ${resolvedTarget}`);
+  }
+  if (targetProfile.disabled === true || targetProfile.tosViolation === true) {
+    throw new Error(`Live acceptance target is not a public usable account: ${resolvedTarget}`);
+  }
+  if (targetProfile.online !== true) {
+    throw new Error(`Live acceptance target is not online: ${resolvedTarget}`);
+  }
+  const playing = await client.json("api/account/playing?nb=50", { signal });
+  const active = (playing.nowPlaying ?? []).map((game) => ({
+    gameId: String(game.gameId ?? game.id ?? ""),
+    opponent: normalizedUsername(
+      game.opponent?.id ?? game.opponent?.username ?? game.opponent?.name,
+    ),
+  }));
+  const unrelated = active.filter((game) => game.opponent !== expectedTarget);
+  if (unrelated.length) {
+    throw new Error("Live acceptance staging account has an unrelated active game");
+  }
+  if (active.length > 1) {
+    throw new Error("Live acceptance staging account has multiple active games");
+  }
+  return {
+    account: expectedAccount,
+    target: resolvedTarget,
+    target_title: "BOT",
+    target_online: true,
+    recovered_game_id: active[0]?.gameId || null,
+  };
 }
 
 export function apiAuthorityKey(url, expectedAccount) {
@@ -3995,11 +4055,21 @@ export async function main(argv = process.argv.slice(2)) {
   const runtimeDir = path.resolve(options.runtime_dir ?? DEFAULT_RUNTIME_DIR);
   if (options.command === "run") configureRuntimeLog(runtimeDir);
   if (options.command === "startup" && options.action === "status") {
-    console.log(JSON.stringify({ status: "ready", startup: await queryWindowsStartup() }));
+    const startup = process.platform === "win32"
+      ? await queryWindowsStartup()
+      : process.platform === "linux"
+        ? await queryLinuxStartup()
+        : (() => { throw new Error(`Unsupported startup platform: ${process.platform}`); })();
+    console.log(JSON.stringify({ status: "ready", startup }));
     return 0;
   }
   if (options.command === "startup" && options.action === "uninstall") {
-    console.log(JSON.stringify({ status: "ready", startup: await uninstallWindowsStartup(runtimeDir) }));
+    const startup = process.platform === "win32"
+      ? await uninstallWindowsStartup(runtimeDir)
+      : process.platform === "linux"
+        ? await uninstallLinuxStartup(runtimeDir)
+        : (() => { throw new Error(`Unsupported startup platform: ${process.platform}`); })();
+    console.log(JSON.stringify({ status: "ready", startup }));
     return 0;
   }
   const config = loadRuntimeConfig({
@@ -4029,16 +4099,21 @@ export async function main(argv = process.argv.slice(2)) {
       config,
       qualificationProfile,
     );
-    const startup = await installWindowsStartup({
+    const startupOptions = {
       config: path.resolve(options.config ?? DEFAULT_TEMPLATE),
       tokenFile: path.resolve(options.token_file ?? DEFAULT_TOKEN_FILE),
       expectedAccount: options.expected_account,
       runtimeDir,
-      profile: options.profile,
-      timeProfile: options.time_profile,
-      capacityProfile: options.capacity_profile,
-      modelRoot: options.model_root,
-    });
+      profile: config.engine.single_game_profile,
+      timeProfile: options.time_profile ?? config.engine.time_profile,
+      capacityProfile: options.capacity_profile ?? config.capacity.capacity_profile,
+      modelRoot: config.engine.uci_options.ModelRoot,
+    };
+    const startup = process.platform === "win32"
+      ? await installWindowsStartup(startupOptions)
+      : process.platform === "linux"
+        ? await installLinuxStartup(startupOptions)
+        : (() => { throw new Error(`Unsupported startup platform: ${process.platform}`); })();
     console.log(JSON.stringify({ status: "ready", startup }));
     return 0;
   }
@@ -4143,6 +4218,29 @@ export async function main(argv = process.argv.slice(2)) {
     if (options.command === "probe") {
       console.log(JSON.stringify({ status: "ready", account: profile.username, is_bot: true, games: profile.games }));
       return 0;
+    }
+    if (options.acceptance_mode) {
+      if (options.acceptance_mode !== "staging-bot-v1") {
+        throw new Error(`Unsupported live acceptance mode: ${options.acceptance_mode}`);
+      }
+      if (options.acceptance_confirm !== LIVE_ACCEPTANCE_CONFIRMATION) {
+        throw new Error("Live acceptance requires the exact explicit confirmation phrase");
+      }
+      if (!options.opponent) throw new Error("Live acceptance requires --opponent");
+      if (config.outbound_challenge.rated !== false
+          || config.scheduler.enabled
+          || config.capacity.bot.target_active !== 0) {
+        throw new Error(
+          "Live acceptance config must be casual and disable automatic bot scheduling",
+        );
+      }
+      const participants = await validateLiveAcceptanceParticipants({
+        client,
+        account: profile.username,
+        target: options.opponent,
+        signal: controller.signal,
+      });
+      log("live_acceptance_participants_ready", participants);
     }
     log("adapter_started", {
       account: profile.username,
