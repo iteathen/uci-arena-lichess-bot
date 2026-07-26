@@ -183,8 +183,11 @@ const TIME_PROFILE_RESERVED_OPTIONS = new Set([
   "McgsBookPriorBlendPermille", "McgsTimePolicy",
   "NNSpeculation", "ModelRoot", "NNBatchSize", "NNBatchWaitUs", "OnnxProvider",
   "IterativeTimeController", "TimeProfileProviderReserveUs", "TimeProfileBackupEmitReserveUs",
-  "TimeProfileIterationForecastScalePermille", "Move Overhead", "Ponder",
-  "OwnBook",
+  "TimeProfileIterationForecastScalePermille", "TimeProfileIterationTransitionP95Ms",
+  "Move Overhead", "Ponder",
+  "OwnBook", "BookFile", "BookStatsFile", "BookPolicyFile", "BookSeed",
+  "BookMaxPly", "SyzygyPath", "SyzygyProbeLimit", "SyzygyProbeDepth",
+  "Syzygy50MoveRule", "SyzygyRootProbe", "SyzygyInternalProbe",
 ]);
 
 function percentile(values, quantile) {

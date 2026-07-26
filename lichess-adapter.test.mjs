@@ -1187,6 +1187,47 @@ test("UCI readiness requires explicit ponder and move-overhead support", () => {
   ]);
 });
 
+test("timing identity excludes independently validated local knowledge options", () => {
+  const engine = new UciEngine({
+    uci_options: {
+      SearchCore: "v2",
+      Threads: 6,
+      RootWorkers: 6,
+      V2SplitDepth: 2,
+      NNBatchSize: 64,
+      NNBatchWaitUs: 0,
+      OnnxProvider: "directml",
+      BackgroundSearch: false,
+      NNSpeculation: false,
+      ModelRoot: "C:/installed/models/default",
+      OwnBook: true,
+      BookFile: "E:/books/strong_rare_v1.bin",
+      BookStatsFile: "E:/books/strong_rare_v1.ffstats",
+      BookPolicyFile: "E:/books/strong_rare_v1.policy",
+      BookSeed: 9,
+      BookMaxPly: 30,
+      SyzygyPath: "E:/syzygy/standard/6",
+      SyzygyProbeLimit: 6,
+      SyzygyProbeDepth: 1,
+      Syzygy50MoveRule: true,
+      SyzygyRootProbe: true,
+      SyzygyInternalProbe: true,
+      BehaviorProfile: "balanced",
+      ModelBackend: "flashfork",
+      TimePolicy: "RelativeClockV2",
+    },
+    timing: { initial_transport_reserve_ms: 650 },
+  });
+  assert.deepEqual(
+    engine.timeProfileConfiguration().extraEngineOptions,
+    {
+      BehaviorProfile: "balanced",
+      ModelBackend: "flashfork",
+      TimePolicy: "RelativeClockV2",
+    },
+  );
+});
+
 test("missing timing profile remains observable with zero reserve and controller disabled", async () => {
   const events = [];
   const engine = new UciEngine({
