@@ -202,8 +202,15 @@ export function observeAcceptanceEvent(state, event, target) {
   return state;
 }
 
-async function terminateChild(child) {
+export async function terminateChild(child) {
   if (child.exitCode !== null || child.signalCode !== null) return;
+  if (child.stdin?.writable) {
+    child.stdin.end("shutdown\n");
+    for (let index = 0; index < 20; index += 1) {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      await wait(100);
+    }
+  }
   child.kill("SIGTERM");
   for (let index = 0; index < 20; index += 1) {
     if (child.exitCode !== null || child.signalCode !== null) return;
@@ -273,7 +280,7 @@ export async function runSpawnedAttempt({
   const child = spawnImpl(process.execPath, adapterArguments(options, configPath, runtimeDir), {
     cwd: ROOT,
     env: acceptanceChildEnvironment(options),
-    stdio: ["ignore", "ignore", "ignore"],
+    stdio: ["pipe", "ignore", "ignore"],
     windowsHide: true,
   });
   let exited = false;

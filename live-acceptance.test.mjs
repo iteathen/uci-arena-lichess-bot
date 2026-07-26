@@ -12,6 +12,7 @@ import {
   buildAcceptanceConfig,
   executeAcceptancePlan,
   observeAcceptanceEvent,
+  terminateChild,
   validateAcceptanceOptions,
 } from "./live-acceptance.mjs";
 
@@ -43,6 +44,26 @@ function mockApi(routes) {
     },
   };
 }
+
+test("acceptance requests graceful child shutdown before forced termination", async () => {
+  const actions = [];
+  const child = {
+    exitCode: null,
+    signalCode: null,
+    stdin: {
+      writable: true,
+      end(value) {
+        actions.push(["stdin", value]);
+        child.exitCode = 0;
+      },
+    },
+    kill(signal) {
+      actions.push(["kill", signal]);
+    },
+  };
+  await terminateChild(child);
+  assert.deepEqual(actions, [["stdin", "shutdown\n"]]);
+});
 
 test("mock API accepts only the named online public BOT and no unrelated game", async () => {
   const client = mockApi({

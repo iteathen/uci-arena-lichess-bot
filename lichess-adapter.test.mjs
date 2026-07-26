@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 
 import {
@@ -14,6 +15,7 @@ import {
   ROOT,
   UciEngine,
   TransportProfileTracker,
+  bindShutdownInput,
   challengeFromSelf,
   challengeDeclineReason,
   applyAdaptiveTemporalCurveProfile,
@@ -2201,6 +2203,19 @@ test("nested local control commands parse without touching credentials", () => {
   assert.deepEqual(parseArguments(["reserve", "--opponent", "owner", "--games", "2"]), {
     command: "reserve", opponent: "owner", games: "2",
   });
+});
+
+test("private stdin shutdown command aborts the adapter cooperatively", async () => {
+  const controller = new AbortController();
+  const input = new PassThrough();
+  const unbind = bindShutdownInput(controller, input);
+  input.write("shut");
+  input.write("down\n");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(controller.signal.aborted, true);
+  assert.match(controller.signal.reason.message, /shutdown command/);
+  unbind();
+  input.destroy();
 });
 
 test("concurrent inbound events cannot overbook one bot slot", async () => {

@@ -4028,6 +4028,25 @@ export function parseArguments(argv) {
   return options;
 }
 
+export function bindShutdownInput(controller, input = process.stdin) {
+  let buffered = "";
+  const onData = (chunk) => {
+    buffered += String(chunk);
+    if (buffered.length > 128) buffered = buffered.slice(-128);
+    let newline;
+    while ((newline = buffered.indexOf("\n")) >= 0) {
+      const command = buffered.slice(0, newline).trim();
+      buffered = buffered.slice(newline + 1);
+      if (command === "shutdown") {
+        controller.abort(new Error("Received shutdown command"));
+        return;
+      }
+    }
+  };
+  input.on("data", onData);
+  return () => input.off("data", onData);
+}
+
 async function preflightQualifiedEngine(config) {
   const engine = new UciEngine(config.engine);
   try {
@@ -4248,6 +4267,7 @@ export async function main(argv = process.argv.slice(2)) {
   for (const signal of ["SIGINT", "SIGTERM"]) {
     process.once(signal, () => controller.abort(new Error(`Received ${signal}`)));
   }
+  const unbindShutdownInput = bindShutdownInput(controller);
   const store = new LichessStore(path.resolve(options.store ?? path.join(runtimeDir, "matches.sqlite")));
   const authority = apiAuthorityKey(config.url, expectedAccount);
   const leaseOwner = randomUUID();
@@ -4328,6 +4348,7 @@ export async function main(argv = process.argv.slice(2)) {
       store,
     }).run(options.opponent);
   } finally {
+    unbindShutdownInput();
     if (leaseHeartbeat) clearInterval(leaseHeartbeat);
     store.releaseApiLease(authority, leaseOwner);
     store.close();
