@@ -1188,6 +1188,7 @@ test("UCI readiness requires explicit ponder and move-overhead support", () => {
 });
 
 test("missing timing profile remains observable with zero reserve and controller disabled", async () => {
+  const events = [];
   const engine = new UciEngine({
     executable: "engine.exe",
     working_directory: process.cwd(),
@@ -1207,7 +1208,8 @@ test("missing timing profile remains observable with zero reserve and controller
       TimeProfileBackupEmitReserveUs: 1000,
       TimeProfileIterationForecastScalePermille: 1000,
     },
-  });
+    timing: { opponent_turn_search: true },
+  }, (event) => events.push(event));
   engine.runtimeStatus = async () => ({
     time_profile_provider_reserve_us: 0,
     time_profile_backup_emit_reserve_us: 1000,
@@ -1219,6 +1221,11 @@ test("missing timing profile remains observable with zero reserve and controller
   assert.equal(status.provider_service_reserve_us, 0);
   assert.equal(status.backup_emit_reserve_us, 1000);
   assert.equal(status.predictive_controller_enabled, false);
+  assert.equal(engine.timing.opponent_turn_search, false);
+  assert.equal(engine.config.timing.opponent_turn_search, false);
+  assert.equal(events.some((event) =>
+    event.event === "opponent_turn_search_disabled"
+      && event.reason === "timing_profile_not_applied"), true);
 });
 
 test("timing profile identity owns the configured MCGS book-prior blend", () => {

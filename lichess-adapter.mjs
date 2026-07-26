@@ -1883,6 +1883,16 @@ export class UciEngine {
     };
   }
 
+  disableUnqualifiedOpponentTurnSearch() {
+    if (!this.timing.opponent_turn_search) return;
+    this.timing.opponent_turn_search = false;
+    if (this.config.timing) this.config.timing.opponent_turn_search = false;
+    this.telemetry({
+      event: "opponent_turn_search_disabled",
+      reason: "timing_profile_not_applied",
+    });
+  }
+
   async configureTimeProfile() {
     const initialStatus = await this.runtimeStatus();
     if (initialStatus.time_profile_provider_reserve_us !== 0) {
@@ -1900,6 +1910,7 @@ export class UciEngine {
         "missing",
         "no timing profile was configured",
       );
+      this.disableUnqualifiedOpponentTurnSearch();
       this.telemetry({ event: "time_profile_status", ...this.timeProfileStatus });
       return this.timeProfileStatus;
     }
@@ -1911,6 +1922,7 @@ export class UciEngine {
         "missing",
         `timing profile is unavailable: ${resolvedPath}`,
       );
+      this.disableUnqualifiedOpponentTurnSearch();
       this.telemetry({ event: "time_profile_status", ...this.timeProfileStatus });
       return this.timeProfileStatus;
     }
@@ -1971,6 +1983,9 @@ export class UciEngine {
         }
       }
       this.timeProfileStatus = timeProfileFallbackStatus("rejected", error.message);
+    }
+    if (this.timeProfileStatus.applied !== true) {
+      this.disableUnqualifiedOpponentTurnSearch();
     }
     this.telemetry({ event: "time_profile_status", ...this.timeProfileStatus });
     return this.timeProfileStatus;
