@@ -14,7 +14,7 @@ function options() {
   return {
     config: "deploy/lichess/config.uci_arena.template.yml",
     tokenFile: "secrets/lichess_bot_token.txt",
-    expectedAccount: "staging-bot",
+    expectedAccount: "operator-bot",
     runtimeDir: "runtime_state/lichess",
     profile: "runtime_state/model/single.json",
     timeProfile: "runtime_state/model/time.json",

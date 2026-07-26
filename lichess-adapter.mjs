@@ -53,7 +53,7 @@ export const DEFAULT_TEMPLATE = path.join(HERE, "config.uci_arena.template.yml")
 export const DEFAULT_TOKEN_FILE = path.join(ROOT, "secrets", "lichess_bot_token.txt");
 export const DEFAULT_RUNTIME_DIR = path.join(ROOT, "runtime_state", "lichess");
 export const DEFAULT_STORE_FILE = path.join(DEFAULT_RUNTIME_DIR, "matches.sqlite");
-export const LIVE_ACCEPTANCE_CONFIRMATION = "I_ACCEPT_ONE_STAGING_BOT_GAME";
+export const LIVE_ACCEPTANCE_CONFIRMATION = "I_ACCEPT_ONE_BOT_GAME";
 
 const PROFILE_OWNED_UCI_OPTIONS = Object.freeze({
   search_core: "SearchCore",
@@ -1289,10 +1289,10 @@ export async function validateLiveAcceptanceParticipants({
   const expectedAccount = normalizedUsername(account);
   const expectedTarget = normalizedUsername(target);
   if (!expectedAccount || !expectedTarget) {
-    throw new Error("Live acceptance requires both staging and target account names");
+    throw new Error("Live acceptance requires both operator and target account names");
   }
   if (expectedAccount === expectedTarget) {
-    throw new Error("Live acceptance target must be distinct from the staging account");
+    throw new Error("Live acceptance target must be distinct from the operator account");
   }
   const targetProfile = await client.json(
     `api/user/${encodeURIComponent(expectedTarget)}`,
@@ -1320,10 +1320,10 @@ export async function validateLiveAcceptanceParticipants({
   }));
   const unrelated = active.filter((game) => game.opponent !== expectedTarget);
   if (unrelated.length) {
-    throw new Error("Live acceptance staging account has an unrelated active game");
+    throw new Error("Live acceptance operator account has an unrelated active game");
   }
   if (active.length > 1) {
-    throw new Error("Live acceptance staging account has multiple active games");
+    throw new Error("Live acceptance operator account has multiple active games");
   }
   return {
     account: expectedAccount,
@@ -4220,7 +4220,7 @@ export async function main(argv = process.argv.slice(2)) {
       return 0;
     }
     if (options.acceptance_mode) {
-      if (options.acceptance_mode !== "staging-bot-v1") {
+      if (options.acceptance_mode !== "operator-bot-v1") {
         throw new Error(`Unsupported live acceptance mode: ${options.acceptance_mode}`);
       }
       if (options.acceptance_confirm !== LIVE_ACCEPTANCE_CONFIRMATION) {

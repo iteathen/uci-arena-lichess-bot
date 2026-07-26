@@ -15,7 +15,7 @@ import {
 function options(overrides = {}) {
   return validateAcceptanceOptions({
     confirm: LIVE_ACCEPTANCE_CONFIRMATION,
-    expected_account: "StagingBot",
+    expected_account: "OperatorBot",
     opponent: "PublicBot",
     token_file: "opaque-token-path",
     attempts: "3",
@@ -47,11 +47,11 @@ test("mock API accepts only the named online public BOT and no unrelated game", 
   });
   const result = await validateLiveAcceptanceParticipants({
     client,
-    account: "stagingbot",
+    account: "operatorbot",
     target: "publicbot",
   });
   assert.deepEqual(result, {
-    account: "stagingbot",
+    account: "operatorbot",
     target: "publicbot",
     target_title: "BOT",
     target_online: true,
@@ -76,7 +76,7 @@ test("mock API fails closed for non-BOT, offline, and unrelated active games", a
     await assert.rejects(
       validateLiveAcceptanceParticipants({
         client,
-        account: "stagingbot",
+        account: "operatorbot",
         target: "publicbot",
       }),
       /not BOT-titled|not online|not a public usable account/,
@@ -91,7 +91,7 @@ test("mock API fails closed for non-BOT, offline, and unrelated active games", a
   await assert.rejects(
     validateLiveAcceptanceParticipants({
       client,
-      account: "stagingbot",
+      account: "operatorbot",
       target: "publicbot",
     }),
     /unrelated active game/,

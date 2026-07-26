@@ -77,7 +77,7 @@ capacity profile qualified at that concurrency.
 - `lichess-store.mjs`: WAL-mode SQLite reservations, attempts, games, and W/D/L.
 - `windows-startup.mjs`: hidden Task Scheduler supervision.
 - `linux-startup.mjs`: per-user systemd supervision.
-- `live-acceptance.mjs`: explicitly confirmed staging BOT acceptance harness.
+- `live-acceptance.mjs`: explicitly confirmed existing-account BOT acceptance harness.
 - `native/`: independent Windows GUI-subsystem launcher.
 - `smoke-uci-startup.mjs`: local startup smoke; it never contacts Lichess.
 
@@ -229,20 +229,21 @@ recovery before admitting new work.
 ## Protected live acceptance
 
 The live acceptance harness is disabled unless the exact confirmation phrase is
-provided. It verifies the authenticated staging identity, requires the named
+provided. It verifies the existing authenticated operator identity, requires the named
 opponent to be a distinct public online BOT-titled account, disables automatic
 discovery and inbound public play, and asks only that opponent for a casual
 standard game. It makes at most three challenge attempts in twenty minutes and
 passes only after the authoritative game stream reports one completed game.
+It does not require or provision a second BOT account.
 
 The token is supplied only as an opaque file path. Unit/package tests use mock
 API and process boundaries and never run this command.
 
 ```powershell
 node deploy\lichess\live-acceptance.mjs `
-  --confirm I_ACCEPT_ONE_STAGING_BOT_GAME `
+  --confirm I_ACCEPT_ONE_BOT_GAME `
   --token-file secrets\lichess_bot_token.txt `
-  --expected-account <STAGING_BOT_ACCOUNT> `
+  --expected-account <EXISTING_BOT_ACCOUNT> `
   --opponent <PUBLIC_ONLINE_BOT_ACCOUNT>
 ```
 

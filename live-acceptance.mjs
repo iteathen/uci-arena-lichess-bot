@@ -68,7 +68,7 @@ export function validateAcceptanceOptions(options) {
   if (!expectedAccount) throw new Error("--expected-account is required");
   if (!opponent) throw new Error("--opponent is required");
   if (expectedAccount === opponent) {
-    throw new Error("Live acceptance opponent must differ from the staging account");
+    throw new Error("Live acceptance opponent must differ from the operator account");
   }
   if (!options.token_file) throw new Error("--token-file is required");
   return {
@@ -212,7 +212,7 @@ function adapterArguments(options, configPath, runtimeDir) {
     "--opponent",
     options.opponent,
     "--acceptance-mode",
-    "staging-bot-v1",
+    "operator-bot-v1",
     "--acceptance-confirm",
     LIVE_ACCEPTANCE_CONFIRMATION,
     "--runtime-dir",
