@@ -101,10 +101,21 @@ export function buildAcceptanceConfig(sourceConfig) {
     throw new Error("Live acceptance requires at least one configured bot slot");
   }
   config.scheduler = { ...config.scheduler, enabled: false };
-  config.capacity.bot = { ...config.capacity.bot, target_active: 0 };
-  config.capacity.human = {
-    ...config.capacity.human,
-    accept_public: false,
+  config.capacity = {
+    ...config.capacity,
+    total_slots: 1,
+    startup_parallelism: 1,
+    human: {
+      ...config.capacity.human,
+      slots: 0,
+      allow_borrowing: false,
+      accept_public: false,
+    },
+    bot: {
+      ...config.capacity.bot,
+      slots: 1,
+      target_active: 0,
+    },
   };
   config.challenges = {
     ...config.challenges,
@@ -201,7 +212,7 @@ async function terminateChild(child) {
   child.kill("SIGKILL");
 }
 
-function adapterArguments(options, configPath, runtimeDir) {
+export function adapterArguments(options, configPath, runtimeDir) {
   const values = [
     ADAPTER,
     "run",
@@ -222,6 +233,8 @@ function adapterArguments(options, configPath, runtimeDir) {
   ];
   for (const [flag, value] of [
     ["--repo-root", options.repo_root],
+    ["--engine", options.engine],
+    ["--working-directory", options.working_directory],
     ["--profile", options.profile],
     ["--time-profile", options.time_profile],
     ["--capacity-profile", options.capacity_profile],
@@ -230,6 +243,14 @@ function adapterArguments(options, configPath, runtimeDir) {
     if (value) values.push(flag, path.resolve(value));
   }
   return values;
+}
+
+export function acceptanceChildEnvironment(options, environment = process.env) {
+  if (!options.knowledge_root) return environment;
+  return {
+    ...environment,
+    UCI_ARENA_KNOWLEDGE_ROOT: path.resolve(options.knowledge_root),
+  };
 }
 
 export async function runSpawnedAttempt({
@@ -251,6 +272,7 @@ export async function runSpawnedAttempt({
   };
   const child = spawnImpl(process.execPath, adapterArguments(options, configPath, runtimeDir), {
     cwd: ROOT,
+    env: acceptanceChildEnvironment(options),
     stdio: ["ignore", "ignore", "ignore"],
     windowsHide: true,
   });

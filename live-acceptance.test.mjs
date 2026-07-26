@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import path from "node:path";
 import test from "node:test";
 
 import {
@@ -6,6 +7,8 @@ import {
   validateLiveAcceptanceParticipants,
 } from "./lichess-adapter.mjs";
 import {
+  acceptanceChildEnvironment,
+  adapterArguments,
   buildAcceptanceConfig,
   executeAcceptancePlan,
   observeAcceptanceEvent,
@@ -125,11 +128,36 @@ test("acceptance config permits only the explicit casual outbound target", () =>
     outbound_challenge: { rated: true, color: "white" },
   });
   assert.equal(config.scheduler.enabled, false);
+  assert.equal(config.capacity.total_slots, 1);
+  assert.equal(config.capacity.startup_parallelism, 1);
+  assert.equal(config.capacity.human.slots, 0);
+  assert.equal(config.capacity.bot.slots, 1);
   assert.equal(config.capacity.bot.target_active, 0);
   assert.equal(config.capacity.human.accept_public, false);
   assert.equal(config.challenges.accept_bots, false);
   assert.deepEqual(config.challenges.modes, ["casual"]);
   assert.equal(config.outbound_challenge.rated, false);
+});
+
+test("acceptance passes exact installed runtime bindings and shared knowledge root", () => {
+  const args = adapterArguments({
+    token_file: "token.txt",
+    expected_account: "operatorbot",
+    opponent: "publicbot",
+    engine: "installed/bin/flashfork_uci.exe",
+    working_directory: "installed",
+    model_root: "installed/models/default",
+  }, "acceptance.json", "runtime");
+  const engineIndex = args.indexOf("--engine");
+  assert.equal(args[engineIndex + 1], path.resolve("installed/bin/flashfork_uci.exe"));
+  assert.equal(args[engineIndex + 2], "--working-directory");
+  assert.equal(args[engineIndex + 3], path.resolve("installed"));
+  const environment = acceptanceChildEnvironment(
+    { knowledge_root: "shared/knowledge" },
+    { SENTINEL: "retained" },
+  );
+  assert.equal(environment.SENTINEL, "retained");
+  assert.equal(environment.UCI_ARENA_KNOWLEDGE_ROOT, path.resolve("shared/knowledge"));
 });
 
 test("event evidence requires a completed game against the named opponent", () => {

@@ -90,6 +90,22 @@ cmake --build build --config Release --target flashfork_uci
 node deploy\lichess\smoke-uci-startup.mjs --config deploy\lichess\config.uci_arena.template.yml
 ```
 
+Publish a self-contained profile for the exact executable and checkpoint from
+current diagnostic and complete-game evidence. `local_live_safety` permits a
+shared-resource diagnostic for a bounded local bot test but grants no release,
+performance, tuning, or strength authority; use `release` only with
+resource-isolated evidence.
+
+```powershell
+node deploy\lichess\publish-single-game-profile.mjs `
+  --engine <installed-engine> `
+  --model-root <installed-model-root> `
+  --diagnostic-evidence <diagnostic-json> `
+  --complete-game-evidence <complete-game-json> `
+  --qualification-scope local_live_safety `
+  --output <qualification-root>\uci_arena_single_game_profile_v1.json
+```
+
 Validate the existing `uci_arena_single_game_profile_v1`. This local command
 does not read a Lichess credential. Its telemetry probe temporarily disables
 the opening book, then restores the configured/default-on book for live play.

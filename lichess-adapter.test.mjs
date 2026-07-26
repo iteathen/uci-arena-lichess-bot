@@ -566,6 +566,19 @@ test("runtime config accepts the shared active model environment override", () =
   assert.equal(explicit.engine.uci_options.ModelRoot, "engine/runtime/models/explicit/engine");
 });
 
+test("runtime config accepts exact installed engine and working-directory overrides", () => {
+  const engine = path.resolve("installed/bin/flashfork_uci.exe");
+  const workingDirectory = path.resolve("installed");
+  const config = loadRuntimeConfig({
+    templatePath: DEFAULT_TEMPLATE,
+    repoRoot: ROOT,
+    enginePath: engine,
+    workingDirectory,
+  });
+  assert.equal(config.engine.executable, engine);
+  assert.equal(config.engine.working_directory, workingDirectory);
+});
+
 test("timing profile has a distinct config, environment, and CLI path", () => {
   const selected = "runtime_state/models/model/cache/uci_time_profile_v1.json";
   const config = loadRuntimeConfig({

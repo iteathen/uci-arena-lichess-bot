@@ -507,6 +507,8 @@ function migrateV2Config(config) {
 export function loadRuntimeConfig({
   templatePath = DEFAULT_TEMPLATE,
   repoRoot = ROOT,
+  enginePath,
+  workingDirectory,
   modelRoot,
   profilePath,
   timeProfilePath,
@@ -530,6 +532,8 @@ export function loadRuntimeConfig({
   if (!config.engine?.executable || !config.engine?.working_directory) {
     throw new Error("Lichess adapter config is missing engine paths");
   }
+  if (enginePath) config.engine.executable = path.resolve(enginePath);
+  if (workingDirectory) config.engine.working_directory = path.resolve(workingDirectory);
   if (!config.engine.uci_options || typeof config.engine.uci_options !== "object") {
     throw new Error("Lichess adapter config is missing engine UCI options");
   }
@@ -4075,6 +4079,8 @@ export async function main(argv = process.argv.slice(2)) {
   const config = loadRuntimeConfig({
     templatePath: path.resolve(options.config ?? DEFAULT_TEMPLATE),
     repoRoot: path.resolve(options.repo_root ?? ROOT),
+    enginePath: options.engine,
+    workingDirectory: options.working_directory,
     modelRoot: options.model_root,
     profilePath: options.profile,
     timeProfilePath: options.time_profile,
