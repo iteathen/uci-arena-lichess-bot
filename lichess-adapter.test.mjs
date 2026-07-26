@@ -2005,6 +2005,34 @@ test("API client applies at least sixty seconds of global backoff after 429", as
   assert.ok(client.requestQueue.cooldownUntil >= before + 60_000);
 });
 
+test("API client exposes only bounded sanitized Lichess error detail", async () => {
+  const client = new LichessClient({
+    token: "test-token",
+    fetchImpl: async () => ({
+      ok: false,
+      status: 400,
+      headers: { get: () => null },
+      text: async () => JSON.stringify({
+        error: `Challenge rejected\n${"x".repeat(300)}`,
+        ignored: "arbitrary response document",
+      }),
+    }),
+  });
+  await assert.rejects(
+    client.postJson("api/challenge/test-bot", { rated: false }),
+    (error) => {
+      assert.ok(error instanceof LichessHttpError);
+      assert.equal(error.status, 400);
+      assert.equal(error.detail.includes("\n"), false);
+      assert.equal(error.detail.length, 256);
+      assert.match(error.message, /Challenge rejected/);
+      assert.equal(error.message.includes("arbitrary response document"), false);
+      assert.equal(error.message.includes("test-token"), false);
+      return true;
+    },
+  );
+});
+
 test("API client holds the single-flight permit through finite response consumption", async () => {
   let releaseFirst;
   const firstBody = new Promise((resolve) => { releaseFirst = resolve; });

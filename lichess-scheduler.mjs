@@ -275,12 +275,20 @@ export function reservationBlocksPublicHuman({ reservation, opponent, reservatio
 }
 
 export class LichessHttpError extends Error {
-  constructor(method, endpoint, status, retryAfterMs = 0, requestClass = "ordinary") {
-    super(`Lichess ${method} ${endpoint} failed with HTTP ${status}`);
+  constructor(
+    method,
+    endpoint,
+    status,
+    retryAfterMs = 0,
+    requestClass = "ordinary",
+    detail = "",
+  ) {
+    super(`Lichess ${method} ${endpoint} failed with HTTP ${status}${detail ? `: ${detail}` : ""}`);
     this.name = "LichessHttpError";
     this.status = status;
     this.retryAfterMs = retryAfterMs;
     this.requestClass = requestClass;
+    this.detail = detail;
   }
 }
 

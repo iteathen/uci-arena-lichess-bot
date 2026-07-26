@@ -1083,6 +1083,38 @@ async function discardResponseBody(response) {
   if (typeof response?.body?.cancel === "function") await response.body.cancel();
 }
 
+async function boundedApiErrorDetail(response) {
+  let text = "";
+  try {
+    if (typeof response?.text === "function") {
+      text = await response.text();
+    } else if (typeof response?.arrayBuffer === "function") {
+      text = new TextDecoder().decode(await response.arrayBuffer());
+    } else {
+      if (typeof response?.body?.cancel === "function") await response.body.cancel();
+      return "";
+    }
+  } catch {
+    return "";
+  }
+  let value;
+  try {
+    const parsed = JSON.parse(text);
+    value = typeof parsed?.error === "string"
+      ? parsed.error
+      : typeof parsed?.message === "string"
+        ? parsed.message
+        : "";
+  } catch {
+    return "";
+  }
+  return value
+    .replace(/[\u0000-\u001f\u007f]+/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .slice(0, 256);
+}
+
 function apiRequestClass(endpoint, method = "GET") {
   const normalized = String(endpoint).replace(/^\/+/, "");
   if (normalized.includes("/move/")) return "move";
@@ -1157,8 +1189,15 @@ export class LichessClient {
           requestClass,
         );
       }
-      await discardResponseBody(response);
-      throw new LichessHttpError(method, endpoint, response.status, retryAfterMs, requestClass);
+      const detail = await boundedApiErrorDetail(response);
+      throw new LichessHttpError(
+        method,
+        endpoint,
+        response.status,
+        retryAfterMs,
+        requestClass,
+        detail,
+      );
     }
     return response;
   }
