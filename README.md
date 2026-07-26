@@ -90,6 +90,11 @@ cmake --build build --config Release --target flashfork_uci
 node deploy\lichess\smoke-uci-startup.mjs --config deploy\lichess\config.uci_arena.template.yml
 ```
 
+When the supplied configuration includes `BookFile` or `SyzygyPath`, the smoke
+also requires `runtime_status` to report the opening book and tablebases active
+and returns their entry count and loaded cardinality. A preserved locator alone
+does not satisfy installed-runtime acceptance.
+
 Publish a self-contained profile for the exact executable and checkpoint from
 current diagnostic and complete-game evidence. `local_live_safety` permits a
 shared-resource diagnostic for a bounded local bot test but grants no release,

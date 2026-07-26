@@ -66,6 +66,29 @@ export async function smoke(options) {
     }
     send("isready");
     await readUntil(iterator, (line) => line === "readyok", options.timeoutMs);
+    send("runtime_status");
+    const runtimeStatusPrefix = "info string runtime_status_v1 ";
+    const runtimeStatusLines = await readUntil(
+      iterator,
+      (line) => line.startsWith(runtimeStatusPrefix),
+      options.timeoutMs,
+    );
+    const runtimeStatusLine = runtimeStatusLines.at(-1);
+    const runtimeStatus = JSON.parse(
+      runtimeStatusLine.slice(runtimeStatusPrefix.length),
+    );
+    if (Object.hasOwn(config.engine.uci_options, "BookFile")
+        && runtimeStatus.opening_book_active !== true) {
+      throw new Error(
+        `Configured opening book is not active: ${runtimeStatus.opening_book_message ?? "unknown"}`,
+      );
+    }
+    if (Object.hasOwn(config.engine.uci_options, "SyzygyPath")
+        && runtimeStatus.syzygy_active !== true) {
+      throw new Error(
+        `Configured Syzygy tablebases are not active: ${runtimeStatus.syzygy_message ?? "unknown"}`,
+      );
+    }
     send("ucinewgame");
     send("position startpos");
     send(`go depth ${options.depth}`);
@@ -80,6 +103,12 @@ export async function smoke(options) {
       bestmove,
       advertised_option_count: advertised.size,
       applied_uci_options: Object.keys(config.engine.uci_options).sort(),
+      opening_book_active: runtimeStatus.opening_book_active === true,
+      opening_book_entries: Number(runtimeStatus.opening_book_entries ?? 0),
+      syzygy_active: runtimeStatus.syzygy_active === true,
+      syzygy_loaded_cardinality: Number(
+        runtimeStatus.syzygy_loaded_cardinality ?? 0,
+      ),
     };
   } finally {
     send("quit");
