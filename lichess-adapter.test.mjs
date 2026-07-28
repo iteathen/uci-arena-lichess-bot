@@ -1298,8 +1298,14 @@ test("timing profile identity owns the configured MCGS book-prior blend", () => 
     Object.hasOwn(configuration.extraEngineOptions, "McgsBookPriorBlendPermille"),
     false,
   );
-  assert.equal(configuration.extraEngineOptions.SyzygyProbeLimit, "6");
-  assert.equal(configuration.extraEngineOptions.SyzygyInternalProbe, "true");
+  assert.equal(
+    Object.hasOwn(configuration.extraEngineOptions, "SyzygyProbeLimit"),
+    false,
+  );
+  assert.equal(
+    Object.hasOwn(configuration.extraEngineOptions, "SyzygyInternalProbe"),
+    false,
+  );
 });
 
 test("UCI search telemetry retains identity across later info string lines", () => {

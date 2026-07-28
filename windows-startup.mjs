@@ -45,6 +45,7 @@ export function startupAction(options) {
   for (const [flag, value] of [
     ["--profile", options.profile],
     ["--time-profile", options.timeProfile],
+    ["--temporal-curve-profile", options.temporalCurve],
     ["--capacity-profile", options.capacityProfile],
     ["--model-root", options.modelRoot],
   ]) {

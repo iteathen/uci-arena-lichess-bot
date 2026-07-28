@@ -18,6 +18,7 @@ function options() {
     runtimeDir: "runtime_state/lichess",
     profile: "runtime_state/model/single.json",
     timeProfile: "runtime_state/model/time.json",
+    temporalCurve: "runtime_state/model/curve.json",
     capacityProfile: "runtime_state/model/capacity.json",
     modelRoot: "engine/runtime/models/model/engine",
   };
@@ -28,6 +29,7 @@ test("Linux startup action runs the foreground adapter with path-only credential
   assert.equal(action.command, path.resolve(process.execPath));
   assert.equal(action.arguments[0].endsWith("lichess-adapter.mjs"), true);
   assert.equal(action.arguments.includes("--token-file"), true);
+  assert.equal(action.arguments.includes("--temporal-curve-profile"), true);
   assert.equal(
     action.arguments[action.arguments.indexOf("--token-file") + 1],
     path.resolve("secrets/lichess_bot_token.txt"),

@@ -4194,6 +4194,7 @@ export async function main(argv = process.argv.slice(2)) {
       runtimeDir,
       profile: config.engine.single_game_profile,
       timeProfile: options.time_profile ?? config.engine.time_profile,
+      temporalCurve: config.engine.temporal_curve_profile,
       capacityProfile: options.capacity_profile ?? config.capacity.capacity_profile,
       modelRoot: config.engine.uci_options.ModelRoot,
     };

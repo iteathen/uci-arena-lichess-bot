@@ -22,6 +22,7 @@ function options() {
     runtimeDir: "runtime_state/lichess",
     profile: "runtime_state/model/single.json",
     timeProfile: "runtime_state/model/time.json",
+    temporalCurve: "runtime_state/model/curve.json",
     capacityProfile: "runtime_state/model/capacity.json",
     modelRoot: "engine/runtime/models/model/engine",
     nativeLauncher: NATIVE_LAUNCHER,
@@ -34,6 +35,7 @@ test("startup task is hidden, supervised, and invokes the foreground adapter thr
   assert.match(action.arguments, /lichess-adapter\.mjs run/);
   assert.match(action.arguments, /--token-file/);
   assert.match(action.arguments, /--time-profile/);
+  assert.match(action.arguments, /--temporal-curve-profile/);
   const xml = buildTaskXml(options(), "S-1-5-21-1");
   assert.match(xml, new RegExp(STARTUP_TASK_NAME));
   assert.match(xml, /<Hidden>true<\/Hidden>/);
