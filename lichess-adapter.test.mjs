@@ -116,7 +116,7 @@ function qualifiedFixture() {
     schema: "uci_arena_mcgs_adaptive_temporal_curve_v1",
     revision: 1,
     generated_at: "2026-07-25T00:00:00.000Z",
-    status: "provisional_live_authority",
+    status: "qualified_live_authority",
     deployable: true,
     formula: "adaptive_curve_v1_fixed_point",
     coefficients: BOOTSTRAP_COEFFICIENTS,
@@ -276,6 +276,24 @@ test("adaptive temporal-curve manifest tampering fails closed", () => {
   assert.throws(
     () => loadAdaptiveTemporalCurveProfile(fixture.temporalCurvePath),
     /evidence manifest hash mismatch/,
+  );
+});
+
+test("evidence-gated adaptive temporal curve is rejected for live deployment", () => {
+  const fixture = qualifiedFixture();
+  const evidenceGated = {
+    ...fixture.temporalCurve,
+    status: "evidence_gated_non_live",
+    deployable: false,
+    promotion: {
+      ready: false,
+      reasons: ["insufficient_independent_pair_coverage"],
+    },
+  };
+  writeFileSync(fixture.temporalCurvePath, JSON.stringify(evidenceGated));
+  assert.throws(
+    () => loadAdaptiveTemporalCurveProfile(fixture.temporalCurvePath),
+    /not deployable/,
   );
 });
 
@@ -524,6 +542,8 @@ test("runtime config is credential-free and resolves repository paths", () => {
   assert.equal(config.timing.bootstrap_transport_reserve_ms, 650);
   assert.equal(config.engine.uci_options.ModelRoot, "engine/runtime/models/example/engine");
   assert.equal(config.engine.uci_options.McgsTimePolicy, "RelativeClockTemporalV1");
+  assert.equal(config.engine.uci_options.McgsTemporalWeightProfile, "EarlyCurrent");
+  assert.equal(config.engine.temporal_curve_profile, null);
   assert.equal(config.engine.uci_options.OwnBook, true);
   assert.equal(config.engine.executable.includes(ROOT.replaceAll("\\", "/")), true);
 });
@@ -676,6 +696,19 @@ test("qualified MCGS single-game profile is identity-bound and owns the parallel
       McgsCpuctPermille: 1750,
       McgsOutstandingBatches: 3,
     },
+  );
+});
+
+test("qualified static temporal profile remains live without an adaptive artifact", () => {
+  const fixture = qualifiedFixture();
+  fixture.config.engine.temporal_curve_profile = null;
+  fixture.config.engine.uci_options.McgsTemporalWeightProfile = "EarlyCurrent";
+  const profile = applySingleGameProfile(fixture.config);
+  assert.equal(profile.temporal_curve, null);
+  assert.equal(fixture.config.engine.temporal_curve_profile_status, null);
+  assert.equal(
+    fixture.config.engine.uci_options.McgsTemporalWeightProfile,
+    "EarlyCurrent",
   );
 });
 

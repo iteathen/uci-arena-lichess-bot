@@ -73,10 +73,8 @@ const PROFILE_OWNED_UCI_OPTIONS = Object.freeze({
 });
 const ADAPTIVE_CURVE_SCHEMA = "uci_arena_mcgs_adaptive_temporal_curve_v1";
 const ADAPTIVE_CURVE_FORMULA = "adaptive_curve_v1_fixed_point";
-const ADAPTIVE_CURVE_STATUS = new Set([
-  "provisional_live_authority",
-  "qualified_live_authority",
-]);
+const ADAPTIVE_CURVE_STATUS = new Set(["qualified_live_authority"]);
+const QUALIFIED_STATIC_TEMPORAL_PROFILE = "EarlyCurrent";
 const ADAPTIVE_CURVE_FIELDS = Object.freeze({
   reference_pool_ms: {
     option: "McgsTemporalCurveReferencePoolMs",
@@ -546,17 +544,29 @@ export function loadRuntimeConfig({
   if (selectedTemporalCurve) {
     config.engine.temporal_curve_profile = selectedTemporalCurve;
   }
-  if (!config.engine.temporal_curve_profile) {
-    throw new Error("Lichess adapter config is missing engine.temporal_curve_profile");
-  }
-  config.engine.temporal_curve_profile = path.isAbsolute(
-    config.engine.temporal_curve_profile,
-  )
-    ? config.engine.temporal_curve_profile
-    : path.resolve(
-      config.engine.working_directory,
+  if (config.engine.temporal_curve_profile) {
+    config.engine.temporal_curve_profile = path.isAbsolute(
       config.engine.temporal_curve_profile,
-    );
+    )
+      ? config.engine.temporal_curve_profile
+      : path.resolve(
+        config.engine.working_directory,
+        config.engine.temporal_curve_profile,
+      );
+    if (config.engine.uci_options.McgsTemporalWeightProfile
+        === QUALIFIED_STATIC_TEMPORAL_PROFILE) {
+      delete config.engine.uci_options.McgsTemporalWeightProfile;
+    }
+  } else {
+    config.engine.temporal_curve_profile = null;
+    if (config.engine.uci_options.McgsTemporalWeightProfile
+        !== QUALIFIED_STATIC_TEMPORAL_PROFILE) {
+      throw new Error(
+        `Live MCGS config without a qualified adaptive curve requires `
+        + `McgsTemporalWeightProfile=${QUALIFIED_STATIC_TEMPORAL_PROFILE}`,
+      );
+    }
+  }
   config.engine.selected_bundle = "mcgs";
   normalizeTimingConfig(config);
   if (config.timing.transport_profile_path) {
@@ -885,7 +895,19 @@ export function applySingleGameProfile(config) {
     }
   }
   config.engine.uci_options = { ...config.engine.uci_options, ...profileValues };
-  profile.temporal_curve = applyAdaptiveTemporalCurveProfile(config);
+  if (config.engine.temporal_curve_profile) {
+    profile.temporal_curve = applyAdaptiveTemporalCurveProfile(config);
+  } else {
+    if (config.engine.uci_options.McgsTemporalWeightProfile
+        !== QUALIFIED_STATIC_TEMPORAL_PROFILE) {
+      throw new Error(
+        `Live MCGS config without a qualified adaptive curve requires `
+        + `McgsTemporalWeightProfile=${QUALIFIED_STATIC_TEMPORAL_PROFILE}`,
+      );
+    }
+    profile.temporal_curve = null;
+    config.engine.temporal_curve_profile_status = null;
+  }
   config.engine.qualification_profile = profile;
   return profile;
 }

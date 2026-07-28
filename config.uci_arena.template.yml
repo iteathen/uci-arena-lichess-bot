@@ -6,7 +6,7 @@
     "working_directory": "<UCI_ARENA_REPO>",
     "single_game_profile": "<UCI_ARENA_REPO>/runtime_state/models/compact_chessformer_gab_v1/cache/uci_arena_single_game_profile_v1.json",
     "time_profile": "<UCI_ARENA_REPO>/runtime_state/models/compact_chessformer_gab_v1/cache/uci_time_profile_v3.json",
-    "temporal_curve_profile": "<UCI_ARENA_REPO>/engine/runtime/time/mcgs_adaptive_curve_v1.json",
+    "temporal_curve_profile": null,
     "fallback_bundle": null,
     "search_timeout_grace_ms": 10000,
     "shutdown_grace_ms": 5000,
@@ -15,6 +15,7 @@
       "ModelBackend": "native",
       "ModelRoot": "engine/runtime/models/compact_chessformer_gab_v1/engine",
       "McgsTimePolicy": "RelativeClockTemporalV1",
+      "McgsTemporalWeightProfile": "EarlyCurrent",
       "OwnBook": true
     }
   },
