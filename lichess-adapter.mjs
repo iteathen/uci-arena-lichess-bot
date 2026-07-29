@@ -1315,7 +1315,10 @@ export async function probeAccount({
   });
   const profile = await apiClient.json("api/account", { signal });
   const username = String(profile.username ?? profile.id ?? "");
-  if (username.toLocaleLowerCase() !== expectedAccount.toLocaleLowerCase()) {
+  if (
+    expectedAccount
+    && username.toLocaleLowerCase() !== expectedAccount.toLocaleLowerCase()
+  ) {
     throw new Error(`Authenticated Lichess account mismatch: ${username}`);
   }
   const games = Number(profile.count?.all ?? 0);
@@ -4262,7 +4265,9 @@ export async function main(argv = process.argv.slice(2)) {
     );
   }
   const expectedAccount = options.expected_account;
-  if (!expectedAccount) throw new Error("--expected-account is required");
+  if (!expectedAccount && options.command !== "probe") {
+    throw new Error("--expected-account is required");
+  }
   const tokenFile = path.resolve(options.token_file ?? DEFAULT_TOKEN_FILE);
   const controller = new AbortController();
   for (const signal of ["SIGINT", "SIGTERM"]) {
@@ -4270,7 +4275,7 @@ export async function main(argv = process.argv.slice(2)) {
   }
   const unbindShutdownInput = bindShutdownInput(controller);
   const store = new LichessStore(path.resolve(options.store ?? path.join(runtimeDir, "matches.sqlite")));
-  const authority = apiAuthorityKey(config.url, expectedAccount);
+  const authority = apiAuthorityKey(config.url, expectedAccount ?? "account-probe");
   const leaseOwner = randomUUID();
   let leaseHeartbeat = null;
   try {

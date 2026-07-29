@@ -225,12 +225,15 @@ node deploy\lichess\lichess-adapter.mjs capacity-qualify `
   --capacity-profile runtime_state\models\<MODEL_ID>\cache\uci_arena_lichess_capacity_profile_v2.json
 ```
 
-Probe the account, then run. Pass the token file by path only.
+Probe the account, then run. Pass the token file by path only. The `probe`
+command may omit `--expected-account` to discover and validate the BOT-titled
+account for Manager onboarding; `run` and startup installation still require
+the expected account as an identity guard.
 
 ```powershell
 node deploy\lichess\lichess-adapter.mjs probe `
   --token-file secrets\lichess_bot_token.txt `
-  --expected-account <LICHESS_ACCOUNT>
+  [--expected-account <LICHESS_ACCOUNT>]
 
 node deploy\lichess\lichess-adapter.mjs run `
   --token-file secrets\lichess_bot_token.txt `

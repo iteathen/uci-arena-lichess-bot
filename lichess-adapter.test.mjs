@@ -2164,6 +2164,27 @@ test("account probe rejects a mismatched account", async () => {
   );
 });
 
+test("account probe discovers a BOT identity when no expected account is supplied", async () => {
+  const fetchImpl = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      username: "detected-bot",
+      title: "BOT",
+      count: { all: 7 },
+    }),
+  });
+  assert.deepEqual(
+    await probeAccount({ tokenFile: temporaryToken(), fetchImpl }),
+    {
+      username: "detected-bot",
+      title: "BOT",
+      is_bot: true,
+      games: 7,
+    },
+  );
+});
+
 test("account probe explains BOT ineligibility after prior play", async () => {
   const fetchImpl = async () => ({
     ok: true,
