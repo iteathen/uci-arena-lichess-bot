@@ -225,18 +225,20 @@ node deploy\lichess\lichess-adapter.mjs capacity-qualify `
   --capacity-profile runtime_state\models\<MODEL_ID>\cache\uci_arena_lichess_capacity_profile_v2.json
 ```
 
-Probe the account, then run. Pass the token file by path only. The `probe`
-command may omit `--expected-account` to discover and validate the BOT-titled
-account for Manager onboarding; `run` and startup installation still require
-the expected account as an identity guard.
+Probe the account, then run. Every local installation supplies an
+operator-owned token file outside the repository and installed provider
+component. Pass its path explicitly; there is no packaged or repository-relative
+default. The `probe` command may omit `--expected-account` to discover and
+validate the BOT-titled account for Manager onboarding; `run` and startup
+installation still require the expected account as an identity guard.
 
 ```powershell
 node deploy\lichess\lichess-adapter.mjs probe `
-  --token-file secrets\lichess_bot_token.txt `
+  --token-file "$env:USERPROFILE\.uci-arena-credentials\lichess-bot.token" `
   [--expected-account <LICHESS_ACCOUNT>]
 
 node deploy\lichess\lichess-adapter.mjs run `
-  --token-file secrets\lichess_bot_token.txt `
+  --token-file "$env:USERPROFILE\.uci-arena-credentials\lichess-bot.token" `
   --expected-account <LICHESS_ACCOUNT>
 ```
 
@@ -266,7 +268,7 @@ API and process boundaries and never run this command.
 ```powershell
 node deploy\lichess\live-acceptance.mjs `
   --confirm I_ACCEPT_ONE_BOT_GAME `
-  --token-file secrets\lichess_bot_token.txt `
+  --token-file "$env:USERPROFILE\.uci-arena-credentials\lichess-bot.token" `
   --expected-account <EXISTING_BOT_ACCOUNT> `
   --opponent <PUBLIC_ONLINE_BOT_ACCOUNT>
 ```
@@ -362,7 +364,7 @@ cmake -S deploy\lichess\native -B deploy\lichess\native\build -A x64
 cmake --build deploy\lichess\native\build --config Release
 
 node deploy\lichess\lichess-adapter.mjs startup install `
-  --token-file secrets\lichess_bot_token.txt `
+  --token-file "$env:USERPROFILE\.uci-arena-credentials\lichess-bot.token" `
   --expected-account <LICHESS_ACCOUNT>
 
 node deploy\lichess\lichess-adapter.mjs startup status
@@ -378,7 +380,7 @@ requires root:
 
 ```bash
 node deploy/lichess/lichess-adapter.mjs startup install \
-  --token-file secrets/lichess_bot_token.txt \
+  --token-file "$HOME/.config/uci-arena-credentials/lichess-bot.token" \
   --expected-account <LICHESS_ACCOUNT>
 
 node deploy/lichess/lichess-adapter.mjs startup status
@@ -402,10 +404,19 @@ Operational state is under `runtime_state/lichess`: `runtime.json`,
 source for opponent W/D/L, challenge outcomes, owner reservations, and pause
 state.
 
+## Credential-free API integration tests
+
+`fake-api-server.mjs` provides a deterministic, finite Lichess-compatible HTTP
+fixture on an ephemeral loopback port. Tests create a temporary external token
+file containing the documented non-secret fixture value, exercise the real
+account probe and transport client over HTTP, and then remove the temporary
+file. The server never journals request headers or authorization values and is
+not imported by production configuration or packaged as a runtime fallback.
+
 ## Guardrails
 
-- Never read, print, inspect, or copy `secrets/lichess_bot_token.txt`; pass its
-  path only to the adapter.
+- Never read, print, inspect, copy, bundle, or default a real credential. Pass
+  only an operator-selected external file path to the adapter.
 - Do not commit credentials, account handles, SQLite/runtime state, logs, model
   artifacts, capacity evidence, or generated native build output.
 - Keep Lichess integration outside `engine/src` and `engine/include`.

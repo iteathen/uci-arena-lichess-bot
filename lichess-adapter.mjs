@@ -50,7 +50,6 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT = path.resolve(HERE, "../..");
 export const REPO_PLACEHOLDER = "<UCI_ARENA_REPO>";
 export const DEFAULT_TEMPLATE = path.join(HERE, "config.uci_arena.template.yml");
-export const DEFAULT_TOKEN_FILE = path.join(ROOT, "secrets", "lichess_bot_token.txt");
 export const DEFAULT_RUNTIME_DIR = path.join(ROOT, "runtime_state", "lichess");
 export const DEFAULT_STORE_FILE = path.join(DEFAULT_RUNTIME_DIR, "matches.sqlite");
 export const LIVE_ACCEPTANCE_CONFIRMATION = "I_ACCEPT_ONE_BOT_GAME";
@@ -4031,6 +4030,23 @@ export function parseArguments(argv) {
   return options;
 }
 
+export function resolveExternalTokenFile(options, componentRoot = ROOT) {
+  const supplied = options?.token_file;
+  if (typeof supplied !== "string" || !supplied.trim()) {
+    throw new Error(
+      "--token-file is required and must name an operator-owned file outside the installed component",
+    );
+  }
+  const resolved = path.resolve(supplied);
+  const relative = path.relative(path.resolve(componentRoot), resolved);
+  if (relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))) {
+    throw new Error(
+      "--token-file must be outside the adapter repository or installed component root",
+    );
+  }
+  return resolved;
+}
+
 export function bindShutdownInput(controller, input = process.stdin) {
   let buffered = "";
   const onData = (chunk) => {
@@ -4184,6 +4200,7 @@ export async function main(argv = process.argv.slice(2)) {
     return 0;
   }
   if (options.command === "startup" && options.action === "install") {
+    const tokenFile = resolveExternalTokenFile(options);
     const { qualificationProfile } = await preflightDeploymentBundle(config);
     loadCapacityProfile(
       options.capacity_profile ?? config.capacity.capacity_profile,
@@ -4192,7 +4209,7 @@ export async function main(argv = process.argv.slice(2)) {
     );
     const startupOptions = {
       config: path.resolve(options.config ?? DEFAULT_TEMPLATE),
-      tokenFile: path.resolve(options.token_file ?? DEFAULT_TOKEN_FILE),
+      tokenFile,
       expectedAccount: options.expected_account,
       runtimeDir,
       profile: config.engine.single_game_profile,
@@ -4212,6 +4229,9 @@ export async function main(argv = process.argv.slice(2)) {
   if (!new Set(["qualify", "capacity-qualify", "probe", "run"]).has(options.command)) {
     throw new Error(`Unknown command: ${options.command}`);
   }
+  const tokenFile = new Set(["probe", "run"]).has(options.command)
+    ? resolveExternalTokenFile(options)
+    : null;
   let qualificationStatus;
   if (new Set(["qualify", "capacity-qualify", "run"]).has(options.command)) {
     let qualificationProfile = applySingleGameProfile(config);
@@ -4268,7 +4288,6 @@ export async function main(argv = process.argv.slice(2)) {
   if (!expectedAccount && options.command !== "probe") {
     throw new Error("--expected-account is required");
   }
-  const tokenFile = path.resolve(options.token_file ?? DEFAULT_TOKEN_FILE);
   const controller = new AbortController();
   for (const signal of ["SIGINT", "SIGTERM"]) {
     process.once(signal, () => controller.abort(new Error(`Received ${signal}`)));

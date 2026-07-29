@@ -30,6 +30,7 @@ import {
   parseArguments,
   parseRuntimeStatus,
   probeAccount,
+  resolveExternalTokenFile,
   validateRuntimeStatus,
 } from "./lichess-adapter.mjs";
 import {
@@ -595,6 +596,25 @@ test("timing profile has a distinct config, environment, and CLI path", () => {
   assert.deepEqual(
     parseArguments(["run", "--profile", "single.json", "--time-profile", "time.json"]),
     { command: "run", profile: "single.json", time_profile: "time.json" },
+  );
+});
+
+test("credential path is explicit and outside the adapter component", () => {
+  const componentRoot = path.resolve("fixture-component");
+  const external = path.resolve("fixture-operator", "lichess.token");
+  assert.equal(
+    resolveExternalTokenFile({ token_file: external }, componentRoot),
+    external,
+  );
+  assert.throws(
+    () => resolveExternalTokenFile({}, componentRoot),
+    /--token-file is required/,
+  );
+  assert.throws(
+    () => resolveExternalTokenFile({
+      token_file: path.join(componentRoot, "secrets", "lichess.token"),
+    }, componentRoot),
+    /outside the adapter repository/,
   );
 });
 

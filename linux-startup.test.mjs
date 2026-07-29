@@ -13,7 +13,7 @@ import {
 function options() {
   return {
     config: "deploy/lichess/config.uci_arena.template.yml",
-    tokenFile: "secrets/lichess_bot_token.txt",
+    tokenFile: path.join(path.parse(path.resolve(".")).root, "operator-secrets", "lichess-bot.token"),
     expectedAccount: "operator-bot",
     runtimeDir: "runtime_state/lichess",
     profile: "runtime_state/model/single.json",
@@ -32,7 +32,7 @@ test("Linux startup action runs the foreground adapter with path-only credential
   assert.equal(action.arguments.includes("--temporal-curve-profile"), true);
   assert.equal(
     action.arguments[action.arguments.indexOf("--token-file") + 1],
-    path.resolve("secrets/lichess_bot_token.txt"),
+    path.resolve(options().tokenFile),
   );
 });
 
