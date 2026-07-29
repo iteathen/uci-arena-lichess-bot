@@ -19,7 +19,7 @@ function sha256(value) {
 
 function fixture() {
   const root = mkdtempSync(path.join(os.tmpdir(), "uci-single-game-profile-"));
-  const engine = path.join(root, "flashfork_uci.exe");
+  const engine = path.join(root, "uci_arena_engine.exe");
   const modelRoot = path.join(root, "models", "default");
   const output = path.join(root, "qualification", "profile.json");
   const diagnosticPath = path.join(root, "diagnostic.json");

@@ -569,7 +569,7 @@ test("runtime config accepts the shared active model environment override", () =
 });
 
 test("runtime config accepts exact installed engine and working-directory overrides", () => {
-  const engine = path.resolve("installed/bin/flashfork_uci.exe");
+    const engine = path.resolve("installed/bin/uci_arena_engine.exe");
   const workingDirectory = path.resolve("installed");
   const config = loadRuntimeConfig({
     templatePath: DEFAULT_TEMPLATE,
@@ -817,7 +817,7 @@ test("alternate search fallback bundles are rejected", () => {
     time_profile: "fallback-time.json",
     capacity_profile: "fallback-capacity.json",
     uci_options: {
-      ModelBackend: "native",
+      ModelBackend: "onnx",
       ModelRoot: "fallback-model",
     },
   };
@@ -1215,7 +1215,7 @@ test("timing identity excludes independently validated local knowledge options",
       SyzygyRootProbe: true,
       SyzygyInternalProbe: true,
       BehaviorProfile: "balanced",
-      ModelBackend: "flashfork",
+        ModelBackend: "onnx",
       TimePolicy: "RelativeClockV2",
     },
     timing: { initial_transport_reserve_ms: 650 },
@@ -1224,7 +1224,7 @@ test("timing identity excludes independently validated local knowledge options",
     engine.timeProfileConfiguration().extraEngineOptions,
     {
       BehaviorProfile: "balanced",
-      ModelBackend: "flashfork",
+        ModelBackend: "onnx",
       TimePolicy: "RelativeClockV2",
     },
   );

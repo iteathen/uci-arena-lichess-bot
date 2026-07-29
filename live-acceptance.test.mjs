@@ -173,12 +173,12 @@ test("acceptance passes exact installed runtime bindings and shared knowledge ro
     token_file: "token.txt",
     expected_account: "operatorbot",
     opponent: "publicbot",
-    engine: "installed/bin/flashfork_uci.exe",
+      engine: "installed/bin/uci_arena_engine.exe",
     working_directory: "installed",
     model_root: "installed/models/default",
   }, "acceptance.json", "runtime");
   const engineIndex = args.indexOf("--engine");
-  assert.equal(args[engineIndex + 1], path.resolve("installed/bin/flashfork_uci.exe"));
+    assert.equal(args[engineIndex + 1], path.resolve("installed/bin/uci_arena_engine.exe"));
   assert.equal(args[engineIndex + 2], "--working-directory");
   assert.equal(args[engineIndex + 3], path.resolve("installed"));
   const environment = acceptanceChildEnvironment(

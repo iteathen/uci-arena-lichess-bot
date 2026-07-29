@@ -86,7 +86,7 @@ capacity profile qualified at that concurrency.
 Build the release engine and verify its UCI surface:
 
 ```powershell
-cmake --build build --config Release --target flashfork_uci
+cmake --build build --config Release --target uci_arena_engine
 node deploy\lichess\smoke-uci-startup.mjs --config deploy\lichess\config.uci_arena.template.yml
 ```
 
@@ -133,7 +133,7 @@ Syzygy options; tablebase-disabled worker evidence is not deployment evidence.
 
 ```powershell
 node engine\tools\benchmark_mcgs_workers.mjs `
-  --engine build\Release\uci_arena.exe `
+  --engine build\Release\uci_arena_engine.exe `
   --model-root engine\runtime\models\<MODEL_ID>\engine `
   --workers 3,4,6,8 `
   --movetimes 250,500,1000 `
@@ -142,7 +142,7 @@ node engine\tools\benchmark_mcgs_workers.mjs `
   --performance-cores 6 `
   --efficiency-cores 4 `
   --engine-option BehaviorProfile=balanced `
-  --engine-option ModelBackend=native `
+  --engine-option ModelBackend=onnx `
   --engine-option SyzygyPath=E:/syzygy/standard/6 `
   --engine-option SyzygyManifest=E:/syzygy/standard/6/syzygy_manifest_v1.json `
   --engine-option SyzygyProbeLimit=6 `
@@ -188,7 +188,7 @@ node engine\tools\build_mcgs_book_prior_corpus.mjs `
 
 ```powershell
 node engine\tools\benchmark_mcgs_book_prior.mjs `
-  --engine build\Release\uci_arena.exe `
+  --engine build\Release\uci_arena_engine.exe `
   --model-root engine\runtime\models\<MODEL_ID>\engine `
   --corpus runtime_state\lichess\mcgs_book_prior_corpus.json `
   --blends 0,125,250,375,500 `
