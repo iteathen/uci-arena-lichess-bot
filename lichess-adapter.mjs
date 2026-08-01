@@ -45,7 +45,7 @@ import {
   timeProfileFallbackStatus,
   validateAppliedTimeProfileReserve,
   validateProfileRuntimeSnapshot,
-} from "../../engine/tools/qualify_uci_time_profile.mjs";
+} from "@uci-arena/time-profile-contract";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT = path.resolve(HERE, "../..");

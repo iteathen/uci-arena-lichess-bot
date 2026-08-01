@@ -11,6 +11,7 @@
     "acceptance:live": "node live-acceptance.mjs"
   },
   "dependencies": {
+    "@uci-arena/time-profile-contract": "file:../../packages/time-profile-contract",
     "chess.js": "1.4.0"
   }
 }
