@@ -353,6 +353,31 @@ node deploy\lichess\lichess-adapter.mjs scheduler resume
 A reservation claims the next human slot for its owner and survives restart.
 Other human slots remain public. It never interrupts an active game.
 
+The adapter also owns the bounded configuration surface used by UCI Arena
+Manager. `config get` returns only the editable capacity, inbound challenge,
+outbound challenge, scheduler, and opponent-selection groups. `config update`
+requires an explicit local config path, rejects unknown fields, validates the
+whole result, preserves portable path placeholders, and atomically replaces the
+file only after validation succeeds:
+
+```powershell
+node deploy\lichess\lichess-adapter.mjs config get `
+  --config deploy\lichess\config.uci_arena.template.yml
+
+node deploy\lichess\lichess-adapter.mjs config update `
+  --config C:\path\to\local\lichess-config.json `
+  --settings '{"inbound_challenges":{"accept_bots":false},"scheduler":{"discovery_interval_seconds":90}}'
+```
+
+Enabling rated play additionally requires
+`--confirm-rated I_ACCEPT_RATED_BOT_GAMES`. Transitioning automatic outbound
+play from disabled to enabled requires
+`--confirm-outbound I_ACCEPT_AUTOMATIC_OUTBOUND_CHALLENGES`. Capacity-shape
+changes require a present qualified capacity profile and cannot exceed its
+maximum concurrency. These operations never accept or read a token; the token
+remains an external path used only by authenticated probe, startup, and run
+operations.
+
 ## Background service on Windows
 
 Build the independent no-console launcher, then install the hidden logon task.

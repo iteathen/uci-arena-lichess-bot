@@ -8,6 +8,9 @@ import test from "node:test";
 
 import {
   DEFAULT_TEMPLATE,
+  MANAGER_OPTIONS_SCHEMA,
+  OUTBOUND_CHALLENGE_CONFIRMATION,
+  RATED_PLAY_CONFIRMATION,
   BotController,
   ForegroundSearchCoordinator,
   GameSession,
@@ -31,6 +34,8 @@ import {
   parseRuntimeStatus,
   probeAccount,
   resolveExternalTokenFile,
+  managerOptionsProjection,
+  updateManagerOptions,
   validateRuntimeStatus,
 } from "./lichess-adapter.mjs";
 import {
@@ -549,6 +554,146 @@ test("runtime config is credential-free and resolves repository paths", () => {
   assert.equal(config.engine.temporal_curve_profile, null);
   assert.equal(config.engine.uci_options.OwnBook, true);
   assert.equal(config.engine.executable.includes(ROOT.replaceAll("\\", "/")), true);
+});
+
+test("Manager options projection is bounded and configuration updates are atomic", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-manager-options-"));
+  const configPath = path.join(directory, "config.json");
+  const original = readFileSync(DEFAULT_TEMPLATE, "utf8");
+  writeFileSync(configPath, original, "utf8");
+
+  const before = loadRuntimeConfig({ templatePath: configPath, repoRoot: ROOT });
+  const projection = managerOptionsProjection(before);
+  assert.equal(projection.schema, MANAGER_OPTIONS_SCHEMA);
+  assert.deepEqual(Object.keys(projection), [
+    "schema",
+    "capacity",
+    "inbound_challenges",
+    "outbound_challenge",
+    "scheduler",
+    "opponent_selection",
+  ]);
+  assert.equal(Object.hasOwn(projection, "engine"), false);
+  assert.equal(JSON.stringify(projection).includes("capacity_profile"), false);
+
+  const updated = updateManagerOptions({
+    templatePath: configPath,
+    repoRoot: ROOT,
+    settings: {
+      inbound_challenges: { accept_bots: false, speeds: ["rapid"] },
+      outbound_challenge: { color: "white", clock_limit: 900 },
+      scheduler: { discovery_interval_seconds: 90 },
+      opponent_selection: { rating_target: 2100, rating_spread: 500 },
+    },
+  });
+  assert.equal(updated.inbound_challenges.accept_bots, false);
+  assert.deepEqual(updated.inbound_challenges.speeds, ["rapid"]);
+  assert.equal(updated.outbound_challenge.color, "white");
+  assert.equal(updated.scheduler.discovery_interval_seconds, 90);
+  assert.equal(updated.opponent_selection.rating_target, 2100);
+
+  const persisted = JSON.parse(readFileSync(configPath, "utf8"));
+  assert.equal(persisted.engine.executable, JSON.parse(original).engine.executable);
+  assert.equal(persisted.engine.executable.includes("<UCI_ARENA_REPO>"), true);
+  assert.equal(persisted.challenges.accept_bots, false);
+
+  const stable = readFileSync(configPath, "utf8");
+  assert.throws(
+    () => updateManagerOptions({
+      templatePath: configPath,
+      repoRoot: ROOT,
+      settings: { engine: { executable: "untrusted.exe" } },
+    }),
+    /settings\.engine is not editable/,
+  );
+  assert.equal(readFileSync(configPath, "utf8"), stable);
+});
+
+test("Manager options require explicit rated and outbound confirmations", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-manager-confirm-"));
+  const configPath = path.join(directory, "config.json");
+  const raw = JSON.parse(readFileSync(DEFAULT_TEMPLATE, "utf8"));
+  raw.scheduler.enabled = false;
+  writeFileSync(configPath, JSON.stringify(raw), "utf8");
+
+  assert.throws(
+    () => updateManagerOptions({
+      templatePath: configPath,
+      repoRoot: ROOT,
+      settings: { outbound_challenge: { rated: true } },
+    }),
+    new RegExp(RATED_PLAY_CONFIRMATION),
+  );
+  updateManagerOptions({
+    templatePath: configPath,
+    repoRoot: ROOT,
+    ratedConfirmation: RATED_PLAY_CONFIRMATION,
+    settings: { outbound_challenge: { rated: true } },
+  });
+
+  assert.throws(
+    () => updateManagerOptions({
+      templatePath: configPath,
+      repoRoot: ROOT,
+      settings: { inbound_challenges: { modes: ["casual", "rated"] } },
+    }),
+    new RegExp(RATED_PLAY_CONFIRMATION),
+  );
+  updateManagerOptions({
+    templatePath: configPath,
+    repoRoot: ROOT,
+    ratedConfirmation: RATED_PLAY_CONFIRMATION,
+    settings: { inbound_challenges: { modes: ["casual", "rated"] } },
+  });
+
+  assert.throws(
+    () => updateManagerOptions({
+      templatePath: configPath,
+      repoRoot: ROOT,
+      settings: { scheduler: { enabled: true } },
+    }),
+    new RegExp(OUTBOUND_CHALLENGE_CONFIRMATION),
+  );
+  const updated = updateManagerOptions({
+    templatePath: configPath,
+    repoRoot: ROOT,
+    outboundConfirmation: OUTBOUND_CHALLENGE_CONFIRMATION,
+    settings: { scheduler: { enabled: true } },
+  });
+  assert.equal(updated.scheduler.enabled, true);
+});
+
+test("Manager capacity updates reject summary-only evidence without exact bindings", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-manager-capacity-"));
+  const configPath = path.join(directory, "config.json");
+  const capacityPath = path.join(directory, "capacity.json");
+  const raw = JSON.parse(readFileSync(DEFAULT_TEMPLATE, "utf8"));
+  raw.capacity.capacity_profile = capacityPath;
+  writeFileSync(capacityPath, JSON.stringify({
+    schema: "uci_arena_lichess_capacity_profile_v2",
+    qualified: true,
+    maximum_concurrency: 2,
+  }), "utf8");
+  writeFileSync(configPath, JSON.stringify(raw), "utf8");
+  const stable = readFileSync(configPath, "utf8");
+
+  assert.throws(
+    () => updateManagerOptions({
+      templatePath: configPath,
+      repoRoot: ROOT,
+      settings: {
+        capacity: { total_slots: 3, human: { slots: 1 }, bot: { slots: 2 } },
+      },
+    }),
+    /present qualified capacity profile/,
+  );
+  assert.equal(readFileSync(configPath, "utf8"), stable);
+
+  const projection = managerOptionsProjection(
+    loadRuntimeConfig({ templatePath: configPath, repoRoot: ROOT }),
+  );
+  assert.equal(projection.capacity.evidence.status, "rejected");
+  assert.equal(projection.capacity.evidence.qualified, false);
 });
 
 test("runtime config accepts the shared active model environment override", () => {
@@ -2249,6 +2394,9 @@ test("nested local control commands parse without touching credentials", () => {
   });
   assert.deepEqual(parseArguments(["reserve", "--opponent", "owner", "--games", "2"]), {
     command: "reserve", opponent: "owner", games: "2",
+  });
+  assert.deepEqual(parseArguments(["config", "update", "--config", "local.json", "--settings", "{}"]), {
+    command: "config", action: "update", config: "local.json", settings: "{}",
   });
 });
 

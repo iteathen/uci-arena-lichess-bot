@@ -9,6 +9,7 @@ import {
   readFileSync,
   renameSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { createInterface } from "node:readline";
@@ -53,6 +54,9 @@ export const DEFAULT_TEMPLATE = path.join(HERE, "config.uci_arena.template.yml")
 export const DEFAULT_RUNTIME_DIR = path.join(ROOT, "runtime_state", "lichess");
 export const DEFAULT_STORE_FILE = path.join(DEFAULT_RUNTIME_DIR, "matches.sqlite");
 export const LIVE_ACCEPTANCE_CONFIRMATION = "I_ACCEPT_ONE_BOT_GAME";
+export const RATED_PLAY_CONFIRMATION = "I_ACCEPT_RATED_BOT_GAMES";
+export const OUTBOUND_CHALLENGE_CONFIRMATION = "I_ACCEPT_AUTOMATIC_OUTBOUND_CHALLENGES";
+export const MANAGER_OPTIONS_SCHEMA = "uci_arena_lichess_manager_options_v1";
 
 const PROFILE_OWNED_UCI_OPTIONS = Object.freeze({
   search_core: "SearchCore",
@@ -412,6 +416,305 @@ function validateCapacityConfig(config) {
   return config;
 }
 
+function requireBoolean(value, label) {
+  if (typeof value !== "boolean") throw new Error(`${label} must be boolean`);
+  return value;
+}
+
+function requireStringChoice(value, label, choices) {
+  if (typeof value !== "string" || !choices.has(value)) {
+    throw new Error(`${label} must be one of ${[...choices].join(", ")}`);
+  }
+  return value;
+}
+
+function requireStringChoices(value, label, choices) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > choices.size) {
+    throw new Error(`${label} must be a non-empty bounded array`);
+  }
+  const unique = new Set();
+  for (const entry of value) {
+    requireStringChoice(entry, label, choices);
+    if (unique.has(entry)) throw new Error(`${label} must not contain duplicates`);
+    unique.add(entry);
+  }
+  return [...value];
+}
+
+function validateBotPolicyConfig(config) {
+  const inbound = config.challenges;
+  if (!inbound || typeof inbound !== "object" || Array.isArray(inbound)) {
+    throw new Error("Lichess adapter config is missing challenges policy");
+  }
+  requireBoolean(inbound.accept_bots, "challenges.accept_bots");
+  requireInteger(inbound.min_base, "challenges.min_base", 0, 86_400);
+  requireInteger(inbound.max_base, "challenges.max_base", 0, 86_400);
+  requireInteger(inbound.min_increment, "challenges.min_increment", 0, 300);
+  requireInteger(inbound.max_increment, "challenges.max_increment", 0, 300);
+  if (inbound.min_base > inbound.max_base) {
+    throw new Error("challenges.min_base must not exceed challenges.max_base");
+  }
+  if (inbound.min_increment > inbound.max_increment) {
+    throw new Error("challenges.min_increment must not exceed challenges.max_increment");
+  }
+  requireStringChoices(
+    inbound.speeds,
+    "challenges.speeds",
+    new Set(["ultraBullet", "bullet", "blitz", "rapid", "classical", "correspondence"]),
+  );
+  requireStringChoices(inbound.modes, "challenges.modes", new Set(["casual", "rated"]));
+
+  const outbound = config.outbound_challenge;
+  if (!outbound || typeof outbound !== "object" || Array.isArray(outbound)) {
+    throw new Error("Lichess adapter config is missing outbound_challenge policy");
+  }
+  requireBoolean(outbound.rated, "outbound_challenge.rated");
+  requireStringChoice(
+    outbound.color,
+    "outbound_challenge.color",
+    new Set(["random", "white", "black"]),
+  );
+  requireInteger(outbound.clock_limit, "outbound_challenge.clock_limit", 0, 86_400);
+  requireInteger(outbound.clock_increment, "outbound_challenge.clock_increment", 0, 300);
+  return config;
+}
+
+function requirePlainObject(value, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} must be an object`);
+  }
+  return value;
+}
+
+function requireOnlyKeys(value, label, allowed) {
+  requirePlainObject(value, label);
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) throw new Error(`${label}.${key} is not editable`);
+  }
+  return value;
+}
+
+function capacityEvidenceSummary(config) {
+  if (config.capacity.legacy_shared) {
+    return { status: "legacy_shared", qualified: true, maximum_concurrency: 1 };
+  }
+  const configured = config.capacity.capacity_profile;
+  if (!configured) return { status: "missing", qualified: false, maximum_concurrency: null };
+  const resolved = path.isAbsolute(configured)
+    ? configured
+    : path.resolve(config.engine.working_directory, configured);
+  try {
+    const singleGameProfile = applySingleGameProfile(config);
+    if (singleGameProfile.search_core === "mcgs") {
+      const timingProfile = loadTimeProfile(
+        config.engine.time_profile,
+        config.engine.working_directory,
+      );
+      config.engine.time_profile_status = {
+        accepted: true,
+        profile_path: timingProfile.profile_path,
+        identity_sha256: timingProfile.identity_sha256,
+      };
+    }
+    const profile = loadCapacityProfile(resolved, config, singleGameProfile);
+    return {
+      status: "qualified",
+      qualified: true,
+      maximum_concurrency: profile.maximum_concurrency,
+    };
+  } catch {
+    return { status: "rejected", qualified: false, maximum_concurrency: null };
+  }
+}
+
+export function managerOptionsProjection(config) {
+  const capacityEvidence = capacityEvidenceSummary(config);
+  return {
+    schema: MANAGER_OPTIONS_SCHEMA,
+    capacity: {
+      total_slots: config.capacity.total_slots,
+      startup_parallelism: config.capacity.startup_parallelism,
+      human: {
+        slots: config.capacity.human.slots,
+        allow_borrowing: config.capacity.human.allow_borrowing,
+        accept_public: config.capacity.human.accept_public,
+      },
+      bot: {
+        slots: config.capacity.bot.slots,
+        target_active: config.capacity.bot.target_active,
+      },
+      evidence: capacityEvidence,
+    },
+    inbound_challenges: { ...config.challenges },
+    outbound_challenge: { ...config.outbound_challenge },
+    scheduler: {
+      enabled: config.scheduler.enabled,
+      discovery_interval_seconds: config.scheduler.discovery_interval_seconds,
+      challenge_interval_seconds: config.scheduler.challenge_interval_seconds,
+      reservation_retry_seconds: config.scheduler.reservation_retry_seconds,
+      challenge_timeout_seconds: config.scheduler.challenge_timeout_seconds,
+    },
+    opponent_selection: {
+      max_games_per_opponent_per_day: config.scheduler.max_games_per_opponent_per_day,
+      timeout_cooldown_minutes: config.scheduler.timeout_cooldown_minutes,
+      decline_cooldown_minutes: config.scheduler.decline_cooldown_minutes,
+      rating_target: config.scheduler.rating_target,
+      rating_spread: config.scheduler.rating_spread,
+    },
+  };
+}
+
+function applyManagerOptionsPatch(rawConfig, patch) {
+  requireOnlyKeys(
+    patch,
+    "settings",
+    new Set([
+      "capacity",
+      "inbound_challenges",
+      "outbound_challenge",
+      "scheduler",
+      "opponent_selection",
+    ]),
+  );
+  const updated = structuredClone(rawConfig);
+  if (patch.capacity !== undefined) {
+    const capacity = requireOnlyKeys(
+      patch.capacity,
+      "settings.capacity",
+      new Set(["total_slots", "startup_parallelism", "human", "bot"]),
+    );
+    if (capacity.total_slots !== undefined) updated.capacity.total_slots = capacity.total_slots;
+    if (capacity.startup_parallelism !== undefined) {
+      updated.capacity.startup_parallelism = capacity.startup_parallelism;
+    }
+    if (capacity.human !== undefined) {
+      requireOnlyKeys(
+        capacity.human,
+        "settings.capacity.human",
+        new Set(["slots", "allow_borrowing", "accept_public"]),
+      );
+      Object.assign(updated.capacity.human, capacity.human);
+    }
+    if (capacity.bot !== undefined) {
+      requireOnlyKeys(
+        capacity.bot,
+        "settings.capacity.bot",
+        new Set(["slots", "target_active"]),
+      );
+      Object.assign(updated.capacity.bot, capacity.bot);
+    }
+  }
+  if (patch.inbound_challenges !== undefined) {
+    requireOnlyKeys(
+      patch.inbound_challenges,
+      "settings.inbound_challenges",
+      new Set([
+        "accept_bots", "min_base", "max_base", "min_increment", "max_increment",
+        "speeds", "modes",
+      ]),
+    );
+    Object.assign(updated.challenges, patch.inbound_challenges);
+  }
+  if (patch.outbound_challenge !== undefined) {
+    requireOnlyKeys(
+      patch.outbound_challenge,
+      "settings.outbound_challenge",
+      new Set(["rated", "color", "clock_limit", "clock_increment"]),
+    );
+    Object.assign(updated.outbound_challenge, patch.outbound_challenge);
+  }
+  if (patch.scheduler !== undefined) {
+    requireOnlyKeys(
+      patch.scheduler,
+      "settings.scheduler",
+      new Set([
+        "enabled", "discovery_interval_seconds", "challenge_interval_seconds",
+        "reservation_retry_seconds", "challenge_timeout_seconds",
+      ]),
+    );
+    Object.assign(updated.scheduler, patch.scheduler);
+  }
+  if (patch.opponent_selection !== undefined) {
+    requireOnlyKeys(
+      patch.opponent_selection,
+      "settings.opponent_selection",
+      new Set([
+        "max_games_per_opponent_per_day", "timeout_cooldown_minutes",
+        "decline_cooldown_minutes", "rating_target", "rating_spread",
+      ]),
+    );
+    Object.assign(updated.scheduler, patch.opponent_selection);
+  }
+  return updated;
+}
+
+function capacityShapeChanged(before, after) {
+  return before.capacity.total_slots !== after.capacity.total_slots
+    || before.capacity.startup_parallelism !== after.capacity.startup_parallelism
+    || before.capacity.human.slots !== after.capacity.human.slots
+    || before.capacity.bot.slots !== after.capacity.bot.slots
+    || before.capacity.bot.target_active !== after.capacity.bot.target_active;
+}
+
+export function updateManagerOptions({
+  templatePath,
+  settings,
+  repoRoot = ROOT,
+  ratedConfirmation,
+  outboundConfirmation,
+} = {}) {
+  if (typeof templatePath !== "string" || !templatePath.trim()) {
+    throw new Error("config update requires an explicit --config path");
+  }
+  const target = path.resolve(templatePath);
+  const originalRaw = JSON.parse(readFileSync(target, "utf8"));
+  const before = loadRuntimeConfig({ templatePath: target, repoRoot });
+  const patch = typeof settings === "string" ? JSON.parse(settings) : settings;
+  const updatedRaw = applyManagerOptionsPatch(originalRaw, patch);
+  const inboundRatedWasEnabled = before.challenges.modes.includes("rated");
+  const inboundRatedWillBeEnabled = updatedRaw.challenges.modes.includes("rated");
+  const ratedPlayWillBeNewlyEnabled = (updatedRaw.outbound_challenge.rated === true
+      && before.outbound_challenge.rated !== true)
+    || (inboundRatedWillBeEnabled && !inboundRatedWasEnabled);
+  if (ratedPlayWillBeNewlyEnabled
+      && ratedConfirmation !== RATED_PLAY_CONFIRMATION) {
+    throw new Error(`Enabling rated play requires ${RATED_PLAY_CONFIRMATION}`);
+  }
+  const outboundWasDisabled = before.scheduler.enabled !== true
+    || before.capacity.bot.target_active === 0;
+  const outboundWillBeEnabled = updatedRaw.scheduler.enabled === true
+    && updatedRaw.capacity.bot.target_active > 0;
+  if (outboundWasDisabled && outboundWillBeEnabled
+      && outboundConfirmation !== OUTBOUND_CHALLENGE_CONFIRMATION) {
+    throw new Error(`Enabling automatic outbound challenges requires ${OUTBOUND_CHALLENGE_CONFIRMATION}`);
+  }
+
+  const temporary = path.join(
+    path.dirname(target),
+    `.${path.basename(target)}.tmp-${process.pid}-${randomUUID()}`,
+  );
+  try {
+    writeFileSync(temporary, `${JSON.stringify(updatedRaw, null, 2)}\n`, "utf8");
+    const after = loadRuntimeConfig({ templatePath: temporary, repoRoot });
+    if (capacityShapeChanged(before, after) && !after.capacity.legacy_shared) {
+      const evidence = capacityEvidenceSummary(after);
+      if (!evidence.qualified) {
+        throw new Error("Capacity changes require a present qualified capacity profile");
+      }
+      if (after.capacity.total_slots > evidence.maximum_concurrency) {
+        throw new Error(
+          `Configured Lichess capacity ${after.capacity.total_slots} exceeds qualified maximum ${evidence.maximum_concurrency}`,
+        );
+      }
+    }
+    renameSync(temporary, target);
+    return managerOptionsProjection(after);
+  } catch (error) {
+    if (existsSync(temporary)) unlinkSync(temporary);
+    throw error;
+  }
+}
+
 function normalizeTimingConfig(config) {
   const timing = config.timing ?? {};
   config.timing = {
@@ -591,7 +894,7 @@ export function loadRuntimeConfig({
   if (transportProfile.qualified) {
     config.timing.initial_transport_reserve_ms = transportProfile.reserveMs;
   }
-  return validateCapacityConfig(config);
+  return validateBotPolicyConfig(validateCapacityConfig(config));
 }
 
 export function loadSingleGameProfile(profilePath) {
@@ -4017,7 +4320,7 @@ export function parseArguments(argv) {
   if (!command) throw new Error("Expected a Lichess adapter command");
   const rest = [...argumentsList];
   const options = { command };
-  if (new Set(["owner", "reservation", "scheduler", "startup"]).has(command)
+  if (new Set(["owner", "reservation", "scheduler", "startup", "config"]).has(command)
       && rest[0] && !rest[0].startsWith("--")) {
     options.action = rest.shift();
   }
@@ -4133,13 +4436,13 @@ function runStoreCommand(options) {
     } else if (options.command === "reservation" && options.action === "cancel") {
       result = { canceled: store.cancelReservation() };
     } else if (options.command === "scheduler" && options.action === "status") {
-      result = store.status();
+      result = { scheduler: { paused: store.control().paused } };
     } else if (options.command === "scheduler" && options.action === "pause") {
       store.setPaused(true);
-      result = store.status();
+      result = { scheduler: { paused: store.control().paused } };
     } else if (options.command === "scheduler" && options.action === "resume") {
       store.setPaused(false);
-      result = store.status();
+      result = { scheduler: { paused: store.control().paused } };
     } else {
       throw new Error(`Unknown local control command: ${options.command}${options.action ? ` ${options.action}` : ""}`);
     }
@@ -4177,8 +4480,9 @@ export async function main(argv = process.argv.slice(2)) {
     console.log(JSON.stringify({ status: "ready", startup }));
     return 0;
   }
+  const configPath = path.resolve(options.config ?? DEFAULT_TEMPLATE);
   const config = loadRuntimeConfig({
-    templatePath: path.resolve(options.config ?? DEFAULT_TEMPLATE),
+    templatePath: configPath,
     repoRoot: path.resolve(options.repo_root ?? ROOT),
     enginePath: options.engine,
     workingDirectory: options.working_directory,
@@ -4187,7 +4491,19 @@ export async function main(argv = process.argv.slice(2)) {
     timeProfilePath: options.time_profile,
     temporalCurvePath: options.temporal_curve_profile,
   });
-  if (options.command === "config") {
+  if (options.command === "config" && options.action === "update") {
+    if (!options.config) throw new Error("config update requires an explicit --config path");
+    const editable = updateManagerOptions({
+      templatePath: configPath,
+      settings: options.settings,
+      repoRoot: path.resolve(options.repo_root ?? ROOT),
+      ratedConfirmation: options.confirm_rated,
+      outboundConfirmation: options.confirm_outbound,
+    });
+    console.log(JSON.stringify({ status: "ready", editable }));
+    return 0;
+  }
+  if (options.command === "config" && (!options.action || options.action === "get")) {
     console.log(JSON.stringify({
       status: "ready",
       schema: config.schema,
@@ -4196,8 +4512,12 @@ export async function main(argv = process.argv.slice(2)) {
       temporal_curve_profile: config.engine.temporal_curve_profile ?? null,
       capacity: config.capacity,
       scheduler: config.scheduler,
+      editable: managerOptionsProjection(config),
     }));
     return 0;
+  }
+  if (options.command === "config") {
+    throw new Error(`Unknown config action: ${options.action ?? "missing"}`);
   }
   if (options.command === "startup" && options.action === "install") {
     const tokenFile = resolveExternalTokenFile(options);
