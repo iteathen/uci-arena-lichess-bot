@@ -1,0 +1,163 @@
+name: Lichess Bot component candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact component version
+        type: string
+        required: true
+      target:
+        description: Target platform
+        type: choice
+        required: true
+        options:
+          - windows-x64
+          - linux-x64
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: lichess-component-${{ inputs.version }}-${{ inputs.target }}-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  build-sign-verify:
+    runs-on: ${{ inputs.target == 'windows-x64' && 'windows-2025' || 'ubuntu-24.04' }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.15.0
+          cache: npm
+
+      - name: Install exact Node dependency closure
+        shell: pwsh
+        run: npm ci --ignore-scripts
+
+      - name: Build Windows windowless launcher
+        if: inputs.target == 'windows-x64'
+        shell: pwsh
+        run: |
+          cmake -S native -B native/build -A x64
+          if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed' }
+          cmake --build native/build --config Release
+          if ($LASTEXITCODE -ne 0) { throw 'native launcher build failed' }
+          & native/build/Release/lichess_adapter_launcher.exe --probe
+          if ($LASTEXITCODE -ne 0) { throw 'native launcher probe failed' }
+
+      - name: Test exact component source
+        shell: pwsh
+        run: |
+          node tools/write-test-receipt.mjs `
+            --output "release-receipts/${{ inputs.target }}.json" `
+            --target "${{ inputs.target }}"
+
+      - name: Build deterministic Windows component
+        if: inputs.target == 'windows-x64'
+        shell: pwsh
+        run: |
+          $epoch = git show -s --format=%ct HEAD
+          node tools/build-component-release.mjs `
+            --definition packaging/component-definition.json `
+            --version "${{ inputs.version }}" `
+            --target "${{ inputs.target }}" `
+            --output-dir dist `
+            --source-date-epoch $epoch `
+            --workflow-identity "${{ github.workflow_ref }}" `
+            --test-receipt "release-receipts/${{ inputs.target }}.json" `
+            --native-launcher native/build/Release/lichess_adapter_launcher.exe
+
+      - name: Build deterministic Linux component
+        if: inputs.target == 'linux-x64'
+        shell: pwsh
+        run: |
+          $epoch = git show -s --format=%ct HEAD
+          node tools/build-component-release.mjs `
+            --definition packaging/component-definition.json `
+            --version "${{ inputs.version }}" `
+            --target "${{ inputs.target }}" `
+            --output-dir dist `
+            --source-date-epoch $epoch `
+            --workflow-identity "${{ github.workflow_ref }}" `
+            --test-receipt "release-receipts/${{ inputs.target }}.json"
+
+      - name: Extract and verify component contract
+        shell: pwsh
+        run: |
+          $archives = @(Get-ChildItem dist -Filter '*.tar.gz')
+          $results = @(Get-ChildItem dist -Filter '*.provider-result.json')
+          if ($archives.Count -ne 1 -or $results.Count -ne 1) { throw 'expected one component artifact and one result' }
+          $archive = $archives[0].FullName
+          $result = $results[0].FullName
+          New-Item -ItemType Directory -Path dist/verification | Out-Null
+          cmake -E chdir dist/verification cmake -E tar xzf $archive
+          if ($LASTEXITCODE -ne 0) { throw 'component extraction failed' }
+          node tools/verify-component-release.mjs `
+            --root dist/verification `
+            --artifact $archive `
+            --result $result
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        with:
+          cosign-release: v3.0.6
+
+      - name: Prepare exact in-toto statement
+        id: attestation
+        shell: pwsh
+        env:
+          STATEMENT_DIRECTORY: ${{ runner.temp }}/provider-attestation
+        run: |
+          node tools/provider-attestation.mjs prepare `
+            --output-dir dist `
+            --statement-dir $env:STATEMENT_DIRECTORY `
+            --github-output $env:GITHUB_OUTPUT
+
+      - name: Sign and verify exact provenance
+        shell: pwsh
+        env:
+          ARTIFACT_PATH: ${{ steps.attestation.outputs.artifact_path }}
+          BUNDLE_PATH: ${{ steps.attestation.outputs.bundle_path }}
+          CERTIFICATE_IDENTITY: https://github.com/${{ github.workflow_ref }}
+          CERTIFICATE_OIDC_ISSUER: https://token.actions.githubusercontent.com
+          PREDICATE_TYPE: ${{ steps.attestation.outputs.predicate_type }}
+          STATEMENT_PATH: ${{ steps.attestation.outputs.statement_path }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+          WORKFLOW_REF: ${{ github.ref }}
+          WORKFLOW_REPOSITORY: ${{ github.repository }}
+          WORKFLOW_SHA: ${{ github.sha }}
+          WORKFLOW_TRIGGER: ${{ github.event_name }}
+        run: |
+          cosign attest-blob --yes `
+            --statement $env:STATEMENT_PATH `
+            --bundle $env:BUNDLE_PATH
+          if ($LASTEXITCODE -ne 0) { throw 'Sigstore attestation failed' }
+          cosign verify-blob-attestation `
+            --bundle $env:BUNDLE_PATH `
+            --certificate-identity $env:CERTIFICATE_IDENTITY `
+            --certificate-oidc-issuer $env:CERTIFICATE_OIDC_ISSUER `
+            --certificate-github-workflow-repository $env:WORKFLOW_REPOSITORY `
+            --certificate-github-workflow-sha $env:WORKFLOW_SHA `
+            --certificate-github-workflow-name $env:WORKFLOW_NAME `
+            --certificate-github-workflow-ref $env:WORKFLOW_REF `
+            --certificate-github-workflow-trigger $env:WORKFLOW_TRIGGER `
+            --type $env:PREDICATE_TYPE `
+            $env:ARTIFACT_PATH
+          if ($LASTEXITCODE -ne 0) { throw 'Sigstore verification failed' }
+          node tools/provider-attestation.mjs verify-bundle `
+            --bundle $env:BUNDLE_PATH `
+            --statement $env:STATEMENT_PATH
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: lichess-bot-${{ inputs.version }}-${{ inputs.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.provider-result.json
+            dist/*.sigstore.json
+          if-no-files-found: error
+          retention-days: 30

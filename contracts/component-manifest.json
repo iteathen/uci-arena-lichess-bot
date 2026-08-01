@@ -1,0 +1,54 @@
+{
+  "schema": "uci_arena_component_manifest_v1",
+  "component": {
+    "id": "lichess.adapter",
+    "product_id": "uci_arena.lichess_bot",
+    "version": "1.0.0",
+    "repository": "iteathen/uci-arena-lichess-bot"
+  },
+  "runtime": {
+    "entrypoint": "lichess-adapter.mjs",
+    "working_directory": ".",
+    "runtime_requirement": "node >=24.15.0",
+    "health_checks": [
+      {
+        "type": "typed_cli_json",
+        "arguments": ["status"],
+        "expected": {"schema": "uci_arena_lichess_status_v3", "installed": true},
+        "credential_required": false
+      }
+    ]
+  },
+  "installation": {
+    "owned_paths": [
+      "*.mjs",
+      "config.uci_arena.template.yml",
+      "contracts",
+      "native",
+      "node_modules",
+      "package.json",
+      "package-lock.json",
+      "README.md",
+      "vendor"
+    ],
+    "preserved_paths": [],
+    "optional_paths": ["native/lichess_adapter_launcher.exe"],
+    "generated_paths": [],
+    "external_user_data": ["manager_data/lichess"],
+    "external_credentials": ["operator_selected_token_file"],
+    "uninstall_preserves_user_data": true
+  },
+  "contracts": {
+    "service": "contracts/service-contract.json",
+    "configuration": "contracts/configuration-schema.json",
+    "configuration_update": "contracts/configuration-update-schema.json",
+    "status": "contracts/status-schema.json",
+    "manager_operations": "contracts/manager-operations-schema.json"
+  },
+  "compatibility": {
+    "manager_api": 1,
+    "installer_minimum": "1.3.0",
+    "required_components": ["uci_arena.engine"],
+    "optional_components": ["opening_book.standard"]
+  }
+}

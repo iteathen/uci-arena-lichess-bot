@@ -1,0 +1,35 @@
+{
+  "schema": "uci_arena_component_definition_v1",
+  "component_id": "lichess.adapter",
+  "package_json": "package.json",
+  "component_manifest": "contracts/component-manifest.json",
+  "include": [
+    {"source": "backfill-game-provenance.mjs", "target": "backfill-game-provenance.mjs"},
+    {"source": "chess-legality.mjs", "target": "chess-legality.mjs"},
+    {"source": "config.uci_arena.template.yml", "target": "config.uci_arena.template.yml"},
+    {"source": "contracts", "target": "contracts"},
+    {"source": "lichess-adapter.mjs", "target": "lichess-adapter.mjs"},
+    {"source": "lichess-scheduler.mjs", "target": "lichess-scheduler.mjs"},
+    {"source": "lichess-store.mjs", "target": "lichess-store.mjs"},
+    {"source": "linux-startup.mjs", "target": "linux-startup.mjs"},
+    {"source": "live-acceptance.mjs", "target": "live-acceptance.mjs"},
+    {"source": "publish-single-game-profile.mjs", "target": "publish-single-game-profile.mjs"},
+    {"source": "smoke-uci-startup.mjs", "target": "smoke-uci-startup.mjs"},
+    {"source": "vendor/time-profile-contract/package.json", "target": "vendor/time-profile-contract/package.json"},
+    {"source": "vendor/time-profile-contract/src", "target": "vendor/time-profile-contract/src"},
+    {"source": "windows-startup.mjs", "target": "windows-startup.mjs"},
+    {"source": "README.md", "target": "README.md"}
+  ],
+  "native_launcher": {
+    "windows-x64": {
+      "required": true,
+      "target": "native/lichess_adapter_launcher.exe"
+    },
+    "linux-x64": {
+      "required": false
+    }
+  },
+  "required_test_suites": [
+    "npm run check"
+  ]
+}

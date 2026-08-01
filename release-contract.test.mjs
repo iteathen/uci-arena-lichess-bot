@@ -1,0 +1,116 @@
+import assert from "node:assert/strict";
+import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+
+const root = path.dirname(new URL(import.meta.url).pathname.slice(1)).replaceAll("/", path.sep);
+
+test("component definition packages runtime contracts without test or source-tree coupling", () => {
+  const definition = JSON.parse(readFileSync(path.join(root, "packaging", "component-definition.json"), "utf8"));
+  assert.equal(definition.schema, "uci_arena_component_definition_v1");
+  assert.equal(definition.component_id, "lichess.adapter");
+  const sources = definition.include.map((entry) => entry.source);
+  assert.equal(sources.includes("contracts"), true);
+  assert.equal(sources.includes("vendor"), false);
+  assert.equal(sources.includes("vendor/time-profile-contract/package.json"), true);
+  assert.equal(sources.includes("vendor/time-profile-contract/src"), true);
+  assert.equal(sources.includes("lichess-adapter.mjs"), true);
+  assert.equal(sources.some((source) => source.includes("fake-api")
+    || source.includes("test-fixtures")
+    || source.includes("/test")), false);
+  assert.equal(JSON.stringify(definition).includes("../"), false);
+  assert.equal(definition.native_launcher["windows-x64"].required, true);
+  assert.equal(definition.native_launcher["linux-x64"].required, false);
+});
+
+test("Manager configuration and status contracts are closed and separate requests from responses", () => {
+  const configuration = JSON.parse(readFileSync(path.join(root, "contracts", "configuration-schema.json"), "utf8"));
+  const update = JSON.parse(readFileSync(path.join(root, "contracts", "configuration-update-schema.json"), "utf8"));
+  const status = JSON.parse(readFileSync(path.join(root, "contracts", "status-schema.json"), "utf8"));
+  assert.deepEqual(configuration.required, [
+    "schema",
+    "capacity",
+    "inbound_challenges",
+    "outbound_challenge",
+    "scheduler",
+    "opponent_selection",
+  ]);
+  assert.equal(configuration.properties.groups, undefined);
+  assert.equal(configuration.properties.capacity.additionalProperties, false);
+  assert.equal(update.required.includes("settings"), true);
+  assert.equal(update.properties.settings.additionalProperties, false);
+  assert.equal(update.properties.settings.properties.scheduler.required, undefined);
+  assert.equal(status.properties.capacity.additionalProperties, false);
+  assert.equal(status.$defs.slot_counts.required.includes("cancelling"), true);
+  assert.equal(status.properties.games.required.includes("cancelling"), true);
+});
+
+test("manual workflow uses free OIDC Cosign provenance and no automatic trigger", () => {
+  const workflow = readFileSync(path.join(root, ".github", "workflows", "component-release.yml"), "utf8");
+  assert.match(workflow, /^  workflow_dispatch:/m);
+  assert.doesNotMatch(workflow, /^  (?:push|pull_request|merge_group|schedule):/m);
+  assert.match(workflow, /^  id-token: write$/m);
+  assert.match(workflow, /cosign attest-blob[\s\S]*cosign verify-blob-attestation/u);
+  assert.match(workflow, /--certificate-github-workflow-repository/u);
+  assert.match(workflow, /provider-attestation\.mjs verify-bundle/u);
+  assert.doesNotMatch(workflow, /actions\/attest-build-provenance|attestations:\s*write/u);
+});
+
+test("provider attestation binds and verifies the exact in-toto payload", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-lichess-attestation-"));
+  const output = path.join(directory, "output");
+  const statements = path.join(directory, "statements");
+  mkdirSync(output);
+  const artifactName = "lichess.adapter-1.0.0-windows-x64.tar.gz";
+  const artifact = Buffer.from("exact-provider-artifact");
+  writeFileSync(path.join(output, artifactName), artifact);
+  writeFileSync(path.join(output, `${artifactName}.provider-result.json`), JSON.stringify({
+    schema: "arena_provider_release_result_v1",
+    component_id: "lichess.adapter",
+    version: "1.0.0",
+    target: "windows-x64",
+    artifact_name: artifactName,
+    artifact_sha256: createHash("sha256").update(artifact).digest("hex"),
+  }));
+  const prepared = JSON.parse(execFileSync(process.execPath, [
+    path.join(root, "tools", "provider-attestation.mjs"),
+    "prepare",
+    "--output-dir",
+    output,
+    "--statement-dir",
+    statements,
+  ], { encoding: "utf8", windowsHide: true }));
+  const statement = readFileSync(prepared.statement_path);
+  writeFileSync(prepared.bundle_path, JSON.stringify({
+    mediaType: "application/vnd.dev.sigstore.bundle.v0.3+json",
+    dsseEnvelope: {
+      payloadType: "application/vnd.in-toto+json",
+      payload: statement.toString("base64"),
+      signatures: [{ sig: "synthetic-signature-for-payload-test" }],
+    },
+  }));
+  assert.match(execFileSync(process.execPath, [
+    path.join(root, "tools", "provider-attestation.mjs"),
+    "verify-bundle",
+    "--bundle",
+    prepared.bundle_path,
+    "--statement",
+    prepared.statement_path,
+  ], { encoding: "utf8", windowsHide: true }), /verified/);
+  const tampered = JSON.parse(statement);
+  tampered.subject[0].digest.sha256 = "0".repeat(64);
+  writeFileSync(prepared.statement_path, JSON.stringify(tampered));
+  const rejected = spawnSync(process.execPath, [
+    path.join(root, "tools", "provider-attestation.mjs"),
+    "verify-bundle",
+    "--bundle",
+    prepared.bundle_path,
+    "--statement",
+    prepared.statement_path,
+  ], { encoding: "utf8", windowsHide: true });
+  assert.notEqual(rejected.status, 0);
+  assert.match(rejected.stderr, /signed payload differs/);
+});

@@ -18,7 +18,7 @@ import {
 import { normalizedUsername } from "./lichess-store.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const ROOT = path.resolve(HERE, "../..");
+const ROOT = HERE;
 const ADAPTER = path.join(HERE, "lichess-adapter.mjs");
 
 export const MAX_LIVE_ACCEPTANCE_ATTEMPTS = 3;
@@ -94,8 +94,8 @@ export function validateAcceptanceOptions(options) {
 
 export function buildAcceptanceConfig(sourceConfig) {
   const config = structuredClone(sourceConfig);
-  if (config.schema !== "uci_arena_lichess_adapter_v5") {
-    throw new Error("Live acceptance requires a v5 Lichess adapter configuration");
+  if (config.schema !== "uci_arena_lichess_adapter_v6") {
+    throw new Error("Live acceptance requires a v6 Lichess adapter configuration");
   }
   if (!config.capacity?.bot || config.capacity.bot.slots < 1) {
     throw new Error("Live acceptance requires at least one configured bot slot");
@@ -239,7 +239,7 @@ export function adapterArguments(options, configPath, runtimeDir) {
     runtimeDir,
   ];
   for (const [flag, value] of [
-    ["--repo-root", options.repo_root],
+    ["--engine-root", options.engine_root],
     ["--engine", options.engine],
     ["--working-directory", options.working_directory],
     ["--profile", options.profile],

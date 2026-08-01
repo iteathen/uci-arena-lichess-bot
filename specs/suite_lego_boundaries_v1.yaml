@@ -1,0 +1,63 @@
+meta:
+  spec_id: uci_arena_lichess_bot_suite_lego_boundaries_v1
+  version: 1
+  status: active
+  owner: governance
+  purpose: >
+    Make the canonical UCI Arena complete-suite architecture enforceable at
+    the Lichess Bot repository boundary.
+
+authority:
+  canonical_document:
+    repository: iteathen/uci-arena-installer
+    path: docs/architecture/UCI_ARENA_COMPLETE_LEGO_ARCHITECTURE.md
+    url: https://github.com/iteathen/uci-arena-installer/blob/main/docs/architecture/UCI_ARENA_COMPLETE_LEGO_ARCHITECTURE.md
+  detailed_provider_spec: specs/lichess_match_scheduler_v1.yaml
+
+repository_role:
+  repository: iteathen/uci-arena-lichess-bot
+  product_role: lichess_bot_api_and_game_provider
+  owns:
+    - lichess_bot_api_transport_and_streams
+    - account_probe_and_identity
+    - challenge_policy_and_outbound_scheduling
+    - opponent_selection_reservations_and_capacity_admission
+    - canonical_game_reconstruction_and_move_submission
+    - one_uci_process_per_admitted_game
+    - persistent_account_opponent_game_and_rate_limit_state
+    - reconnect_reconciliation_and_recovery
+    - provider_configuration_status_telemetry_and_startup
+    - manager_account_and_control_projection
+    - provider_component_artifact_manifest_and_provenance
+  must_not_own:
+    - chess_search_evaluation_or_model_semantics
+    - engine_internal_runtime_or_source
+    - manager_control_plane_state
+    - opening_book_production
+    - evidence_production_or_qualification
+    - suite_installation_or_release_composition
+
+mandatory_boundaries:
+  - "Any conforming UCI executable is usable; the provider never imports or assumes UCI Arena Engine internals."
+  - "Engine and timing behavior enter through UCI plus immutable engine-owned contract packages and artifacts."
+  - "Manager invokes fixed typed operations and renders bounded projections; it never opens provider configuration, SQLite, logs, or runtime storage directly."
+  - "Installer owns suite composition and transactions; the provider publishes one immutable component artifact and manifest."
+  - "Token contents are read only by the running provider transport adapter and never cross into Manager, Installer, tracked configuration, argv, logs, telemetry, or release artifacts."
+  - "One global event stream owns account lifecycle and each admitted game owns one independent qualified UCI child and game stream."
+  - "Repositories exchange versioned contracts and immutable release artifacts and never import one another's internal source trees."
+
+substitution_acceptance:
+  required:
+    - "Fake UCI and fabricated loopback Lichess API tests prove provider behavior without Engine source, public network access, or a real credential."
+    - "UCI Arena Engine, Stockfish, LCZero, and another conforming UCI executable can be selected through configuration without provider source changes."
+    - "A conforming Manager consumes configuration, account controls, status, and lifecycle only through the published provider contract."
+    - "Installer can install, repair, upgrade, and remove the provider from its manifest without provider-specific installer control flow."
+    - "Unknown contract majors, identity drift, stale game state, illegal engine moves, rate-limit ambiguity, and component substitution fail closed."
+
+change_gate:
+  questions:
+    - "Is this Lichess provider behavior or engine/control-plane/installer behavior?"
+    - "Does the dependency cross through UCI or a published immutable contract?"
+    - "Can a conforming UCI engine or Manager adapter be substituted without provider changes?"
+    - "Does the change preserve credential isolation, capacity ownership, canonical game state, and rate-limit safety?"
+    - "Does the change reduce the radius of future change without weakening fail-closed behavior?"

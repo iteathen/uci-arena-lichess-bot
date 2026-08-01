@@ -1,0 +1,92 @@
+{
+  "schema": "uci_arena_lichess_manager_api_v1",
+  "version": "1.0",
+  "transport": {
+    "kind": "cli_json",
+    "entrypoint": "lichess-adapter.mjs",
+    "stdout": "one_bounded_json_document",
+    "stderr": "sanitized_diagnostics",
+    "shell": false
+  },
+  "operations": {
+    "config_get": {
+      "arguments": ["config", "get"],
+      "mutates": false,
+      "credential": "forbidden",
+      "response": "uci_arena_lichess_manager_options_v1"
+    },
+    "config_update": {
+      "arguments": ["config", "update"],
+      "mutates": true,
+      "credential": "forbidden",
+      "request": "contracts/configuration-update-schema.json",
+      "response": "uci_arena_lichess_manager_options_v1"
+    },
+    "owner_list": {
+      "arguments": ["owner", "list"],
+      "mutates": false,
+      "credential": "forbidden"
+    },
+    "owner_add": {
+      "arguments": ["owner", "add"],
+      "mutates": true,
+      "credential": "forbidden"
+    },
+    "owner_remove": {
+      "arguments": ["owner", "remove"],
+      "mutates": true,
+      "credential": "forbidden"
+    },
+    "reservation_create": {
+      "arguments": ["reserve"],
+      "mutates": true,
+      "credential": "forbidden"
+    },
+    "reservation_status": {
+      "arguments": ["reservation", "status"],
+      "mutates": false,
+      "credential": "forbidden"
+    },
+    "reservation_cancel": {
+      "arguments": ["reservation", "cancel"],
+      "mutates": true,
+      "credential": "forbidden"
+    },
+    "scheduler_status": {
+      "arguments": ["scheduler", "status"],
+      "mutates": false,
+      "credential": "forbidden"
+    },
+    "scheduler_pause": {
+      "arguments": ["scheduler", "pause"],
+      "mutates": true,
+      "credential": "forbidden"
+    },
+    "scheduler_resume": {
+      "arguments": ["scheduler", "resume"],
+      "mutates": true,
+      "credential": "forbidden"
+    },
+    "startup_status": {
+      "arguments": ["startup", "status"],
+      "mutates": false,
+      "credential": "forbidden"
+    },
+    "provider_status": {
+      "arguments": ["status"],
+      "mutates": false,
+      "credential": "forbidden",
+      "response": "uci_arena_lichess_status_v3"
+    },
+    "account_probe": {
+      "arguments": ["probe"],
+      "mutates": false,
+      "credential": "external_file_path_only"
+    }
+  },
+  "compatibility": {
+    "unknown_operation": "reject",
+    "unknown_major": "incompatible",
+    "additive_minor_operations": "ignore_until_supported"
+  }
+}

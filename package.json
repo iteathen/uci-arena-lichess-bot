@@ -7,11 +7,16 @@
     "node": ">=24.15.0"
   },
   "scripts": {
-    "test": "node --test *.test.mjs",
+    "test": "node --test *.test.mjs vendor/time-profile-contract/test/*.test.mjs",
+    "check:contracts": "node tools/contract-check.mjs",
+    "check:github": "node tools/check-github-automation.mjs",
+    "check:vendor": "node tools/verify-vendor-lock.mjs",
+    "check:boundary": "node tools/repository-boundary-check.mjs",
+    "check": "npm run check:contracts && npm run check:github && npm run check:vendor && npm run check:boundary && npm test",
     "acceptance:live": "node live-acceptance.mjs"
   },
   "dependencies": {
-    "@uci-arena/time-profile-contract": "file:../../packages/time-profile-contract",
+    "@uci-arena/time-profile-contract": "file:vendor/time-profile-contract",
     "chess.js": "1.4.0"
   }
 }

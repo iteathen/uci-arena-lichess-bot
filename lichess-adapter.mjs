@@ -48,8 +48,8 @@ import {
 } from "@uci-arena/time-profile-contract";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-export const ROOT = path.resolve(HERE, "../..");
-export const REPO_PLACEHOLDER = "<UCI_ARENA_REPO>";
+export const ROOT = HERE;
+export const ENGINE_ROOT_PLACEHOLDER = "<UCI_ARENA_ENGINE_ROOT>";
 export const DEFAULT_TEMPLATE = path.join(HERE, "config.uci_arena.template.yml");
 export const DEFAULT_RUNTIME_DIR = path.join(ROOT, "runtime_state", "lichess");
 export const DEFAULT_STORE_FILE = path.join(DEFAULT_RUNTIME_DIR, "matches.sqlite");
@@ -363,14 +363,19 @@ function requireInteger(value, label, minimum, maximum = Number.MAX_SAFE_INTEGER
   return value;
 }
 
-function replaceRepoPlaceholder(value, repoRoot) {
+function replaceEngineRootPlaceholder(value, engineRoot) {
   if (typeof value === "string") {
-    return value.split(REPO_PLACEHOLDER).join(repoRoot.replaceAll("\\", "/"));
+    return value.split(ENGINE_ROOT_PLACEHOLDER).join(engineRoot.replaceAll("\\", "/"));
   }
-  if (Array.isArray(value)) return value.map((item) => replaceRepoPlaceholder(item, repoRoot));
+  if (Array.isArray(value)) {
+    return value.map((item) => replaceEngineRootPlaceholder(item, engineRoot));
+  }
   if (value && typeof value === "object") {
     return Object.fromEntries(
-      Object.entries(value).map(([key, item]) => [key, replaceRepoPlaceholder(item, repoRoot)]),
+      Object.entries(value).map(([key, item]) => [
+        key,
+        replaceEngineRootPlaceholder(item, engineRoot),
+      ]),
     );
   }
   return value;
@@ -659,7 +664,7 @@ function capacityShapeChanged(before, after) {
 export function updateManagerOptions({
   templatePath,
   settings,
-  repoRoot = ROOT,
+  engineRoot = ROOT,
   ratedConfirmation,
   outboundConfirmation,
 } = {}) {
@@ -668,7 +673,7 @@ export function updateManagerOptions({
   }
   const target = path.resolve(templatePath);
   const originalRaw = JSON.parse(readFileSync(target, "utf8"));
-  const before = loadManagerConfig({ templatePath: target, repoRoot });
+  const before = loadManagerConfig({ templatePath: target, engineRoot });
   const patch = typeof settings === "string" ? JSON.parse(settings) : settings;
   const updatedRaw = applyManagerOptionsPatch(originalRaw, patch);
   const inboundRatedWasEnabled = before.challenges.modes.includes("rated");
@@ -695,7 +700,7 @@ export function updateManagerOptions({
   );
   try {
     writeFileSync(temporary, `${JSON.stringify(updatedRaw, null, 2)}\n`, "utf8");
-    const after = loadManagerConfig({ templatePath: temporary, repoRoot });
+    const after = loadManagerConfig({ templatePath: temporary, engineRoot });
     if (capacityShapeChanged(before, after) && !after.capacity.legacy_shared) {
       const evidence = capacityEvidenceSummary(after);
       if (!evidence.qualified) {
@@ -809,7 +814,7 @@ function migrateV2Config(config) {
   return config;
 }
 
-function loadConfigDocument({ templatePath = DEFAULT_TEMPLATE, repoRoot = ROOT } = {}) {
+function loadConfigDocument({ templatePath = DEFAULT_TEMPLATE, engineRoot = ROOT } = {}) {
   const parsed = JSON.parse(readFileSync(templatePath, "utf8"));
   if (parsed.schema !== CURRENT_CONFIG_SCHEMA && !LEGACY_CONFIG_SCHEMAS.has(parsed.schema)) {
     throw new Error(`Unsupported Lichess adapter config schema: ${parsed.schema ?? "missing"}`);
@@ -818,7 +823,7 @@ function loadConfigDocument({ templatePath = DEFAULT_TEMPLATE, repoRoot = ROOT }
   if (serialized.includes("oauth_token") || serialized.includes("bearer ")) {
     throw new Error("Tracked Lichess config must not contain credentials");
   }
-  const config = replaceRepoPlaceholder(parsed, path.resolve(repoRoot));
+  const config = replaceEngineRootPlaceholder(parsed, path.resolve(engineRoot));
   if (config.schema === "uci_arena_lichess_adapter_v2") migrateV2Config(config);
   if (config.schema !== CURRENT_CONFIG_SCHEMA) {
     config.timing ??= {};
@@ -833,7 +838,7 @@ export function loadManagerConfig(options = {}) {
 
 export function loadRuntimeConfig({
   templatePath = DEFAULT_TEMPLATE,
-  repoRoot = ROOT,
+  engineRoot = ROOT,
   enginePath,
   workingDirectory,
   modelRoot,
@@ -842,7 +847,7 @@ export function loadRuntimeConfig({
   temporalCurvePath,
   environment = process.env,
 } = {}) {
-  const config = loadConfigDocument({ templatePath, repoRoot });
+  const config = loadConfigDocument({ templatePath, engineRoot });
   if (!config.engine?.executable || !config.engine?.working_directory) {
     throw new Error("Lichess adapter config is missing engine paths");
   }
@@ -4324,6 +4329,107 @@ function writeRuntimeMetadata(runtimeDir, metadata) {
   renameSync(temporary, target);
 }
 
+function boundedRuntimeMetadata(runtimeDir) {
+  const target = path.join(path.resolve(runtimeDir), "runtime.json");
+  if (!existsSync(target)) return { runtime: null, error: "runtime_status_missing" };
+  try {
+    if (statSync(target).size > 1024 * 1024) {
+      return { runtime: null, error: "runtime_status_oversized" };
+    }
+    const runtime = JSON.parse(readFileSync(target, "utf8"));
+    if (runtime?.schema !== "uci_arena_lichess_runtime_v3") {
+      return { runtime: null, error: "runtime_status_incompatible" };
+    }
+    return { runtime, error: null };
+  } catch {
+    return { runtime: null, error: "runtime_status_invalid" };
+  }
+}
+
+function processIsAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+export function providerStatusProjection({
+  runtime = null,
+  runtimeError = runtime ? null : "runtime_status_missing",
+  startup = { installed: false },
+  active = runtime ? processIsAlive(runtime.pid) : false,
+  startupError = null,
+} = {}) {
+  const slots = Array.isArray(runtime?.slots) ? runtime.slots : [];
+  const slotCounts = Object.fromEntries(
+    ["empty", "preparing", "pending", "cancelling", "active", "draining"].map((state) => [
+      state,
+      slots.filter((slot) => slot?.state === state).length,
+    ]),
+  );
+  const streamConnected = active && runtime?.stream_connected === true;
+  const schedulerFault = runtime?.scheduler?.fault ?? null;
+  const blockers = [];
+  if (runtimeError) blockers.push(runtimeError);
+  if (!active) blockers.push("provider_process_inactive");
+  if (active && !streamConnected) blockers.push("event_stream_disconnected");
+  if (schedulerFault) blockers.push("scheduler_fault");
+  if (startupError) blockers.push("startup_status_unavailable");
+  return {
+    schema: "uci_arena_lichess_status_v3",
+    installed: true,
+    registered: startup?.installed === true,
+    active,
+    ready: active && streamConnected && !schedulerFault,
+    stream_connected: streamConnected,
+    runtime_updated_at: typeof runtime?.updated_at === "string" ? runtime.updated_at : null,
+    account: runtime?.account
+      ? { username: String(runtime.account), bot: true }
+      : null,
+    capacity: {
+      configured: Number.isSafeInteger(runtime?.configured_capacity)
+        ? runtime.configured_capacity
+        : null,
+      qualified: Number.isSafeInteger(runtime?.qualified_capacity)
+        ? runtime.qualified_capacity
+        : null,
+      slots: slotCounts,
+    },
+    games: {
+      active: slotCounts.active,
+      preparing: slotCounts.preparing,
+      pending: slotCounts.pending,
+      cancelling: slotCounts.cancelling,
+      draining: slotCounts.draining,
+    },
+    scheduler: {
+      enabled: runtime?.scheduler?.enabled === true,
+      paused: runtime?.scheduler?.paused === true,
+      target_active_bots: Number.isSafeInteger(runtime?.scheduler?.target_active_bots)
+        ? runtime.scheduler.target_active_bots
+        : null,
+      fault: schedulerFault
+        ? {
+          kind: String(schedulerFault.kind ?? "unknown").slice(0, 128),
+          status: Number.isSafeInteger(schedulerFault.status) ? schedulerFault.status : null,
+        }
+        : null,
+    },
+    rate_limit: {
+      state: runtime?.api_safety?.state ?? "unknown",
+      cooldown_until: runtime?.api_safety?.cooldown_until ?? null,
+      cooldown_remaining_ms: runtime?.api_safety?.cooldown_remaining_ms ?? null,
+      strike_count: runtime?.api_safety?.strike_count ?? null,
+      queue_depth: runtime?.api_safety?.queue_depth ?? null,
+      in_flight_class: runtime?.api_safety?.in_flight_class ?? null,
+    },
+    blockers: [...new Set(blockers)].slice(0, 64),
+  };
+}
+
 export function parseArguments(argv) {
   const [command, ...argumentsList] = argv;
   if (!command) throw new Error("Expected a Lichess adapter command");
@@ -4471,6 +4577,27 @@ export async function main(argv = process.argv.slice(2)) {
   }
   const runtimeDir = path.resolve(options.runtime_dir ?? DEFAULT_RUNTIME_DIR);
   if (options.command === "run") configureRuntimeLog(runtimeDir);
+  if (options.command === "status") {
+    const { runtime, error: runtimeError } = boundedRuntimeMetadata(runtimeDir);
+    let startup = { installed: false };
+    let startupError = null;
+    try {
+      startup = process.platform === "win32"
+        ? await queryWindowsStartup()
+        : process.platform === "linux"
+          ? await queryLinuxStartup()
+          : { installed: false };
+    } catch {
+      startupError = "startup_status_unavailable";
+    }
+    console.log(JSON.stringify(providerStatusProjection({
+      runtime,
+      runtimeError,
+      startup,
+      startupError,
+    })));
+    return 0;
+  }
   if (options.command === "startup" && options.action === "status") {
     const startup = process.platform === "win32"
       ? await queryWindowsStartup()
@@ -4495,7 +4622,7 @@ export async function main(argv = process.argv.slice(2)) {
     const editable = updateManagerOptions({
       templatePath: configPath,
       settings: options.settings,
-      repoRoot: path.resolve(options.repo_root ?? ROOT),
+      engineRoot: path.resolve(options.engine_root ?? ROOT),
       ratedConfirmation: options.confirm_rated,
       outboundConfirmation: options.confirm_outbound,
     });
@@ -4505,7 +4632,7 @@ export async function main(argv = process.argv.slice(2)) {
   if (options.command === "config" && (!options.action || options.action === "get")) {
     const config = loadManagerConfig({
       templatePath: configPath,
-      repoRoot: path.resolve(options.repo_root ?? ROOT),
+      engineRoot: path.resolve(options.engine_root ?? ROOT),
     });
     console.log(JSON.stringify({
       status: "ready",
@@ -4524,7 +4651,7 @@ export async function main(argv = process.argv.slice(2)) {
   }
   const config = loadRuntimeConfig({
     templatePath: configPath,
-    repoRoot: path.resolve(options.repo_root ?? ROOT),
+    engineRoot: path.resolve(options.engine_root ?? ROOT),
     enginePath: options.engine,
     workingDirectory: options.working_directory,
     modelRoot: options.model_root,
