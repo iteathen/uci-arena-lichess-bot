@@ -26,6 +26,7 @@ import {
   gameRuntimeProvenance,
   loadAdaptiveTemporalCurveProfile,
   loadCapacityProfile,
+  loadManagerConfig,
   loadRuntimeConfig,
   loadSingleGameProfile,
   loadTransportProfile,
@@ -35,6 +36,7 @@ import {
   probeAccount,
   resolveExternalTokenFile,
   managerOptionsProjection,
+  main,
   updateManagerOptions,
   validateRuntimeStatus,
 } from "./lichess-adapter.mjs";
@@ -607,6 +609,53 @@ test("Manager options projection is bounded and configuration updates are atomic
     /settings\.engine is not editable/,
   );
   assert.equal(readFileSync(configPath, "utf8"), stable);
+});
+
+test("Manager options remain usable while live-engine onboarding is incomplete", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-manager-incomplete-"));
+  const configPath = path.join(directory, "config.json");
+  const raw = JSON.parse(readFileSync(DEFAULT_TEMPLATE, "utf8"));
+  delete raw.engine.single_game_profile;
+  delete raw.engine.time_profile;
+  writeFileSync(configPath, JSON.stringify(raw), "utf8");
+
+  assert.throws(
+    () => loadRuntimeConfig({ templatePath: configPath, repoRoot: ROOT }),
+    /missing engine\.single_game_profile/,
+  );
+  const config = loadManagerConfig({ templatePath: configPath, repoRoot: ROOT });
+  assert.equal(managerOptionsProjection(config).capacity.evidence.qualified, false);
+
+  const updated = updateManagerOptions({
+    templatePath: configPath,
+    repoRoot: ROOT,
+    settings: { scheduler: { discovery_interval_seconds: 75 } },
+  });
+  assert.equal(updated.scheduler.discovery_interval_seconds, 75);
+  assert.equal(JSON.parse(readFileSync(configPath, "utf8")).engine.single_game_profile, undefined);
+
+  assert.throws(
+    () => updateManagerOptions({
+      templatePath: configPath,
+      repoRoot: ROOT,
+      settings: {
+        capacity: { total_slots: 3, startup_parallelism: 3, bot: { slots: 2 } },
+      },
+    }),
+    /present qualified capacity profile/,
+  );
+
+  const messages = [];
+  const originalLog = console.log;
+  console.log = (message) => messages.push(message);
+  try {
+    assert.equal(await main(["config", "get", "--config", configPath]), 0);
+  } finally {
+    console.log = originalLog;
+  }
+  const response = JSON.parse(messages.at(-1));
+  assert.equal(response.status, "ready");
+  assert.equal(response.editable.scheduler.discovery_interval_seconds, 75);
 });
 
 test("Manager options require explicit rated and outbound confirmations", () => {

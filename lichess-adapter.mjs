@@ -668,7 +668,7 @@ export function updateManagerOptions({
   }
   const target = path.resolve(templatePath);
   const originalRaw = JSON.parse(readFileSync(target, "utf8"));
-  const before = loadRuntimeConfig({ templatePath: target, repoRoot });
+  const before = loadManagerConfig({ templatePath: target, repoRoot });
   const patch = typeof settings === "string" ? JSON.parse(settings) : settings;
   const updatedRaw = applyManagerOptionsPatch(originalRaw, patch);
   const inboundRatedWasEnabled = before.challenges.modes.includes("rated");
@@ -695,7 +695,7 @@ export function updateManagerOptions({
   );
   try {
     writeFileSync(temporary, `${JSON.stringify(updatedRaw, null, 2)}\n`, "utf8");
-    const after = loadRuntimeConfig({ templatePath: temporary, repoRoot });
+    const after = loadManagerConfig({ templatePath: temporary, repoRoot });
     if (capacityShapeChanged(before, after) && !after.capacity.legacy_shared) {
       const evidence = capacityEvidenceSummary(after);
       if (!evidence.qualified) {
@@ -809,17 +809,7 @@ function migrateV2Config(config) {
   return config;
 }
 
-export function loadRuntimeConfig({
-  templatePath = DEFAULT_TEMPLATE,
-  repoRoot = ROOT,
-  enginePath,
-  workingDirectory,
-  modelRoot,
-  profilePath,
-  timeProfilePath,
-  temporalCurvePath,
-  environment = process.env,
-} = {}) {
+function loadConfigDocument({ templatePath = DEFAULT_TEMPLATE, repoRoot = ROOT } = {}) {
   const parsed = JSON.parse(readFileSync(templatePath, "utf8"));
   if (parsed.schema !== CURRENT_CONFIG_SCHEMA && !LEGACY_CONFIG_SCHEMAS.has(parsed.schema)) {
     throw new Error(`Unsupported Lichess adapter config schema: ${parsed.schema ?? "missing"}`);
@@ -834,6 +824,25 @@ export function loadRuntimeConfig({
     config.timing ??= {};
     config.timing.initial_transport_reserve_ms ??= 250;
   }
+  return config;
+}
+
+export function loadManagerConfig(options = {}) {
+  return validateBotPolicyConfig(validateCapacityConfig(loadConfigDocument(options)));
+}
+
+export function loadRuntimeConfig({
+  templatePath = DEFAULT_TEMPLATE,
+  repoRoot = ROOT,
+  enginePath,
+  workingDirectory,
+  modelRoot,
+  profilePath,
+  timeProfilePath,
+  temporalCurvePath,
+  environment = process.env,
+} = {}) {
+  const config = loadConfigDocument({ templatePath, repoRoot });
   if (!config.engine?.executable || !config.engine?.working_directory) {
     throw new Error("Lichess adapter config is missing engine paths");
   }
@@ -4481,16 +4490,6 @@ export async function main(argv = process.argv.slice(2)) {
     return 0;
   }
   const configPath = path.resolve(options.config ?? DEFAULT_TEMPLATE);
-  const config = loadRuntimeConfig({
-    templatePath: configPath,
-    repoRoot: path.resolve(options.repo_root ?? ROOT),
-    enginePath: options.engine,
-    workingDirectory: options.working_directory,
-    modelRoot: options.model_root,
-    profilePath: options.profile,
-    timeProfilePath: options.time_profile,
-    temporalCurvePath: options.temporal_curve_profile,
-  });
   if (options.command === "config" && options.action === "update") {
     if (!options.config) throw new Error("config update requires an explicit --config path");
     const editable = updateManagerOptions({
@@ -4504,12 +4503,16 @@ export async function main(argv = process.argv.slice(2)) {
     return 0;
   }
   if (options.command === "config" && (!options.action || options.action === "get")) {
+    const config = loadManagerConfig({
+      templatePath: configPath,
+      repoRoot: path.resolve(options.repo_root ?? ROOT),
+    });
     console.log(JSON.stringify({
       status: "ready",
       schema: config.schema,
-      engine: config.engine.executable,
-      time_profile: config.engine.time_profile ?? null,
-      temporal_curve_profile: config.engine.temporal_curve_profile ?? null,
+      engine: config.engine?.executable ?? null,
+      time_profile: config.engine?.time_profile ?? null,
+      temporal_curve_profile: config.engine?.temporal_curve_profile ?? null,
       capacity: config.capacity,
       scheduler: config.scheduler,
       editable: managerOptionsProjection(config),
@@ -4519,6 +4522,16 @@ export async function main(argv = process.argv.slice(2)) {
   if (options.command === "config") {
     throw new Error(`Unknown config action: ${options.action ?? "missing"}`);
   }
+  const config = loadRuntimeConfig({
+    templatePath: configPath,
+    repoRoot: path.resolve(options.repo_root ?? ROOT),
+    enginePath: options.engine,
+    workingDirectory: options.working_directory,
+    modelRoot: options.model_root,
+    profilePath: options.profile,
+    timeProfilePath: options.time_profile,
+    temporalCurvePath: options.temporal_curve_profile,
+  });
   if (options.command === "startup" && options.action === "install") {
     const tokenFile = resolveExternalTokenFile(options);
     const { qualificationProfile } = await preflightDeploymentBundle(config);
