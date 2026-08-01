@@ -187,16 +187,76 @@ function spdxFromLock(lock, component, epoch) {
   };
 }
 
+function stringArray(value, label) {
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || !entry)) {
+    throw new Error(`${label} must be an array of nonempty strings`);
+  }
+  return [...value];
+}
+
+function installerManifest(componentContract, version, target, staging) {
+  const installation = componentContract.installation;
+  if (componentContract.schema !== "uci_arena_component_manifest_v1"
+      || componentContract.component?.id !== "lichess.adapter"
+      || componentContract.component?.version !== version
+      || componentContract.component?.repository !== "iteathen/uci-arena-lichess-bot"
+      || installation?.install_manifest_schema !== "arena_install_component_v1"
+      || typeof installation.contract_manifest !== "string"
+      || typeof installation.configuration_template !== "string"
+      || typeof installation.workspace_name !== "string"
+      || !/^[A-Za-z0-9._-]+$/u.test(installation.workspace_name)
+      || installation.startup?.credential_gated !== true) {
+    throw new Error("component contract cannot produce an Installer manifest");
+  }
+  const entrypoints = Object.fromEntries(Object.entries(installation.entrypoints ?? {})
+    .map(([name, relative]) => [name, safeRelative(relative)]));
+  if (!entrypoints.cli || !entrypoints.adapter || !entrypoints.startup) {
+    throw new Error("component contract is missing required Installer entrypoints");
+  }
+  const contractManifest = safeRelative(installation.contract_manifest);
+  const configurationTemplate = safeRelative(installation.configuration_template);
+  const files = listFiles(staging).map((relative) => {
+    const absolute = path.join(staging, relative);
+    return {
+      path: relative,
+      sha256: sha256File(absolute),
+      size_bytes: statSync(absolute).size,
+    };
+  });
+  const owned = new Set(files.map((file) => file.path));
+  for (const relative of [...Object.values(entrypoints), contractManifest, configurationTemplate]) {
+    if (!owned.has(relative)) throw new Error(`Installer contract path is absent: ${relative}`);
+  }
+  return {
+    schema: "arena_install_component_v1",
+    schema_version: 1,
+    component_id: componentContract.component.id,
+    component_version: version,
+    target_triple: target,
+    entrypoints,
+    contract_manifest: contractManifest,
+    capabilities: stringArray(installation.capabilities, "installation.capabilities"),
+    dependencies: stringArray(installation.dependencies, "installation.dependencies"),
+    startup: installation.startup,
+    data_paths: stringArray(installation.data_paths, "installation.data_paths"),
+    workspace_name: installation.workspace_name,
+    configuration_template: configurationTemplate,
+    files,
+  };
+}
+
 function build(args) {
   const definitionPath = path.resolve(args.definition ?? path.join(root, "packaging/component-definition.json"));
   const definition = JSON.parse(readFileSync(definitionPath, "utf8"));
   const packageManifest = JSON.parse(readFileSync(path.join(root, definition.package_json), "utf8"));
+  const componentContractPath = path.join(root, definition.component_manifest);
+  const componentContract = JSON.parse(readFileSync(componentContractPath, "utf8"));
   const version = args.version ?? packageManifest.version;
   const target = args.target;
   if (definition.schema !== "uci_arena_component_definition_v1"
       || definition.component_id !== "lichess.adapter"
       || version !== packageManifest.version
-      || !/^(?:windows|linux)-x64$/u.test(target ?? "")) {
+      || !/^(?:windows|linux)-x86_64$/u.test(target ?? "")) {
     throw new Error("invalid component definition, version, or target");
   }
   const identity = sourceIdentity();
@@ -282,7 +342,7 @@ function build(args) {
     target,
     source: identity,
     definition_sha256: sha256File(definitionPath),
-    component_manifest_sha256: sha256File(path.join(root, definition.component_manifest)),
+    product_component_manifest_sha256: sha256File(componentContractPath),
     test_receipt_sha256: sha256File(receiptPath),
     workflow_identity: args["workflow-identity"] ?? "local-development",
   };
@@ -294,18 +354,53 @@ function build(args) {
     schema: "uci_arena_component_checksums_v1",
     files: checksums,
   }, null, 2)}\n`);
+  const installManifest = installerManifest(componentContract, version, target, staging);
+  writeFileSync(
+    path.join(staging, "arena-component.json"),
+    `${JSON.stringify(installManifest, null, 2)}\n`,
+  );
   listFiles(staging);
   writeFileSync(artifact, deterministicTarGz(staging, epoch));
+  const licenseFiles = listFiles(staging)
+    .filter((relative) => /(?:^|\/)(?:LICENSE|COPYING)(?:\.|$)/iu.test(relative));
+  if (licenseFiles.length === 0) throw new Error("component payload has no license evidence");
+  const licensesSha256 = sha256(Buffer.concat(
+    licenseFiles.map((relative) => readFileSync(path.join(staging, relative))),
+  ));
   const result = {
     schema: "arena_provider_release_result_v1",
     component_id: definition.component_id,
-    version,
-    target,
+    component_version: version,
+    target_triple: target,
     artifact_name: path.basename(artifact),
     artifact_sha256: sha256File(artifact),
-    artifact_size: statSync(artifact).size,
-    source: identity,
+    artifact_size_bytes: statSync(artifact).size,
+    component_manifest_sha256: sha256File(path.join(staging, "arena-component.json")),
+    source_repository: definition.source_repository,
+    source_commit: identity.commit,
+    source_tree_sha256: identity.tree_sha256,
+    clean_tree: identity.clean,
+    release_authority: "provider_component_only",
+    suite_installer_authority: "iteathen/uci-arena-installer",
+    workflow_identity: args["workflow-identity"] ?? "local-development",
+    toolchain_identity: {
+      node: process.version,
+      platform: process.platform,
+      architecture: process.arch,
+    },
+    dependency_lock_identities: {
+      package_lock_sha256: sha256File(path.join(staging, "package-lock.json")),
+      time_profile_contract_sha256: sha256File(
+        path.join(staging, "vendor", "time-profile-contract", "package.json"),
+      ),
+    },
+    build_flags: ["npm ci --ignore-scripts --omit=dev --no-audit --no-fund"],
+    sbom_sha256: sha256File(path.join(releaseDirectory, "sbom.spdx.json")),
+    licenses_sha256: licensesSha256,
     test_receipt_sha256: sha256File(receiptPath),
+    tests: Array.isArray(receipt.tests) && receipt.tests.length > 0
+      ? receipt.tests
+      : [{ command: receipt.command, passed: receipt.passed, exit_code: receipt.exit_code }],
   };
   const resultPath = path.join(output, `${basename}.provider-result.json`);
   writeFileSync(resultPath, `${JSON.stringify(result, null, 2)}\n`);

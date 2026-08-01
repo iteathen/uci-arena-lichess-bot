@@ -23,8 +23,8 @@ function argumentsFrom(argv) {
 }
 
 const args = argumentsFrom(process.argv.slice(2));
-if (!args.output || !/^(?:windows|linux)-x64$/u.test(args.target ?? "")) {
-  throw new Error("usage: write-test-receipt --output <path> --target <windows-x64|linux-x64>");
+if (!args.output || !/^(?:windows|linux)-x86_64$/u.test(args.target ?? "")) {
+  throw new Error("usage: write-test-receipt --output <path> --target <windows-x86_64|linux-x86_64>");
 }
 const commit = execFileSync("git", ["-C", root, "rev-parse", "HEAD"], {
   encoding: "utf8",

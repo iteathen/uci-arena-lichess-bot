@@ -43,6 +43,25 @@ if (component.component?.id !== service.service?.component_id) {
 if (component.component?.version !== readJson("package.json").version) {
   errors.push("component and package versions differ");
 }
+if (service.service?.component_version !== component.component?.version) {
+  errors.push("service and component versions differ");
+}
+if (component.installation?.install_manifest_schema !== "arena_install_component_v1"
+    || component.installation?.contract_manifest !== "contracts/service-contract.json"
+    || component.installation?.configuration_template !== "config.uci_arena.template.yml"
+    || component.installation?.workspace_name !== "lichess-adapter"
+    || component.installation?.startup?.credential_gated !== true
+    || component.installation?.entrypoints?.cli !== service.service?.entrypoint
+    || !component.installation?.dependencies?.includes("node_runtime.private")
+    || !component.installation?.dependencies?.includes("uci_arena.engine")) {
+  errors.push("Installer component projection is incomplete or inconsistent");
+}
+if (service.startup?.credential_gated !== true
+    || service.persistence?.upgrade !== "preserve_and_migrate"
+    || service.persistence?.repair !== "preserve"
+    || service.persistence?.uninstall_default !== "preserve") {
+  errors.push("service startup or persistence ownership is incomplete");
+}
 if (operations.schema !== "uci_arena_lichess_manager_api_v1"
     || Object.keys(operations.operations ?? {}).length < 13) {
   errors.push("Manager operation catalog is missing required operations");

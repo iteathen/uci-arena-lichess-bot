@@ -20,6 +20,30 @@
     ]
   },
   "installation": {
+    "install_manifest_schema": "arena_install_component_v1",
+    "contract_manifest": "contracts/service-contract.json",
+    "entrypoints": {
+      "adapter": "lichess-adapter.mjs",
+      "cli": "lichess-adapter.mjs",
+      "startup": "lichess-adapter.mjs",
+      "live_acceptance": "live-acceptance.mjs",
+      "uci_smoke": "smoke-uci-startup.mjs"
+    },
+    "capabilities": [
+      "manager_operations",
+      "provider_configuration",
+      "provider_status",
+      "startup_install"
+    ],
+    "dependencies": ["node_runtime.private", "uci_arena.engine"],
+    "startup": {
+      "windows": "per_user_task_scheduler",
+      "linux": "per_user_systemd",
+      "credential_gated": true
+    },
+    "data_paths": ["workspace"],
+    "workspace_name": "lichess-adapter",
+    "configuration_template": "config.uci_arena.template.yml",
     "owned_paths": [
       "*.mjs",
       "config.uci_arena.template.yml",

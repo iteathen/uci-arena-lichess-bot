@@ -12,8 +12,8 @@ on:
         type: choice
         required: true
         options:
-          - windows-x64
-          - linux-x64
+          - windows-x86_64
+          - linux-x86_64
 
 permissions:
   contents: read
@@ -25,7 +25,7 @@ concurrency:
 
 jobs:
   build-sign-verify:
-    runs-on: ${{ inputs.target == 'windows-x64' && 'windows-2025' || 'ubuntu-24.04' }}
+    runs-on: ${{ inputs.target == 'windows-x86_64' && 'windows-2025' || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
@@ -39,7 +39,7 @@ jobs:
         run: npm ci --ignore-scripts
 
       - name: Build Windows windowless launcher
-        if: inputs.target == 'windows-x64'
+        if: inputs.target == 'windows-x86_64'
         shell: pwsh
         run: |
           cmake -S native -B native/build -A x64
@@ -57,7 +57,7 @@ jobs:
             --target "${{ inputs.target }}"
 
       - name: Build deterministic Windows component
-        if: inputs.target == 'windows-x64'
+        if: inputs.target == 'windows-x86_64'
         shell: pwsh
         run: |
           $epoch = git show -s --format=%ct HEAD
@@ -72,7 +72,7 @@ jobs:
             --native-launcher native/build/Release/lichess_adapter_launcher.exe
 
       - name: Build deterministic Linux component
-        if: inputs.target == 'linux-x64'
+        if: inputs.target == 'linux-x86_64'
         shell: pwsh
         run: |
           $epoch = git show -s --format=%ct HEAD

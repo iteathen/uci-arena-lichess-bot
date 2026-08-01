@@ -2,7 +2,7 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
@@ -21,6 +21,10 @@ function parseArguments(argv) {
 
 function sha256File(filename) {
   return createHash("sha256").update(readFileSync(filename)).digest("hex");
+}
+
+function sha256(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
 }
 
 function listFiles(root, relative = "") {
@@ -42,14 +46,32 @@ function verify(args) {
   const result = JSON.parse(readFileSync(path.resolve(args.result ?? ""), "utf8"));
   if (result.schema !== "arena_provider_release_result_v1"
       || result.component_id !== "lichess.adapter"
-      || result.artifact_sha256 !== sha256File(artifact)) {
+      || result.release_authority !== "provider_component_only"
+      || result.suite_installer_authority !== "iteathen/uci-arena-installer"
+      || result.artifact_sha256 !== sha256File(artifact)
+      || result.artifact_size_bytes !== statSync(artifact).size) {
     throw new Error("release result does not bind the exact component artifact");
   }
   const manifest = JSON.parse(readFileSync(path.join(root, "contracts", "component-manifest.json"), "utf8"));
   if (manifest.component?.id !== result.component_id
-      || manifest.component?.version !== result.version
+      || manifest.component?.version !== result.component_version
+      || manifest.component?.repository !== result.source_repository
       || manifest.runtime?.entrypoint !== "lichess-adapter.mjs") {
     throw new Error("payload component manifest does not match release result");
+  }
+  const installManifestPath = path.join(root, "arena-component.json");
+  const installManifest = JSON.parse(readFileSync(installManifestPath, "utf8"));
+  if (installManifest.schema !== "arena_install_component_v1"
+      || installManifest.schema_version !== 1
+      || installManifest.component_id !== result.component_id
+      || installManifest.component_version !== result.component_version
+      || installManifest.target_triple !== result.target_triple
+      || installManifest.contract_manifest !== "contracts/service-contract.json"
+      || installManifest.configuration_template !== "config.uci_arena.template.yml"
+      || installManifest.workspace_name !== "lichess-adapter"
+      || installManifest.startup?.credential_gated !== true
+      || result.component_manifest_sha256 !== sha256File(installManifestPath)) {
+    throw new Error("Installer component manifest does not match release result");
   }
   const definitionPath = path.join(root, "release", "component-definition.json");
   const definition = JSON.parse(readFileSync(definitionPath, "utf8"));
@@ -63,11 +85,13 @@ function verify(args) {
   const provenance = JSON.parse(readFileSync(path.join(root, "release", "provenance.json"), "utf8"));
   if (provenance.schema !== "uci_arena_component_provenance_v1"
       || provenance.component_id !== result.component_id
-      || provenance.version !== result.version
-      || provenance.target !== result.target
-      || JSON.stringify(provenance.source) !== JSON.stringify(result.source)
+      || provenance.version !== result.component_version
+      || provenance.target !== result.target_triple
+      || provenance.source?.commit !== result.source_commit
+      || provenance.source?.tree_sha256 !== result.source_tree_sha256
+      || provenance.source?.clean !== result.clean_tree
       || provenance.definition_sha256 !== sha256File(definitionPath)
-      || provenance.component_manifest_sha256
+      || provenance.product_component_manifest_sha256
         !== sha256File(path.join(root, definition.component_manifest))
       || provenance.test_receipt_sha256 !== sha256File(receiptPath)
       || result.test_receipt_sha256 !== provenance.test_receipt_sha256) {
@@ -75,17 +99,18 @@ function verify(args) {
   }
   if (receipt.schema !== "uci_arena_component_test_receipt_v1"
       || receipt.component_id !== result.component_id
-      || receipt.component_version !== result.version
-      || receipt.target !== result.target
-      || receipt.source_commit !== result.source?.commit
-      || receipt.source_tree_sha256 !== result.source?.tree_sha256
+      || receipt.component_version !== result.component_version
+      || receipt.target !== result.target_triple
+      || receipt.source_commit !== result.source_commit
+      || receipt.source_tree_sha256 !== result.source_tree_sha256
       || receipt.passed !== true
       || receipt.exit_code !== 0) {
     throw new Error("payload test receipt does not authorize this release result");
   }
   const checksums = JSON.parse(readFileSync(path.join(root, "release", "checksums.json"), "utf8"));
   const actualFiles = listFiles(root)
-    .filter((relative) => relative !== "release/checksums.json")
+    .filter((relative) => relative !== "release/checksums.json"
+      && relative !== "arena-component.json")
     .sort();
   const expectedFiles = Object.keys(checksums.files ?? {}).sort();
   if (JSON.stringify(actualFiles) !== JSON.stringify(expectedFiles)) {
@@ -96,6 +121,32 @@ function verify(args) {
       throw new Error(`payload checksum mismatch: ${relative}`);
     }
   }
+  const installFiles = [...(installManifest.files ?? [])]
+    .sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0);
+  const installPaths = installFiles.map((file) => file.path);
+  const stagedFiles = listFiles(root)
+    .filter((relative) => relative !== "arena-component.json")
+    .sort();
+  if (JSON.stringify(installPaths) !== JSON.stringify(stagedFiles)) {
+    throw new Error("Installer component manifest file set differs from payload");
+  }
+  for (const file of installFiles) {
+    const filename = path.join(root, file.path);
+    if (file.sha256 !== sha256File(filename)
+        || file.size_bytes !== statSync(filename).size) {
+      throw new Error(`Installer component manifest mismatch: ${file.path}`);
+    }
+  }
+  const licenseFiles = stagedFiles
+    .filter((relative) => /(?:^|\/)(?:LICENSE|COPYING)(?:\.|$)/iu.test(relative));
+  const licensesSha256 = sha256(Buffer.concat(
+    licenseFiles.map((relative) => readFileSync(path.join(root, relative))),
+  ));
+  if (licenseFiles.length === 0
+      || result.licenses_sha256 !== licensesSha256
+      || result.sbom_sha256 !== sha256File(path.join(root, "release", "sbom.spdx.json"))) {
+    throw new Error("release result does not bind SBOM and license evidence");
+  }
   for (const forbidden of ["fake-api-server.mjs", "fake-api-server.test.mjs", "test-fixtures"] ) {
     if (existsSync(path.join(root, forbidden))) {
       throw new Error(`test-only entry was packaged: ${forbidden}`);
@@ -105,7 +156,7 @@ function verify(args) {
       || existsSync(path.join(root, "vendor", "upstream.lock.json"))) {
     throw new Error("repository-only test or vendor provenance content was packaged");
   }
-  if (result.target === "windows-x64"
+  if (result.target_triple === "windows-x86_64"
       && !existsSync(path.join(root, "native", "lichess_adapter_launcher.exe"))) {
     throw new Error("Windows component lacks its windowless native launcher");
   }
@@ -128,7 +179,7 @@ function verify(args) {
       || !status.blockers.includes("provider_process_inactive")) {
     throw new Error("packaged provider status smoke failed");
   }
-  if (result.target === "windows-x64") {
+  if (result.target_triple === "windows-x86_64") {
     const probe = execFileSync(path.join(root, "native", "lichess_adapter_launcher.exe"), ["--probe"], {
       encoding: "utf8",
       windowsHide: true,

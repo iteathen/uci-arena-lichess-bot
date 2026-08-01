@@ -22,8 +22,8 @@ test("component definition packages runtime contracts without test or source-tre
     || source.includes("test-fixtures")
     || source.includes("/test")), false);
   assert.equal(JSON.stringify(definition).includes("../"), false);
-  assert.equal(definition.native_launcher["windows-x64"].required, true);
-  assert.equal(definition.native_launcher["linux-x64"].required, false);
+  assert.equal(definition.native_launcher["windows-x86_64"].required, true);
+  assert.equal(definition.native_launcher["linux-x86_64"].required, false);
 });
 
 test("Manager configuration and status contracts are closed and separate requests from responses", () => {
@@ -64,14 +64,14 @@ test("provider attestation binds and verifies the exact in-toto payload", () => 
   const output = path.join(directory, "output");
   const statements = path.join(directory, "statements");
   mkdirSync(output);
-  const artifactName = "lichess.adapter-1.0.0-windows-x64.tar.gz";
+  const artifactName = "lichess.adapter-1.0.0-windows-x86_64.tar.gz";
   const artifact = Buffer.from("exact-provider-artifact");
   writeFileSync(path.join(output, artifactName), artifact);
   writeFileSync(path.join(output, `${artifactName}.provider-result.json`), JSON.stringify({
     schema: "arena_provider_release_result_v1",
     component_id: "lichess.adapter",
-    version: "1.0.0",
-    target: "windows-x64",
+    component_version: "1.0.0",
+    target_triple: "windows-x86_64",
     artifact_name: artifactName,
     artifact_sha256: createHash("sha256").update(artifact).digest("hex"),
   }));

@@ -3,6 +3,7 @@
   "component_id": "lichess.adapter",
   "package_json": "package.json",
   "component_manifest": "contracts/component-manifest.json",
+  "source_repository": "iteathen/uci-arena-lichess-bot",
   "include": [
     {"source": "backfill-game-provenance.mjs", "target": "backfill-game-provenance.mjs"},
     {"source": "chess-legality.mjs", "target": "chess-legality.mjs"},
@@ -21,11 +22,11 @@
     {"source": "README.md", "target": "README.md"}
   ],
   "native_launcher": {
-    "windows-x64": {
+    "windows-x86_64": {
       "required": true,
       "target": "native/lichess_adapter_launcher.exe"
     },
-    "linux-x64": {
+    "linux-x86_64": {
       "required": false
     }
   },
