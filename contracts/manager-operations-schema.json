@@ -72,6 +72,16 @@
       "mutates": false,
       "credential": "forbidden"
     },
+    "startup_install": {
+      "arguments": ["startup", "install"],
+      "mutates": true,
+      "credential": "external_file_path_only"
+    },
+    "startup_uninstall": {
+      "arguments": ["startup", "uninstall"],
+      "mutates": true,
+      "credential": "forbidden"
+    },
     "provider_status": {
       "arguments": ["status"],
       "mutates": false,

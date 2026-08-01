@@ -62,8 +62,22 @@ if (service.startup?.credential_gated !== true
     || service.persistence?.uninstall_default !== "preserve") {
   errors.push("service startup or persistence ownership is incomplete");
 }
+if (service.invocation?.kind !== "dependency_runtime"
+    || service.invocation?.runtime_component_id !== "node_runtime.private"
+    || service.invocation?.runtime_entrypoint !== "node"
+    || !component.installation?.dependencies?.includes(
+      service.invocation.runtime_component_id,
+    )) {
+  errors.push("service invocation runtime is incomplete or undeclared");
+}
+const requiredOperations = new Set([
+  "account_probe", "config_get", "config_update", "owner_add", "owner_list",
+  "owner_remove", "provider_status", "reservation_cancel", "reservation_create",
+  "reservation_status", "scheduler_pause", "scheduler_resume", "scheduler_status",
+  "startup_install", "startup_status", "startup_uninstall",
+]);
 if (operations.schema !== "uci_arena_lichess_manager_api_v1"
-    || Object.keys(operations.operations ?? {}).length < 13) {
+    || [...requiredOperations].some((name) => !operations.operations?.[name])) {
   errors.push("Manager operation catalog is missing required operations");
 }
 for (const [name, operation] of Object.entries(operations.operations ?? {})) {

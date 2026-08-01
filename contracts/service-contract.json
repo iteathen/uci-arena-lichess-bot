@@ -8,6 +8,11 @@
     "transport": "cli_json",
     "entrypoint": "lichess-adapter.mjs"
   },
+  "invocation": {
+    "kind": "dependency_runtime",
+    "runtime_component_id": "node_runtime.private",
+    "runtime_entrypoint": "node"
+  },
   "provided_capabilities": [
     "lichess.account_probe",
     "lichess.challenge_policy",
