@@ -35,7 +35,7 @@
       "provider_status",
       "startup_install"
     ],
-    "dependencies": ["node_runtime.private", "uci_arena.engine"],
+    "dependencies": ["node_runtime.private"],
     "startup": {
       "windows": "per_user_task_scheduler",
       "linux": "per_user_systemd",
@@ -72,7 +72,9 @@
   "compatibility": {
     "manager_api": 1,
     "installer_minimum": "1.3.0",
-    "required_components": ["uci_arena.engine"],
+    "required_components": [],
+    "required_capabilities": ["uci.engine.process"],
+    "compatible_default_components": ["uci_arena.engine"],
     "optional_components": ["opening_book.standard"]
   }
 }

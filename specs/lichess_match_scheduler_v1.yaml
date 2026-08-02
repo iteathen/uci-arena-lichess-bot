@@ -12,7 +12,7 @@ meta:
 
 authority:
   transport_and_scheduler: iteathen/uci-arena-lichess-bot
-  engine_move_selection: uci_arena_engine
+  engine_move_selection: selected_external_uci_process
   durable_runtime_store: runtime_state/lichess/matches.sqlite
   timing_profile_consumption_contract:
     package: '@uci-arena/time-profile-contract'
@@ -22,6 +22,8 @@ authority:
   rules:
     - "The scheduler, Lichess API, reservations, statistics, capacity admission, startup, and provider persistence belong to the independent Lichess Bot repository."
     - "The Lichess Bot consumes an immutable UCI engine artifact and project-owned contract packages; it never imports engine repository source."
+    - "The provider component manifest requires the neutral uci.engine.process capability. UCI Arena Engine is a compatible suite default chosen by product composition, not a hard provider dependency."
+    - "The provider selects one explicit engine adapter at composition time. standard_uci_v1 accepts any conforming UCI process; uci_arena_extended_v1 adds UCI Arena runtime, timing, model, and evidence validation without weakening the neutral UCI boundary."
     - "One global event stream owns challenge/game lifecycle; each admitted game owns one independent qualified UCI child and game stream."
     - "An active game is never aborted or preempted to free a slot."
     - "Token contents never enter configuration, SQLite, logs, metadata, argv, or child environments."
@@ -51,12 +53,13 @@ local_api_simulator:
     - "The simulator is test tooling only and cannot be selected by tracked production configuration or packaged as a runtime fallback."
 
 configuration:
-  schema: uci_arena_lichess_adapter_v6
-  backward_compatibility: "v2/v3/v4/v5 retain their declared migrations; new configuration is emitted as v6."
+  schema: uci_arena_lichess_adapter_v7
+  backward_compatibility: "v2/v3/v4/v5/v6 retain their declared migrations; new configuration is emitted as v7. Legacy documents without engine.adapter retain uci_arena_extended_v1 behavior."
   path_independence:
     - "Provider source and runtime paths resolve from the provider component root, never the process current working directory or a former engine-repository location."
     - "Engine executable, engine working directory, model, timing, capacity, and qualification paths enter explicitly from installed component discovery or invocation options."
     - "The tracked template uses an engine-component placeholder and does not name an engine source-tree layout."
+    - "An engine may declare a bounded argument array for a direct process launch. Arguments are never concatenated into a shell command, and launch provenance binds the exact array plus any existing file arguments."
   credential:
     input: required_explicit_token_file_path
     ownership: operator_external
@@ -65,6 +68,8 @@ configuration:
       - "The resolved token path must be outside the adapter repository or installed provider component root."
       - "Explicit token-path validation occurs before engine qualification or startup installation work."
       - "Startup status and uninstall never require a credential path."
+      - "Configuration loading recursively rejects credential-bearing field names and bearer values; token material cannot hide beneath an otherwise unknown object."
+      - "Runtime token reads accept one bounded non-whitespace value from a regular file and never copy it into provider state."
   capacity:
     required: [total_slots, capacity_profile, human, bot]
     human: [slots, allow_borrowing, accept_public]
@@ -74,6 +79,7 @@ configuration:
       - human_slots_plus_bot_slots_equals_total_slots
       - bot_target_active_between_zero_and_bot_slots
       - configured_total_does_not_exceed_qualified_max_concurrency
+      - "A standard_uci_v1 engine receives one qualified slot from a fresh legal-move startup probe. More than one slot requires a capacity artifact binding the exact executable, UCI identity, applied options, and concurrent probe evidence."
   scheduler_defaults:
     enabled: true
     discovery_interval_seconds: 60
@@ -95,7 +101,7 @@ configuration:
     public_humans: true
 
 capacity_profile:
-  schema: uci_arena_lichess_capacity_profile_v1
+  schemas: [uci_arena_lichess_capacity_profile_v1, uci_arena_lichess_capacity_profile_v2, uci_arena_lichess_standard_uci_capacity_profile_v1]
   required_bindings:
     - qualified
     - published_at
@@ -115,6 +121,29 @@ capacity_profile:
     cursor fields have no MCGS authority. A smaller configured capacity may
     use a profile qualified at a greater capacity with identical bindings.
   failure: "Missing, stale, mismatched, or undersized capacity evidence blocks live run before credentials are read."
+
+engine_adapters:
+  selection: explicit_configuration
+  standard_uci_v1:
+    required_protocol:
+      - "The child completes uci/uciok and isready/readyok within bounded time."
+      - "Only options advertised by that child may be applied. Missing optional Ponder or Move Overhead disables the corresponding optimization rather than rejecting an otherwise conforming engine."
+      - "A fresh start-position qualification search must return a syntactically valid and independently legal move before a slot may be admitted."
+      - "Clocked move search uses only standard position and go wtime/btime/winc/binc commands. Opponent-turn search uses standard go ponder when supported and otherwise remains disabled."
+      - "Standard-UCI execution never requires runtime_status, MCGS telemetry, a model package, ONNX provider identity, a UCI Arena timing profile, or UCI Arena-owned option names."
+    provenance:
+      - "Every game binds executable SHA-256, normalized UCI id lines, advertised-option identity, applied options, and adapter identity. Model, provider, and UCI Arena timing fields remain explicitly absent rather than invented."
+  uci_arena_extended_v1:
+    required_protocol:
+      - "The existing exact single-game, model, provider, MCGS, timing, capacity, opening-book, and tablebase gates remain authoritative."
+      - "Extended telemetry is validated only inside this adapter and never becomes a requirement of standard_uci_v1."
+  substitution:
+    - "Selecting standard_uci_v1 or uci_arena_extended_v1 changes adapter-owned qualification and telemetry validation only; Lichess streams, legality, challenge policy, persistence, slot admission, and move submission remain unchanged."
+    - "Account probe and credential validation do not require an engine to be configured or qualified. Live run and startup registration do."
+    - "The packaged UCI smoke delegates process launch, configured literal arguments, option validation, and qualification to the selected engine adapter; it never independently requires UCI Arena-only commands from standard_uci_v1."
+  process_boundary:
+    - "UCI option names and values are bounded single-line protocol values; configuration cannot inject additional UCI commands."
+    - "Engine stdout protocol lines, retained identity lines, and projected stderr are bounded. Protocol overflow terminates the child and fails pending work."
 
 protected_live_acceptance:
   capacity: {total_slots: 1, human_slots: 0, bot_slots: 1, bot_target_active: 0}
@@ -139,6 +168,9 @@ slots:
     - "Public humans may use unreserved human slots; BOT-title challengers use only bot slots."
     - "On restart, reconcile /api/account/playing before creating or accepting new work."
     - "After a global event-stream disconnect, reconnect with bounded exponential backoff and reconcile /api/account/playing before resuming scheduling so a gameStart event lost during the gap is recovered."
+    - "Game admission is serialized by game id. Concurrent event-stream and reconciliation observations coalesce into one start, one child, one stream, and one slot generation."
+    - "Every asynchronous slot transition and release is authorized by the generation captured when the slot was claimed; a stale callback can never mutate or release a later occupant."
+    - "An outbound gameStart that races the challenge-create response adopts the already preparing opponent slot. The late create response may attach its challenge id but cannot move an active slot backward to pending or release its engine."
     - "A disconnected per-game stream reconnects and reconstructs position from authoritative gameFull/gameState moves without releasing its active slot."
 
 owner_control:
@@ -180,10 +212,13 @@ storage:
     - "Historical provenance may be backfilled only into blank provenance fields from an explicit, reviewable evidence manifest whose runtime identity is bound to an already-recorded game fingerprint and a bounded UTC interval. Backfill never overwrites non-empty identity, records evidence sources and unknown fields in the versioned JSON, is transactional, and reports matched, updated, skipped, and conflicting rows."
     - "Aggregates remain derivable from immutable game rows and separable by runtime identity."
     - "Startup reconciliation may fill missing terminal results without duplicating games."
+    - "Reservation consumption is one SQLite transaction so a concurrent Manager cancellation or replacement cannot decrement or delete a different reservation."
+    - "Persisting API safety state never shortens cooldown or replaces a newer strike observation with stale state."
 
 windows_supervision:
   task_name: UCI Arena Lichess Adapter
-  launcher: native/build/Release/lichess_adapter_launcher.exe
+  installed_launcher: native/lichess_adapter_launcher.exe
+  development_build_output: native/build/Release/lichess_adapter_launcher.exe
   rules:
     - "The registered logon task is hidden, least-privilege, single-instance, network-gated, unlimited-duration, and restarted after failure."
     - "The task starts a Windows GUI-subsystem launcher; the launcher creates the foreground Node adapter with CREATE_NO_WINDOW and supervises it in a kill-on-close job."
@@ -203,6 +238,15 @@ telemetry:
     - api_cooldown_deadline_and_backoff_level
     - api_queue_depth_and_in_flight_request_class
     - api_429_counts_and_client_lease_health
+  status_authority:
+    - "A live PID is insufficient authority for active or ready. Runtime evidence older than the bounded heartbeat window is stale even if that PID has been reused by another process."
+    - "Status distinguishes missing, invalid, stale, inactive, disconnected, scheduler-faulted, and ready states without reading a credential."
+
+transport_bounds:
+  rules:
+    - "Every JSON or NDJSON response crossing the Lichess boundary has a byte bound before complete buffering or parsing. Long-lived streams are unbounded in duration but each record is bounded."
+    - "Finite discovery results have an item bound consistent with the requested Lichess limit. Oversized bodies, records, and result sets fail closed with bounded errors."
+    - "Successful empty-response operations cancel or boundedly drain unexpected response bodies; error-detail extraction never buffers an arbitrary response document."
 
 validation:
   - "Config fixtures cover v2 compatibility, 1, default 1+1, 16-game layouts, invalid sums, and capacity-profile rejection."
@@ -211,6 +255,10 @@ validation:
   - "Mock API tests prove discovery, serialized challenge operations, move priority, 429 backoff, cancellation-before-timeout-release, late-accept retention, active-game recovery borrowing, and event races."
   - "Loopback API-server integration proves real HTTP account probing, bearer rejection, BOT rejection, NDJSON discovery/stream parsing, challenge creation, and move submission without contacting Lichess."
   - "Concurrent engine tests require legal moves, isolated children, bounded startup, and graceful cleanup at every claimed capacity."
+  - "Substitution tests run a minimal standard UCI fixture with no UCI Arena options or runtime_status and prove qualification, legal move submission, provenance, and one-slot admission."
+  - "Race tests prove duplicate gameStart/reconciliation and outbound create-response reordering cannot create two children, two streams, a leaked slot, or a stale-generation release."
+  - "Transport tests reject oversized JSON, NDJSON records, and finite collections before unbounded buffering."
+  - "Packaged Windows startup tests resolve the launcher at native/lichess_adapter_launcher.exe rather than a source-build directory."
 
 adaptive_temporal_curve_profile_2026_07_25:
   status: active
@@ -366,7 +414,7 @@ mixed_mcgs_capacity_canary_2026_07_20:
   profile_schema: uci_arena_lichess_capacity_profile_v2
   rules:
     - "A two-slot profile binds exact single-game and timing-profile hashes and qualifies one timed foreground child beside one opponent-root child, then swaps roles."
-    - "Primary and fallback deployment bundles carry their own capacity-profile paths; selecting fallback changes engine, model, timing, single-game, and capacity authority as one pre-token transaction."
+    - "Each independently selectable engine-adapter configuration carries its own capacity evidence. Changing adapter, executable, model, timing, or options requires a newly validated composition before token contents are read; there is no hidden runtime fallback bundle."
     - "Both children remain GPU-backed and satisfy deadline, stop/drain, handoff, stale-publication, and reservation-integrity gates in every evidence round."
     - "The initial live canary is one casual public-human slot plus one casual bot slot at rapid/classical controls with outbound 600+2 and at most one game per opponent per day."
 
@@ -445,7 +493,7 @@ protected_live_acceptance_2026_07_26:
     - "Accept the credential only as a token-file path passed to the adapter process."
     - "Never enable this acceptance from unit tests, package build, or default startup."
     - "Use the existing operator BOT account; do not require or provision a second account."
-    - "The acceptance harness consumes the current v6 provider configuration and runs from the provider component root independent of the caller's working directory."
+    - "The acceptance harness consumes the current v7 provider configuration and runs from the provider component root independent of the caller's working directory."
   participant_gate:
     - "The authenticated identity must exactly match the expected operator account and have title BOT."
     - "The target must be distinct, public, online, and have title BOT."
@@ -492,7 +540,7 @@ manager_account_and_options_contract_2026_07_31:
     rules:
       - "The published JSON Schema must describe the exact top-level projection returned by config get. The schema, provider output, and Manager operation response identifier must not introduce a wrapper that the other two do not use."
       - "The config update request has its own closed schema. Every editable group and nested field is typed and bounded; response and request contracts must not be conflated."
-      - "Configuration and status objects reject undeclared nested fields. Capacity evidence, slot state, scheduler faults, rate-limit state, nullable counters, and bounded identifiers are explicit contract fields rather than untyped objects."
+      - "Configuration and status objects reject undeclared nested fields. Capacity evidence, slot state, scheduler faults, rate-limit state, nullable counters, and bounded identifiers are explicit contract fields rather than untyped objects. Capacity evidence distinguishes legacy one-slot authority, a standard-UCI one-slot startup probe, standard-UCI evidence requiring runtime revalidation, missing evidence, qualified evidence, and rejected evidence."
       - "The Node adapter is the sole schema, validation, migration, and atomic-write owner for these groups. Manager invokes the declared adapter operation and renders the bounded result."
       - "Reading the bounded projection and updating non-capacity policy groups remain available while engine, timing, single-game, temporal-curve, or capacity qualification is incomplete. These configuration operations validate the provider document and editable policy schema without claiming live readiness."
       - "Editable operations use a strict allowlist. Engine paths, model/profile paths, URL, runtime directory, store path, startup definition, arbitrary UCI options, and unknown fields are not writable through the Manager projection."
@@ -535,9 +583,10 @@ manager_account_and_options_contract_2026_07_31:
   validation:
     - "Contract checks compare the provider projection shape and fixed Manager operation bindings with the published closed schemas so wrapper or field drift fails before packaging."
     - "Unit tests cover complete projection, strict unknown-field rejection, valid atomic updates, invalid-update rollback, capacity-evidence rejection, and rated/outbound confirmation gates."
-    - "Unit tests prove projection reads and non-capacity updates remain usable with incomplete live-engine qualification while run, probe, startup installation, and capacity changes remain fail-closed."
+    - "Unit tests prove account probe, projection reads, and non-capacity updates remain usable with incomplete live-engine qualification while run, startup installation, and capacity changes remain fail-closed."
     - "Manager integration tests cover every account-control action and configuration group through the provider boundary without a shell and without contacting Lichess."
     - "Provider status tests cover missing state, stale/dead process evidence, active disconnected state, and active ready state without reading a credential."
+    - "Runtime NDJSON logs rotate into one bounded retained predecessor; logging failures remain observable only through lost diagnostics and never interrupt a live game."
     - "Installed headless acceptance proves the configured bot is discoverable, its activity and blockers are visible, and account/options controls are reachable without opening a terminal."
     - "Release packaging includes only provider runtime files and the vendored contract runtime closure; provider tests, fabricated APIs, fixtures, source provenance history, and repository-only vendor locks are excluded."
     - "Release verification binds the outer provider result to the artifact and binds the internal provenance, component definition, component manifest, exact source identity, and exact passing test receipt before signing."

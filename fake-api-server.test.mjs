@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
 import {
+  DEFAULT_TEMPLATE,
   LichessClient,
+  main,
   probeAccount,
 } from "./lichess-adapter.mjs";
 import { startFakeLichessApi } from "./fake-api-server.mjs";
@@ -47,6 +49,44 @@ test("loopback API server exercises the real account probe without a Lichess cre
     assert.equal(JSON.stringify(api.requests).includes("Bearer"), false);
     assert.equal(JSON.stringify(api.requests).includes(FIXTURE_TOKEN), false);
   } finally {
+    await token.close();
+    await api.close();
+  }
+});
+
+test("provider probe reaches the account API without a configured engine", async () => {
+  const api = await startFakeLichessApi({ fixtureToken: FIXTURE_TOKEN });
+  const token = await temporaryToken();
+  const root = await mkdtemp(path.join(os.tmpdir(), "uci-arena-provider-probe-"));
+  const configPath = path.join(root, "config.json");
+  const runtimeDir = path.join(root, "runtime");
+  const config = JSON.parse(await readFile(DEFAULT_TEMPLATE, "utf8"));
+  config.url = api.origin;
+  config.engine.executable = "";
+  config.engine.working_directory = "";
+  await writeFile(configPath, JSON.stringify(config), "utf8");
+  const output = [];
+  const originalLog = console.log;
+  console.log = (line) => output.push(String(line));
+  try {
+    assert.equal(await main([
+      "probe",
+      "--config", configPath,
+      "--token-file", token.tokenFile,
+      "--runtime-dir", runtimeDir,
+    ]), 0);
+    assert.deepEqual(JSON.parse(output.at(-1)), {
+      status: "ready",
+      account: "FixtureArenaBot",
+      is_bot: true,
+      games: 0,
+    });
+    assert.deepEqual(api.requests, [
+      { method: "GET", path: "/api/account", form: {} },
+    ]);
+  } finally {
+    console.log = originalLog;
+    await rm(root, { recursive: true, force: true });
     await token.close();
     await api.close();
   }

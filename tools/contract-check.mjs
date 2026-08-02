@@ -53,7 +53,10 @@ if (component.installation?.install_manifest_schema !== "arena_install_component
     || component.installation?.startup?.credential_gated !== true
     || component.installation?.entrypoints?.cli !== service.service?.entrypoint
     || !component.installation?.dependencies?.includes("node_runtime.private")
-    || !component.installation?.dependencies?.includes("uci_arena.engine")) {
+    || component.installation?.dependencies?.includes("uci_arena.engine")
+    || !component.compatibility?.required_capabilities?.includes("uci.engine.process")
+    || !component.compatibility?.compatible_default_components?.includes("uci_arena.engine")
+    || !service.required_capabilities?.includes("uci.engine.process")) {
   errors.push("Installer component projection is incomplete or inconsistent");
 }
 if (service.startup?.credential_gated !== true
@@ -88,6 +91,20 @@ for (const [name, operation] of Object.entries(operations.operations ?? {})) {
 }
 if (configuration.properties?.schema?.const !== "uci_arena_lichess_manager_options_v1") {
   errors.push("configuration projection schema is incompatible");
+}
+const capacityEvidenceStatuses = configuration.properties?.capacity
+  ?.properties?.evidence?.properties?.status?.enum ?? [];
+for (const expected of [
+  "legacy_shared",
+  "standard_uci_startup_probe_required",
+  "runtime_revalidation_required",
+  "missing",
+  "qualified",
+  "rejected",
+]) {
+  if (!capacityEvidenceStatuses.includes(expected)) {
+    errors.push(`configuration projection omits capacity evidence status ${expected}`);
+  }
 }
 if (configurationUpdate.required?.[0] !== "settings"
     || configurationUpdate.properties?.settings?.additionalProperties !== false) {

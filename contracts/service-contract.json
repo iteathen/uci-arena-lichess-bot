@@ -24,9 +24,16 @@
     "lichess.startup"
   ],
   "required_capabilities": [
-    "uci.engine.process",
+    "uci.engine.process"
+  ],
+  "optional_capabilities": [
+    "uci.runtime_status.v1",
     "uci.time_profile.contract.v3"
   ],
+  "engine_adapters": {
+    "standard_uci_v1": "provider-neutral UCI process with fresh legal-move qualification",
+    "uci_arena_extended_v1": "UCI Arena Engine extensions with model, runtime-status, timing, and capacity evidence"
+  },
   "credential_contract": {
     "input": "external_absolute_file_path",
     "contents_visible_to": "provider_transport_only",

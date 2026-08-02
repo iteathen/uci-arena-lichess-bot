@@ -89,6 +89,7 @@ test("provider status distinguishes inactive, disconnected, and ready states", (
     runtime,
     active: true,
     startup: { installed: true },
+    now: Date.parse(runtime.updated_at),
   });
   assert.equal(disconnected.registered, true);
   assert.equal(disconnected.active, true);
@@ -101,10 +102,21 @@ test("provider status distinguishes inactive, disconnected, and ready states", (
     runtime: { ...runtime, stream_connected: true },
     active: true,
     startup: { installed: true },
+    now: Date.parse(runtime.updated_at),
   });
   assert.equal(ready.ready, true);
   assert.deepEqual(ready.blockers, []);
   assert.deepEqual(Object.keys(ready.account), ["username", "bot"]);
+
+  const stale = providerStatusProjection({
+    runtime: { ...runtime, stream_connected: true },
+    active: true,
+    startup: { installed: true },
+    now: Date.parse(runtime.updated_at) + 15_001,
+  });
+  assert.equal(stale.active, false);
+  assert.equal(stale.ready, false);
+  assert.deepEqual(stale.blockers, ["runtime_status_stale", "provider_process_inactive"]);
 });
 
 function qualifiedFixture() {
@@ -556,14 +568,14 @@ function mockStore() {
   };
 }
 
-function createGameSession(engine, client) {
+function createGameSession(engine, client, config = gameConfig()) {
   let sessions = [];
   const foregroundCoordinator = new ForegroundSearchCoordinator({
     sessions: () => sessions,
   });
   const session = new GameSession({
     client,
-    config: gameConfig(),
+    config,
     account: "arena-bot",
     gameId: "game-1",
     signal: { aborted: false },
@@ -589,7 +601,7 @@ test("runtime config is credential-free and resolves repository paths", () => {
   const serialized = JSON.stringify(config).toLowerCase();
   assert.equal(serialized.includes("test-token"), false);
   assert.equal(serialized.includes("oauth_token"), false);
-  assert.equal(config.schema, "uci_arena_lichess_adapter_v6");
+  assert.equal(config.schema, "uci_arena_lichess_adapter_v7");
   assert.equal(config.timing.opponent_turn_search, true);
   assert.equal(config.timing.foreground_preempts_ponder, true);
   assert.equal(config.timing.initial_transport_reserve_ms, 650);
@@ -600,6 +612,174 @@ test("runtime config is credential-free and resolves repository paths", () => {
   assert.equal(config.engine.temporal_curve_profile, null);
   assert.equal(config.engine.uci_options.OwnBook, true);
   assert.equal(config.engine.executable.includes(ROOT.replaceAll("\\", "/")), true);
+});
+
+test("configuration recursively rejects hidden credential fields and bearer values", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-credential-config-"));
+  const configPath = path.join(directory, "config.json");
+  const raw = JSON.parse(readFileSync(DEFAULT_TEMPLATE, "utf8"));
+  raw.unrelated = { nested: { token: "not-allowed" } };
+  writeFileSync(configPath, JSON.stringify(raw), "utf8");
+  assert.throws(
+    () => loadManagerConfig({ templatePath: configPath }),
+    /credential field/,
+  );
+  delete raw.unrelated;
+  raw.label = "Bearer not-allowed";
+  writeFileSync(configPath, JSON.stringify(raw), "utf8");
+  assert.throws(
+    () => loadManagerConfig({ templatePath: configPath }),
+    /bearer credential/,
+  );
+});
+
+test("explicit engine path options can complete an otherwise unbound standard UCI config", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-engine-override-"));
+  const configPath = path.join(directory, "config.json");
+  const raw = JSON.parse(readFileSync(DEFAULT_TEMPLATE, "utf8"));
+  raw.engine = {
+    adapter: "standard_uci_v1",
+    executable: "",
+    working_directory: "",
+    arguments: [],
+    uci_options: {},
+  };
+  raw.capacity = {
+    total_slots: 1,
+    capacity_profile: null,
+    startup_parallelism: 1,
+    human: { slots: 1, allow_borrowing: false, accept_public: true },
+    bot: { slots: 0, target_active: 0 },
+  };
+  raw.scheduler.enabled = false;
+  writeFileSync(configPath, JSON.stringify(raw), "utf8");
+  const config = loadRuntimeConfig({
+    templatePath: configPath,
+    enginePath: process.execPath,
+    workingDirectory: directory,
+  });
+  assert.equal(config.engine.executable, path.resolve(process.execPath));
+  assert.equal(config.engine.working_directory, path.resolve(directory));
+});
+
+test("standard UCI adapter qualifies a conforming engine without UCI Arena extensions", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-standard-uci-"));
+  const fixtureEngine = path.join(directory, "fixture-uci.mjs");
+  writeFileSync(fixtureEngine, `
+import { createInterface } from "node:readline";
+const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
+for await (const line of input) {
+  if (line === "uci") {
+    console.log("id name Contract Fixture");
+    console.log("id author UCI Arena Tests");
+    console.log("option name Ponder type check default false");
+    console.log("uciok");
+  } else if (line === "isready") console.log("readyok");
+  else if (line.startsWith("go ")) console.log("bestmove e2e4 ponder e7e5");
+  else if (line === "stop") console.log("bestmove 0000");
+  else if (line === "quit") process.exit(0);
+}
+`, "utf8");
+  const configPath = path.join(directory, "config.json");
+  const raw = JSON.parse(readFileSync(DEFAULT_TEMPLATE, "utf8"));
+  raw.engine = {
+    adapter: "standard_uci_v1",
+    executable: process.execPath,
+    arguments: [fixtureEngine],
+    working_directory: directory,
+    search_timeout_grace_ms: 1_000,
+    shutdown_grace_ms: 1_000,
+    uci_options: {},
+  };
+  raw.capacity = {
+    total_slots: 1,
+    capacity_profile: null,
+    startup_parallelism: 1,
+    human: { slots: 1, allow_borrowing: false, accept_public: true },
+    bot: { slots: 0, target_active: 0 },
+  };
+  raw.scheduler.enabled = false;
+  writeFileSync(configPath, JSON.stringify(raw), "utf8");
+
+  const config = loadRuntimeConfig({ templatePath: configPath });
+  assert.equal(config.engine.single_game_profile, undefined);
+  const engine = new UciEngine(config.engine);
+  try {
+    await engine.start();
+    assert.equal(engine.qualificationStatus.qualified, true);
+    assert.equal(engine.qualificationStatus.engine_adapter, "standard_uci_v1");
+    assert.match(engine.qualificationStatus.uci_identity_sha256, /^sha256:[0-9a-f]{64}$/);
+    assert.match(engine.qualificationStatus.engine_launch_identity_sha256, /^sha256:[0-9a-f]{64}$/);
+    assert.equal(engine.timeProfileStatus.applied, false);
+    assert.equal(config.timing.opponent_turn_search, true);
+    assert.equal(engine.timing.opponent_turn_search, true);
+    assert.equal(loadCapacityProfile(
+      null,
+      config,
+      null,
+      engine.qualificationStatus,
+    ).maximum_concurrency, 1);
+    const provenance = gameRuntimeProvenance(config, engine).provenance;
+    assert.equal(provenance.engine.adapter, "standard_uci_v1");
+    assert.equal(provenance.model.id, "");
+    assert.equal(provenance.search.core, "engine_owned");
+    assert.equal(Object.hasOwn(provenance.search.applied_uci_options, "OnnxProvider"), false);
+  } finally {
+    await engine.close();
+  }
+});
+
+test("UCI process adapter rejects command injection and protocol overflow", () => {
+  const writes = [];
+  let killed = false;
+  const engine = new UciEngine({ timing: {}, uci_options: {} });
+  engine.child = {
+    stdin: { writable: true, write: (value) => writes.push(value) },
+    kill: () => { killed = true; },
+  };
+  assert.throws(() => engine.setOption("Hash", "16\nisready"), /single-line UCI value/);
+  assert.deepEqual(writes, []);
+  engine.onLine(`info string ${"x".repeat(64 * 1024)}`);
+  assert.equal(killed, true);
+});
+
+test("runtime token input is one bounded non-whitespace file value", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-token-shape-"));
+  const tokenFile = path.join(directory, "token");
+  writeFileSync(tokenFile, "two tokens\n", "utf8");
+  await assert.rejects(
+    probeAccount({ tokenFile, fetchImpl: async () => { throw new Error("unreachable"); } }),
+    /exactly one non-whitespace token/,
+  );
+  writeFileSync(tokenFile, "x".repeat(4 * 1024 + 1), "utf8");
+  await assert.rejects(
+    probeAccount({ tokenFile, fetchImpl: async () => { throw new Error("unreachable"); } }),
+    /no larger than 4096 bytes/,
+  );
+});
+
+test("standard UCI games submit independently legal moves without extended telemetry", async () => {
+  const posts = [];
+  const client = { post: async (endpoint) => posts.push(endpoint) };
+  const engine = new MockGameEngine([{ bestmove: "e2e4" }]);
+  engine.qualificationStatus = {
+    engine_adapter: "standard_uci_v1",
+    engine_build_fingerprint: `sha256:${"a".repeat(64)}`,
+    engine_launch_identity_sha256: `sha256:${"b".repeat(64)}`,
+    uci_identity_sha256: `sha256:${"c".repeat(64)}`,
+    uci_id_lines: ["id name Generic Fixture"],
+  };
+  engine.appliedUciOptions = {};
+  const config = gameConfig();
+  config.engine.adapter = "standard_uci_v1";
+  delete config.engine.qualification_profile;
+  config.timing.opponent_turn_search = false;
+  const session = createGameSession(engine, client, config);
+  const initial = startedState("");
+  await session.initialize(gameFull(initial), engine);
+  await session.onState(initial, engine);
+  assert.equal(posts.length, 1);
+  assert.match(posts[0], /\/move\/e2e4$/);
 });
 
 test("Manager options projection is bounded and configuration updates are atomic", () => {
@@ -700,6 +880,34 @@ test("Manager options remain usable while live-engine onboarding is incomplete",
   const response = JSON.parse(messages.at(-1));
   assert.equal(response.status, "ready");
   assert.equal(response.editable.scheduler.discovery_interval_seconds, 75);
+});
+
+test("Manager capacity projection publishes the standard-UCI startup evidence state", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-manager-standard-uci-"));
+  const configPath = path.join(directory, "config.json");
+  const raw = JSON.parse(readFileSync(DEFAULT_TEMPLATE, "utf8"));
+  raw.engine.adapter = "standard_uci_v1";
+  raw.engine.executable = process.execPath;
+  raw.engine.working_directory = directory;
+  raw.engine.uci_options = {};
+  raw.capacity = {
+    total_slots: 1,
+    capacity_profile: null,
+    startup_parallelism: 1,
+    human: { slots: 1, allow_borrowing: false, accept_public: true },
+    bot: { slots: 0, target_active: 0 },
+  };
+  writeFileSync(configPath, JSON.stringify(raw), "utf8");
+
+  const projected = managerOptionsProjection(loadManagerConfig({
+    templatePath: configPath,
+    engineRoot: ROOT,
+  }));
+  assert.deepEqual(projected.capacity.evidence, {
+    status: "standard_uci_startup_probe_required",
+    qualified: true,
+    maximum_concurrency: 1,
+  });
 });
 
 test("Manager options require explicit rated and outbound confirmations", () => {
@@ -870,7 +1078,7 @@ test("v2 config migrates to one shared slot with automatic scheduling disabled",
   assert.equal(config.capacity.total_slots, 1);
   assert.equal(config.capacity.legacy_shared, true);
   assert.equal(config.scheduler.enabled, false);
-  assert.equal(config.schema, "uci_arena_lichess_adapter_v6");
+  assert.equal(config.schema, "uci_arena_lichess_adapter_v7");
   assert.equal(config.timing.opponent_turn_search, true);
   assert.equal(config.timing.initial_transport_reserve_ms, 250);
 });
@@ -2244,6 +2452,43 @@ test("NDJSON parser handles split chunks and keepalive lines", async () => {
   assert.deepEqual(events, [{ type: "gameStart" }, { type: "gameFinish" }]);
 });
 
+test("Lichess transport rejects oversized JSON, NDJSON records, and finite collections", async () => {
+  const oversizedRecord = new PassThrough();
+  const recordResult = (async () => {
+    const rows = [];
+    for await (const row of parseNdjsonStream(oversizedRecord)) rows.push(row);
+    return rows;
+  })();
+  oversizedRecord.end(`{"value":"${"x".repeat(1024 * 1024)}"}\n`);
+  await assert.rejects(recordResult, /NDJSON record exceeds/);
+
+  const oversizedJson = new PassThrough();
+  const jsonClient = new LichessClient({
+    token: "fixture-token",
+    fetchImpl: async () => ({
+      ok: true,
+      headers: { get: () => null },
+      body: oversizedJson,
+    }),
+  });
+  const jsonResult = jsonClient.json("api/account");
+  oversizedJson.end(`{"value":"${"x".repeat(1024 * 1024)}"}`);
+  await assert.rejects(jsonResult, /response body exceeds/);
+
+  const finite = new PassThrough();
+  const finiteClient = new LichessClient({
+    token: "fixture-token",
+    fetchImpl: async () => ({
+      ok: true,
+      headers: { get: () => null },
+      body: finite,
+    }),
+  });
+  const finiteResult = finiteClient.collectNdjson("api/bot/online?nb=512");
+  finite.end(`${Array.from({ length: 1025 }, (_, index) => JSON.stringify({ index })).join("\n")}\n`);
+  await assert.rejects(finiteResult, /finite NDJSON response exceeds/);
+});
+
 test("API client keeps credentials in the authorization header", async () => {
   let request;
   const fetchImpl = async (url, options) => {
@@ -2517,6 +2762,14 @@ test("concurrent inbound events cannot overbook one bot slot", async () => {
     },
   };
   const config = {
+    engine: {
+      adapter: "standard_uci_v1",
+      executable: "fixture-engine",
+      selected_bundle: "standard_uci",
+      uci_options: {},
+    },
+    timing: { opponent_turn_search: false, initial_transport_reserve_ms: 250 },
+    scheduler: { enabled: false },
     capacity: {
       total_slots: 1,
       startup_parallelism: 1,
@@ -2547,7 +2800,7 @@ test("concurrent inbound events cannot overbook one bot slot", async () => {
   const preparationGate = new Promise((resolve) => { releasePreparation = resolve; });
   controller.prepareSlot = async (slot) => {
     await preparationGate;
-    controller.slots.attachEngine(slot, { close: async () => {} });
+    controller.slots.attachEngine(slot, { close: async () => {} }, slot.generation);
     return slot;
   };
   const challenge = (id, name) => ({
@@ -2568,6 +2821,133 @@ test("concurrent inbound events cannot overbook one bot slot", async () => {
       && entry.form.reason === "later").length, 1);
     assert.equal(controller.slots.snapshot().byAudience.bot.pending, 1);
   } finally {
+    await controller.slots.drainAll();
+    store.close();
+  }
+});
+
+test("concurrent observations of one game coalesce into one start operation", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-start-coalesce-"));
+  const store = new LichessStore(path.join(directory, "matches.sqlite"));
+  const controller = new BotController({
+    client: {},
+    config: {
+      engine: { adapter: "standard_uci_v1", uci_options: {} },
+      timing: { opponent_turn_search: false },
+      scheduler: { enabled: false },
+      capacity: {
+        total_slots: 1,
+        startup_parallelism: 1,
+        human: { slots: 0, allow_borrowing: false, accept_public: false },
+        bot: { slots: 1, target_active: 0 },
+      },
+    },
+    account: "self",
+    runtimeDir: directory,
+    signal: new AbortController().signal,
+    store,
+  });
+  let releaseStart;
+  const gate = new Promise((resolve) => { releaseStart = resolve; });
+  let starts = 0;
+  controller.startGameOnce = async () => {
+    starts += 1;
+    await gate;
+    return null;
+  };
+  try {
+    const first = controller.startGame({ gameId: "same-game" });
+    const second = controller.startGame({ gameId: "same-game" });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(starts, 1);
+    releaseStart();
+    await Promise.all([first, second]);
+    assert.equal(controller.startingGames.size, 0);
+  } finally {
+    await controller.slots.drainAll();
+    store.close();
+  }
+});
+
+test("outbound gameStart racing the create response adopts the preparing slot", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-outbound-create-race-"));
+  const store = new LichessStore(path.join(directory, "matches.sqlite"));
+  const lifetime = new AbortController();
+  let releaseStream;
+  const streamGate = new Promise((resolve) => { releaseStream = resolve; });
+  let controller;
+  const client = {
+    postJson: async (_endpoint, _form, _signal, _priority, beforeDispatch) => {
+      beforeDispatch();
+      await controller.startGame({
+        gameId: "raced-game",
+        opponent: { id: "raced-bot", title: "BOT" },
+      });
+      return { challenge: { id: "raced-challenge" } };
+    },
+    stream: async function* stream() {
+      await streamGate;
+    },
+  };
+  const config = {
+    engine: {
+      adapter: "standard_uci_v1",
+      executable: "fixture-engine",
+      selected_bundle: "standard_uci",
+      uci_options: {},
+    },
+    timing: { opponent_turn_search: false, initial_transport_reserve_ms: 250 },
+    scheduler: {
+      enabled: false,
+      timeout_cooldown_minutes: 30,
+    },
+    outbound_challenge: {
+      rated: false,
+      color: "random",
+      clock_limit: 180,
+      clock_increment: 2,
+    },
+    capacity: {
+      total_slots: 1,
+      startup_parallelism: 1,
+      human: { slots: 0, allow_borrowing: false, accept_public: false },
+      bot: { slots: 1, target_active: 0 },
+    },
+  };
+  controller = new BotController({
+    client,
+    config,
+    account: "self",
+    runtimeDir: directory,
+    signal: lifetime.signal,
+    store,
+  });
+  controller.streamConnected = true;
+  let closes = 0;
+  controller.prepareSlot = async (slot) => {
+    controller.slots.attachEngine(slot, {
+      close: async () => { closes += 1; },
+      mode: "idle",
+      stopAndDrain: async () => ({ drained: false }),
+    }, slot.generation);
+    return slot;
+  };
+  try {
+    assert.equal(await controller.createChallenge("raced-bot", "bot"), true);
+    const slot = controller.slots.findGame("raced-game");
+    assert.ok(slot);
+    assert.equal(slot.challengeId, "raced-challenge");
+    assert.equal(controller.slots.occupied("bot"), 1);
+    assert.equal(store.db.prepare(`
+      SELECT status FROM challenge_attempts WHERE challenge_id='raced-challenge'
+    `).get().status, "accepted");
+    lifetime.abort(new Error("outbound race test complete"));
+    releaseStream();
+    await Promise.allSettled(controller.activeGames.values());
+    assert.equal(controller.slots.snapshot().byAudience.bot.empty, 1);
+    assert.equal(closes, 1);
+  } finally {
+    releaseStream();
     await controller.slots.drainAll();
     store.close();
   }
@@ -2614,7 +2994,7 @@ test("cooldown-delayed inbound acceptance expires before fetch dispatch", async 
     now: () => now,
   });
   controller.prepareSlot = async (slot) => {
-    controller.slots.attachEngine(slot, { close: async () => {} });
+    controller.slots.attachEngine(slot, { close: async () => {} }, slot.generation);
     return slot;
   };
   try {
@@ -2649,14 +3029,23 @@ test("restart recovery prefers canonical opponent id over a title-prefixed displ
         }],
       };
     },
-  };
-  const config = {
-    capacity: {
-      total_slots: 2,
-      startup_parallelism: 2,
-      human: { slots: 1, allow_borrowing: false, accept_public: true },
-      bot: { slots: 1, target_active: 1 },
+    stream: async function* stream() {
+      yield {
+        ...gameFull(startedState("", { status: "aborted" }), "self"),
+        black: { id: "usunfish", name: "BOT uSunfish", title: "BOT" },
+      };
     },
+  };
+  const config = gameConfig();
+  config.engine.adapter = "standard_uci_v1";
+  delete config.engine.qualification_profile;
+  config.timing.opponent_turn_search = false;
+  config.scheduler = { enabled: false };
+  config.capacity = {
+    total_slots: 2,
+    startup_parallelism: 2,
+    human: { slots: 1, allow_borrowing: false, accept_public: true },
+    bot: { slots: 1, target_active: 1 },
   };
   const controller = new BotController({
     client,
@@ -2666,17 +3055,28 @@ test("restart recovery prefers canonical opponent id over a title-prefixed displ
     signal: new AbortController().signal,
     store,
   });
-  let recovered;
+  let recoveredSlot;
   controller.prepareSlot = async (slot) => {
-    controller.slots.attachEngine(slot, { close: async () => {} });
+    const engine = new MockGameEngine();
+    engine.close = async () => {};
+    engine.qualificationStatus = {
+      engine_adapter: "standard_uci_v1",
+      engine_build_fingerprint: `sha256:${"a".repeat(64)}`,
+      engine_launch_identity_sha256: `sha256:${"b".repeat(64)}`,
+      uci_identity_sha256: `sha256:${"c".repeat(64)}`,
+      uci_id_lines: ["id name Recovery Fixture"],
+    };
+    engine.appliedUciOptions = {};
+    controller.slots.attachEngine(slot, engine, slot.generation);
+    recoveredSlot = slot;
     return slot;
   };
-  controller.startGame = async (game, slot) => { recovered = { game, slot }; };
   try {
     await controller.recoverPlayingGames();
     assert.equal(requestedEndpoint, "api/account/playing?nb=50");
-    assert.equal(recovered.slot.opponent, "usunfish");
-    assert.equal(recovered.slot.audience, "bot");
+    assert.equal(recoveredSlot.opponent, "usunfish");
+    assert.equal(recoveredSlot.audience, "bot");
+    await Promise.allSettled(controller.activeGames.values());
   } finally {
     await controller.slots.drainAll();
     store.close();
@@ -2714,8 +3114,8 @@ test("outbound timeout cancels the remote challenge before releasing its slot", 
     direction: "outbound",
     createdAt: 1,
   });
-  controller.slots.attachEngine(slot, { close: async () => { closes += 1; } });
-  controller.slots.pending(slot, "late-challenge");
+  controller.slots.attachEngine(slot, { close: async () => { closes += 1; } }, slot.generation);
+  controller.slots.pending(slot, "late-challenge", slot.generation);
   store.recordChallenge({
     id: "late-challenge",
     opponent: "late-bot",
@@ -2769,8 +3169,8 @@ test("permanent timeout cancellation failure retains the slot and faults outboun
     direction: "outbound",
     createdAt: 1,
   });
-  controller.slots.attachEngine(slot, { close: async () => { closes += 1; } });
-  controller.slots.pending(slot, "late-challenge");
+  controller.slots.attachEngine(slot, { close: async () => { closes += 1; } }, slot.generation);
+  controller.slots.pending(slot, "late-challenge", slot.generation);
   try {
     await controller.expirePending(25_001);
     assert.equal(slot.state, "cancelling");
@@ -2816,8 +3216,8 @@ test("timeout cancellation 404 reconciles once then releases after the late-even
     direction: "outbound",
     createdAt: 1,
   });
-  controller.slots.attachEngine(slot, { close: async () => { closes += 1; } });
-  controller.slots.pending(slot, "gone-challenge");
+  controller.slots.attachEngine(slot, { close: async () => { closes += 1; } }, slot.generation);
+  controller.slots.pending(slot, "gone-challenge", slot.generation);
   try {
     await controller.expirePending(25_001);
     assert.equal(slot.state, "cancelling");
@@ -2864,10 +3264,10 @@ test("timeout cancellation 404 recovers an already-started game without releasin
     direction: "outbound",
     createdAt: 1,
   });
-  controller.slots.attachEngine(slot, { close: async () => { closes += 1; } });
-  controller.slots.pending(slot, "accepted-challenge");
+  controller.slots.attachEngine(slot, { close: async () => { closes += 1; } }, slot.generation);
+  controller.slots.pending(slot, "accepted-challenge", slot.generation);
   controller.startGame = async (game, recoveredSlot) => {
-    controller.slots.active(recoveredSlot, game.gameId);
+    controller.slots.active(recoveredSlot, game.gameId, recoveredSlot.generation);
   };
   try {
     await controller.expirePending(25_001);

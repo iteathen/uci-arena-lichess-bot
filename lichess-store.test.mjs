@@ -123,6 +123,18 @@ test("API cooldown state is durable and never shortened", () => {
       last429At: 50_000,
       lastRetryAfterMs: 1_000,
     });
+    store.saveApiSafetyState(key, {
+      cooldownUntil: 80_000,
+      strikeCount: 1,
+      last429At: 45_000,
+      lastRetryAfterMs: 500,
+    }, 60_000);
+    assert.deepEqual(store.apiSafetyState(key), {
+      cooldownUntil: 100_000,
+      strikeCount: 2,
+      last429At: 50_000,
+      lastRetryAfterMs: 1_000,
+    });
   } finally {
     store.close();
   }

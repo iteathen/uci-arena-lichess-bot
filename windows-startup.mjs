@@ -10,7 +10,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = HERE;
 const ADAPTER = path.join(HERE, "lichess-adapter.mjs");
 export const STARTUP_TASK_NAME = "UCI Arena Lichess Adapter";
-export const NATIVE_LAUNCHER = path.join(HERE, "native", "build", "Release", "lichess_adapter_launcher.exe");
+export const NATIVE_LAUNCHER = path.join(HERE, "native", "lichess_adapter_launcher.exe");
 
 function requireWindows() {
   if (process.platform !== "win32") throw new Error("Lichess startup supervision is supported only on Windows");

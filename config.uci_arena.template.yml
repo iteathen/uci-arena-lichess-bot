@@ -1,8 +1,10 @@
 {
-  "schema": "uci_arena_lichess_adapter_v6",
+  "schema": "uci_arena_lichess_adapter_v7",
   "url": "https://lichess.org/",
   "engine": {
+    "adapter": "uci_arena_extended_v1",
     "executable": "<UCI_ARENA_ENGINE_ROOT>/bin/uci_arena_engine.exe",
+    "arguments": [],
     "working_directory": "<UCI_ARENA_ENGINE_ROOT>",
     "single_game_profile": "<UCI_ARENA_ENGINE_ROOT>/profiles/uci_arena_single_game_profile_v1.json",
     "time_profile": "<UCI_ARENA_ENGINE_ROOT>/profiles/uci_time_profile_v3.json",

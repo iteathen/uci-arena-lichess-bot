@@ -281,11 +281,31 @@ export class LichessStore {
   }
 
   consumeReservation(opponent, now = Date.now()) {
-    const reservation = this.getReservation(now);
-    if (!reservation || reservation.opponent !== normalizedUsername(opponent)) return false;
-    if (reservation.games_remaining <= 1) this.db.prepare("DELETE FROM reservations WHERE id=1").run();
-    else this.db.prepare("UPDATE reservations SET games_remaining=games_remaining-1 WHERE id=1").run();
-    return true;
+    const normalized = normalizedUsername(opponent);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("DELETE FROM reservations WHERE expires_at <= ?").run(now);
+      const reservation = this.db.prepare(`
+        SELECT opponent, games_remaining FROM reservations WHERE id=1
+      `).get();
+      if (!reservation || reservation.opponent !== normalized) {
+        this.db.exec("COMMIT");
+        return false;
+      }
+      if (reservation.games_remaining <= 1) {
+        this.db.prepare("DELETE FROM reservations WHERE id=1 AND opponent=?").run(normalized);
+      } else {
+        this.db.prepare(`
+          UPDATE reservations SET games_remaining=games_remaining-1
+          WHERE id=1 AND opponent=?
+        `).run(normalized);
+      }
+      this.db.exec("COMMIT");
+      return true;
+    } catch (error) {
+      if (this.db.isTransaction) this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   cancelReservation() {
@@ -338,10 +358,21 @@ export class LichessStore {
       VALUES(?, ?, ?, ?, ?, ?)
       ON CONFLICT(authority_key) DO UPDATE SET
         cooldown_until=MAX(api_safety_state.cooldown_until, excluded.cooldown_until),
-        strike_count=excluded.strike_count,
-        last_429_at=excluded.last_429_at,
-        last_retry_after_ms=excluded.last_retry_after_ms,
-        updated_at=excluded.updated_at
+        strike_count=CASE
+          WHEN excluded.last_429_at>api_safety_state.last_429_at THEN excluded.strike_count
+          WHEN excluded.last_429_at=api_safety_state.last_429_at
+            THEN MAX(api_safety_state.strike_count, excluded.strike_count)
+          ELSE api_safety_state.strike_count
+        END,
+        last_429_at=MAX(api_safety_state.last_429_at, excluded.last_429_at),
+        last_retry_after_ms=CASE
+          WHEN excluded.last_429_at>api_safety_state.last_429_at
+            THEN excluded.last_retry_after_ms
+          WHEN excluded.last_429_at=api_safety_state.last_429_at
+            THEN MAX(api_safety_state.last_retry_after_ms, excluded.last_retry_after_ms)
+          ELSE api_safety_state.last_retry_after_ms
+        END,
+        updated_at=MAX(api_safety_state.updated_at, excluded.updated_at)
     `).run(
       normalized,
       integer(state.cooldownUntil),
