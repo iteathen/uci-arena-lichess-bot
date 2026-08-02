@@ -5,8 +5,9 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
-const root = path.dirname(new URL(import.meta.url).pathname.slice(1)).replaceAll("/", path.sep);
+const root = path.dirname(fileURLToPath(import.meta.url));
 
 test("component definition packages runtime contracts without test or source-tree coupling", () => {
   const definition = JSON.parse(readFileSync(path.join(root, "packaging", "component-definition.json"), "utf8"));
