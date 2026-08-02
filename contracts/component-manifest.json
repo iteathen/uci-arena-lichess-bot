@@ -3,7 +3,7 @@
   "component": {
     "id": "lichess.adapter",
     "product_id": "uci_arena.lichess_bot",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "repository": "iteathen/uci-arena-lichess-bot"
   },
   "runtime": {
@@ -25,6 +25,7 @@
     "entrypoints": {
       "adapter": "lichess-adapter.mjs",
       "cli": "lichess-adapter.mjs",
+      "installer_integration": "installer-integration.mjs",
       "startup": "lichess-adapter.mjs",
       "live_acceptance": "live-acceptance.mjs",
       "uci_smoke": "smoke-uci-startup.mjs"
@@ -43,6 +44,33 @@
     },
     "data_paths": ["workspace"],
     "workspace_name": "lichess-adapter",
+    "installer_integration": {
+      "schema": "arena_provider_installer_integration_v1",
+      "schema_version": 1,
+      "entrypoint": "installer_integration",
+      "invocation": {
+        "kind": "dependency_runtime",
+        "runtime_component_id": "node_runtime.private",
+        "runtime_entrypoint": "node"
+      },
+      "arguments": ["--context"],
+      "workspace_name": "lichess-adapter",
+      "configure_when_disabled": true,
+      "dependency_bindings": [
+        {"name": "default_engine", "component_id": "uci_arena.engine", "source": "entrypoint", "entrypoint": "uci", "required": false},
+        {"name": "default_engine_root", "component_id": "uci_arena.engine", "source": "active_root", "required": false},
+        {"name": "default_model_root", "component_id": "uci_arena.engine", "source": "component_path", "path": "models/default", "required": false}
+      ],
+      "locator_bindings": [
+        {"name": "uci_engine", "kind": "uci_engine", "required": false},
+        {"name": "timing_profile", "kind": "timing_profile", "required": false},
+        {"name": "lichess_single_game_profile", "kind": "lichess_single_game_profile", "required": false},
+        {"name": "lichess_capacity_profile", "kind": "lichess_capacity_profile", "required": false},
+        {"name": "lichess_transport_profile", "kind": "lichess_transport_profile", "required": false},
+        {"name": "opening_book", "kind": "opening_book", "required": false},
+        {"name": "syzygy", "kind": "syzygy", "required": false}
+      ]
+    },
     "configuration_template": "config.uci_arena.template.yml",
     "owned_paths": [
       "*.mjs",

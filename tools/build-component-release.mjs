@@ -212,8 +212,26 @@ function installerManifest(componentContract, version, target, staging) {
   }
   const entrypoints = Object.fromEntries(Object.entries(installation.entrypoints ?? {})
     .map(([name, relative]) => [name, safeRelative(relative)]));
-  if (!entrypoints.cli || !entrypoints.adapter || !entrypoints.startup) {
+  if (!entrypoints.cli || !entrypoints.adapter || !entrypoints.startup
+      || !entrypoints.installer_integration) {
     throw new Error("component contract is missing required Installer entrypoints");
+  }
+  const dependencies = stringArray(installation.dependencies, "installation.dependencies");
+  const installerIntegration = structuredClone(installation.installer_integration);
+  if (installerIntegration?.schema !== "arena_provider_installer_integration_v1"
+      || installerIntegration.schema_version !== 1
+      || installerIntegration.entrypoint !== "installer_integration"
+      || JSON.stringify(installerIntegration.arguments) !== JSON.stringify(["--context"])
+      || installerIntegration.workspace_name !== installation.workspace_name
+      || installerIntegration.configure_when_disabled !== true
+      || installerIntegration.invocation?.kind !== "dependency_runtime"
+      || !dependencies.includes(installerIntegration.invocation.runtime_component_id)
+      || !/^[A-Za-z0-9._-]+$/u.test(
+        installerIntegration.invocation.runtime_entrypoint ?? "",
+      )
+      || !Array.isArray(installerIntegration.dependency_bindings)
+      || !Array.isArray(installerIntegration.locator_bindings)) {
+    throw new Error("component installer-integration contract is invalid");
   }
   const contractManifest = safeRelative(installation.contract_manifest);
   const configurationTemplate = safeRelative(installation.configuration_template);
@@ -238,7 +256,8 @@ function installerManifest(componentContract, version, target, staging) {
     entrypoints,
     contract_manifest: contractManifest,
     capabilities: stringArray(installation.capabilities, "installation.capabilities"),
-    dependencies: stringArray(installation.dependencies, "installation.dependencies"),
+    dependencies,
+    installer_integration: installerIntegration,
     startup: installation.startup,
     data_paths: stringArray(installation.data_paths, "installation.data_paths"),
     workspace_name: installation.workspace_name,

@@ -75,13 +75,13 @@ test("provider attestation binds and verifies the exact in-toto payload", () => 
   const output = path.join(directory, "output");
   const statements = path.join(directory, "statements");
   mkdirSync(output);
-  const artifactName = "lichess.adapter-1.0.1-windows-x86_64.tar.gz";
+  const artifactName = "lichess.adapter-1.0.2-windows-x86_64.tar.gz";
   const artifact = Buffer.from("exact-provider-artifact");
   writeFileSync(path.join(output, artifactName), artifact);
   writeFileSync(path.join(output, `${artifactName}.provider-result.json`), JSON.stringify({
     schema: "arena_provider_release_result_v1",
     component_id: "lichess.adapter",
-    component_version: "1.0.1",
+    component_version: "1.0.2",
     target_triple: "windows-x86_64",
     artifact_name: artifactName,
     artifact_sha256: createHash("sha256").update(artifact).digest("hex"),

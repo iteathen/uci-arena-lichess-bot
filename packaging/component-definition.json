@@ -19,6 +19,7 @@
     {"source": "lichess-adapter.mjs", "target": "lichess-adapter.mjs"},
     {"source": "lichess-scheduler.mjs", "target": "lichess-scheduler.mjs"},
     {"source": "lichess-store.mjs", "target": "lichess-store.mjs"},
+    {"source": "installer-integration.mjs", "target": "installer-integration.mjs"},
     {"source": "linux-startup.mjs", "target": "linux-startup.mjs"},
     {"source": "live-acceptance.mjs", "target": "live-acceptance.mjs"},
     {"source": "publish-single-game-profile.mjs", "target": "publish-single-game-profile.mjs"},
