@@ -161,3 +161,27 @@ jobs:
             dist/*.sigstore.json
           if-no-files-found: error
           retention-days: 30
+
+  publish:
+    needs: build-sign-verify
+    runs-on: ubuntu-24.04
+    environment: component-candidate
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: lichess-bot-${{ inputs.version }}-${{ inputs.target }}
+          path: dist
+      - name: Publish immutable private candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_TARGET: ${{ inputs.target }}
+        run: |
+          tag="component/lichess-bot/v${RELEASE_VERSION}/${RELEASE_TARGET}"
+          gh release create "${tag}" dist/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --prerelease \
+            --title "lichess-bot ${RELEASE_VERSION} ${RELEASE_TARGET}" \
+            --notes "Immutable private component candidate; uci-arena-installer retains suite composition and promotion authority."
