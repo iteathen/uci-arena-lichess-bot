@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 
 const execFileAsync = promisify(execFile);
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const ROOT = path.resolve(HERE, "../..");
+const ROOT = HERE;
 const ADAPTER = path.join(HERE, "lichess-adapter.mjs");
 export const STARTUP_TASK_NAME = "UCI Arena Lichess Adapter";
 export const NATIVE_LAUNCHER = path.join(HERE, "native", "build", "Release", "lichess_adapter_launcher.exe");

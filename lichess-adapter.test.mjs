@@ -34,6 +34,7 @@ import {
   parseArguments,
   parseRuntimeStatus,
   probeAccount,
+  providerStatusProjection,
   resolveExternalTokenFile,
   managerOptionsProjection,
   main,
@@ -44,7 +45,7 @@ import {
   BOUNDS,
   BOOTSTRAP_COEFFICIENTS,
   coefficientOptions,
-} from "../../arena/update_mcgs_adaptive_curve.mjs";
+} from "./test-fixtures/adaptive-temporal-curve.mjs";
 import { ApiSafetyCoordinator, LichessHttpError } from "./lichess-scheduler.mjs";
 import { LichessStore } from "./lichess-store.mjs";
 import {
@@ -62,6 +63,49 @@ function temporaryToken() {
 function sha256(content) {
   return `sha256:${createHash("sha256").update(content).digest("hex")}`;
 }
+
+test("provider status distinguishes inactive, disconnected, and ready states", () => {
+  const missing = providerStatusProjection();
+  assert.equal(missing.active, false);
+  assert.equal(missing.ready, false);
+  assert.deepEqual(missing.blockers, ["runtime_status_missing", "provider_process_inactive"]);
+
+  const runtime = {
+    schema: "uci_arena_lichess_runtime_v3",
+    pid: 42,
+    account: "arena-bot",
+    stream_connected: false,
+    configured_capacity: 2,
+    qualified_capacity: 2,
+    slots: [
+      { state: "active", audience: "human" },
+      { state: "cancelling", audience: "bot" },
+    ],
+    scheduler: { enabled: true, paused: false, target_active_bots: 1, fault: null },
+    api_safety: { state: "ready", queue_depth: 0 },
+    updated_at: "2026-08-01T00:00:00.000Z",
+  };
+  const disconnected = providerStatusProjection({
+    runtime,
+    active: true,
+    startup: { installed: true },
+  });
+  assert.equal(disconnected.registered, true);
+  assert.equal(disconnected.active, true);
+  assert.equal(disconnected.ready, false);
+  assert.deepEqual(disconnected.blockers, ["event_stream_disconnected"]);
+  assert.equal(disconnected.games.active, 1);
+  assert.equal(disconnected.games.cancelling, 1);
+
+  const ready = providerStatusProjection({
+    runtime: { ...runtime, stream_connected: true },
+    active: true,
+    startup: { installed: true },
+  });
+  assert.equal(ready.ready, true);
+  assert.deepEqual(ready.blockers, []);
+  assert.deepEqual(Object.keys(ready.account), ["username", "bot"]);
+});
 
 function qualifiedFixture() {
   const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-profile-"));
@@ -539,7 +583,7 @@ test("runtime config is credential-free and resolves repository paths", () => {
   writeFileSync(isolatedTemplate, JSON.stringify(template), "utf8");
   const config = loadRuntimeConfig({
     templatePath: isolatedTemplate,
-    repoRoot: ROOT,
+    engineRoot: ROOT,
     modelRoot: "engine/runtime/models/example/engine",
   });
   const serialized = JSON.stringify(config).toLowerCase();
@@ -564,7 +608,7 @@ test("Manager options projection is bounded and configuration updates are atomic
   const original = readFileSync(DEFAULT_TEMPLATE, "utf8");
   writeFileSync(configPath, original, "utf8");
 
-  const before = loadRuntimeConfig({ templatePath: configPath, repoRoot: ROOT });
+  const before = loadRuntimeConfig({ templatePath: configPath, engineRoot: ROOT });
   const projection = managerOptionsProjection(before);
   assert.equal(projection.schema, MANAGER_OPTIONS_SCHEMA);
   assert.deepEqual(Object.keys(projection), [
@@ -580,7 +624,7 @@ test("Manager options projection is bounded and configuration updates are atomic
 
   const updated = updateManagerOptions({
     templatePath: configPath,
-    repoRoot: ROOT,
+    engineRoot: ROOT,
     settings: {
       inbound_challenges: { accept_bots: false, speeds: ["rapid"] },
       outbound_challenge: { color: "white", clock_limit: 900 },
@@ -596,14 +640,14 @@ test("Manager options projection is bounded and configuration updates are atomic
 
   const persisted = JSON.parse(readFileSync(configPath, "utf8"));
   assert.equal(persisted.engine.executable, JSON.parse(original).engine.executable);
-  assert.equal(persisted.engine.executable.includes("<UCI_ARENA_REPO>"), true);
+  assert.equal(persisted.engine.executable.includes("<UCI_ARENA_ENGINE_ROOT>"), true);
   assert.equal(persisted.challenges.accept_bots, false);
 
   const stable = readFileSync(configPath, "utf8");
   assert.throws(
     () => updateManagerOptions({
       templatePath: configPath,
-      repoRoot: ROOT,
+      engineRoot: ROOT,
       settings: { engine: { executable: "untrusted.exe" } },
     }),
     /settings\.engine is not editable/,
@@ -620,15 +664,15 @@ test("Manager options remain usable while live-engine onboarding is incomplete",
   writeFileSync(configPath, JSON.stringify(raw), "utf8");
 
   assert.throws(
-    () => loadRuntimeConfig({ templatePath: configPath, repoRoot: ROOT }),
+    () => loadRuntimeConfig({ templatePath: configPath, engineRoot: ROOT }),
     /missing engine\.single_game_profile/,
   );
-  const config = loadManagerConfig({ templatePath: configPath, repoRoot: ROOT });
+  const config = loadManagerConfig({ templatePath: configPath, engineRoot: ROOT });
   assert.equal(managerOptionsProjection(config).capacity.evidence.qualified, false);
 
   const updated = updateManagerOptions({
     templatePath: configPath,
-    repoRoot: ROOT,
+    engineRoot: ROOT,
     settings: { scheduler: { discovery_interval_seconds: 75 } },
   });
   assert.equal(updated.scheduler.discovery_interval_seconds, 75);
@@ -637,7 +681,7 @@ test("Manager options remain usable while live-engine onboarding is incomplete",
   assert.throws(
     () => updateManagerOptions({
       templatePath: configPath,
-      repoRoot: ROOT,
+      engineRoot: ROOT,
       settings: {
         capacity: { total_slots: 3, startup_parallelism: 3, bot: { slots: 2 } },
       },
@@ -668,14 +712,14 @@ test("Manager options require explicit rated and outbound confirmations", () => 
   assert.throws(
     () => updateManagerOptions({
       templatePath: configPath,
-      repoRoot: ROOT,
+      engineRoot: ROOT,
       settings: { outbound_challenge: { rated: true } },
     }),
     new RegExp(RATED_PLAY_CONFIRMATION),
   );
   updateManagerOptions({
     templatePath: configPath,
-    repoRoot: ROOT,
+    engineRoot: ROOT,
     ratedConfirmation: RATED_PLAY_CONFIRMATION,
     settings: { outbound_challenge: { rated: true } },
   });
@@ -683,14 +727,14 @@ test("Manager options require explicit rated and outbound confirmations", () => 
   assert.throws(
     () => updateManagerOptions({
       templatePath: configPath,
-      repoRoot: ROOT,
+      engineRoot: ROOT,
       settings: { inbound_challenges: { modes: ["casual", "rated"] } },
     }),
     new RegExp(RATED_PLAY_CONFIRMATION),
   );
   updateManagerOptions({
     templatePath: configPath,
-    repoRoot: ROOT,
+    engineRoot: ROOT,
     ratedConfirmation: RATED_PLAY_CONFIRMATION,
     settings: { inbound_challenges: { modes: ["casual", "rated"] } },
   });
@@ -698,14 +742,14 @@ test("Manager options require explicit rated and outbound confirmations", () => 
   assert.throws(
     () => updateManagerOptions({
       templatePath: configPath,
-      repoRoot: ROOT,
+      engineRoot: ROOT,
       settings: { scheduler: { enabled: true } },
     }),
     new RegExp(OUTBOUND_CHALLENGE_CONFIRMATION),
   );
   const updated = updateManagerOptions({
     templatePath: configPath,
-    repoRoot: ROOT,
+    engineRoot: ROOT,
     outboundConfirmation: OUTBOUND_CHALLENGE_CONFIRMATION,
     settings: { scheduler: { enabled: true } },
   });
@@ -729,7 +773,7 @@ test("Manager capacity updates reject summary-only evidence without exact bindin
   assert.throws(
     () => updateManagerOptions({
       templatePath: configPath,
-      repoRoot: ROOT,
+      engineRoot: ROOT,
       settings: {
         capacity: { total_slots: 3, human: { slots: 1 }, bot: { slots: 2 } },
       },
@@ -739,24 +783,24 @@ test("Manager capacity updates reject summary-only evidence without exact bindin
   assert.equal(readFileSync(configPath, "utf8"), stable);
 
   const projection = managerOptionsProjection(
-    loadRuntimeConfig({ templatePath: configPath, repoRoot: ROOT }),
+    loadRuntimeConfig({ templatePath: configPath, engineRoot: ROOT }),
   );
   assert.equal(projection.capacity.evidence.status, "rejected");
   assert.equal(projection.capacity.evidence.qualified, false);
 });
 
 test("runtime config accepts the shared active model environment override", () => {
-  const selected = "engine/runtime/models/compact_chessformer_gab_v1/engine";
+  const selected = "models/latticeknight";
   const config = loadRuntimeConfig({
     templatePath: DEFAULT_TEMPLATE,
-    repoRoot: ROOT,
+    engineRoot: ROOT,
     environment: { UCI_ARENA_MODEL_ROOT: selected },
   });
   assert.equal(config.engine.uci_options.ModelRoot, selected);
 
   const explicit = loadRuntimeConfig({
     templatePath: DEFAULT_TEMPLATE,
-    repoRoot: ROOT,
+    engineRoot: ROOT,
     modelRoot: "engine/runtime/models/explicit/engine",
     environment: { UCI_ARENA_MODEL_ROOT: selected },
   });
@@ -768,7 +812,7 @@ test("runtime config accepts exact installed engine and working-directory overri
   const workingDirectory = path.resolve("installed");
   const config = loadRuntimeConfig({
     templatePath: DEFAULT_TEMPLATE,
-    repoRoot: ROOT,
+    engineRoot: ROOT,
     enginePath: engine,
     workingDirectory,
   });
@@ -780,7 +824,7 @@ test("timing profile has a distinct config, environment, and CLI path", () => {
   const selected = "runtime_state/models/model/cache/uci_time_profile_v1.json";
   const config = loadRuntimeConfig({
     templatePath: DEFAULT_TEMPLATE,
-    repoRoot: ROOT,
+    engineRoot: ROOT,
     environment: { UCI_ARENA_TIME_PROFILE: selected },
   });
   assert.equal(config.engine.time_profile, selected);
@@ -1037,7 +1081,7 @@ test("alternate search fallback bundles are rejected", () => {
   };
   writeFileSync(templatePath, JSON.stringify(template));
   assert.throws(
-    () => loadRuntimeConfig({ templatePath, repoRoot: ROOT }),
+    () => loadRuntimeConfig({ templatePath, engineRoot: ROOT }),
     /fallback_bundle is disabled/,
   );
 });

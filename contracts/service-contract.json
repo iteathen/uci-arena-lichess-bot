@@ -1,0 +1,56 @@
+{
+  "schema": "uci_arena_service_contract_v1",
+  "service": {
+    "component_id": "lichess.adapter",
+    "component_version": "1.0.0",
+    "product_id": "uci_arena.lichess_bot",
+    "contract_version": "1.0",
+    "transport": "cli_json",
+    "entrypoint": "lichess-adapter.mjs"
+  },
+  "invocation": {
+    "kind": "dependency_runtime",
+    "runtime_component_id": "node_runtime.private",
+    "runtime_entrypoint": "node"
+  },
+  "provided_capabilities": [
+    "lichess.account_probe",
+    "lichess.challenge_policy",
+    "lichess.game_execution",
+    "lichess.scheduler",
+    "lichess.owner_reservations",
+    "lichess.provider_configuration",
+    "lichess.provider_status",
+    "lichess.startup"
+  ],
+  "required_capabilities": [
+    "uci.engine.process",
+    "uci.time_profile.contract.v3"
+  ],
+  "credential_contract": {
+    "input": "external_absolute_file_path",
+    "contents_visible_to": "provider_transport_only",
+    "manager_projection": "path_and_redacted_status_only",
+    "installer_behavior": "never_package_copy_or_inspect"
+  },
+  "startup": {
+    "windows": "per_user_task_scheduler",
+    "linux": "per_user_systemd",
+    "credential_gated": true
+  },
+  "persistence": {
+    "upgrade": "preserve_and_migrate",
+    "repair": "preserve",
+    "uninstall_default": "preserve"
+  },
+  "manager_operations": "contracts/manager-operations-schema.json",
+  "configuration_schema": "contracts/configuration-schema.json",
+  "configuration_update_schema": "contracts/configuration-update-schema.json",
+  "status_schema": "contracts/status-schema.json",
+  "error_contract": {
+    "format": "bounded_typed_json",
+    "secrets": "redacted",
+    "unknown_operation": "fail_closed",
+    "unknown_major_version": "incompatible"
+  }
+}

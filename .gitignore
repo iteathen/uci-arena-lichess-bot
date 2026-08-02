@@ -5,5 +5,8 @@ config.local.yml
 runtime/
 games/
 logs/
-native/build/
 node_modules/
+dist/
+native/build/
+release-receipts/
+*.log

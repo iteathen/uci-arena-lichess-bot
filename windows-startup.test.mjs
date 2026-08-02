@@ -16,7 +16,7 @@ const execFileAsync = promisify(execFile);
 
 function options() {
   return {
-    config: "deploy/lichess/config.uci_arena.template.yml",
+    config: "config.uci_arena.template.yml",
     tokenFile: path.join(path.parse(path.resolve(".")).root, "operator-secrets", "lichess-bot.token"),
     expectedAccount: "account",
     runtimeDir: "runtime_state/lichess",

@@ -8,13 +8,13 @@ import { fileURLToPath } from "node:url";
 import { DEFAULT_TEMPLATE, ROOT, loadRuntimeConfig } from "./lichess-adapter.mjs";
 
 function parseArguments(argv) {
-  const options = { template: DEFAULT_TEMPLATE, repoRoot: ROOT, depth: 1, timeoutMs: 30000 };
+  const options = { template: DEFAULT_TEMPLATE, engineRoot: ROOT, depth: 1, timeoutMs: 30000 };
   for (let index = 0; index < argv.length; index += 2) {
     const key = argv[index];
     const value = argv[index + 1];
     if (!key?.startsWith("--") || value === undefined) throw new Error(`Invalid argument: ${key}`);
     if (key === "--config") options.template = value;
-    else if (key === "--repo-root") options.repoRoot = value;
+    else if (key === "--engine-root") options.engineRoot = value;
     else if (key === "--depth") options.depth = Number(value);
     else if (key === "--timeout") options.timeoutMs = Number(value) * 1000;
     else throw new Error(`Unknown argument: ${key}`);
@@ -42,7 +42,10 @@ async function readUntil(iterator, predicate, timeoutMs) {
 }
 
 export async function smoke(options) {
-  const config = loadRuntimeConfig({ templatePath: path.resolve(options.template), repoRoot: options.repoRoot });
+  const config = loadRuntimeConfig({
+    templatePath: path.resolve(options.template),
+    engineRoot: options.engineRoot,
+  });
   const executable = config.engine.executable;
   const child = spawn(executable, [], {
     cwd: config.engine.working_directory,

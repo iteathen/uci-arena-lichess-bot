@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://uci-arena.example/contracts/lichess-manager-options-v1.json",
+  "title": "UCI Arena Lichess Bot Manager Options",
+  "type": "object",
+  "required": [
+    "schema",
+    "capacity",
+    "inbound_challenges",
+    "outbound_challenge",
+    "scheduler",
+    "opponent_selection"
+  ],
+  "properties": {
+    "schema": {"const": "uci_arena_lichess_manager_options_v1"},
+    "capacity": {
+      "type": "object",
+      "required": ["total_slots", "startup_parallelism", "human", "bot", "evidence"],
+      "properties": {
+        "total_slots": {"type": "integer", "minimum": 1, "maximum": 64},
+        "startup_parallelism": {"type": "integer", "minimum": 1, "maximum": 64},
+        "human": {
+          "type": "object",
+          "required": ["slots", "allow_borrowing", "accept_public"],
+          "properties": {
+            "slots": {"type": "integer", "minimum": 0, "maximum": 64},
+            "allow_borrowing": {"type": "boolean"},
+            "accept_public": {"type": "boolean"}
+          },
+          "additionalProperties": false
+        },
+        "bot": {
+          "type": "object",
+          "required": ["slots", "target_active"],
+          "properties": {
+            "slots": {"type": "integer", "minimum": 0, "maximum": 64},
+            "target_active": {"type": "integer", "minimum": 0, "maximum": 64}
+          },
+          "additionalProperties": false
+        },
+        "evidence": {
+          "type": "object",
+          "required": ["status", "qualified", "maximum_concurrency"],
+          "properties": {
+            "status": {"enum": ["legacy_shared", "missing", "qualified", "rejected"]},
+            "qualified": {"type": "boolean"},
+            "maximum_concurrency": {
+              "oneOf": [
+                {"type": "integer", "minimum": 1, "maximum": 64},
+                {"type": "null"}
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "inbound_challenges": {"$ref": "#/$defs/inbound_challenges"},
+    "outbound_challenge": {"$ref": "#/$defs/outbound_challenge"},
+    "scheduler": {"$ref": "#/$defs/scheduler"},
+    "opponent_selection": {"$ref": "#/$defs/opponent_selection"}
+  },
+  "$defs": {
+    "inbound_challenges": {
+      "type": "object",
+      "required": ["accept_bots", "min_base", "max_base", "min_increment", "max_increment", "speeds", "modes"],
+      "properties": {
+        "accept_bots": {"type": "boolean"},
+        "min_base": {"type": "integer", "minimum": 0, "maximum": 86400},
+        "max_base": {"type": "integer", "minimum": 0, "maximum": 86400},
+        "min_increment": {"type": "integer", "minimum": 0, "maximum": 300},
+        "max_increment": {"type": "integer", "minimum": 0, "maximum": 300},
+        "speeds": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 6,
+          "uniqueItems": true,
+          "items": {"enum": ["ultraBullet", "bullet", "blitz", "rapid", "classical", "correspondence"]}
+        },
+        "modes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": {"enum": ["casual", "rated"]}
+        }
+      },
+      "additionalProperties": false
+    },
+    "outbound_challenge": {
+      "type": "object",
+      "required": ["rated", "color", "clock_limit", "clock_increment"],
+      "properties": {
+        "rated": {"type": "boolean"},
+        "color": {"enum": ["random", "white", "black"]},
+        "clock_limit": {"type": "integer", "minimum": 0, "maximum": 86400},
+        "clock_increment": {"type": "integer", "minimum": 0, "maximum": 300}
+      },
+      "additionalProperties": false
+    },
+    "scheduler": {
+      "type": "object",
+      "required": ["enabled", "discovery_interval_seconds", "challenge_interval_seconds", "reservation_retry_seconds", "challenge_timeout_seconds"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "discovery_interval_seconds": {"type": "integer", "minimum": 15, "maximum": 3600},
+        "challenge_interval_seconds": {"type": "integer", "minimum": 1, "maximum": 300},
+        "reservation_retry_seconds": {"type": "integer", "minimum": 5, "maximum": 600},
+        "challenge_timeout_seconds": {"type": "integer", "minimum": 10, "maximum": 300}
+      },
+      "additionalProperties": false
+    },
+    "opponent_selection": {
+      "type": "object",
+      "required": ["max_games_per_opponent_per_day", "timeout_cooldown_minutes", "decline_cooldown_minutes", "rating_target", "rating_spread"],
+      "properties": {
+        "max_games_per_opponent_per_day": {"type": "integer", "minimum": 1, "maximum": 100},
+        "timeout_cooldown_minutes": {"type": "integer", "minimum": 1, "maximum": 1440},
+        "decline_cooldown_minutes": {"type": "integer", "minimum": 1, "maximum": 10080},
+        "rating_target": {"type": "integer", "minimum": 400, "maximum": 4000},
+        "rating_spread": {"type": "integer", "minimum": 50, "maximum": 2000}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "x-forbidden-fields": [
+    "token",
+    "token_contents",
+    "engine_path",
+    "model_path",
+    "runtime_path",
+    "store_path",
+    "arbitrary_uci_options",
+    "shell_command"
+  ]
+}

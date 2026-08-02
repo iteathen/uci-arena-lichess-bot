@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://uci-arena.example/contracts/lichess-status-v3.json",
+  "title": "UCI Arena Lichess Bot Status",
+  "type": "object",
+  "required": [
+    "schema",
+    "installed",
+    "registered",
+    "active",
+    "ready",
+    "stream_connected",
+    "runtime_updated_at",
+    "account",
+    "capacity",
+    "games",
+    "scheduler",
+    "rate_limit",
+    "blockers"
+  ],
+  "properties": {
+    "schema": {"const": "uci_arena_lichess_status_v3"},
+    "installed": {"type": "boolean"},
+    "registered": {"type": "boolean"},
+    "active": {"type": "boolean"},
+    "ready": {"type": "boolean"},
+    "stream_connected": {"type": "boolean"},
+    "runtime_updated_at": {
+      "oneOf": [
+        {"type": "string", "format": "date-time", "maxLength": 64},
+        {"type": "null"}
+      ]
+    },
+    "account": {
+      "type": ["object", "null"],
+      "required": ["username", "bot"],
+      "properties": {
+        "username": {"type": "string", "minLength": 1, "maxLength": 64},
+        "bot": {"const": true}
+      },
+      "additionalProperties": false
+    },
+    "capacity": {
+      "type": "object",
+      "required": ["configured", "qualified", "slots"],
+      "properties": {
+        "configured": {"$ref": "#/$defs/nullable_capacity"},
+        "qualified": {"$ref": "#/$defs/nullable_capacity"},
+        "slots": {"$ref": "#/$defs/slot_counts"}
+      },
+      "additionalProperties": false
+    },
+    "games": {
+      "type": "object",
+      "required": ["active", "preparing", "pending", "cancelling", "draining"],
+      "properties": {
+        "active": {"$ref": "#/$defs/count"},
+        "preparing": {"$ref": "#/$defs/count"},
+        "pending": {"$ref": "#/$defs/count"},
+        "cancelling": {"$ref": "#/$defs/count"},
+        "draining": {"$ref": "#/$defs/count"}
+      },
+      "additionalProperties": false
+    },
+    "scheduler": {
+      "type": "object",
+      "required": ["enabled", "paused", "target_active_bots", "fault"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "paused": {"type": "boolean"},
+        "target_active_bots": {"$ref": "#/$defs/nullable_capacity"},
+        "fault": {
+          "oneOf": [
+            {"type": "null"},
+            {
+              "type": "object",
+              "required": ["kind", "status"],
+              "properties": {
+                "kind": {"type": "string", "minLength": 1, "maxLength": 128},
+                "status": {
+                  "oneOf": [
+                    {"type": "integer", "minimum": 100, "maximum": 599},
+                    {"type": "null"}
+                  ]
+                }
+              },
+              "additionalProperties": false
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "rate_limit": {
+      "type": "object",
+      "required": ["state", "cooldown_until", "cooldown_remaining_ms", "strike_count", "queue_depth", "in_flight_class"],
+      "properties": {
+        "state": {"enum": ["unknown", "ready", "cooldown"]},
+        "cooldown_until": {"$ref": "#/$defs/nullable_nonnegative_integer"},
+        "cooldown_remaining_ms": {"$ref": "#/$defs/nullable_nonnegative_integer"},
+        "strike_count": {"$ref": "#/$defs/nullable_nonnegative_integer"},
+        "queue_depth": {"$ref": "#/$defs/nullable_nonnegative_integer"},
+        "in_flight_class": {
+          "oneOf": [
+            {"type": "string", "minLength": 1, "maxLength": 64},
+            {"type": "null"}
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "blockers": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1, "maxLength": 128},
+      "maxItems": 64,
+      "uniqueItems": true
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "count": {"type": "integer", "minimum": 0, "maximum": 64},
+    "nullable_capacity": {
+      "oneOf": [
+        {"type": "integer", "minimum": 0, "maximum": 64},
+        {"type": "null"}
+      ]
+    },
+    "nullable_nonnegative_integer": {
+      "oneOf": [
+        {"type": "integer", "minimum": 0},
+        {"type": "null"}
+      ]
+    },
+    "slot_counts": {
+      "type": "object",
+      "required": ["empty", "preparing", "pending", "cancelling", "active", "draining"],
+      "properties": {
+        "empty": {"$ref": "#/$defs/count"},
+        "preparing": {"$ref": "#/$defs/count"},
+        "pending": {"$ref": "#/$defs/count"},
+        "cancelling": {"$ref": "#/$defs/count"},
+        "active": {"$ref": "#/$defs/count"},
+        "draining": {"$ref": "#/$defs/count"}
+      },
+      "additionalProperties": false
+    }
+  }
+}

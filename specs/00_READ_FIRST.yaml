@@ -1,0 +1,18 @@
+meta:
+  spec_id: uci_arena_lichess_bot_foundation_v1
+  version: 1
+  status: active
+  owner: governance
+
+north_star: >
+  Maintain an independently buildable and releasable Lichess BOT provider that
+  safely operates any conforming UCI engine without acquiring engine, Manager,
+  or Installer internals.
+
+hard_rules:
+  - The provider never imports Engine, Manager, Book Forge, Evidence Service, or Installer source.
+  - One admitted game owns one isolated qualified UCI child.
+  - Canonical streamed game state and independent legality validation gate every move submission.
+  - Provider configuration, scheduling, reservations, rate limiting, recovery, and persistence remain provider-owned.
+  - Credentials are external operator-owned files whose contents are never exposed to agents, tests, logs, artifacts, Manager, or Installer.
+  - Component releases carry exact digests, SBOMs, test receipts, and signed provenance.
