@@ -218,6 +218,7 @@ function installerManifest(componentContract, version, target, staging) {
   }
   const dependencies = stringArray(installation.dependencies, "installation.dependencies");
   const installerIntegration = structuredClone(installation.installer_integration);
+  const startupControl = installerIntegration?.startup_control;
   if (installerIntegration?.schema !== "arena_provider_installer_integration_v1"
       || installerIntegration.schema_version !== 1
       || installerIntegration.entrypoint !== "installer_integration"
@@ -230,7 +231,19 @@ function installerManifest(componentContract, version, target, staging) {
         installerIntegration.invocation.runtime_entrypoint ?? "",
       )
       || !Array.isArray(installerIntegration.dependency_bindings)
-      || !Array.isArray(installerIntegration.locator_bindings)) {
+      || !Array.isArray(installerIntegration.locator_bindings)
+      || startupControl?.schema !== "arena_provider_startup_control_v1"
+      || startupControl.schema_version !== 1
+      || startupControl.entrypoint !== "startup"
+      || !Object.hasOwn(entrypoints, startupControl.entrypoint)
+      || JSON.stringify(startupControl.actions?.install) !== JSON.stringify(["startup", "install"])
+      || JSON.stringify(startupControl.actions?.uninstall) !== JSON.stringify(["startup", "uninstall"])
+      || startupControl.workspace_argument?.flag !== "--runtime-dir"
+      || startupControl.workspace_argument?.relative_path !== "runtime"
+      || startupControl.configuration_argument !== "--config"
+      || startupControl.result?.envelope !== "startup"
+      || startupControl.result?.require_configuration_match_on_install !== false
+      || startupControl.result?.require_live_on_install !== false) {
     throw new Error("component installer-integration contract is invalid");
   }
   const contractManifest = safeRelative(installation.contract_manifest);

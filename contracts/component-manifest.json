@@ -3,7 +3,7 @@
   "component": {
     "id": "lichess.adapter",
     "product_id": "uci_arena.lichess_bot",
-    "version": "1.0.2",
+    "version": "1.0.3",
     "repository": "iteathen/uci-arena-lichess-bot"
   },
   "runtime": {
@@ -34,7 +34,8 @@
       "manager_operations",
       "provider_configuration",
       "provider_status",
-      "startup_install"
+      "startup_install",
+      "startup_uninstall"
     ],
     "dependencies": ["node_runtime.private"],
     "startup": {
@@ -69,7 +70,23 @@
         {"name": "lichess_transport_profile", "kind": "lichess_transport_profile", "required": false},
         {"name": "opening_book", "kind": "opening_book", "required": false},
         {"name": "syzygy", "kind": "syzygy", "required": false}
-      ]
+      ],
+      "startup_control": {
+        "schema": "arena_provider_startup_control_v1",
+        "schema_version": 1,
+        "entrypoint": "startup",
+        "actions": {
+          "install": ["startup", "install"],
+          "uninstall": ["startup", "uninstall"]
+        },
+        "workspace_argument": {"flag": "--runtime-dir", "relative_path": "runtime"},
+        "configuration_argument": "--config",
+        "result": {
+          "envelope": "startup",
+          "require_configuration_match_on_install": false,
+          "require_live_on_install": false
+        }
+      }
     },
     "configuration_template": "config.uci_arena.template.yml",
     "owned_paths": [
