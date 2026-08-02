@@ -38,16 +38,20 @@ jobs:
         shell: pwsh
         run: npm ci --ignore-scripts
 
-      - name: Build Windows windowless launcher
+      - name: Build independent Windows windowless launchers
         if: inputs.target == 'windows-x86_64'
         shell: pwsh
         run: |
-          cmake -S native -B native/build -A x64
-          if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed' }
-          cmake --build native/build --config Release
-          if ($LASTEXITCODE -ne 0) { throw 'native launcher build failed' }
-          & native/build/Release/lichess_adapter_launcher.exe --probe
-          if ($LASTEXITCODE -ne 0) { throw 'native launcher probe failed' }
+          foreach ($buildRoot in @('native/build', 'native/build-repro')) {
+            cmake -S native -B $buildRoot -A x64
+            if ($LASTEXITCODE -ne 0) { throw "CMake configuration failed: $buildRoot" }
+            cmake --build $buildRoot --config Release
+            if ($LASTEXITCODE -ne 0) { throw "native launcher build failed: $buildRoot" }
+            & "$buildRoot/Release/lichess_adapter_launcher.exe" --probe
+            if ($LASTEXITCODE -ne 0) { throw "native launcher probe failed: $buildRoot" }
+          }
+          Copy-Item -LiteralPath native/build/Release/lichess_adapter_launcher.exe `
+            -Destination native/lichess_adapter_launcher.exe
 
       - name: Test exact component source
         shell: pwsh
@@ -56,48 +60,109 @@ jobs:
             --output "release-receipts/${{ inputs.target }}.json" `
             --target "${{ inputs.target }}"
 
-      - name: Build deterministic Windows component
+      - name: Write exact native toolchain receipt
         if: inputs.target == 'windows-x86_64'
         shell: pwsh
         run: |
-          $epoch = git show -s --format=%ct HEAD
-          node tools/build-component-release.mjs `
+          node tools/native-toolchain-receipt.mjs `
             --definition packaging/component-definition.json `
-            --version "${{ inputs.version }}" `
             --target "${{ inputs.target }}" `
-            --output-dir dist `
-            --source-date-epoch $epoch `
             --workflow-identity "${{ github.workflow_ref }}" `
-            --test-receipt "release-receipts/${{ inputs.target }}.json" `
-            --native-launcher native/build/Release/lichess_adapter_launcher.exe
+            --primary-build-root native/build `
+            --reproduction-build-root native/build-repro `
+            --output release-receipts/native-toolchain.json
+          if ($LASTEXITCODE -ne 0) { throw 'native toolchain receipt construction failed' }
 
-      - name: Build deterministic Linux component
-        if: inputs.target == 'linux-x86_64'
+      - name: Build and compare independent component packages
         shell: pwsh
         run: |
           $epoch = git show -s --format=%ct HEAD
-          node tools/build-component-release.mjs `
-            --definition packaging/component-definition.json `
-            --version "${{ inputs.version }}" `
-            --target "${{ inputs.target }}" `
-            --output-dir dist `
-            --source-date-epoch $epoch `
-            --workflow-identity "${{ github.workflow_ref }}" `
-            --test-receipt "release-receipts/${{ inputs.target }}.json"
+          $baseArguments = @(
+            'tools/build-component-release.mjs',
+            '--definition', 'packaging/component-definition.json',
+            '--version', '${{ inputs.version }}',
+            '--target', '${{ inputs.target }}',
+            '--source-date-epoch', "$epoch",
+            '--workflow-identity', '${{ github.workflow_ref }}',
+            '--test-receipt', 'release-receipts/${{ inputs.target }}.json'
+          )
+          if ('${{ inputs.target }}' -eq 'windows-x86_64') {
+            $baseArguments += @(
+              '--native-toolchain-receipt', 'release-receipts/native-toolchain.json'
+            )
+          }
+          $primaryArguments = @($baseArguments + @('--output-dir', 'dist/provider'))
+          $reproArguments = @($baseArguments + @('--output-dir', 'dist/provider-repro'))
+          if ('${{ inputs.target }}' -eq 'windows-x86_64') {
+            $primaryArguments += @(
+              '--native-launcher', 'native/build/Release/lichess_adapter_launcher.exe'
+            )
+            $reproArguments += @(
+              '--native-launcher', 'native/build-repro/Release/lichess_adapter_launcher.exe'
+            )
+          }
+          & node @primaryArguments
+          if ($LASTEXITCODE -ne 0) { throw 'Primary component construction failed' }
+          & node @reproArguments
+          if ($LASTEXITCODE -ne 0) { throw 'Reproduction component construction failed' }
+
+          $primaryArchive = @(Get-ChildItem -LiteralPath dist/provider -File -Filter '*.tar.gz')
+          $reproArchive = @(Get-ChildItem -LiteralPath dist/provider-repro -File -Filter '*.tar.gz')
+          if ($primaryArchive.Count -ne 1 -or $reproArchive.Count -ne 1) {
+            throw 'Reproducibility check requires exactly one archive per output root'
+          }
+          $primaryHash = (Get-FileHash -LiteralPath $primaryArchive[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $reproHash = (Get-FileHash -LiteralPath $reproArchive[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($primaryHash -ne $reproHash) {
+            $diffRoot = Join-Path $env:RUNNER_TEMP 'lichess-provider-repro-diff'
+            $diffA = Join-Path $diffRoot 'primary'
+            $diffB = Join-Path $diffRoot 'reproduction'
+            New-Item -ItemType Directory -Force $diffA, $diffB | Out-Null
+            cmake -E chdir $diffA cmake -E tar xf $($primaryArchive[0].FullName)
+            if ($LASTEXITCODE -ne 0) { throw 'Primary archive extraction failed during reproducibility diagnosis' }
+            cmake -E chdir $diffB cmake -E tar xf $($reproArchive[0].FullName)
+            if ($LASTEXITCODE -ne 0) { throw 'Reproduction archive extraction failed during reproducibility diagnosis' }
+            $relativeFiles = @(
+              Get-ChildItem -LiteralPath $diffA -File -Recurse |
+                ForEach-Object { $_.FullName.Substring($diffA.Length + 1).Replace('\', '/') }
+              Get-ChildItem -LiteralPath $diffB -File -Recurse |
+                ForEach-Object { $_.FullName.Substring($diffB.Length + 1).Replace('\', '/') }
+            ) | Sort-Object -Unique
+            $firstDifference = '<archive metadata>'
+            foreach ($relative in $relativeFiles) {
+              $left = Join-Path $diffA $relative
+              $right = Join-Path $diffB $relative
+              if (-not (Test-Path -LiteralPath $left) -or -not (Test-Path -LiteralPath $right) -or
+                  (Get-FileHash -LiteralPath $left -Algorithm SHA256).Hash -ne
+                  (Get-FileHash -LiteralPath $right -Algorithm SHA256).Hash) {
+                $firstDifference = $relative
+                break
+              }
+            }
+            throw "Independent component builds differ: primary=$primaryHash repro=$reproHash first_path=$firstDifference"
+          }
+          $primaryResult = @(Get-ChildItem -LiteralPath dist/provider -File -Filter '*.provider-result.json')
+          $reproResult = @(Get-ChildItem -LiteralPath dist/provider-repro -File -Filter '*.provider-result.json')
+          if ($primaryResult.Count -ne 1 -or $reproResult.Count -ne 1 -or
+              (Get-FileHash -LiteralPath $primaryResult[0].FullName -Algorithm SHA256).Hash -ne
+              (Get-FileHash -LiteralPath $reproResult[0].FullName -Algorithm SHA256).Hash) {
+            throw 'Independent component provider results differ'
+          }
+          Write-Output "Independent component reproducibility passed: $primaryHash"
 
       - name: Extract and verify component contract
         shell: pwsh
         run: |
-          $archives = @(Get-ChildItem dist -Filter '*.tar.gz')
-          $results = @(Get-ChildItem dist -Filter '*.provider-result.json')
+          $archives = @(Get-ChildItem dist/provider -Filter '*.tar.gz')
+          $results = @(Get-ChildItem dist/provider -Filter '*.provider-result.json')
           if ($archives.Count -ne 1 -or $results.Count -ne 1) { throw 'expected one component artifact and one result' }
           $archive = $archives[0].FullName
           $result = $results[0].FullName
-          New-Item -ItemType Directory -Path dist/verification | Out-Null
-          cmake -E chdir dist/verification cmake -E tar xzf $archive
+          New-Item -ItemType Directory -Path dist/provider/verification | Out-Null
+          cmake -E chdir dist/provider/verification cmake -E tar xzf $archive
           if ($LASTEXITCODE -ne 0) { throw 'component extraction failed' }
           node tools/verify-component-release.mjs `
-            --root dist/verification `
+            --root dist/provider/verification `
             --artifact $archive `
             --result $result
 
@@ -113,7 +178,7 @@ jobs:
           STATEMENT_DIRECTORY: ${{ runner.temp }}/provider-attestation
         run: |
           node tools/provider-attestation.mjs prepare `
-            --output-dir dist `
+            --output-dir dist/provider `
             --statement-dir $env:STATEMENT_DIRECTORY `
             --github-output $env:GITHUB_OUTPUT
 
@@ -156,9 +221,9 @@ jobs:
         with:
           name: lichess-bot-${{ inputs.version }}-${{ inputs.target }}
           path: |
-            dist/*.tar.gz
-            dist/*.provider-result.json
-            dist/*.sigstore.json
+            dist/provider/*.tar.gz
+            dist/provider/*.provider-result.json
+            dist/provider/*.sigstore.json
           if-no-files-found: error
           retention-days: 30
 
@@ -172,7 +237,7 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: lichess-bot-${{ inputs.version }}-${{ inputs.target }}
-          path: dist
+          path: dist/provider
       - name: Publish immutable private candidate
         env:
           GH_TOKEN: ${{ github.token }}
@@ -180,7 +245,7 @@ jobs:
           RELEASE_TARGET: ${{ inputs.target }}
         run: |
           tag="component/lichess-bot/v${RELEASE_VERSION}/${RELEASE_TARGET}"
-          gh release create "${tag}" dist/* \
+          gh release create "${tag}" dist/provider/* \
             --repo "${GITHUB_REPOSITORY}" \
             --prerelease \
             --title "lichess-bot ${RELEASE_VERSION} ${RELEASE_TARGET}" \

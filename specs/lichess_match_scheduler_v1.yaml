@@ -617,3 +617,13 @@ installer_component_contract_2026_08_01:
     - "Release verification independently recomputes the install manifest inventory, internal checksums, SBOM and license identities, source and test-receipt bindings, and credential-free packaged status smoke."
     - "A second build from the same clean source, target, epoch, native launcher, and test receipt produces the same artifact digest."
     - "Installer substitution tests consume the artifact as an arbitrary component identity and reject a changed service contract, unlisted file, unsafe path, digest mismatch, or incompatible contract major before mutation."
+
+provider_release_reproducibility_2026_08_01:
+  status: active
+  owner: lichess_provider_release
+  rules:
+    - "A Windows Lichess candidate builds its provider-owned launcher twice from independent empty build roots; repacking one launcher or staged payload is not reproducibility evidence."
+    - "Both complete unsigned component archives and both provider-result predicates are byte-identical before signing or publication."
+    - "The exact native toolchain receipt binds component id, target, source commit, workflow identity, and primary plus reproduction build roles."
+    - "The Linux provider artifact contains no native launcher bytes and neither requires nor invents native toolchain evidence."
+    - "A mismatch blocks publication and reports both archive digests plus the first differing payload path."

@@ -18,6 +18,8 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
 
+import { readAndValidateNativeToolchainReceipt } from "./native-toolchain-receipt.mjs";
+
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const forbiddenParts = new Set([".git", "secrets", "runtime_state", "node_modules", "dist"]);
 
@@ -274,6 +276,25 @@ function build(args) {
       || receipt.passed !== true) {
     throw new Error("test receipt does not authorize this exact component source and target");
   }
+  const workflowIdentity = args["workflow-identity"] ?? "local-development";
+  const nativeToolchainRequired = definition.native_toolchain_by_target?.[target] !== undefined;
+  let nativeToolchainEvidence;
+  let nativeReceiptPath;
+  if (nativeToolchainRequired) {
+    if (!args["native-toolchain-receipt"]) {
+      throw new Error("native provider components require an exact toolchain receipt");
+    }
+    nativeReceiptPath = path.resolve(args["native-toolchain-receipt"]);
+    nativeToolchainEvidence = readAndValidateNativeToolchainReceipt({
+      filename: nativeReceiptPath,
+      definition,
+      target,
+      sourceCommit: identity.commit,
+      workflowIdentity,
+    });
+  } else if (args["native-toolchain-receipt"]) {
+    throw new Error("non-native provider component received a native toolchain receipt");
+  }
   const output = path.resolve(args["output-dir"] ?? path.join(root, "dist"));
   if (output === root || !output.startsWith(`${root}${path.sep}`)) {
     throw new Error("component output must be a contained repository directory");
@@ -329,6 +350,9 @@ function build(args) {
   mkdirSync(releaseDirectory, { recursive: true });
   copyFileSync(definitionPath, path.join(releaseDirectory, "component-definition.json"));
   copyFileSync(receiptPath, path.join(releaseDirectory, "test-receipt.json"));
+  if (nativeReceiptPath) {
+    copyFileSync(nativeReceiptPath, path.join(releaseDirectory, "native-toolchain-receipt.json"));
+  }
   const lock = JSON.parse(readFileSync(path.join(staging, "package-lock.json"), "utf8"));
   const epoch = Number(args["source-date-epoch"] ?? git(["show", "-s", "--format=%ct", "HEAD"]));
   if (!Number.isSafeInteger(epoch) || epoch <= 0) throw new Error("invalid source-date-epoch");
@@ -344,7 +368,10 @@ function build(args) {
     definition_sha256: sha256File(definitionPath),
     product_component_manifest_sha256: sha256File(componentContractPath),
     test_receipt_sha256: sha256File(receiptPath),
-    workflow_identity: args["workflow-identity"] ?? "local-development",
+    ...(nativeToolchainEvidence
+      ? { native_toolchain_receipt_sha256: nativeToolchainEvidence.sha256 }
+      : {}),
+    workflow_identity: workflowIdentity,
   };
   writeFileSync(path.join(releaseDirectory, "provenance.json"), `${JSON.stringify(provenance, null, 2)}\n`);
   const checksums = Object.fromEntries(listFiles(staging)
@@ -382,11 +409,15 @@ function build(args) {
     clean_tree: identity.clean,
     release_authority: "provider_component_only",
     suite_installer_authority: "iteathen/uci-arena-installer",
-    workflow_identity: args["workflow-identity"] ?? "local-development",
+    workflow_identity: workflowIdentity,
     toolchain_identity: {
       node: process.version,
       platform: process.platform,
       architecture: process.arch,
+      ...(nativeToolchainEvidence ? {
+        native_receipt_sha256: nativeToolchainEvidence.sha256,
+        native_builds: nativeToolchainEvidence.receipt.builds,
+      } : {}),
     },
     dependency_lock_identities: {
       package_lock_sha256: sha256File(path.join(staging, "package-lock.json")),

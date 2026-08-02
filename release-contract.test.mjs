@@ -25,6 +25,7 @@ test("component definition packages runtime contracts without test or source-tre
   assert.equal(JSON.stringify(definition).includes("../"), false);
   assert.equal(definition.native_launcher["windows-x86_64"].required, true);
   assert.equal(definition.native_launcher["linux-x86_64"].required, false);
+  assert.deepEqual(Object.keys(definition.native_toolchain_by_target), ["windows-x86_64"]);
 });
 
 test("Manager configuration and status contracts are closed and separate requests from responses", () => {
@@ -57,6 +58,15 @@ test("manual workflow uses free OIDC Cosign provenance and no automatic trigger"
   assert.match(workflow, /cosign attest-blob[\s\S]*cosign verify-blob-attestation/u);
   assert.match(workflow, /--certificate-github-workflow-repository/u);
   assert.match(workflow, /provider-attestation\.mjs verify-bundle/u);
+  assert.match(workflow, /native\/build-repro/u);
+  assert.match(workflow, /Destination native\/lichess_adapter_launcher\.exe/u);
+  assert.match(workflow, /native-toolchain-receipt\.mjs/u);
+  assert.match(workflow, /dist\/provider-repro/u);
+  assert.match(workflow, /Independent component builds differ:/u);
+  assert.match(workflow, /first_path=/u);
+  assert.match(workflow, /Independent component provider results differ/u);
+  const nativeCmake = readFileSync(path.join(root, "native", "CMakeLists.txt"), "utf8");
+  assert.match(nativeCmake, /target_link_options\(lichess_adapter_launcher PRIVATE \/Brepro\)/u);
   assert.doesNotMatch(workflow, /actions\/attest-build-provenance|attestations:\s*write/u);
 });
 
@@ -65,13 +75,13 @@ test("provider attestation binds and verifies the exact in-toto payload", () => 
   const output = path.join(directory, "output");
   const statements = path.join(directory, "statements");
   mkdirSync(output);
-  const artifactName = "lichess.adapter-1.0.0-windows-x86_64.tar.gz";
+  const artifactName = "lichess.adapter-1.0.1-windows-x86_64.tar.gz";
   const artifact = Buffer.from("exact-provider-artifact");
   writeFileSync(path.join(output, artifactName), artifact);
   writeFileSync(path.join(output, `${artifactName}.provider-result.json`), JSON.stringify({
     schema: "arena_provider_release_result_v1",
     component_id: "lichess.adapter",
-    component_version: "1.0.0",
+    component_version: "1.0.1",
     target_triple: "windows-x86_64",
     artifact_name: artifactName,
     artifact_sha256: createHash("sha256").update(artifact).digest("hex"),

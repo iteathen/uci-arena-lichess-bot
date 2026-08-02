@@ -4,6 +4,13 @@
   "package_json": "package.json",
   "component_manifest": "contracts/component-manifest.json",
   "source_repository": "iteathen/uci-arena-lichess-bot",
+  "native_toolchain_by_target": {
+    "windows-x86_64": {
+      "receipt_schema": "arena_native_toolchain_receipt_v1",
+      "build_system": "cmake",
+      "language": "cxx"
+    }
+  },
   "include": [
     {"source": "backfill-game-provenance.mjs", "target": "backfill-game-provenance.mjs"},
     {"source": "chess-legality.mjs", "target": "chess-legality.mjs"},

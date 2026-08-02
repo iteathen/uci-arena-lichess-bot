@@ -6,6 +6,8 @@ import { existsSync, lstatSync, readFileSync, readdirSync, statSync } from "node
 import path from "node:path";
 import process from "node:process";
 
+import { readAndValidateNativeToolchainReceipt } from "./native-toolchain-receipt.mjs";
+
 function parseArguments(argv) {
   const values = {};
   for (let index = 0; index < argv.length; index += 2) {
@@ -80,6 +82,24 @@ function verify(args) {
       || definition.component_manifest !== "contracts/component-manifest.json") {
     throw new Error("payload component definition is incompatible");
   }
+  const nativeReceiptPath = path.join(root, "release", "native-toolchain-receipt.json");
+  const nativeToolchainRequired = definition.native_toolchain_by_target?.[result.target_triple]
+    !== undefined;
+  let nativeToolchainEvidence;
+  if (nativeToolchainRequired) {
+    if (!existsSync(nativeReceiptPath)) {
+      throw new Error("native component lacks its exact toolchain receipt");
+    }
+    nativeToolchainEvidence = readAndValidateNativeToolchainReceipt({
+      filename: nativeReceiptPath,
+      definition,
+      target: result.target_triple,
+      sourceCommit: result.source_commit,
+      workflowIdentity: result.workflow_identity,
+    });
+  } else if (existsSync(nativeReceiptPath)) {
+    throw new Error("non-native component contains unexpected toolchain evidence");
+  }
   const receiptPath = path.join(root, "release", "test-receipt.json");
   const receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
   const provenance = JSON.parse(readFileSync(path.join(root, "release", "provenance.json"), "utf8"));
@@ -94,7 +114,16 @@ function verify(args) {
       || provenance.product_component_manifest_sha256
         !== sha256File(path.join(root, definition.component_manifest))
       || provenance.test_receipt_sha256 !== sha256File(receiptPath)
-      || result.test_receipt_sha256 !== provenance.test_receipt_sha256) {
+      || result.test_receipt_sha256 !== provenance.test_receipt_sha256
+      || (nativeToolchainEvidence
+        && (provenance.native_toolchain_receipt_sha256 !== nativeToolchainEvidence.sha256
+          || result.toolchain_identity?.native_receipt_sha256 !== nativeToolchainEvidence.sha256
+          || JSON.stringify(result.toolchain_identity?.native_builds)
+            !== JSON.stringify(nativeToolchainEvidence.receipt.builds)))
+      || (!nativeToolchainEvidence
+        && (provenance.native_toolchain_receipt_sha256 !== undefined
+          || result.toolchain_identity?.native_receipt_sha256 !== undefined
+          || result.toolchain_identity?.native_builds !== undefined))) {
     throw new Error("payload provenance does not bind the release inputs and result");
   }
   if (receipt.schema !== "uci_arena_component_test_receipt_v1"
