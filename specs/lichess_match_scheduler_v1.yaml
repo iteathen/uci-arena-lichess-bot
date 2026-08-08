@@ -193,6 +193,7 @@ slots:
     - "Every asynchronous slot transition and release is authorized by the generation captured when the slot was claimed; a stale callback can never mutate or release a later occupant."
     - "An outbound gameStart that races the challenge-create response adopts the already preparing opponent slot. The late create response may attach its challenge id but cannot move an active slot backward to pending or release its engine."
     - "A disconnected per-game stream reconnects and reconstructs position from authoritative gameFull/gameState moves without releasing its active slot."
+    - "Repeated per-game stream failures retain the active slot and qualified child while retrying with bounded backoff. A retry-count threshold never converts an unfinished remote game into a local terminal session; only authoritative terminal state or explicit whole-provider shutdown ends it."
 
 owner_control:
   storage: runtime_sqlite_only
@@ -278,6 +279,7 @@ validation:
   - "Concurrent engine tests require legal moves, isolated children, bounded startup, and graceful cleanup at every claimed capacity."
   - "Substitution tests run a minimal standard UCI fixture with no UCI Arena options or runtime_status and prove qualification, legal move submission, provenance, and one-slot admission."
   - "Race tests prove duplicate gameStart/reconciliation and outbound create-response reordering cannot create two children, two streams, a leaked slot, or a stale-generation release."
+  - "Reconnect tests exceed the former retry threshold without ending the active session or releasing its authority."
   - "Transport tests reject oversized JSON, NDJSON records, and finite collections before unbounded buffering."
   - "Packaged Windows startup tests resolve the launcher at native/lichess_adapter_launcher.exe rather than a source-build directory."
 
@@ -337,6 +339,8 @@ opponent_turn_time_management_2026_07_20:
     - "A qualified v1 dispatch-to-ack profile remains readable as a read-only legacy authority, but is never rewritten as v2 and cannot claim coverage for legality or queue latency."
     - "Compatible qualified transport evidence does not lose authority merely because wall-clock time passed. Its age remains visible provenance; only a measurement-contract incompatibility, invalid evidence, or replacement evidence from completed games can change transport authority."
     - "A missing, incompatible, invalid, or unqualified transport profile selects the 650 ms bootstrap reserve. V2 retains a bounded rolling window of the latest 2000 valid samples, incorporates new observations only after a game completes, and changes the effective reserve only between games."
+    - "Move observations remain isolated as non-authoritative pending samples by game id. Only an authoritative terminal game observation commits that game's samples; session failure, shutdown, or abandonment discards them, and completion of another game cannot adopt them."
+    - "Transport learning writes only the adapter-owned transport profile and effective transport reserve. It never rewrites, replaces, or changes the authority of the Engine-owned timing profile or a selected temporal-curve artifact."
     - "Opponent-turn search is enabled only after the exact semantic timing authority is accepted and applied. Qualified-versus-current executable drift is retained as provenance and does not disable the curve when the timing/search contract, model semantics, provider/runtime, hardware, and effective topology still match. Missing or rejected timing evidence retains conservative foreground search and the bootstrap transport reserve, and disables ponder/opponent-root work before live play."
   telemetry:
     - state_received_to_go_ms
@@ -381,6 +385,7 @@ opponent_turn_time_management_2026_07_20:
     - "Independent legality tests cover illegal engine output, castling, en passant, promotion, pins, long incremental games, and unsupported initial positions."
     - "A completed ponder hit begins POST within 10 ms p95 after authoritative validation, excluding network transit."
     - "Foreground-preemption tests prove bounded stop/drain and no cross-game background interference."
+    - "Transport-profile tests prove an incomplete or failed game cannot change the committed sample set, qualification, reserve, or profile bytes, including when another game completes afterward."
 
 outbound_timeout_reconciliation_2026_07_20:
   status: active

@@ -287,7 +287,7 @@ export class TransportProfileTracker {
     this.now = now;
     this.telemetry = telemetry;
     this.samples = [];
-    this.pendingGames = new Set();
+    this.pendingSamples = new Map();
     this.effectiveReserveMs = bootstrapReserveMs;
     this.legacyReadOnly = false;
     if (profilePath && existsSync(profilePath)) {
@@ -313,7 +313,9 @@ export class TransportProfileTracker {
     const sample = typeof timing === "number" ? { bestmove_to_ack_ms: timing } : timing;
     const durationMs = Number(sample?.bestmove_to_ack_ms);
     if (!gameId || !Number.isFinite(durationMs) || durationMs < 0) return;
-    this.samples.push({
+    const key = String(gameId);
+    const pending = this.pendingSamples.get(key) ?? [];
+    pending.push({
       game_id: String(gameId),
       bestmove_to_ack_ms: Math.round(durationMs * 1_000) / 1_000,
       bestmove_to_legality_ms: Number.isFinite(sample?.bestmove_to_legality_ms)
@@ -327,12 +329,21 @@ export class TransportProfileTracker {
         : null,
       recorded_at_ms: this.now(),
     });
-    this.samples = this.samples.slice(-TRANSPORT_PROFILE_MAXIMUM_SAMPLES);
-    this.pendingGames.add(String(gameId));
+    this.pendingSamples.set(
+      key,
+      pending.slice(-TRANSPORT_PROFILE_MAXIMUM_SAMPLES),
+    );
+  }
+
+  abandonGame(gameId) {
+    this.pendingSamples.delete(String(gameId));
   }
 
   finishGame(gameId) {
-    if (!this.pendingGames.delete(String(gameId)) || !this.profilePath) return this.effectiveReserveMs;
+    const key = String(gameId);
+    const completedSamples = this.pendingSamples.get(key) ?? [];
+    this.pendingSamples.delete(key);
+    if (completedSamples.length === 0 || !this.profilePath) return this.effectiveReserveMs;
     if (this.legacyReadOnly) {
       this.telemetry({
         event: "transport_profile_status",
@@ -342,6 +353,8 @@ export class TransportProfileTracker {
       });
       return this.effectiveReserveMs;
     }
+    this.samples.push(...completedSamples);
+    this.samples = this.samples.slice(-TRANSPORT_PROFILE_MAXIMUM_SAMPLES);
     const values = this.samples.map((sample) => sample.bestmove_to_ack_ms);
     const gameCount = new Set(this.samples.map((sample) => sample.game_id)).size;
     const p50 = percentile(values, 0.50);
@@ -3640,6 +3653,7 @@ export class GameSession {
     store,
     foregroundCoordinator,
     onMoveTransportSample = () => {},
+    waitForReconnect = delay,
   }) {
     this.client = client;
     this.config = { ...config, timing: { ...DEFAULT_TIMING_CONFIG, ...(config.timing ?? {}) } };
@@ -3664,6 +3678,7 @@ export class GameSession {
     this.staleBestmoveDrained = false;
     this.opponentSearchDrainMs = 0;
     this.onMoveTransportSample = onMoveTransportSample;
+    this.waitForReconnect = waitForReconnect;
     this.reconnecting = false;
     this.opponentOperation = Promise.resolve();
   }
@@ -3694,12 +3709,10 @@ export class GameSession {
           game_id: this.gameId,
           message: error.message,
           retry_ms: retryMs,
+          consecutive_failures: consecutiveFailures,
         });
-        if (consecutiveFailures >= 5) {
-          throw new Error(`Game session failed ${consecutiveFailures} consecutive times: ${error.message}`);
-        }
         try {
-          await delay(retryMs, this.signal);
+          await this.waitForReconnect(retryMs, this.signal);
         } catch (retryError) {
           if (this.signal.aborted) break;
           throw retryError;
@@ -4734,7 +4747,12 @@ export class BotController {
       this.activeGames.delete(gameId);
       this.gameSessions.delete(gameId);
       await this.slots.release(slot, slotGeneration);
-      const reserve = this.transportProfile.finishGame(gameId);
+      let reserve = this.transportProfile.effectiveReserveMs;
+      if (session.finished) {
+        reserve = this.transportProfile.finishGame(gameId);
+      } else {
+        this.transportProfile.abandonGame(gameId);
+      }
       this.config.timing.initial_transport_reserve_ms = reserve;
       this.config.engine.timing.initial_transport_reserve_ms = reserve;
       await this.writeStatus();

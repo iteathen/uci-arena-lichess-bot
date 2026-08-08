@@ -144,7 +144,10 @@ age is provenance, not an invalidation trigger. Qualified v1 dispatch-to-ack
 profiles remain readable as read-only legacy authority, while new collection
 uses v2. Missing, incompatible, invalid, or unqualified evidence selects the
 documented 650 ms bootstrap reserve. Transport evidence never regenerates or
-changes the Engine-owned timing authority.
+changes the Engine-owned timing authority. Per-move transport observations stay
+non-authoritative and isolated by game until authoritative terminal game state
+is observed; failed, interrupted, or abandoned games discard their pending
+observations rather than changing either profile.
 
 ## Status and health
 

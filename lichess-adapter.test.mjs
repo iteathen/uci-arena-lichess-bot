@@ -2050,6 +2050,73 @@ test("transport profile publishes only after ten games and two hundred successfu
   assert.ok(later.ageMs > 7 * 24 * 60 * 60 * 1_000);
 });
 
+test("incomplete games cannot enter transport evidence or touch timing authority", (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-transport-pending-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const profilePath = path.join(directory, "transport.json");
+  const timingPath = path.join(directory, "uci_time_profile_v3.json");
+  const timingAuthority = `${JSON.stringify({
+    schema: "uci_time_profile_v3",
+    identity_sha256: `sha256:${"a".repeat(64)}`,
+  }, null, 2)}\n`;
+  writeFileSync(timingPath, timingAuthority);
+  const tracker = new TransportProfileTracker({ profilePath, bootstrapReserveMs: 650 });
+
+  tracker.record("completed-1", { bestmove_to_ack_ms: 500 });
+  tracker.finishGame("completed-1");
+  const firstPublication = readFileSync(profilePath, "utf8");
+
+  for (let index = 0; index < 200; index += 1) {
+    tracker.record("failed", { bestmove_to_ack_ms: 1_500 });
+  }
+  assert.equal(tracker.samples.length, 1);
+  tracker.abandonGame("failed");
+  assert.equal(readFileSync(profilePath, "utf8"), firstPublication);
+
+  tracker.record("incomplete", { bestmove_to_ack_ms: 1_500 });
+  tracker.record("completed-2", { bestmove_to_ack_ms: 600 });
+  tracker.finishGame("completed-2");
+  const published = JSON.parse(readFileSync(profilePath, "utf8"));
+  assert.equal(published.qualified, false);
+  assert.equal(published.sample_count, 2);
+  assert.equal(published.game_count, 2);
+  assert.deepEqual(
+    published.samples.map((sample) => sample.game_id),
+    ["completed-1", "completed-2"],
+  );
+  assert.equal(tracker.effectiveReserveMs, 650);
+  assert.equal(readFileSync(timingPath, "utf8"), timingAuthority);
+});
+
+test("active game stream retries beyond the former failure threshold", async () => {
+  const stop = new AbortController();
+  let attempts = 0;
+  const client = {
+    stream: async function* stream() {
+      attempts += 1;
+      if (attempts === 7) {
+        stop.abort();
+        return;
+      }
+      throw new Error(`stream failure ${attempts}`);
+    },
+  };
+  const session = new GameSession({
+    client,
+    config: gameConfig(),
+    account: "arena-bot",
+    gameId: "active-game",
+    signal: stop.signal,
+    slot: { engine: { mode: "idle" } },
+    store: mockStore(),
+    waitForReconnect: async () => {},
+  });
+
+  await session.run();
+  assert.equal(attempts, 7);
+  assert.notEqual(session.finished, true);
+});
+
 test("qualified v1 transport profiles remain readable with legacy coverage", (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-transport-v1-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
