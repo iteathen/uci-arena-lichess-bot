@@ -304,9 +304,38 @@ function qualifiedRuntimeStatus(profile) {
       syzygy_loaded_cardinality: profile.tablebase.loaded_cardinality,
       syzygy_identity: "123456789",
       syzygy_manifest_identity: profile.tablebase.manifest_identity,
+      syzygy_probe_limit: profile.tablebase.probe_limit,
       syzygy_probe_threads: profile.tablebase.probe_threads,
+      syzygy_rule50: profile.tablebase.rule50,
+      syzygy_root_probe: profile.tablebase.root_probe,
+      syzygy_internal_probe: profile.tablebase.internal_probe,
       syzygy_message: "active",
     } : {}),
+  };
+}
+
+function installQualifiedBookFixture(engineConfig) {
+  const directory = path.join(engineConfig.working_directory, "book-fixture");
+  mkdirSync(directory, { recursive: true });
+  const bookFile = path.join(directory, "strong_rare_v1.bin");
+  const statsFile = path.join(directory, "strong_rare_v1.ffstats");
+  const policyFile = path.join(directory, "strong_rare_v1.policy");
+  writeFileSync(bookFile, Buffer.alloc(16));
+  writeFileSync(
+    statsFile,
+    "# uci_arena_book_stats_v1 book_fnv1a64=00000000075bcd15 rows=1259\n",
+  );
+  writeFileSync(policyFile, "fixture=true\n");
+  Object.assign(engineConfig.uci_options, {
+    OwnBook: true,
+    BookFile: bookFile,
+    BookStatsFile: statsFile,
+    BookPolicyFile: policyFile,
+  });
+  return {
+    opening_book_file: bookFile,
+    opening_book_stats_file: statsFile,
+    opening_book_policy_file: policyFile,
   };
 }
 
@@ -1503,8 +1532,10 @@ test("runtime status gate accepts qualified batched MCGS and rejects incomplete 
 });
 
 test("runtime qualification bypasses the book probe and restores live book play", async () => {
-  const { profile } = qualifiedFixture();
-  const engine = new UciEngine({ uci_options: {}, qualification_profile: profile });
+  const { config, profile } = qualifiedFixture();
+  const engineConfig = { ...config.engine, qualification_profile: profile };
+  const bookStatus = installQualifiedBookFixture(engineConfig);
+  const engine = new UciEngine(engineConfig);
   engine.advertisedOptions.add("OwnBook");
   const commands = [];
   engine.send = (command) => commands.push(command);
@@ -1515,7 +1546,7 @@ test("runtime qualification bypasses the book probe and restores live book play"
     if (command === "isready") return "readyok";
     throw new Error(`Unexpected command: ${command}`);
   };
-  engine.runtimeStatus = async () => qualifiedRuntimeStatus(profile);
+  engine.runtimeStatus = async () => ({ ...qualifiedRuntimeStatus(profile), ...bookStatus });
 
   await engine.qualifyRuntime();
 
@@ -1531,8 +1562,10 @@ test("runtime qualification bypasses the book probe and restores live book play"
 });
 
 test("runtime qualification rejects a configured book that did not reactivate", async () => {
-  const { profile } = qualifiedFixture();
-  const engine = new UciEngine({ uci_options: {}, qualification_profile: profile });
+  const { config, profile } = qualifiedFixture();
+  const engineConfig = { ...config.engine, qualification_profile: profile };
+  const bookStatus = installQualifiedBookFixture(engineConfig);
+  const engine = new UciEngine(engineConfig);
   engine.advertisedOptions.add("OwnBook");
   engine.send = () => {};
   engine.newGame = async () => {};
@@ -1542,10 +1575,36 @@ test("runtime qualification rejects a configured book that did not reactivate", 
     statusCalls += 1;
     return statusCalls === 1
       ? qualifiedRuntimeStatus(profile)
-      : { ...qualifiedRuntimeStatus(profile), opening_book_active: false, opening_book_message: "missing" };
+      : {
+        ...qualifiedRuntimeStatus(profile),
+        ...bookStatus,
+        opening_book_active: false,
+        opening_book_message: "missing",
+      };
   };
 
   await assert.rejects(() => engine.qualifyRuntime(), /Opening book failed to activate: missing/);
+});
+
+test("runtime qualification rejects a loaded opening book with the wrong content identity", async () => {
+  const { config, profile } = qualifiedFixture();
+  const engineConfig = { ...config.engine, qualification_profile: profile };
+  const bookStatus = installQualifiedBookFixture(engineConfig);
+  const engine = new UciEngine(engineConfig);
+  engine.advertisedOptions.add("OwnBook");
+  engine.send = () => {};
+  engine.newGame = async () => {};
+  engine.exchange = async (command) => command.startsWith("go depth ") ? "bestmove e2e4" : "readyok";
+  engine.runtimeStatus = async () => ({
+    ...qualifiedRuntimeStatus(profile),
+    ...bookStatus,
+    opening_book_identity: "987654321",
+  });
+
+  await assert.rejects(
+    () => engine.qualifyRuntime(),
+    /Opening book content identity mismatch/,
+  );
 });
 
 test("game provenance captures exact model, effective timing options, and observed book state", () => {

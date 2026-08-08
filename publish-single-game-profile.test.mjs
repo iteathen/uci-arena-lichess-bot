@@ -180,6 +180,62 @@ function fixture(searchCore = "v2") {
   };
 }
 
+function attachTablebase(options) {
+  const tablebasePath = path.join(path.dirname(options.complete_game_evidence), "syzygy");
+  mkdirSync(tablebasePath);
+  const wdl = Buffer.from("qualified-wdl");
+  const dtz = Buffer.from("qualified-dtz");
+  writeFileSync(path.join(tablebasePath, "KQvK.rtbw"), wdl);
+  writeFileSync(path.join(tablebasePath, "KQvK.rtbz"), dtz);
+  const manifest = {
+    schema: "uci_arena_syzygy_manifest_v1",
+    identity_sha256: `sha256:${"c".repeat(64)}`,
+    cardinality: 3,
+    files: [
+      {
+        name: "KQvK.rtbw",
+        directory: "3-wdl",
+        bytes: wdl.length,
+        sha256: sha256(wdl).slice("sha256:".length),
+      },
+      {
+        name: "KQvK.rtbz",
+        directory: "3-dtz",
+        bytes: dtz.length,
+        sha256: sha256(dtz).slice("sha256:".length),
+      },
+    ],
+  };
+  const manifestPath = path.join(tablebasePath, "syzygy_manifest_v1.json");
+  writeFileSync(manifestPath, JSON.stringify(manifest));
+  const tablebase = {
+    path: tablebasePath,
+    manifest: manifestPath,
+    manifest_identity: manifest.identity_sha256,
+    manifest_file_sha256: sha256(readFileSync(manifestPath)),
+    loaded_cardinality: 3,
+    probe_limit: 3,
+    probe_threads: 2,
+    rule50: true,
+    root_probe: true,
+    internal_probe: true,
+  };
+  const completeGame = JSON.parse(readFileSync(options.complete_game_evidence, "utf8"));
+  completeGame.runtime_contract.expected_parallel_topology.tablebase = tablebase;
+  Object.assign(completeGame.runtime_contract.activation_probe.runtime, {
+    syzygy_active: true,
+    syzygy_loaded_cardinality: 3,
+    syzygy_manifest_identity: manifest.identity_sha256,
+    syzygy_probe_limit: 3,
+    syzygy_probe_threads: 2,
+    syzygy_rule50: true,
+    syzygy_root_probe: true,
+    syzygy_internal_probe: true,
+  });
+  writeFileSync(options.complete_game_evidence, JSON.stringify(completeGame));
+  return tablebase;
+}
+
 test("publishes a self-contained exact local-live-safety profile", () => {
   const options = fixture();
   const result = publishSingleGameProfile({
@@ -228,6 +284,35 @@ test("publishes MCGS profile fields from search-core-specific evidence", () => {
   assert.equal(result.mcgs_outstanding_batches, 2);
   assert.equal(result.mcgs_book_prior_blend_permille, 0);
   assert.equal(loadSingleGameProfile(options.output).search_core, "mcgs");
+});
+
+test("publishes and reloads the exact tablebase contract from complete-game evidence", () => {
+  const options = fixture("mcgs");
+  const tablebase = attachTablebase(options);
+  const result = publishSingleGameProfile({
+    ...options,
+    qualification_scope: "local_live_safety",
+  });
+  assert.deepEqual(result.tablebase, tablebase);
+  assert.deepEqual(loadSingleGameProfile(options.output).tablebase, tablebase);
+});
+
+test("rejects tablebase runtime identity drift without replacing prior authority", () => {
+  const options = fixture("mcgs");
+  attachTablebase(options);
+  mkdirSync(path.dirname(options.output), { recursive: true });
+  writeFileSync(options.output, "prior-authority\n");
+  const completeGame = JSON.parse(readFileSync(options.complete_game_evidence, "utf8"));
+  completeGame.runtime_contract.activation_probe.runtime.syzygy_rule50 = false;
+  writeFileSync(options.complete_game_evidence, JSON.stringify(completeGame));
+  assert.throws(
+    () => publishSingleGameProfile({
+      ...options,
+      qualification_scope: "local_live_safety",
+    }),
+    /Syzygy rule-50 policy mismatch/,
+  );
+  assert.equal(readFileSync(options.output, "utf8"), "prior-authority\n");
 });
 
 test("rejects V2 cursor evidence presented as MCGS authority", () => {

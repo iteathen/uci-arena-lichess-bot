@@ -4,9 +4,12 @@ import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   appendFileSync,
+  closeSync,
   existsSync,
+  openSync,
   mkdirSync,
   readFileSync,
+  readSync,
   renameSync,
   statSync,
   unlinkSync,
@@ -370,6 +373,77 @@ function sha256File(filePath) {
 
 function sha256Json(value) {
   return `sha256:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`;
+}
+
+function resolvedEngineDataPath(config, value, label) {
+  requireString(value, label);
+  return path.normalize(path.isAbsolute(value)
+    ? value
+    : path.resolve(config.working_directory, value));
+}
+
+function openingBookContract(config, runtimeStatus) {
+  const configured = config.uci_options ?? {};
+  const bookFile = resolvedEngineDataPath(
+    config,
+    configured.BookFile ?? runtimeStatus.opening_book_file,
+    "opening-book file",
+  );
+  const statsFile = resolvedEngineDataPath(
+    config,
+    configured.BookStatsFile ?? runtimeStatus.opening_book_stats_file,
+    "opening-book stats file",
+  );
+  const policyFile = resolvedEngineDataPath(
+    config,
+    configured.BookPolicyFile ?? runtimeStatus.opening_book_policy_file,
+    "opening-book policy file",
+  );
+  for (const [configuredName, runtimeName, expected] of [
+    ["BookFile", "opening_book_file", bookFile],
+    ["BookStatsFile", "opening_book_stats_file", statsFile],
+    ["BookPolicyFile", "opening_book_policy_file", policyFile],
+  ]) {
+    if (configured[configuredName] !== undefined) {
+      const observed = resolvedEngineDataPath(config, runtimeStatus[runtimeName], runtimeName);
+      if (observed !== expected) {
+        throw new Error(`Opening book runtime path mismatch for ${configuredName}`);
+      }
+    }
+  }
+  for (const [filePath, label] of [
+    [bookFile, "book"],
+    [statsFile, "stats"],
+    [policyFile, "policy"],
+  ]) {
+    if (!existsSync(filePath) || !statSync(filePath).isFile()) {
+      throw new Error(`Opening book ${label} file is missing: ${filePath}`);
+    }
+  }
+  const descriptor = openSync(statsFile, "r");
+  let firstLine;
+  try {
+    const buffer = Buffer.allocUnsafe(4_096);
+    const bytes = readSync(descriptor, buffer, 0, buffer.length, 0);
+    const newline = buffer.subarray(0, bytes).indexOf(0x0a);
+    if (newline < 0) throw new Error("Opening book stats header exceeds 4095 bytes");
+    firstLine = buffer.subarray(0, newline).toString("utf8").replace(/\r$/u, "");
+  } finally {
+    closeSync(descriptor);
+  }
+  const header = firstLine.match(
+    /^# uci_arena_book_stats_v1 book_fnv1a64=([0-9a-fA-F]{16}) rows=([1-9][0-9]*)$/u,
+  );
+  if (!header) throw new Error("Opening book stats header is invalid");
+  const rows = Number(header[2]);
+  if (!Number.isSafeInteger(rows)) throw new Error("Opening book row count is unsafe");
+  return {
+    book_file: bookFile,
+    stats_file: statsFile,
+    policy_file: policyFile,
+    identity: BigInt(`0x${header[1]}`).toString(10),
+    rows,
+  };
 }
 
 function validateEngineArguments(value) {
@@ -2177,6 +2251,22 @@ export function validateRuntimeStatus(profile, status) {
       status.syzygy_probe_threads === profile.tablebase.probe_threads,
       "Syzygy worker topology mismatch",
     );
+    requireRuntimeStatus(
+      status.syzygy_probe_limit === profile.tablebase.probe_limit,
+      "Syzygy probe limit mismatch",
+    );
+    requireRuntimeStatus(
+      status.syzygy_rule50 === profile.tablebase.rule50,
+      "Syzygy rule-50 policy mismatch",
+    );
+    requireRuntimeStatus(
+      status.syzygy_root_probe === profile.tablebase.root_probe,
+      "Syzygy root activation mismatch",
+    );
+    requireRuntimeStatus(
+      status.syzygy_internal_probe === profile.tablebase.internal_probe,
+      "Syzygy internal activation mismatch",
+    );
   }
   requireRuntimeStatus(status.threads_configured === profile.threads, "thread topology mismatch");
   if (profile.search_core === "mcgs") {
@@ -2704,6 +2794,21 @@ export class UciEngine {
         }
         if (bookExpected && liveRuntimeStatus.opening_book_active !== true) {
           throw new Error(`Opening book failed to activate: ${liveRuntimeStatus.opening_book_message}`);
+        }
+        if (bookExpected) {
+          const expectedBook = openingBookContract(this.config, liveRuntimeStatus);
+          if (liveRuntimeStatus.opening_book_identity !== expectedBook.identity) {
+            throw new Error(
+              `Opening book content identity mismatch: `
+              + `${liveRuntimeStatus.opening_book_identity}!=${expectedBook.identity}`,
+            );
+          }
+          if (liveRuntimeStatus.opening_book_entries !== expectedBook.rows) {
+            throw new Error(
+              `Opening book entry count mismatch: `
+              + `${liveRuntimeStatus.opening_book_entries}!=${expectedBook.rows}`,
+            );
+          }
         }
         this.qualificationStatus = {
           ...this.qualificationStatus,

@@ -161,6 +161,59 @@ function validateMcgsCompleteGame(runtime) {
   "Complete-game MCGS deadline-tail work lacks an admission-close observation");
 }
 
+function validateCompleteGameTablebase(tablebase, runtime) {
+  if (tablebase === null || tablebase === undefined) return null;
+  requireValue(tablebase && typeof tablebase === "object",
+    "Complete-game tablebase contract is not an object");
+  requireValue(path.isAbsolute(tablebase.path) && existsSync(tablebase.path),
+    "Complete-game Syzygy path is not an available absolute path");
+  requireValue(path.isAbsolute(tablebase.manifest) && existsSync(tablebase.manifest),
+    "Complete-game Syzygy manifest is not an available absolute path");
+  requireValue(/^sha256:[0-9a-f]{64}$/.test(tablebase.manifest_identity ?? ""),
+    "Complete-game Syzygy manifest identity is invalid");
+  requireValue(/^sha256:[0-9a-f]{64}$/.test(tablebase.manifest_file_sha256 ?? ""),
+    "Complete-game Syzygy manifest file SHA-256 is invalid");
+  same(sha256File(tablebase.manifest), tablebase.manifest_file_sha256,
+    "Complete-game Syzygy manifest file");
+  const manifest = readJson(tablebase.manifest, "Complete-game Syzygy manifest");
+  requireValue(manifest.schema === "uci_arena_syzygy_manifest_v1"
+    && manifest.identity_sha256 === tablebase.manifest_identity
+    && manifest.cardinality === tablebase.loaded_cardinality
+    && Array.isArray(manifest.files) && manifest.files.length > 0,
+  "Complete-game Syzygy manifest contract mismatch");
+  requireInteger(tablebase.loaded_cardinality, "Complete-game Syzygy cardinality", 3, 7);
+  requireInteger(tablebase.probe_limit, "Complete-game Syzygy probe limit", 3, 7);
+  requireValue(tablebase.probe_limit <= tablebase.loaded_cardinality,
+    "Complete-game Syzygy probe limit exceeds loaded cardinality");
+  requireInteger(tablebase.probe_threads, "Complete-game Syzygy probe threads", 2, 8);
+  for (const field of ["rule50", "root_probe", "internal_probe"]) {
+    requireValue(typeof tablebase[field] === "boolean",
+      `Complete-game Syzygy ${field} must be boolean`);
+  }
+  for (const [actual, expected, label] of [
+    [runtime.syzygy_active, true, "active state"],
+    [runtime.syzygy_loaded_cardinality, tablebase.loaded_cardinality, "cardinality"],
+    [runtime.syzygy_manifest_identity, tablebase.manifest_identity, "manifest identity"],
+    [runtime.syzygy_probe_limit, tablebase.probe_limit, "probe limit"],
+    [runtime.syzygy_probe_threads, tablebase.probe_threads, "probe threads"],
+    [runtime.syzygy_rule50, tablebase.rule50, "rule-50 policy"],
+    [runtime.syzygy_root_probe, tablebase.root_probe, "root activation"],
+    [runtime.syzygy_internal_probe, tablebase.internal_probe, "internal activation"],
+  ]) same(actual, expected, `Complete-game Syzygy ${label}`);
+  return {
+    path: tablebase.path,
+    manifest: tablebase.manifest,
+    manifest_identity: tablebase.manifest_identity,
+    manifest_file_sha256: tablebase.manifest_file_sha256,
+    loaded_cardinality: tablebase.loaded_cardinality,
+    probe_limit: tablebase.probe_limit,
+    probe_threads: tablebase.probe_threads,
+    rule50: tablebase.rule50,
+    root_probe: tablebase.root_probe,
+    internal_probe: tablebase.internal_probe,
+  };
+}
+
 function validateCompleteGame(completeGame, identity, executableSha, scope) {
   requireValue(completeGame.schema === "uci_arena_complete_game_matrix_v3",
     "Complete-game evidence schema is not uci_arena_complete_game_matrix_v3");
@@ -238,6 +291,7 @@ function validateCompleteGame(completeGame, identity, executableSha, scope) {
     && runtime.bestmove_active_tickets === 0
     && runtime.bestmove_active_async_leases === 0,
   "Complete-game activation did not drain cleanly");
+  return validateCompleteGameTablebase(topology.tablebase, runtime);
 }
 
 export function publishSingleGameProfile(options) {
@@ -254,7 +308,7 @@ export function publishSingleGameProfile(options) {
     "Checkpoint manifest has no lowercase SHA-256 checkpoint_hash");
   const diagnostic = readJson(diagnosticPath, "Diagnostic evidence");
   const identity = validateDiagnostic(diagnostic, executableSha, checkpoint);
-  validateCompleteGame(
+  const tablebase = validateCompleteGame(
     readJson(completeGamePath, "Complete-game evidence"),
     identity,
     executableSha,
@@ -322,6 +376,7 @@ export function publishSingleGameProfile(options) {
         identity.search.mcgs.book_prior_blend_permille,
     });
   }
+  if (tablebase) profile.tablebase = tablebase;
   requireValue(profile.qualification_probe.depth >= profile.split_depth,
     "Qualification probe depth must be at least split depth");
   mkdirSync(path.dirname(output), { recursive: true });
