@@ -1067,6 +1067,50 @@ test("runtime config accepts the shared active model environment override", () =
   assert.equal(explicit.engine.uci_options.ModelRoot, "engine/runtime/models/explicit/engine");
 });
 
+test("runtime config protects installer-composed absolute paths from ambient overrides", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-composed-paths-"));
+  const configPath = path.join(directory, "config.json");
+  const raw = JSON.parse(readFileSync(DEFAULT_TEMPLATE, "utf8"));
+  const configured = {
+    model: path.join(directory, "installed", "model"),
+    single: path.join(directory, "installed", "single.json"),
+    timing: path.join(directory, "installed", "timing.json"),
+    temporal: path.join(directory, "installed", "temporal.json"),
+  };
+  raw.engine.uci_options.ModelRoot = configured.model;
+  raw.engine.single_game_profile = configured.single;
+  raw.engine.time_profile = configured.timing;
+  raw.engine.temporal_curve_profile = configured.temporal;
+  writeFileSync(configPath, JSON.stringify(raw), "utf8");
+  try {
+    const config = loadRuntimeConfig({
+      templatePath: configPath,
+      engineRoot: ROOT,
+      environment: {
+        UCI_ARENA_MODEL_ROOT: "ambient/model",
+        UCI_ARENA_SINGLE_GAME_PROFILE: "ambient/single.json",
+        UCI_ARENA_TIME_PROFILE: "ambient/timing.json",
+        UCI_ARENA_TEMPORAL_CURVE_PROFILE: "ambient/temporal.json",
+      },
+    });
+    assert.equal(config.engine.uci_options.ModelRoot, configured.model);
+    assert.equal(config.engine.single_game_profile, configured.single);
+    assert.equal(config.engine.time_profile, configured.timing);
+    assert.equal(config.engine.temporal_curve_profile, configured.temporal);
+
+    const explicit = path.join(directory, "explicit", "model");
+    const cli = loadRuntimeConfig({
+      templatePath: configPath,
+      engineRoot: ROOT,
+      modelRoot: explicit,
+      environment: { UCI_ARENA_MODEL_ROOT: "ambient/model" },
+    });
+    assert.equal(cli.engine.uci_options.ModelRoot, explicit);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("runtime config accepts exact installed engine and working-directory overrides", () => {
     const engine = path.resolve("installed/bin/uci_arena_engine.exe");
   const workingDirectory = path.resolve("installed");

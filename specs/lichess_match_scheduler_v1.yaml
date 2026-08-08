@@ -60,6 +60,7 @@ configuration:
   path_independence:
     - "Provider source and runtime paths resolve from the provider component root, never the process current working directory or a former engine-repository location."
     - "Engine executable, engine working directory, model, timing, capacity, and qualification paths enter explicitly from installed component discovery or invocation options."
+    - "Path precedence is explicit invocation, then an absolute path authored in the supplied configuration document, then an ambient development fallback, then a portable template value. Placeholder expansion does not promote a template value into authored absolute authority, and ambient variables never replace installer-composed absolute model, single-game, timing, or temporal-curve authority."
     - "The tracked template uses an engine-component placeholder and does not name an engine source-tree layout."
     - "An engine may declare a bounded argument array for a direct process launch. Arguments are never concatenated into a shell command, and launch provenance binds the exact array plus any existing file arguments."
   credential:

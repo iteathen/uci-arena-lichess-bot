@@ -54,6 +54,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT = HERE;
 export const ENGINE_ROOT_PLACEHOLDER = "<UCI_ARENA_ENGINE_ROOT>";
 export const DEFAULT_TEMPLATE = path.join(HERE, "config.uci_arena.template.yml");
+const CONFIGURED_RUNTIME_PATH_AUTHORITY = Symbol("configuredRuntimePathAuthority");
 export const DEFAULT_RUNTIME_DIR = path.join(ROOT, "runtime_state", "lichess");
 export const DEFAULT_STORE_FILE = path.join(DEFAULT_RUNTIME_DIR, "matches.sqlite");
 export const LIVE_ACCEPTANCE_CONFIRMATION = "I_ACCEPT_ONE_BOT_GAME";
@@ -1078,7 +1079,16 @@ function loadConfigDocument({ templatePath = DEFAULT_TEMPLATE, engineRoot = ROOT
     throw new Error(`Unsupported Lichess adapter config schema: ${parsed.schema ?? "missing"}`);
   }
   assertCredentialFreeConfiguration(parsed);
+  const configuredRuntimePathAuthority = {
+    modelRoot: path.isAbsolute(parsed.engine?.uci_options?.ModelRoot ?? ""),
+    singleGameProfile: path.isAbsolute(parsed.engine?.single_game_profile ?? ""),
+    timeProfile: path.isAbsolute(parsed.engine?.time_profile ?? ""),
+    temporalCurveProfile: path.isAbsolute(parsed.engine?.temporal_curve_profile ?? ""),
+  };
   const config = replaceEngineRootPlaceholder(parsed, path.resolve(engineRoot));
+  Object.defineProperty(config, CONFIGURED_RUNTIME_PATH_AUTHORITY, {
+    value: Object.freeze(configuredRuntimePathAuthority),
+  });
   if (config.schema === "uci_arena_lichess_adapter_v2") migrateV2Config(config);
   config.engine ??= {};
   config.engine.adapter ??= "uci_arena_extended_v1";
@@ -1094,6 +1104,17 @@ function loadConfigDocument({ templatePath = DEFAULT_TEMPLATE, engineRoot = ROOT
 
 export function loadManagerConfig(options = {}) {
   return validateBotPolicyConfig(validateCapacityConfig(loadConfigDocument(options)));
+}
+
+function selectRuntimePath(
+  explicitPath,
+  configuredPath,
+  environmentPath,
+  configuredIsAuthoritative,
+) {
+  if (explicitPath) return explicitPath;
+  if (configuredIsAuthoritative) return configuredPath;
+  return environmentPath?.trim() || configuredPath;
 }
 
 export function loadRuntimeConfig({
@@ -1148,17 +1169,36 @@ export function loadRuntimeConfig({
     config.engine.selected_bundle = "standard_uci";
     return validateBotPolicyConfig(validateCapacityConfig(config));
   }
-  const selectedModelRoot = modelRoot || environment.UCI_ARENA_MODEL_ROOT?.trim();
+  const selectedModelRoot = selectRuntimePath(
+    modelRoot,
+    config.engine.uci_options.ModelRoot,
+    environment.UCI_ARENA_MODEL_ROOT,
+    config[CONFIGURED_RUNTIME_PATH_AUTHORITY].modelRoot,
+  );
   if (selectedModelRoot) config.engine.uci_options.ModelRoot = selectedModelRoot;
-  const selectedProfile = profilePath || environment.UCI_ARENA_SINGLE_GAME_PROFILE?.trim();
+  const selectedProfile = selectRuntimePath(
+    profilePath,
+    config.engine.single_game_profile,
+    environment.UCI_ARENA_SINGLE_GAME_PROFILE,
+    config[CONFIGURED_RUNTIME_PATH_AUTHORITY].singleGameProfile,
+  );
   if (selectedProfile) config.engine.single_game_profile = selectedProfile;
   if (!config.engine.single_game_profile) {
     throw new Error("Lichess adapter config is missing engine.single_game_profile");
   }
-  const selectedTimeProfile = timeProfilePath || environment.UCI_ARENA_TIME_PROFILE?.trim();
+  const selectedTimeProfile = selectRuntimePath(
+    timeProfilePath,
+    config.engine.time_profile,
+    environment.UCI_ARENA_TIME_PROFILE,
+    config[CONFIGURED_RUNTIME_PATH_AUTHORITY].timeProfile,
+  );
   if (selectedTimeProfile) config.engine.time_profile = selectedTimeProfile;
-  const selectedTemporalCurve = temporalCurvePath
-    || environment.UCI_ARENA_TEMPORAL_CURVE_PROFILE?.trim();
+  const selectedTemporalCurve = selectRuntimePath(
+    temporalCurvePath,
+    config.engine.temporal_curve_profile,
+    environment.UCI_ARENA_TEMPORAL_CURVE_PROFILE,
+    config[CONFIGURED_RUNTIME_PATH_AUTHORITY].temporalCurveProfile,
+  );
   if (selectedTemporalCurve) {
     config.engine.temporal_curve_profile = selectedTemporalCurve;
   }
