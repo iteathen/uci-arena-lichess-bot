@@ -318,7 +318,7 @@ function installQualifiedBookFixture(engineConfig) {
   const directory = path.join(engineConfig.working_directory, "book-fixture");
   mkdirSync(directory, { recursive: true });
   const bookFile = path.join(directory, "strong_rare_v1.bin");
-  const statsFile = path.join(directory, "strong_rare_v1.ffstats");
+  const statsFile = path.join(directory, "strong_rare_v1.stats");
   const policyFile = path.join(directory, "strong_rare_v1.policy");
   writeFileSync(bookFile, Buffer.alloc(16));
   writeFileSync(
@@ -1729,7 +1729,7 @@ test("timing identity excludes independently validated local knowledge options",
       ModelRoot: "C:/installed/models/default",
       OwnBook: true,
       BookFile: "E:/books/strong_rare_v1.bin",
-      BookStatsFile: "E:/books/strong_rare_v1.ffstats",
+      BookStatsFile: "E:/books/strong_rare_v1.stats",
       BookPolicyFile: "E:/books/strong_rare_v1.policy",
       BookSeed: 9,
       BookMaxPly: 30,

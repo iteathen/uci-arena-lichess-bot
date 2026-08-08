@@ -51,13 +51,19 @@ function openingBookOptions(locator) {
     throw new Error('opening-book locator must be a regular file or directory');
   }
   const options = { OwnBook: true, BookFile: book };
-  for (const [suffix, option] of [['.ffstats', 'BookStatsFile'], ['.policy', 'BookPolicyFile']]) {
+  for (const [suffix, option] of [['.stats', 'BookStatsFile'], ['.policy', 'BookPolicyFile']]) {
     const sidecar = path.join(path.dirname(book), `${path.basename(book, path.extname(book))}${suffix}`);
     try {
       const sidecarMetadata = lstatSync(sidecar);
-      if (sidecarMetadata.isFile() && !sidecarMetadata.isSymbolicLink()) options[option] = sidecar;
+      if (!sidecarMetadata.isFile() || sidecarMetadata.isSymbolicLink()) {
+        throw new Error(`opening-book ${suffix} sidecar is not a regular file`);
+      }
+      options[option] = sidecar;
     } catch (error) {
-      if (error.code !== 'ENOENT') throw error;
+      if (error.code === 'ENOENT') {
+        throw new Error(`opening-book locator is missing required ${suffix} sidecar`);
+      }
+      throw error;
     }
   }
   return options;

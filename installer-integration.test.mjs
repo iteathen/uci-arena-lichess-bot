@@ -37,7 +37,8 @@ test('installer integration binds complete suite evidence and bounded knowledge 
   const books = path.join(root, 'books');
   mkdirSync(books, { recursive: true });
   writeFileSync(path.join(books, 'strong_rare_v1.bin'), 'book', 'utf8');
-  writeFileSync(path.join(books, 'strong_rare_v1.ffstats'), 'stats', 'utf8');
+  writeFileSync(path.join(books, 'strong_rare_v1.stats'), 'stats', 'utf8');
+  writeFileSync(path.join(books, 'strong_rare_v1.policy'), 'policy', 'utf8');
   const engineRoot = path.join(root, 'engine');
   const result = renderInstallerConfiguration({
     schema: 'arena_provider_install_context_v1',
@@ -65,8 +66,29 @@ test('installer integration binds complete suite evidence and bounded knowledge 
   assert.equal(result.configuration.engine.uci_options.BookFile,
     path.join(books, 'strong_rare_v1.bin'));
   assert.equal(result.configuration.engine.uci_options.BookStatsFile,
-    path.join(books, 'strong_rare_v1.ffstats'));
+    path.join(books, 'strong_rare_v1.stats'));
   assert.equal(result.configuration.engine.uci_options.SyzygyPath,
     path.join(root, 'tablebases'));
   assert.equal(result.configuration.scheduler.enabled, true);
+});
+
+test('installer integration rejects a partial opening-book locator', (t) => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'arena-lichess-partial-book-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const books = path.join(root, 'books');
+  mkdirSync(books, { recursive: true });
+  writeFileSync(path.join(books, 'strong_rare_v1.bin'), 'book', 'utf8');
+  writeFileSync(path.join(books, 'strong_rare_v1.policy'), 'policy', 'utf8');
+  assert.throws(() => renderInstallerConfiguration({
+    schema: 'arena_provider_install_context_v1',
+    schema_version: 1,
+    workspace: path.join(root, 'workspace'),
+    enabled: false,
+    bindings: {
+      default_engine: path.join(root, 'engine', 'uci_arena_engine.exe'),
+      default_engine_root: path.join(root, 'engine'),
+      default_model_root: path.join(root, 'engine', 'models', 'default'),
+    },
+    locators: { opening_book: books },
+  }), /missing required \.stats sidecar/);
 });
