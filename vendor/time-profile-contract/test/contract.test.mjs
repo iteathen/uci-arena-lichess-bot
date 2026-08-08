@@ -13,6 +13,7 @@ import {
   engineCommandIdentity,
   loadTimeProfile,
   sha256Object,
+  timingProfilePermissions,
   timeProfileFallbackStatus,
   validateAppliedTimeProfileReserve,
   validateProfileRuntimeSnapshot,
@@ -28,6 +29,45 @@ test("profile validation fails closed before identity use", () => {
   assert.throws(
     () => validateStoredProfile({ schema: PROFILE_SCHEMA, qualified: false }),
     /not qualified/,
+  );
+});
+
+test("legacy v3 permission projection is derived only from the complete gate set", () => {
+  const baseGates = {
+    legal_moves: true,
+    nonterminal_null_moves: true,
+    controller_disabled: true,
+    provider_timing_captured: true,
+    provider_service_reserve_valid: true,
+    applied_provider_service_reserve_covered: true,
+    applied_backup_emit_reserve_covered: true,
+    p99_deadline_overshoot_passed: true,
+    maximum_deadline_overshoot_passed: true,
+    passed: true,
+  };
+  const profile = {
+    schema: PROFILE_SCHEMA,
+    qualified: true,
+    identity: { search: { search_core: "minimax" } },
+    gates: baseGates,
+  };
+  assert.deepEqual(timingProfilePermissions(profile), {
+    provider_safety_qualified: true,
+    forecast_shadow_qualified: true,
+    adaptive_play_qualified: false,
+  });
+  assert.equal(timingProfilePermissions({
+    ...profile,
+    permissions: { provider_safety_qualified: false },
+  }).provider_safety_qualified, false);
+  assert.equal(timingProfilePermissions({
+    ...profile,
+    gates: { ...baseGates, provider_timing_captured: false },
+    permissions: { provider_safety_qualified: true },
+  }).provider_safety_qualified, false);
+  assert.throws(
+    () => timingProfilePermissions({ ...profile, permissions: { provider_safety_qualified: 1 } }),
+    /must be boolean/,
   );
 });
 

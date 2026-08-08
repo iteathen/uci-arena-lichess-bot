@@ -1658,6 +1658,13 @@ test("game provenance captures exact model, effective timing options, and observ
       iteration_transition_p95_ms: [1, 2, 3],
       predictive_controller_enabled: false,
       permissions: { provider_safety_qualified: true },
+      timing_authority_match: true,
+      engine_provenance: {
+        exact: false,
+        executable_match: false,
+        qualified_executable_sha256: `sha256:${"a".repeat(64)}`,
+        current_executable_sha256: `sha256:${"b".repeat(64)}`,
+      },
     },
   };
 
@@ -1674,6 +1681,9 @@ test("game provenance captures exact model, effective timing options, and observ
   assert.equal(first.provenance.timing.provider_service_reserve_us, 231000);
   assert.equal(first.provenance.timing.backup_emit_reserve_us, 2000);
   assert.equal(first.provenance.timing.transport_reserve_ms, 650);
+  assert.equal(first.provenance.timing.timing_authority_match, true);
+  assert.equal(first.provenance.timing.engine_provenance.exact, false);
+  assert.equal(first.provenance.timing.engine_provenance.executable_match, false);
   assert.equal(first.provenance.book.observed_active, true);
   assert.equal(first.provenance.book.observed_entries, 1259);
   assert.equal(first.provenance.book.observed_identity, "123456789");

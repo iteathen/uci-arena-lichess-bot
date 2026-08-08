@@ -2710,7 +2710,7 @@ export class UciEngine {
       reserveWasSet = true;
       await this.exchange("isready", (line) => line === "readyok", 30_000);
       const appliedStatus = await this.runtimeStatus();
-      validateProfileRuntimeSnapshot({
+      const appliedAcceptance = validateProfileRuntimeSnapshot({
         profile,
         status: appliedStatus,
         executable: this.config.executable,
@@ -2726,7 +2726,11 @@ export class UciEngine {
           iterationForecastScalePermille: accepted.iteration_forecast_scale_permille,
         },
       });
-      this.timeProfileStatus = validateAppliedTimeProfileReserve(profile, appliedStatus);
+      this.timeProfileStatus = {
+        ...appliedAcceptance,
+        ...validateAppliedTimeProfileReserve(profile, appliedStatus),
+        permissions: profile.permissions ?? {},
+      };
     } catch (error) {
       if (reserveWasSet) {
         this.setOption("TimeProfileProviderReserveUs", 0);
@@ -3306,6 +3310,8 @@ export function gameRuntimeProvenance(config, engine) {
       accepted: timeProfile.accepted ?? false,
       applied: timeProfile.applied ?? false,
       permissions: timeProfile.permissions ?? {},
+      timing_authority_match: timeProfile.timing_authority_match ?? false,
+      engine_provenance: timeProfile.engine_provenance ?? null,
       provider_service_reserve_us: timeProfile.provider_service_reserve_us ?? 0,
       backup_emit_reserve_us: timeProfile.backup_emit_reserve_us ?? 1000,
       iteration_forecast_scale_permille:

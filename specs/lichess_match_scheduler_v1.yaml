@@ -222,7 +222,7 @@ storage:
   invariants:
     - "Opening an existing schema-v3 store idempotently materializes every required table. A superseded api_rate_limit singleton is imported as a conservative legacy-global safety row so a branch or adapter upgrade cannot erase or shorten an unexpired 429 cooldown."
     - "Game id and challenge id ingestion are idempotent."
-    - "Every game immutably binds opponent, color, time control, result, engine build, model id/fingerprint/checkpoint/adapter, provider/numeric/runtime/hardware identity, complete search and batching options, timing-profile identity and permissions, and configured plus observed opening-book state."
+    - "Every game immutably binds opponent, color, time control, result, engine build, model id/fingerprint/checkpoint/adapter, provider/numeric/runtime/hardware identity, complete search and batching options, timing-profile identity and permissions, semantic timing-authority match, qualified-versus-current engine provenance comparison, and configured plus observed opening-book state."
     - "When AdaptiveCurveV1 is active, every game additionally binds the validated temporal-curve artifact revision, file sha256, evidence-manifest sha256, formula identity, and complete applied coefficient UCI options."
     - "The games row stores queryable core identity columns plus a versioned uci_arena_game_runtime_provenance_v1 JSON document and its sha256. The JSON includes the complete effective post-qualification UCI option map so later defaults cannot reinterpret a historical game; timing-profile provider, backup/emission, and forecast reserves must overwrite their pre-application defaults in both the option map and typed timing fields."
     - "Idempotent game-start replay may update opponent and clock metadata but never replaces runtime provenance for an existing game id. Legacy rows migrate without invented provenance and remain explicitly distinguishable by an empty provenance hash."
@@ -331,7 +331,7 @@ opponent_turn_time_management_2026_07_20:
     - "Transport timing remains adapter-scoped and separate from model/provider timing calibration."
     - "A uci_arena_lichess_transport_profile_v1 requires at least 200 successful move POST samples from at least ten completed games. Its reserve is p99 dispatch-to-ack plus 50 ms, rounded upward to 50 ms and clamped to 250 through 1500 ms."
     - "A missing, stale, or unqualified transport profile selects the 650 ms bootstrap reserve. Profile changes apply only between games and expire after seven days or after three consecutive games whose rolling p95 differs by more than 25 percent."
-    - "Opponent-turn search is enabled only after an exact timing profile is accepted and applied. Missing or rejected timing evidence retains conservative foreground search and the bootstrap transport reserve, and disables ponder/opponent-root work before live play."
+    - "Opponent-turn search is enabled only after the exact semantic timing authority is accepted and applied. Qualified-versus-current executable drift is retained as provenance and does not disable the curve when the timing/search contract, model semantics, provider/runtime, hardware, and effective topology still match. Missing or rejected timing evidence retains conservative foreground search and the bootstrap transport reserve, and disables ponder/opponent-root work before live play."
   telemetry:
     - state_received_to_go_ms
     - go_to_bestmove_ms

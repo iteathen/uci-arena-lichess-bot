@@ -8,6 +8,32 @@ export const LEGACY_PROFILE_SCHEMA = "uci_time_profile_v1";
 export const TIME_POLICY_VERSION = "persistent_mcgs_relative_clock_temporal_v4";
 export const REQUIRED_MCGS_TIME_POLICY = "RelativeClockTemporalV1";
 
+const BASE_TIMING_GATES = Object.freeze([
+  "legal_moves",
+  "nonterminal_null_moves",
+  "controller_disabled",
+  "provider_timing_captured",
+  "provider_service_reserve_valid",
+  "applied_provider_service_reserve_covered",
+  "applied_backup_emit_reserve_covered",
+  "p99_deadline_overshoot_passed",
+  "maximum_deadline_overshoot_passed",
+  "passed",
+]);
+
+const MCGS_TIMING_GATES = Object.freeze([
+  "mcgs_root_coverage_passed",
+  "mcgs_policy_only_fallback_passed",
+  "mcgs_graph_population_passed",
+  "mcgs_async_overlap_passed",
+  "mcgs_single_owner_passed",
+  "mcgs_low_budget_fallback_passed",
+  "mcgs_deterministic_fallback_passed",
+  "mcgs_completion_integrity_passed",
+  "mcgs_temporal_policy_passed",
+  "mcgs_deadline_tail_telemetry_passed",
+]);
+
 export function canonicalize(value) {
   if (Array.isArray(value)) return value.map(canonicalize);
   if (value !== null && typeof value === "object") {
@@ -59,6 +85,39 @@ export function timingAuthorityIdentity(identity) {
     model: identity.model,
     provider: identity.provider,
     search: identity.search,
+  };
+}
+
+function explicitPermission(value, name) {
+  if (value === undefined || value === null || !Object.hasOwn(value, name)) return null;
+  if (typeof value[name] !== "boolean") {
+    throw new Error(`timing profile permission ${name} must be boolean`);
+  }
+  return value[name];
+}
+
+export function timingProfileGatesPassed(profile) {
+  if (profile?.schema !== PROFILE_SCHEMA || profile.qualified !== true) return false;
+  const required = profile.identity?.search?.search_core === "mcgs"
+    ? [...BASE_TIMING_GATES, ...MCGS_TIMING_GATES]
+    : BASE_TIMING_GATES;
+  return required.every((gate) => profile.gates?.[gate] === true);
+}
+
+export function timingProfilePermissions(profile) {
+  const gatesPassed = timingProfileGatesPassed(profile);
+  const declared = profile?.permissions;
+  if (declared !== undefined
+      && (declared === null || typeof declared !== "object" || Array.isArray(declared))) {
+    throw new Error("timing profile permissions must be an object");
+  }
+  const provider = explicitPermission(declared, "provider_safety_qualified");
+  const forecast = explicitPermission(declared, "forecast_shadow_qualified");
+  const adaptive = explicitPermission(declared, "adaptive_play_qualified");
+  return {
+    provider_safety_qualified: gatesPassed && provider !== false,
+    forecast_shadow_qualified: gatesPassed && forecast !== false,
+    adaptive_play_qualified: adaptive === true,
   };
 }
 
@@ -128,6 +187,7 @@ export function validateStoredProfile(profile) {
   }
   return {
     ...profile,
+    permissions: timingProfilePermissions(profile),
     calibration: {
       ...profile.calibration,
       provider_service_reserve_us: providerReserveUs,
