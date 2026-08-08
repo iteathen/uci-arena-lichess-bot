@@ -166,9 +166,12 @@ node .\publish-single-game-profile.mjs `
   --output C:\ProgramData\UCI Arena\profiles\single-game.json
 ```
 
-The timing profile must contain at least thirty repetitions per declared case;
-the publisher copies both immutable inputs beside the generated profile and
-never replaces prior authority when validation fails.
+The timing profile must contain at least thirty repetitions per declared case.
+The complete-game runner must have validated and applied that exact semantic
+timing authority before its timed work; a provenance-only engine rebuild is
+recorded but does not invalidate compatible timing. The publisher copies both
+immutable inputs beside the generated profile and never replaces prior
+authority when validation fails.
 
 Validate the exact engine package before using credentials:
 

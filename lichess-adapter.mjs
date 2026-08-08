@@ -83,6 +83,7 @@ const PROFILE_OWNED_UCI_OPTIONS = Object.freeze({
   syzygy_root_probe: "SyzygyRootProbe",
   syzygy_internal_probe: "SyzygyInternalProbe",
 });
+const PROFILE_PATH_UCI_OPTIONS = new Set(["SyzygyPath", "SyzygyManifest"]);
 const ADAPTIVE_CURVE_SCHEMA = "uci_arena_mcgs_adaptive_temporal_curve_v1";
 const ADAPTIVE_CURVE_FORMULA = "adaptive_curve_v1_fixed_point";
 const ADAPTIVE_CURVE_STATUS = new Set(["qualified_live_authority"]);
@@ -1466,10 +1467,27 @@ export function applySingleGameProfile(config) {
       SyzygyInternalProbe: profile.tablebase.internal_probe,
     });
   }
+  const equivalentProfileValue = (optionName, configured, selected) => {
+    if (!PROFILE_PATH_UCI_OPTIONS.has(optionName)) {
+      return String(configured) === String(selected);
+    }
+    const canonical = (value) => {
+      const absolutePath = path.isAbsolute(String(value))
+        ? path.resolve(String(value))
+        : path.resolve(config.engine.working_directory, String(value));
+      const normalized = path.normalize(absolutePath);
+      return process.platform === "win32" ? normalized.toLocaleLowerCase() : normalized;
+    };
+    return canonical(configured) === canonical(selected);
+  };
   for (const optionName of Object.values(PROFILE_OWNED_UCI_OPTIONS)
     .filter((name) => Object.hasOwn(profileValues, name))) {
     if (Object.hasOwn(config.engine.uci_options, optionName)
-        && String(config.engine.uci_options[optionName]) !== String(profileValues[optionName])) {
+        && !equivalentProfileValue(
+          optionName,
+          config.engine.uci_options[optionName],
+          profileValues[optionName],
+        )) {
       throw new Error(`Tracked config conflicts with profile-owned UCI option ${optionName}`);
     }
   }

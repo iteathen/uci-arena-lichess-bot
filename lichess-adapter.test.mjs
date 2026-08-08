@@ -1289,12 +1289,22 @@ test("profile application verifies and owns the complete Syzygy asset identity",
     internal_probe: true,
   };
   writeFileSync(fixture.profilePath, JSON.stringify(fixture.profile));
+  fixture.config.engine.uci_options.SyzygyPath = `${tablebasePath}${path.sep}.${path.sep}`;
+  fixture.config.engine.uci_options.SyzygyManifest =
+    `${tablebasePath}${path.sep}.${path.sep}${path.basename(manifestPath)}`;
 
   applySingleGameProfile(fixture.config);
   assert.equal(fixture.config.engine.uci_options.SyzygyPath, tablebasePath);
   assert.equal(fixture.config.engine.uci_options.SyzygyManifest, manifestPath);
   assert.equal(fixture.config.engine.uci_options.SyzygyProbeThreads, 4);
   assert.equal(fixture.config.engine.uci_options.SyzygyInternalProbe, true);
+
+  fixture.config.engine.uci_options.SyzygyPath = path.dirname(tablebasePath);
+  assert.throws(
+    () => applySingleGameProfile(fixture.config),
+    /Tracked config conflicts with profile-owned UCI option SyzygyPath/,
+  );
+  fixture.config.engine.uci_options.SyzygyPath = tablebasePath;
 
   writeFileSync(manifestPath, `${JSON.stringify(manifest)}\n`);
   assert.throws(

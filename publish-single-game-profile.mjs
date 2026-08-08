@@ -226,7 +226,43 @@ function validateCompleteGameTablebase(tablebase, runtime) {
   };
 }
 
-function validateCompleteGame(completeGame, identity, executableSha, scope) {
+function validateCompleteGameTimingProfile(completeGame, timeProfile, timeProfileSha) {
+  const configured = completeGame.config?.timing_profile;
+  const applied = completeGame.runtime_contract?.timing_profile;
+  requireValue(configured && applied,
+    "Complete-game timing-profile application evidence is missing");
+  for (const [actual, expected, label] of [
+    [configured.profile_schema, timeProfile.schema, "configured schema"],
+    [configured.profile_sha256, timeProfileSha, "configured file SHA-256"],
+    [configured.identity_sha256, timeProfile.identity_sha256, "configured identity"],
+    [applied.profile_schema, timeProfile.schema, "applied schema"],
+    [applied.profile_sha256, timeProfileSha, "applied file SHA-256"],
+    [applied.identity_sha256, timeProfile.identity_sha256, "applied identity"],
+    [applied.provider_service_reserve_us,
+      timeProfile.calibration.provider_service_reserve_us, "provider reserve"],
+    [applied.backup_emit_reserve_us,
+      timeProfile.calibration.backup_emit_reserve_us, "backup/emission reserve"],
+    [applied.iteration_forecast_scale_permille,
+      timeProfile.calibration.iteration_forecast_scale_permille, "forecast scale"],
+  ]) same(actual, expected, `Complete-game timing profile ${label}`);
+  requireValue(applied.schema === "uci_arena_complete_game_time_profile_v1"
+    && applied.accepted === true
+    && applied.applied === true
+    && applied.timing_authority_match === true
+    && applied.predictive_controller_enabled === false,
+  "Complete-game timing profile was not admitted and applied exactly");
+  requireValue(applied.engine_provenance && typeof applied.engine_provenance === "object",
+    "Complete-game timing profile has no engine provenance comparison");
+}
+
+function validateCompleteGame(
+  completeGame,
+  identity,
+  executableSha,
+  scope,
+  timeProfile,
+  timeProfileSha,
+) {
   requireValue(completeGame.schema === "uci_arena_complete_game_matrix_v3",
     "Complete-game evidence schema is not uci_arena_complete_game_matrix_v3");
   requireValue(completeGame.completed === true
@@ -247,6 +283,7 @@ function validateCompleteGame(completeGame, identity, executableSha, scope) {
   }
   same(`sha256:${completeGame.config?.executable_sha256?.model_engine}`,
     executableSha, "Complete-game executable");
+  validateCompleteGameTimingProfile(completeGame, timeProfile, timeProfileSha);
   const topology = completeGame.runtime_contract?.expected_parallel_topology;
   const runtime = completeGame.runtime_contract?.activation_probe?.runtime;
   requireValue(topology && runtime, "Complete-game activation runtime is missing");
@@ -318,16 +355,18 @@ export function publishSingleGameProfile(options) {
     "Checkpoint manifest");
   requireValue(/^[0-9a-f]{64}$/.test(checkpoint.checkpoint_hash ?? ""),
     "Checkpoint manifest has no lowercase SHA-256 checkpoint_hash");
-  const timeProfile = readJson(timeProfilePath, "Timing profile");
+  const timeProfile = validateStoredProfile(readJson(timeProfilePath, "Timing profile"));
   const identity = validateTimingProfile(timeProfile, checkpoint);
+  const timeProfileSha = sha256File(timeProfilePath);
   const tablebase = validateCompleteGame(
     readJson(completeGamePath, "Complete-game evidence"),
     identity,
     executableSha,
     scope,
+    timeProfile,
+    timeProfileSha,
   );
 
-  const timeProfileSha = sha256File(timeProfilePath);
   const completeGameSha = sha256File(completeGamePath);
   const evidenceRoot = path.join(path.dirname(output), "evidence");
   const evidenceDirectory = path.join(

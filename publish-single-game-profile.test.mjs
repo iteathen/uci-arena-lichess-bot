@@ -124,11 +124,33 @@ function fixture(searchCore = "v2") {
     ]) timeProfile.gates[gate] = true;
   }
   writeFileSync(timeProfilePath, JSON.stringify(timeProfile));
+  const timeProfileSha = sha256(readFileSync(timeProfilePath));
   writeFileSync(completeGamePath, JSON.stringify({
     schema: "uci_arena_complete_game_matrix_v3",
     completed: true,
-    config: { executable_sha256: { model_engine: engineSha.slice("sha256:".length) } },
+    config: {
+      executable_sha256: { model_engine: engineSha.slice("sha256:".length) },
+      timing_profile: {
+        profile_schema: timeProfile.schema,
+        profile_sha256: timeProfileSha,
+        identity_sha256: timeProfile.identity_sha256,
+      },
+    },
     runtime_contract: {
+      timing_profile: {
+        schema: "uci_arena_complete_game_time_profile_v1",
+        profile_schema: timeProfile.schema,
+        profile_sha256: timeProfileSha,
+        identity_sha256: timeProfile.identity_sha256,
+        accepted: true,
+        applied: true,
+        timing_authority_match: true,
+        provider_service_reserve_us: 2000,
+        backup_emit_reserve_us: 1000,
+        iteration_forecast_scale_permille: 1000,
+        predictive_controller_enabled: false,
+        engine_provenance: { exact: true },
+      },
       expected_parallel_topology: {
         search_core: searchCore,
         provider: "directml",
@@ -204,6 +226,28 @@ function fixture(searchCore = "v2") {
     probe_depth: 6,
     probe_timeout_ms: 240_000,
   };
+}
+
+function rebindCompleteGameTimingProfile(options, engineProvenanceExact = true) {
+  const timeProfile = JSON.parse(readFileSync(options.time_profile, "utf8"));
+  const timeProfileSha = sha256(readFileSync(options.time_profile));
+  const completeGame = JSON.parse(readFileSync(options.complete_game_evidence, "utf8"));
+  Object.assign(completeGame.config.timing_profile, {
+    profile_schema: timeProfile.schema,
+    profile_sha256: timeProfileSha,
+    identity_sha256: timeProfile.identity_sha256,
+  });
+  Object.assign(completeGame.runtime_contract.timing_profile, {
+    profile_schema: timeProfile.schema,
+    profile_sha256: timeProfileSha,
+    identity_sha256: timeProfile.identity_sha256,
+    provider_service_reserve_us: timeProfile.calibration.provider_batch_reserve_us,
+    backup_emit_reserve_us: timeProfile.calibration.backup_emit_reserve_us,
+    iteration_forecast_scale_permille:
+      timeProfile.calibration.iteration_forecast_scale_permille,
+    engine_provenance: { exact: engineProvenanceExact },
+  });
+  writeFileSync(options.complete_game_evidence, JSON.stringify(completeGame));
 }
 
 function attachTablebase(options) {
@@ -297,6 +341,20 @@ test("does not promote shared-resource evidence to release authority", () => {
   );
 });
 
+test("rejects complete-game evidence that omitted timing-profile application", () => {
+  const options = fixture("mcgs");
+  const completeGame = JSON.parse(readFileSync(options.complete_game_evidence, "utf8"));
+  delete completeGame.runtime_contract.timing_profile;
+  writeFileSync(options.complete_game_evidence, JSON.stringify(completeGame));
+  assert.throws(
+    () => publishSingleGameProfile({
+      ...options,
+      qualification_scope: "local_live_safety",
+    }),
+    /timing-profile application evidence is missing/,
+  );
+});
+
 test("publishes MCGS profile fields from search-core-specific evidence", () => {
   const options = fixture("mcgs");
   const result = publishSingleGameProfile({
@@ -318,6 +376,7 @@ test("retains timing authority across provenance-only engine rebuilds", () => {
   timeProfile.identity.engine.executable_sha256 = `sha256:${"f".repeat(64)}`;
   timeProfile.identity_sha256 = sha256Object(timeProfile.identity);
   writeFileSync(options.time_profile, JSON.stringify(timeProfile));
+  rebindCompleteGameTimingProfile(options, false);
 
   const result = publishSingleGameProfile({
     ...options,
