@@ -3,9 +3,11 @@
 import { createHash } from "node:crypto";
 import {
   copyFileSync,
+  existsSync,
   mkdirSync,
   readFileSync,
   renameSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
@@ -38,6 +40,11 @@ function requireValue(condition, message) {
 
 function same(value, expected, label) {
   requireValue(String(value) === String(expected), `${label} mismatch`);
+}
+
+function requireInteger(value, label, minimum = 0, maximum = Number.MAX_SAFE_INTEGER) {
+  requireValue(Number.isSafeInteger(value) && value >= minimum && value <= maximum,
+    `${label} must be an integer in ${minimum}..${maximum}`);
 }
 
 function parseArguments(argv) {
@@ -89,7 +96,8 @@ function validateDiagnostic(diagnostic, executableSha, checkpoint) {
     requireValue(diagnostic.gates?.[gate] === true, `Diagnostic gate ${gate} did not pass`);
   }
   const identity = diagnostic.identity;
-  requireValue(identity?.search?.search_core === "v2", "Diagnostic did not qualify SearchCore v2");
+  requireValue(new Set(["v2", "mcgs"]).has(identity?.search?.search_core),
+    "Diagnostic did not qualify a supported search core");
   requireValue(new Set(["directml", "cuda"]).has(identity.search.provider_effective),
     "Diagnostic did not retain a supported GPU provider");
   requireValue(identity.search.provider_requested === identity.search.provider_effective,
@@ -98,7 +106,59 @@ function validateDiagnostic(diagnostic, executableSha, checkpoint) {
     "Diagnostic must disable background search");
   same(identity.engine.executable_sha256, executableSha, "Diagnostic executable");
   same(identity.model.model_id, checkpoint.model_id, "Diagnostic model id");
+  if (identity.search.search_core === "mcgs") {
+    for (const gate of [
+      "mcgs_root_coverage_passed",
+      "mcgs_policy_only_fallback_passed",
+      "mcgs_graph_population_passed",
+      "mcgs_async_overlap_passed",
+      "mcgs_single_owner_passed",
+      "mcgs_low_budget_fallback_passed",
+      "mcgs_deterministic_fallback_passed",
+      "mcgs_completion_integrity_passed",
+      "mcgs_temporal_policy_passed",
+      "mcgs_deadline_tail_telemetry_passed",
+    ]) {
+      requireValue(diagnostic.gates?.[gate] === true,
+        `Diagnostic MCGS gate ${gate} did not pass`);
+    }
+    const mcgs = identity.search.mcgs;
+    requireValue(mcgs?.time_policy === "RelativeClockTemporalV1",
+      "Diagnostic MCGS temporal policy is not RelativeClockTemporalV1");
+    requireInteger(mcgs.search_graph_mb, "Diagnostic MCGS graph size", 64, 4_096);
+    requireInteger(mcgs.cpuct_permille, "Diagnostic MCGS Cpuct", 100, 10_000);
+    requireInteger(mcgs.outstanding_batches, "Diagnostic MCGS outstanding batches", 1, 4);
+    requireInteger(mcgs.book_prior_blend_permille,
+      "Diagnostic MCGS book-prior blend", 0, 500);
+  }
   return identity;
+}
+
+function validateMcgsCompleteGame(runtime) {
+  for (const [value, label] of [
+    [runtime.mcgs_graph_nodes, "graph nodes"],
+    [runtime.mcgs_graph_edges, "graph edges"],
+    [runtime.mcgs_completed_simulations, "completed simulations"],
+    [runtime.mcgs_async_admissions, "asynchronous admissions"],
+    [runtime.mcgs_outstanding_peak, "outstanding peak"],
+  ]) requireValue(Number(value) > 0, `Complete-game MCGS ${label} is not positive`);
+  requireValue(Number(runtime.mcgs_root_legal_moves) > 0
+    && runtime.mcgs_root_seeded_moves === runtime.mcgs_root_legal_moves,
+  "Complete-game MCGS legal-root coverage is incomplete");
+  requireValue(runtime.mcgs_stale_backups_discarded === 0,
+    "Complete-game MCGS stale backups were discarded");
+  requireValue(runtime.mcgs_reservation_leaks === 0,
+    "Complete-game MCGS reservations leaked");
+  const deadlineTail = [
+    runtime.mcgs_provider_admission_denials,
+    runtime.mcgs_cache_completions_after_admission_close,
+    runtime.mcgs_nonprovider_backups_after_admission_close,
+  ];
+  requireValue(deadlineTail.every((value) => Number.isSafeInteger(value) && value >= 0),
+    "Complete-game MCGS deadline-tail telemetry is missing");
+  requireValue(deadlineTail.every((value) => value === 0)
+    || runtime.mcgs_neural_admission_closed === true,
+  "Complete-game MCGS deadline-tail work lacks an admission-close observation");
 }
 
 function validateCompleteGame(completeGame, identity, executableSha, scope) {
@@ -143,12 +203,37 @@ function validateCompleteGame(completeGame, identity, executableSha, scope) {
   ]) same(actual, expected, `Complete-game ${label}`);
   for (const [value, label] of [
     [runtime.actual_active_workers, "active workers"],
-    [runtime.v2_cursor_admissions, "cursor admissions"],
-    [runtime.v2_cursor_async_pending, "cursor asynchronous pending"],
-    [runtime.v2_cursor_ready_resumes, "cursor ready resumes"],
     [runtime.provider_batches_delta, "provider batches"],
     [runtime.provider_rows_delta, "provider rows"],
   ]) requireValue(Number(value) > 0, `Complete-game ${label} is not positive`);
+  if (identity.search.search_core === "mcgs") {
+    const mcgs = identity.search.mcgs;
+    for (const [actual, expected, label] of [
+      [topology.search_graph_mb, mcgs.search_graph_mb, "MCGS graph size"],
+      [topology.mcgs_cpuct_permille, mcgs.cpuct_permille, "MCGS Cpuct"],
+      [topology.mcgs_outstanding_batches,
+        mcgs.outstanding_batches, "MCGS outstanding batches"],
+      [topology.mcgs_book_prior_blend_permille,
+        mcgs.book_prior_blend_permille, "MCGS book-prior blend"],
+      [runtime.search_graph_mb_configured, mcgs.search_graph_mb,
+        "runtime MCGS graph size"],
+      [runtime.mcgs_cpuct_permille_configured, mcgs.cpuct_permille,
+        "runtime MCGS Cpuct"],
+      [runtime.mcgs_outstanding_batches_configured, mcgs.outstanding_batches,
+        "runtime MCGS outstanding batches"],
+      [runtime.mcgs_book_prior_blend_permille_configured,
+        mcgs.book_prior_blend_permille, "runtime MCGS book-prior blend"],
+      [runtime.mcgs_time_policy_configured,
+        mcgs.time_policy, "runtime MCGS temporal policy"],
+    ]) same(actual, expected, `Complete-game ${label}`);
+    validateMcgsCompleteGame(runtime);
+  } else {
+    for (const [value, label] of [
+      [runtime.v2_cursor_admissions, "cursor admissions"],
+      [runtime.v2_cursor_async_pending, "cursor asynchronous pending"],
+      [runtime.v2_cursor_ready_resumes, "cursor ready resumes"],
+    ]) requireValue(Number(value) > 0, `Complete-game ${label} is not positive`);
+  }
   requireValue(runtime.stale_publications_delta === 0
     && runtime.bestmove_active_tickets === 0
     && runtime.bestmove_active_async_leases === 0,
@@ -176,21 +261,24 @@ export function publishSingleGameProfile(options) {
     scope,
   );
 
-  const evidenceDirectory = path.join(path.dirname(output), "evidence");
-  mkdirSync(evidenceDirectory, { recursive: true });
+  const diagnosticSha = sha256File(diagnosticPath);
+  const completeGameSha = sha256File(completeGamePath);
+  const evidenceRoot = path.join(path.dirname(output), "evidence");
+  const evidenceDirectory = path.join(
+    evidenceRoot,
+    `${diagnosticSha.slice("sha256:".length)}-${completeGameSha.slice("sha256:".length)}`,
+  );
   const diagnosticTarget = path.join(evidenceDirectory, "time-diagnostic.json");
   const completeGameTarget = path.join(evidenceDirectory, "complete-game.json");
-  copyFileSync(diagnosticPath, diagnosticTarget);
-  copyFileSync(completeGamePath, completeGameTarget);
   const diagnosticEvidence = {
     passed: true,
     artifact: path.relative(path.dirname(output), diagnosticTarget).replaceAll("\\", "/"),
-    artifact_sha256: sha256File(diagnosticTarget),
+    artifact_sha256: diagnosticSha,
   };
   const completeGameEvidence = {
     passed: true,
     artifact: path.relative(path.dirname(output), completeGameTarget).replaceAll("\\", "/"),
-    artifact_sha256: sha256File(completeGameTarget),
+    artifact_sha256: completeGameSha,
   };
   const profile = {
     schema: "uci_arena_single_game_profile_v1",
@@ -225,12 +313,56 @@ export function publishSingleGameProfile(options) {
       complete_game: completeGameEvidence,
     },
   };
+  if (identity.search.search_core === "mcgs") {
+    Object.assign(profile, {
+      search_graph_mb: identity.search.mcgs.search_graph_mb,
+      mcgs_cpuct_permille: identity.search.mcgs.cpuct_permille,
+      mcgs_outstanding_batches: identity.search.mcgs.outstanding_batches,
+      mcgs_book_prior_blend_permille:
+        identity.search.mcgs.book_prior_blend_permille,
+    });
+  }
   requireValue(profile.qualification_probe.depth >= profile.split_depth,
     "Qualification probe depth must be at least split depth");
   mkdirSync(path.dirname(output), { recursive: true });
+  mkdirSync(evidenceRoot, { recursive: true });
+  let createdEvidence = false;
+  if (existsSync(evidenceDirectory)) {
+    requireValue(existsSync(diagnosticTarget) && sha256File(diagnosticTarget) === diagnosticSha,
+      "Existing immutable diagnostic evidence does not match its digest path");
+    requireValue(existsSync(completeGameTarget)
+      && sha256File(completeGameTarget) === completeGameSha,
+    "Existing immutable complete-game evidence does not match its digest path");
+  } else {
+    const temporaryEvidence = `${evidenceDirectory}.tmp-${process.pid}`;
+    rmSync(temporaryEvidence, { recursive: true, force: true });
+    try {
+      mkdirSync(temporaryEvidence);
+      copyFileSync(diagnosticPath, path.join(temporaryEvidence, "time-diagnostic.json"));
+      copyFileSync(completeGamePath, path.join(temporaryEvidence, "complete-game.json"));
+      requireValue(
+        sha256File(path.join(temporaryEvidence, "time-diagnostic.json")) === diagnosticSha,
+        "Staged diagnostic evidence digest mismatch",
+      );
+      requireValue(
+        sha256File(path.join(temporaryEvidence, "complete-game.json")) === completeGameSha,
+        "Staged complete-game evidence digest mismatch",
+      );
+      renameSync(temporaryEvidence, evidenceDirectory);
+      createdEvidence = true;
+    } finally {
+      rmSync(temporaryEvidence, { recursive: true, force: true });
+    }
+  }
   const temporary = `${output}.tmp-${process.pid}`;
-  writeFileSync(temporary, `${JSON.stringify(profile, null, 2)}\n`, "utf8");
-  renameSync(temporary, output);
+  try {
+    writeFileSync(temporary, `${JSON.stringify(profile, null, 2)}\n`, "utf8");
+    renameSync(temporary, output);
+  } catch (error) {
+    rmSync(temporary, { force: true });
+    if (createdEvidence) rmSync(evidenceDirectory, { recursive: true, force: true });
+    throw error;
+  }
   return { ...profile, profile_path: output };
 }
 

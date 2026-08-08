@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
+  existsSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -17,7 +18,7 @@ function sha256(value) {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
 }
 
-function fixture() {
+function fixture(searchCore = "v2") {
   const root = mkdtempSync(path.join(os.tmpdir(), "uci-single-game-profile-"));
   const engine = path.join(root, "uci_arena_engine.exe");
   const modelRoot = path.join(root, "models", "default");
@@ -44,9 +45,9 @@ function fixture() {
       onnx_runtime_version: "1.2.3",
     },
     search: {
-      search_core: "v2",
-      threads: 6,
-      root_workers: 6,
+      search_core: searchCore,
+      threads: searchCore === "mcgs" ? 3 : 6,
+      root_workers: searchCore === "mcgs" ? 1 : 6,
       split_depth: 2,
       batch_size_configured: 64,
       batch_size_effective: 64,
@@ -58,6 +59,15 @@ function fixture() {
       nn_speculation: false,
     },
   };
+  if (searchCore === "mcgs") {
+    identity.search.mcgs = {
+      time_policy: "RelativeClockTemporalV1",
+      search_graph_mb: 64,
+      cpuct_permille: 1500,
+      outstanding_batches: 2,
+      book_prior_blend_permille: 0,
+    };
+  }
   writeFileSync(diagnosticPath, JSON.stringify({
     schema: "uci_time_profile_attempt_v3",
     phase: "diagnostic",
@@ -72,18 +82,40 @@ function fixture() {
       passed: true,
     },
   }));
+  if (searchCore === "mcgs") {
+    const diagnostic = JSON.parse(readFileSync(diagnosticPath, "utf8"));
+    for (const gate of [
+      "mcgs_root_coverage_passed",
+      "mcgs_policy_only_fallback_passed",
+      "mcgs_graph_population_passed",
+      "mcgs_async_overlap_passed",
+      "mcgs_single_owner_passed",
+      "mcgs_low_budget_fallback_passed",
+      "mcgs_deterministic_fallback_passed",
+      "mcgs_completion_integrity_passed",
+      "mcgs_temporal_policy_passed",
+      "mcgs_deadline_tail_telemetry_passed",
+    ]) diagnostic.gates[gate] = true;
+    writeFileSync(diagnosticPath, JSON.stringify(diagnostic));
+  }
   writeFileSync(completeGamePath, JSON.stringify({
     schema: "uci_arena_complete_game_matrix_v3",
     completed: true,
     config: { executable_sha256: { model_engine: engineSha.slice("sha256:".length) } },
     runtime_contract: {
       expected_parallel_topology: {
-        search_core: "v2",
+        search_core: searchCore,
         provider: "directml",
-        threads: 6,
-        root_workers: 6,
+        threads: searchCore === "mcgs" ? 3 : 6,
+        root_workers: searchCore === "mcgs" ? 1 : 6,
         split_depth: 2,
         batch_size: 64,
+        ...(searchCore === "mcgs" ? {
+          search_graph_mb: 64,
+          mcgs_cpuct_permille: 1500,
+          mcgs_outstanding_batches: 2,
+          mcgs_book_prior_blend_permille: 0,
+        } : {}),
       },
       activation_probe: {
         runtime: {
@@ -94,10 +126,31 @@ function fixture() {
           provider_numeric_fingerprint: "456",
           hardware_driver_fingerprint: "789",
           onnx_runtime_version: "1.2.3",
-          actual_active_workers: 6,
-          v2_cursor_admissions: 4,
-          v2_cursor_async_pending: 2,
-          v2_cursor_ready_resumes: 2,
+          actual_active_workers: searchCore === "mcgs" ? 3 : 6,
+          ...(searchCore === "mcgs" ? {
+            search_graph_mb_configured: 64,
+            mcgs_cpuct_permille_configured: 1500,
+            mcgs_outstanding_batches_configured: 2,
+            mcgs_book_prior_blend_permille_configured: 0,
+            mcgs_time_policy_configured: "RelativeClockTemporalV1",
+            mcgs_graph_nodes: 64,
+            mcgs_graph_edges: 128,
+            mcgs_completed_simulations: 96,
+            mcgs_async_admissions: 32,
+            mcgs_outstanding_peak: 2,
+            mcgs_root_legal_moves: 20,
+            mcgs_root_seeded_moves: 20,
+            mcgs_stale_backups_discarded: 0,
+            mcgs_reservation_leaks: 0,
+            mcgs_provider_admission_denials: 0,
+            mcgs_cache_completions_after_admission_close: 0,
+            mcgs_nonprovider_backups_after_admission_close: 0,
+            mcgs_neural_admission_closed: false,
+          } : {
+            v2_cursor_admissions: 4,
+            v2_cursor_async_pending: 2,
+            v2_cursor_ready_resumes: 2,
+          }),
           provider_batches_delta: 3,
           provider_rows_delta: 8,
           stale_publications_delta: 0,
@@ -138,9 +191,16 @@ test("publishes a self-contained exact local-live-safety profile", () => {
   assert.equal(result.qualification_scope, "local_live_safety");
   const loaded = loadSingleGameProfile(options.output);
   assert.equal(loaded.model_id, "model-a");
+  const completeGameArtifact = JSON.parse(
+    readFileSync(options.output, "utf8"),
+  ).evidence.complete_game.artifact;
+  assert.match(
+    completeGameArtifact,
+    /^evidence\/[0-9a-f]{64}-[0-9a-f]{64}\/complete-game\.json$/,
+  );
   assert.equal(
-    JSON.parse(readFileSync(options.output, "utf8")).evidence.complete_game.artifact,
-    "evidence/complete-game.json",
+    existsSync(path.resolve(path.dirname(options.output), completeGameArtifact)),
+    true,
   );
 });
 
@@ -153,4 +213,54 @@ test("does not promote shared-resource evidence to release authority", () => {
     }),
     /resource-isolated/,
   );
+});
+
+test("publishes MCGS profile fields from search-core-specific evidence", () => {
+  const options = fixture("mcgs");
+  const result = publishSingleGameProfile({
+    ...options,
+    qualification_scope: "local_live_safety",
+  });
+  assert.equal(result.search_core, "mcgs");
+  assert.equal(result.threads, 3);
+  assert.equal(result.search_graph_mb, 64);
+  assert.equal(result.mcgs_cpuct_permille, 1500);
+  assert.equal(result.mcgs_outstanding_batches, 2);
+  assert.equal(result.mcgs_book_prior_blend_permille, 0);
+  assert.equal(loadSingleGameProfile(options.output).search_core, "mcgs");
+});
+
+test("rejects V2 cursor evidence presented as MCGS authority", () => {
+  const options = fixture("mcgs");
+  const completeGame = JSON.parse(readFileSync(options.complete_game_evidence, "utf8"));
+  delete completeGame.runtime_contract.activation_probe.runtime.mcgs_async_admissions;
+  Object.assign(completeGame.runtime_contract.activation_probe.runtime, {
+    v2_cursor_admissions: 4,
+    v2_cursor_async_pending: 2,
+    v2_cursor_ready_resumes: 2,
+  });
+  writeFileSync(options.complete_game_evidence, JSON.stringify(completeGame));
+  assert.throws(
+    () => publishSingleGameProfile({
+      ...options,
+      qualification_scope: "local_live_safety",
+    }),
+    /MCGS asynchronous admissions/,
+  );
+});
+
+test("rejected publication preserves the prior profile and creates no evidence", () => {
+  const options = fixture("mcgs");
+  mkdirSync(path.dirname(options.output), { recursive: true });
+  writeFileSync(options.output, "prior-authoritative-profile\n");
+  assert.throws(
+    () => publishSingleGameProfile({
+      ...options,
+      probe_depth: 1,
+      qualification_scope: "local_live_safety",
+    }),
+    /probe depth/,
+  );
+  assert.equal(readFileSync(options.output, "utf8"), "prior-authoritative-profile\n");
+  assert.equal(existsSync(path.join(path.dirname(options.output), "evidence")), false);
 });

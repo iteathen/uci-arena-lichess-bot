@@ -122,6 +122,17 @@ capacity_profile:
     use a profile qualified at a greater capacity with identical bindings.
   failure: "Missing, stale, mismatched, or undersized capacity evidence blocks live run before credentials are read."
 
+single_game_profile_publication:
+  schema: uci_arena_single_game_profile_v1
+  owner: lichess_provider_profile_publisher
+  rules:
+    - "The stable evidence field names are compatibility keys; validation and publication select search-core-specific semantics from the diagnostic identity."
+    - "MCGS publication requires the timing diagnostic's complete MCGS graph-population, legal-root-coverage, asynchronous-overlap, single-owner, fallback, reservation-integrity, temporal-policy, and deadline-tail gates. V2 cursor counters cannot satisfy any MCGS gate."
+    - "The complete-game artifact must bind the same executable, model, provider, topology, and search-core-specific runtime fields. MCGS requires positive graph, simulation, asynchronous-admission, and overlap evidence, complete legal-root seeding, and zero stale backups, leaked reservations, active tickets, or active asynchronous leases."
+    - "MCGS graph size, Cpuct, outstanding-batch limit, and book-prior blend are copied from qualified identity rather than supplied independently by the operator."
+    - "Publication validates every input before replacing the profile and copies immutable evidence beside it; a rejected attempt leaves the prior authoritative profile unchanged."
+    - "V2 profiles remain parseable historical evidence but cannot pass the live adapter's MCGS startup gate."
+
 engine_adapters:
   selection: explicit_configuration
   standard_uci_v1:
