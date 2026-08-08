@@ -153,6 +153,23 @@ credential data, logs, SQLite rows, or engine command lines.
 
 ## Qualification and execution
 
+Publish a single-game profile only from the exact qualified timing profile and
+matching complete-game artifact. Intermediate diagnostic attempts are retained
+for investigation but are not deployment authority:
+
+```powershell
+node .\publish-single-game-profile.mjs `
+  --engine C:\Program Files\UCI Arena\components\engine\bin\uci_arena_engine.exe `
+  --model-root C:\Program Files\UCI Arena\components\engine\models\latticeknight `
+  --time-profile C:\ProgramData\UCI Arena\profiles\uci_time_profile_v3.json `
+  --complete-game-evidence C:\ProgramData\UCI Arena\evidence\complete-game.json `
+  --output C:\ProgramData\UCI Arena\profiles\single-game.json
+```
+
+The timing profile must contain at least thirty repetitions per declared case;
+the publisher copies both immutable inputs beside the generated profile and
+never replaces prior authority when validation fails.
+
 Validate the exact engine package before using credentials:
 
 ```powershell

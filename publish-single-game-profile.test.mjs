@@ -11,6 +11,11 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import {
+  sha256Object,
+  TIME_POLICY_VERSION,
+} from "@uci-arena/time-profile-contract";
+
 import { loadSingleGameProfile } from "./lichess-adapter.mjs";
 import { publishSingleGameProfile } from "./publish-single-game-profile.mjs";
 
@@ -23,7 +28,7 @@ function fixture(searchCore = "v2") {
   const engine = path.join(root, "uci_arena_engine.exe");
   const modelRoot = path.join(root, "models", "default");
   const output = path.join(root, "qualification", "profile.json");
-  const diagnosticPath = path.join(root, "diagnostic.json");
+  const timeProfilePath = path.join(root, "time-profile.json");
   const completeGamePath = path.join(root, "complete-game.json");
   mkdirSync(modelRoot, { recursive: true });
   writeFileSync(engine, "exact-engine");
@@ -33,6 +38,7 @@ function fixture(searchCore = "v2") {
   }));
   const engineSha = sha256("exact-engine");
   const identity = {
+    time_policy_version: TIME_POLICY_VERSION,
     engine: { executable_sha256: engineSha },
     model: {
       model_id: "model-a",
@@ -68,22 +74,42 @@ function fixture(searchCore = "v2") {
       book_prior_blend_permille: 0,
     };
   }
-  writeFileSync(diagnosticPath, JSON.stringify({
-    schema: "uci_time_profile_attempt_v3",
-    phase: "diagnostic",
-    outcome: "accepted_for_calibration",
+  const timeProfile = {
+    schema: "uci_time_profile_v3",
+    qualified: true,
     identity,
+    identity_sha256: sha256Object(identity),
+    qualification: { repetitions_per_case: 30 },
+    applicability: {
+      move_overhead_ms: {
+        minimum: 250,
+        maximum: 1500,
+        tested_values: [250, 650, 700, 1500],
+      },
+    },
+    predictive_controller: {
+      default_enabled: false,
+      enabled_by_profile: false,
+    },
+    calibration: {
+      provider_batch_reserve_us: 2000,
+      backup_emit_reserve_us: 1000,
+      iteration_forecast_scale_permille: 1000,
+    },
     gates: {
       legal_moves: true,
-      provider_activity_positive: true,
-      provider_safety_passed: true,
+      nonterminal_null_moves: true,
+      controller_disabled: true,
+      provider_timing_captured: true,
+      provider_service_reserve_valid: true,
+      applied_provider_service_reserve_covered: true,
+      applied_backup_emit_reserve_covered: true,
       p99_deadline_overshoot_passed: true,
       maximum_deadline_overshoot_passed: true,
       passed: true,
     },
-  }));
+  };
   if (searchCore === "mcgs") {
-    const diagnostic = JSON.parse(readFileSync(diagnosticPath, "utf8"));
     for (const gate of [
       "mcgs_root_coverage_passed",
       "mcgs_policy_only_fallback_passed",
@@ -95,9 +121,9 @@ function fixture(searchCore = "v2") {
       "mcgs_completion_integrity_passed",
       "mcgs_temporal_policy_passed",
       "mcgs_deadline_tail_telemetry_passed",
-    ]) diagnostic.gates[gate] = true;
-    writeFileSync(diagnosticPath, JSON.stringify(diagnostic));
+    ]) timeProfile.gates[gate] = true;
   }
+  writeFileSync(timeProfilePath, JSON.stringify(timeProfile));
   writeFileSync(completeGamePath, JSON.stringify({
     schema: "uci_arena_complete_game_matrix_v3",
     completed: true,
@@ -172,7 +198,7 @@ function fixture(searchCore = "v2") {
   return {
     engine,
     model_root: modelRoot,
-    diagnostic_evidence: diagnosticPath,
+    time_profile: timeProfilePath,
     complete_game_evidence: completeGamePath,
     output,
     probe_depth: 6,
@@ -332,6 +358,44 @@ test("rejects V2 cursor evidence presented as MCGS authority", () => {
     }),
     /MCGS asynchronous admissions/,
   );
+});
+
+test("rejects an intermediate timing attempt without replacing prior authority", () => {
+  const options = fixture("mcgs");
+  mkdirSync(path.dirname(options.output), { recursive: true });
+  writeFileSync(options.output, "prior-authoritative-profile\n");
+  writeFileSync(options.time_profile, JSON.stringify({
+    schema: "uci_time_profile_attempt_v3",
+    phase: "diagnostic",
+    outcome: "accepted_for_calibration",
+  }));
+  assert.throws(
+    () => publishSingleGameProfile({
+      ...options,
+      qualification_scope: "local_live_safety",
+    }),
+    /profile schema|uci_time_profile_v3/i,
+  );
+  assert.equal(readFileSync(options.output, "utf8"), "prior-authoritative-profile\n");
+  assert.equal(existsSync(path.join(path.dirname(options.output), "evidence")), false);
+});
+
+test("rejects a smoke-sized timing profile without replacing prior authority", () => {
+  const options = fixture("mcgs");
+  mkdirSync(path.dirname(options.output), { recursive: true });
+  writeFileSync(options.output, "prior-authoritative-profile\n");
+  const timeProfile = JSON.parse(readFileSync(options.time_profile, "utf8"));
+  timeProfile.qualification.repetitions_per_case = 2;
+  writeFileSync(options.time_profile, JSON.stringify(timeProfile));
+  assert.throws(
+    () => publishSingleGameProfile({
+      ...options,
+      qualification_scope: "local_live_safety",
+    }),
+    /repetitions per case/,
+  );
+  assert.equal(readFileSync(options.output, "utf8"), "prior-authoritative-profile\n");
+  assert.equal(existsSync(path.join(path.dirname(options.output), "evidence")), false);
 });
 
 test("rejected publication preserves the prior profile and creates no evidence", () => {

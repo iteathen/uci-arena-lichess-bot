@@ -14,6 +14,11 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
+import {
+  PROFILE_SCHEMA,
+  validateStoredProfile,
+} from "@uci-arena/time-profile-contract";
+
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const LOCAL_SCOPE = "local_live_safety";
 const RELEASE_SCOPE = "release";
@@ -60,7 +65,7 @@ function parseArguments(argv) {
   for (const name of [
     "engine",
     "model_root",
-    "diagnostic_evidence",
+    "time_profile",
     "complete_game_evidence",
     "output",
   ]) {
@@ -79,33 +84,41 @@ function parseArguments(argv) {
   return { ...options, qualification_scope: scope, probe_depth: depth, probe_timeout_ms: timeoutMs };
 }
 
-function validateDiagnostic(diagnostic, executableSha, checkpoint) {
-  requireValue(diagnostic.schema === "uci_time_profile_attempt_v3",
-    "Diagnostic evidence schema is not uci_time_profile_attempt_v3");
-  requireValue(diagnostic.phase === "diagnostic"
-    && diagnostic.outcome === "accepted_for_calibration",
-  "Diagnostic evidence was not accepted for calibration");
+function validateTimingProfile(input, executableSha, checkpoint) {
+  const profile = validateStoredProfile(input);
+  requireValue(profile.schema === PROFILE_SCHEMA,
+    "Timing evidence schema is not uci_time_profile_v3");
+  requireInteger(
+    profile.qualification?.repetitions_per_case,
+    "Timing-profile repetitions per case",
+    30,
+    100,
+  );
   for (const gate of [
     "legal_moves",
-    "provider_activity_positive",
-    "provider_safety_passed",
+    "nonterminal_null_moves",
+    "controller_disabled",
+    "provider_timing_captured",
+    "provider_service_reserve_valid",
+    "applied_provider_service_reserve_covered",
+    "applied_backup_emit_reserve_covered",
     "p99_deadline_overshoot_passed",
     "maximum_deadline_overshoot_passed",
     "passed",
   ]) {
-    requireValue(diagnostic.gates?.[gate] === true, `Diagnostic gate ${gate} did not pass`);
+    requireValue(profile.gates?.[gate] === true, `Timing-profile gate ${gate} did not pass`);
   }
-  const identity = diagnostic.identity;
+  const identity = profile.identity;
   requireValue(new Set(["v2", "mcgs"]).has(identity?.search?.search_core),
-    "Diagnostic did not qualify a supported search core");
+    "Timing profile did not qualify a supported search core");
   requireValue(new Set(["directml", "cuda"]).has(identity.search.provider_effective),
-    "Diagnostic did not retain a supported GPU provider");
+    "Timing profile did not retain a supported GPU provider");
   requireValue(identity.search.provider_requested === identity.search.provider_effective,
-    "Diagnostic provider request/effective identity differs");
+    "Timing-profile provider request/effective identity differs");
   requireValue(identity.search.background_search === false,
-    "Diagnostic must disable background search");
-  same(identity.engine.executable_sha256, executableSha, "Diagnostic executable");
-  same(identity.model.model_id, checkpoint.model_id, "Diagnostic model id");
+    "Timing profile must disable background search");
+  same(identity.engine.executable_sha256, executableSha, "Timing-profile executable");
+  same(identity.model.model_id, checkpoint.model_id, "Timing-profile model id");
   if (identity.search.search_core === "mcgs") {
     for (const gate of [
       "mcgs_root_coverage_passed",
@@ -119,17 +132,17 @@ function validateDiagnostic(diagnostic, executableSha, checkpoint) {
       "mcgs_temporal_policy_passed",
       "mcgs_deadline_tail_telemetry_passed",
     ]) {
-      requireValue(diagnostic.gates?.[gate] === true,
-        `Diagnostic MCGS gate ${gate} did not pass`);
+      requireValue(profile.gates?.[gate] === true,
+        `Timing-profile MCGS gate ${gate} did not pass`);
     }
     const mcgs = identity.search.mcgs;
     requireValue(mcgs?.time_policy === "RelativeClockTemporalV1",
-      "Diagnostic MCGS temporal policy is not RelativeClockTemporalV1");
-    requireInteger(mcgs.search_graph_mb, "Diagnostic MCGS graph size", 64, 4_096);
-    requireInteger(mcgs.cpuct_permille, "Diagnostic MCGS Cpuct", 100, 10_000);
-    requireInteger(mcgs.outstanding_batches, "Diagnostic MCGS outstanding batches", 1, 4);
+      "Timing-profile MCGS temporal policy is not RelativeClockTemporalV1");
+    requireInteger(mcgs.search_graph_mb, "Timing-profile MCGS graph size", 64, 4_096);
+    requireInteger(mcgs.cpuct_permille, "Timing-profile MCGS Cpuct", 100, 10_000);
+    requireInteger(mcgs.outstanding_batches, "Timing-profile MCGS outstanding batches", 1, 4);
     requireInteger(mcgs.book_prior_blend_permille,
-      "Diagnostic MCGS book-prior blend", 0, 500);
+      "Timing-profile MCGS book-prior blend", 0, 500);
   }
   return identity;
 }
@@ -297,7 +310,7 @@ function validateCompleteGame(completeGame, identity, executableSha, scope) {
 export function publishSingleGameProfile(options) {
   const engine = path.resolve(options.engine);
   const modelRoot = path.resolve(options.model_root);
-  const diagnosticPath = path.resolve(options.diagnostic_evidence);
+  const timeProfilePath = path.resolve(options.time_profile);
   const completeGamePath = path.resolve(options.complete_game_evidence);
   const output = path.resolve(options.output);
   const scope = options.qualification_scope ?? LOCAL_SCOPE;
@@ -306,8 +319,8 @@ export function publishSingleGameProfile(options) {
     "Checkpoint manifest");
   requireValue(/^[0-9a-f]{64}$/.test(checkpoint.checkpoint_hash ?? ""),
     "Checkpoint manifest has no lowercase SHA-256 checkpoint_hash");
-  const diagnostic = readJson(diagnosticPath, "Diagnostic evidence");
-  const identity = validateDiagnostic(diagnostic, executableSha, checkpoint);
+  const timeProfile = readJson(timeProfilePath, "Timing profile");
+  const identity = validateTimingProfile(timeProfile, executableSha, checkpoint);
   const tablebase = validateCompleteGame(
     readJson(completeGamePath, "Complete-game evidence"),
     identity,
@@ -315,19 +328,19 @@ export function publishSingleGameProfile(options) {
     scope,
   );
 
-  const diagnosticSha = sha256File(diagnosticPath);
+  const timeProfileSha = sha256File(timeProfilePath);
   const completeGameSha = sha256File(completeGamePath);
   const evidenceRoot = path.join(path.dirname(output), "evidence");
   const evidenceDirectory = path.join(
     evidenceRoot,
-    `${diagnosticSha.slice("sha256:".length)}-${completeGameSha.slice("sha256:".length)}`,
+    `${timeProfileSha.slice("sha256:".length)}-${completeGameSha.slice("sha256:".length)}`,
   );
-  const diagnosticTarget = path.join(evidenceDirectory, "time-diagnostic.json");
+  const timeProfileTarget = path.join(evidenceDirectory, "time-profile.json");
   const completeGameTarget = path.join(evidenceDirectory, "complete-game.json");
-  const diagnosticEvidence = {
+  const timingProfileEvidence = {
     passed: true,
-    artifact: path.relative(path.dirname(output), diagnosticTarget).replaceAll("\\", "/"),
-    artifact_sha256: diagnosticSha,
+    artifact: path.relative(path.dirname(output), timeProfileTarget).replaceAll("\\", "/"),
+    artifact_sha256: timeProfileSha,
   };
   const completeGameEvidence = {
     passed: true,
@@ -361,8 +374,8 @@ export function publishSingleGameProfile(options) {
     },
     evidence: {
       cursor_correctness: completeGameEvidence,
-      provider_parity: diagnosticEvidence,
-      deadline: diagnosticEvidence,
+      provider_parity: timingProfileEvidence,
+      deadline: timingProfileEvidence,
       topology: completeGameEvidence,
       complete_game: completeGameEvidence,
     },
@@ -383,8 +396,8 @@ export function publishSingleGameProfile(options) {
   mkdirSync(evidenceRoot, { recursive: true });
   let createdEvidence = false;
   if (existsSync(evidenceDirectory)) {
-    requireValue(existsSync(diagnosticTarget) && sha256File(diagnosticTarget) === diagnosticSha,
-      "Existing immutable diagnostic evidence does not match its digest path");
+    requireValue(existsSync(timeProfileTarget) && sha256File(timeProfileTarget) === timeProfileSha,
+      "Existing immutable timing-profile evidence does not match its digest path");
     requireValue(existsSync(completeGameTarget)
       && sha256File(completeGameTarget) === completeGameSha,
     "Existing immutable complete-game evidence does not match its digest path");
@@ -393,11 +406,11 @@ export function publishSingleGameProfile(options) {
     rmSync(temporaryEvidence, { recursive: true, force: true });
     try {
       mkdirSync(temporaryEvidence);
-      copyFileSync(diagnosticPath, path.join(temporaryEvidence, "time-diagnostic.json"));
+      copyFileSync(timeProfilePath, path.join(temporaryEvidence, "time-profile.json"));
       copyFileSync(completeGamePath, path.join(temporaryEvidence, "complete-game.json"));
       requireValue(
-        sha256File(path.join(temporaryEvidence, "time-diagnostic.json")) === diagnosticSha,
-        "Staged diagnostic evidence digest mismatch",
+        sha256File(path.join(temporaryEvidence, "time-profile.json")) === timeProfileSha,
+        "Staged timing-profile evidence digest mismatch",
       );
       requireValue(
         sha256File(path.join(temporaryEvidence, "complete-game.json")) === completeGameSha,
