@@ -30,6 +30,38 @@ export function sha256Object(value) {
   return sha256Bytes(Buffer.from(canonicalJson(value), "utf8"));
 }
 
+export function searchContractFingerprint(identity) {
+  if (typeof identity?.time_policy_version !== "string"
+      || identity.time_policy_version.length === 0
+      || identity?.search === null
+      || typeof identity?.search !== "object"
+      || Array.isArray(identity.search)) {
+    throw new Error("timing profile search contract is incomplete");
+  }
+  return sha256Object({
+    timing_contract_version: identity.time_policy_version,
+    search: identity.search,
+  });
+}
+
+export function timingAuthorityIdentity(identity) {
+  const derivedSearchContract = searchContractFingerprint(identity);
+  if (identity.search_contract_fingerprint !== undefined
+      && identity.search_contract_fingerprint !== derivedSearchContract) {
+    throw new Error(
+      `timing profile search contract fingerprint mismatch: expected ${derivedSearchContract}`
+      + ` got ${identity.search_contract_fingerprint}`,
+    );
+  }
+  return {
+    time_policy_version: identity.time_policy_version,
+    search_contract_fingerprint: derivedSearchContract,
+    model: identity.model,
+    provider: identity.provider,
+    search: identity.search,
+  };
+}
+
 export function validateStoredProfile(profile) {
   if (![PROFILE_SCHEMA, PREVIOUS_PROFILE_SCHEMA, LEGACY_PROFILE_SCHEMA]
     .includes(profile?.schema)) {
@@ -71,6 +103,7 @@ export function validateStoredProfile(profile) {
           !== REQUIRED_MCGS_TIME_POLICY) {
       throw new Error("timing profile does not bind RelativeClockTemporalV1");
     }
+    timingAuthorityIdentity(profile.identity);
     const overhead = profile.applicability?.move_overhead_ms;
     if (overhead?.minimum !== 250
         || overhead?.maximum !== 1500
@@ -171,6 +204,12 @@ export function validateRuntimeIdentity(status, options, label = "runtime_status
   }
   if (typeof status.provider_effective !== "string" || status.provider_effective.length === 0) {
     throw new Error(`${label}: provider_effective is empty`);
+  }
+  if (status.timing_contract_version !== TIME_POLICY_VERSION) {
+    throw new Error(
+      `${label}.timing_contract_version expected ${TIME_POLICY_VERSION}`
+      + ` got ${JSON.stringify(status.timing_contract_version)}`,
+    );
   }
   const expectedProfileReserveUs = options.appliedTimeProfileReserveUs ?? 0;
   if (status.time_profile_provider_reserve_us !== expectedProfileReserveUs) {
@@ -296,8 +335,13 @@ export function buildProfileIdentity(status, engine, commandIdentity, options) {
     uci_identity_lines: uciIdentityLines,
     uci_option_contract_sha256: sha256Object(optionContract),
   };
+  const search = materialSearchConfiguration(status, options);
   return {
     time_policy_version: TIME_POLICY_VERSION,
+    search_contract_fingerprint: searchContractFingerprint({
+      time_policy_version: status.timing_contract_version,
+      search,
+    }),
     engine: {
       ...buildEvidence,
       engine_build_fingerprint: sha256Object(buildEvidence),
@@ -312,7 +356,7 @@ export function buildProfileIdentity(status, engine, commandIdentity, options) {
       hardware_driver_fingerprint: status.hardware_driver_fingerprint,
       onnx_runtime_version: status.onnx_runtime_version,
     },
-    search: materialSearchConfiguration(status, options),
+    search,
   };
 }
 
@@ -348,30 +392,30 @@ export function assertMatchingIdentity(expected, actual, label = "timing profile
   }
 }
 
-function reconcileRelocatedUciDefaults(expected, actual) {
-  const expectedEngine = expected?.engine;
-  const actualEngine = actual?.engine;
-  if (!expectedEngine || !actualEngine
-      || expectedEngine.executable_sha256 !== actualEngine.executable_sha256
-      || firstDifference(
-        expectedEngine.argument_fingerprints,
-        actualEngine.argument_fingerprints,
-        "identity.engine.argument_fingerprints",
-      )
-      || firstDifference(
-        expectedEngine.uci_identity_lines,
-        actualEngine.uci_identity_lines,
-        "identity.engine.uci_identity_lines",
-      )) {
-    return actual;
-  }
+function engineProvenanceComparison(expected, actual) {
+  const executableMatch = expected?.executable_sha256 === actual?.executable_sha256;
+  const argumentsMatch = !firstDifference(
+    expected?.argument_fingerprints,
+    actual?.argument_fingerprints,
+    "provenance.argument_fingerprints",
+  );
+  const identityLinesMatch = !firstDifference(
+    expected?.uci_identity_lines,
+    actual?.uci_identity_lines,
+    "provenance.uci_identity_lines",
+  );
+  const optionContractMatch =
+    expected?.uci_option_contract_sha256 === actual?.uci_option_contract_sha256;
   return {
-    ...actual,
-    engine: {
-      ...actualEngine,
-      uci_option_contract_sha256: expectedEngine.uci_option_contract_sha256,
-      engine_build_fingerprint: expectedEngine.engine_build_fingerprint,
-    },
+    exact: executableMatch && argumentsMatch && identityLinesMatch && optionContractMatch,
+    executable_match: executableMatch,
+    arguments_match: argumentsMatch,
+    uci_identity_lines_match: identityLinesMatch,
+    uci_option_contract_match: optionContractMatch,
+    qualified_executable_sha256: expected?.executable_sha256 ?? null,
+    current_executable_sha256: actual?.executable_sha256 ?? null,
+    qualified_engine_build_fingerprint: expected?.engine_build_fingerprint ?? null,
+    current_engine_build_fingerprint: actual?.engine_build_fingerprint ?? null,
   };
 }
 
@@ -412,7 +456,7 @@ export function validateAppliedTimeProfileReserve(profileValue, status) {
     backup_emit_reserve_us: expectedBackupEmitReserveUs,
     iteration_forecast_scale_permille: expectedForecastScalePermille,
     predictive_controller_enabled: false,
-    reason: "exact_runtime_identity_match_and_provider_reserve_applied",
+    reason: "exact_timing_authority_match_and_provider_reserve_applied",
   };
 }
 
@@ -475,16 +519,24 @@ export function validateProfileRuntimeSnapshot({
       );
     }
   }
-  const currentIdentity = reconcileRelocatedUciDefaults(
-    profile.identity,
-    buildProfileIdentity(
-      status,
-      { idLines: uciIdLines, optionLines: uciOptionLines },
-      engineCommandIdentity(options),
-      options,
-    ),
+  const currentIdentity = buildProfileIdentity(
+    status,
+    { idLines: uciIdLines, optionLines: uciOptionLines },
+    engineCommandIdentity(options),
+    options,
   );
-  assertMatchingIdentity(profile.identity, currentIdentity);
+  const provenance = engineProvenanceComparison(profile.identity.engine, currentIdentity.engine);
+  if (profile.schema === PROFILE_SCHEMA) {
+    assertMatchingIdentity(
+      timingAuthorityIdentity(profile.identity),
+      timingAuthorityIdentity(currentIdentity),
+      "timing profile authority",
+    );
+  } else {
+    const legacyCurrentIdentity = { ...currentIdentity };
+    delete legacyCurrentIdentity.search_contract_fingerprint;
+    assertMatchingIdentity(profile.identity, legacyCurrentIdentity);
+  }
   return {
     schema: "uci_time_profile_runtime_status_v1",
     status: "accepted",
@@ -493,6 +545,8 @@ export function validateProfileRuntimeSnapshot({
     profile_path: profile.profile_path ?? null,
     model_id: currentIdentity.model.model_id,
     identity_sha256: profile.identity_sha256,
+    timing_authority_match: true,
+    engine_provenance: provenance,
     provider_service_reserve_us: profile.calibration.provider_service_reserve_us,
     backup_emit_reserve_us: profile.calibration.backup_emit_reserve_us,
     iteration_forecast_scale_permille:

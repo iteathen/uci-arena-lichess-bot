@@ -84,7 +84,7 @@ function parseArguments(argv) {
   return { ...options, qualification_scope: scope, probe_depth: depth, probe_timeout_ms: timeoutMs };
 }
 
-function validateTimingProfile(input, executableSha, checkpoint) {
+function validateTimingProfile(input, checkpoint) {
   const profile = validateStoredProfile(input);
   requireValue(profile.schema === PROFILE_SCHEMA,
     "Timing evidence schema is not uci_time_profile_v3");
@@ -117,7 +117,6 @@ function validateTimingProfile(input, executableSha, checkpoint) {
     "Timing-profile provider request/effective identity differs");
   requireValue(identity.search.background_search === false,
     "Timing profile must disable background search");
-  same(identity.engine.executable_sha256, executableSha, "Timing-profile executable");
   same(identity.model.model_id, checkpoint.model_id, "Timing-profile model id");
   if (identity.search.search_core === "mcgs") {
     for (const gate of [
@@ -320,7 +319,7 @@ export function publishSingleGameProfile(options) {
   requireValue(/^[0-9a-f]{64}$/.test(checkpoint.checkpoint_hash ?? ""),
     "Checkpoint manifest has no lowercase SHA-256 checkpoint_hash");
   const timeProfile = readJson(timeProfilePath, "Timing profile");
-  const identity = validateTimingProfile(timeProfile, executableSha, checkpoint);
+  const identity = validateTimingProfile(timeProfile, checkpoint);
   const tablebase = validateCompleteGame(
     readJson(completeGamePath, "Complete-game evidence"),
     identity,

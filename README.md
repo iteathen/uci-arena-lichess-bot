@@ -256,9 +256,11 @@ node .\lichess-adapter.mjs startup status
 node .\lichess-adapter.mjs startup uninstall --runtime-dir C:\ProgramData\UCI Arena\lichess
 ```
 
-Startup installation qualifies the exact engine, model, timing, and capacity
-required by the selected adapter before registering anything and before reading
-credentials. The packaged Windows launcher is `native/lichess_adapter_launcher.exe`;
+Startup installation qualifies the exact engine, model, timing contract, and
+capacity required by the selected adapter before registering anything and
+before reading credentials. Timing-profile executable drift is reported as
+provenance and is accepted only when the Engine-owned semantic timing identity
+still matches exactly. The packaged Windows launcher is `native/lichess_adapter_launcher.exe`;
 `native/build/Release` is only a development build location and is never stored
 in installed startup registration.
 

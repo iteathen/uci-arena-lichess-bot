@@ -16,7 +16,7 @@ authority:
   durable_runtime_store: runtime_state/lichess/matches.sqlite
   timing_profile_consumption_contract:
     package: '@uci-arena/time-profile-contract'
-    minimum_version: 1.1.0
+    minimum_version: 1.2.0
     owner: uci_arena_engine
     distribution: immutable_digest_pinned_package_snapshot
   rules:
@@ -128,7 +128,7 @@ single_game_profile_publication:
   owner: lichess_provider_profile_publisher
   rules:
     - "The stable evidence field names are compatibility keys; validation and publication select search-core-specific semantics from the qualified timing-profile identity."
-    - "Publication consumes the immutable qualified uci_time_profile_v3 artifact, not an intermediate diagnostic attempt. The timing profile must bind the exact executable, model, adapter, provider/runtime, hardware/driver, search topology, and at least thirty repetitions per declared case."
+    - "Publication consumes the immutable qualified uci_time_profile_v3 artifact, not an intermediate diagnostic attempt. The timing profile must bind the exact semantic timing/search contract, model, adapter, provider/runtime, hardware/driver, search topology, and at least thirty repetitions per declared case. Its executable digest remains provenance and may differ after a timing-compatible rebuild; the independent complete-game and single-game evidence still bind the exact current executable."
     - "MCGS publication requires the timing profile's complete MCGS graph-population, legal-root-coverage, asynchronous-overlap, single-owner, fallback, reservation-integrity, temporal-policy, and deadline-tail gates. V2 cursor counters cannot satisfy any MCGS gate."
     - "The complete-game artifact must bind the same executable, model, provider, topology, and search-core-specific runtime fields. MCGS requires positive graph, simulation, asynchronous-admission, and overlap evidence, complete legal-root seeding, and zero stale backups, leaked reservations, active tickets, or active asynchronous leases."
     - "MCGS graph size, Cpuct, outstanding-batch limit, and book-prior blend are copied from qualified identity rather than supplied independently by the operator."

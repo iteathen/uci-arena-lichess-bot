@@ -59,6 +59,7 @@ test("consumer contract validates an exact relocated runtime without qualifier s
       extraEngineOptions: {},
     };
     const status = {
+      timing_contract_version: TIME_POLICY_VERSION,
       model_loaded: true,
       model_id: "latticeknight_fixture",
       model_fingerprint: "101",
@@ -128,6 +129,51 @@ test("consumer contract validates an exact relocated runtime without qualifier s
       configuration,
     });
     assert.deepEqual(accepted.uci_options.map(({ value }) => value), [12_000, 2_000, 1_500]);
+    assert.equal(accepted.engine_provenance.exact, true);
+
+    writeFileSync(executable, "engine-contract-fixture-unrelated-rebuild", "utf8");
+    const provenanceDrift = validateProfileRuntimeSnapshot({
+      profile: loaded,
+      status,
+      executable,
+      cwd: directory,
+      uciIdLines,
+      uciOptionLines: [...uciOptionLines, "option name BookStatsFile type string default book.stats"],
+      configuration,
+    });
+    assert.equal(provenanceDrift.timing_authority_match, true);
+    assert.equal(provenanceDrift.engine_provenance.exact, false);
+    assert.equal(provenanceDrift.engine_provenance.executable_match, false);
+    assert.equal(provenanceDrift.engine_provenance.uci_option_contract_match, false);
+
+    const legacyV3Identity = structuredClone(identity);
+    delete legacyV3Identity.search_contract_fingerprint;
+    const legacyV3 = {
+      ...profile,
+      identity: legacyV3Identity,
+      identity_sha256: sha256Object(legacyV3Identity),
+    };
+    assert.equal(validateProfileRuntimeSnapshot({
+      profile: legacyV3,
+      status,
+      executable,
+      cwd: directory,
+      uciIdLines,
+      uciOptionLines,
+      configuration,
+    }).timing_authority_match, true);
+    assert.throws(
+      () => validateProfileRuntimeSnapshot({
+        profile: loaded,
+        status: { ...status, timing_contract_version: "changed-timing-contract" },
+        executable,
+        cwd: directory,
+        uciIdLines,
+        uciOptionLines,
+        configuration,
+      }),
+      /timing_contract_version/,
+    );
     const appliedStatus = {
       ...status,
       time_profile_provider_reserve_us: 12_000,

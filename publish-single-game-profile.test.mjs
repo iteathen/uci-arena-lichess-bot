@@ -312,6 +312,21 @@ test("publishes MCGS profile fields from search-core-specific evidence", () => {
   assert.equal(loadSingleGameProfile(options.output).search_core, "mcgs");
 });
 
+test("retains timing authority across provenance-only engine rebuilds", () => {
+  const options = fixture("mcgs");
+  const timeProfile = JSON.parse(readFileSync(options.time_profile, "utf8"));
+  timeProfile.identity.engine.executable_sha256 = `sha256:${"f".repeat(64)}`;
+  timeProfile.identity_sha256 = sha256Object(timeProfile.identity);
+  writeFileSync(options.time_profile, JSON.stringify(timeProfile));
+
+  const result = publishSingleGameProfile({
+    ...options,
+    qualification_scope: "local_live_safety",
+  });
+  assert.equal(result.qualified, true);
+  assert.equal(result.engine_build_fingerprint, sha256("exact-engine"));
+});
+
 test("publishes and reloads the exact tablebase contract from complete-game evidence", () => {
   const options = fixture("mcgs");
   const tablebase = attachTablebase(options);

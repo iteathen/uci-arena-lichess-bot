@@ -1,13 +1,13 @@
 {
   "schema": "uci_arena_upstream_vendor_lock_v1",
   "source_repository": "iteathen/UCI_Arena",
-  "source_commit": "b7d5e8c011dc4a412bbf9c157835f0e2dc1cb56d",
+  "source_commit": "d22fbde69a2de9b004c2a861bee3f5c4049d0287",
   "packages": {
-    "@uci-arena/time-profile-contract": "1.1.0"
+    "@uci-arena/time-profile-contract": "1.2.0"
   },
   "files": {
-    "time-profile-contract/package.json": "1619b427fbae5629c84c839cfa914a734f5cc54639461314c9e9192053b27f85",
-    "time-profile-contract/src/index.mjs": "13335d25715b5c518261166d7e6cee5dc81a835943af85cb0c28385a0c080b10",
-    "time-profile-contract/test/contract.test.mjs": "5f8d93d47a157f3eb8a5889d64a6954de3f5c155f6096b1322aec2d4ef9efdba"
+    "time-profile-contract/package.json": "fe783efc1e9b88bd8175b8fab8cbe954958b41ff7a9b43f1332e4ba4b75523cc",
+    "time-profile-contract/src/index.mjs": "2d9581446b8bdede7b932d2eedf66968038806c9ce513a62e4d5362ad7efad1b",
+    "time-profile-contract/test/contract.test.mjs": "be5b022e8f51a7297ed825eb31f31f45a72c95bf93f715332ab59e7bd5593efc"
   }
 }
