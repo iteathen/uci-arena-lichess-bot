@@ -55,6 +55,14 @@ test("manual workflow uses free OIDC Cosign provenance and no automatic trigger"
   assert.match(workflow, /^  workflow_dispatch:/m);
   assert.doesNotMatch(workflow, /^  (?:push|pull_request|merge_group|schedule):/m);
   assert.match(workflow, /^  id-token: write$/m);
+  assert.match(
+    workflow,
+    /RELEASE_WORKFLOW_IDENTITY: \$\{\{ github\.workflow_ref \}\}#\$\{\{ github\.run_id \}\}\.\$\{\{ github\.run_attempt \}\}/u,
+  );
+  assert.doesNotMatch(
+    workflow,
+    /--workflow-identity ["']\$\{\{ github\.workflow_ref \}\}["']/u,
+  );
   assert.match(workflow, /cosign attest-blob[\s\S]*cosign verify-blob-attestation/u);
   assert.match(workflow, /--certificate-github-workflow-repository/u);
   assert.match(workflow, /provider-attestation\.mjs verify-bundle/u);

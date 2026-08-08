@@ -663,6 +663,7 @@ provider_release_reproducibility_2026_08_01:
   status: active
   owner: lichess_provider_release
   rules:
+    - "The signed provider result and native toolchain receipt bind the exact workflow branch ref plus GitHub run id and run attempt; a branch-only workflow identity is not release provenance."
     - "A Windows Lichess candidate builds its provider-owned launcher twice from independent empty build roots; repacking one launcher or staged payload is not reproducibility evidence."
     - "Both complete unsigned component archives and both provider-result predicates are byte-identical before signing or publication."
     - "The exact native toolchain receipt binds component id, target, source commit, workflow identity, and primary plus reproduction build roles."

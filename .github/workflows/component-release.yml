@@ -26,6 +26,8 @@ concurrency:
 jobs:
   build-sign-verify:
     runs-on: ${{ inputs.target == 'windows-x86_64' && 'windows-2025' || 'ubuntu-24.04' }}
+    env:
+      RELEASE_WORKFLOW_IDENTITY: ${{ github.workflow_ref }}#${{ github.run_id }}.${{ github.run_attempt }}
     permissions:
       contents: write
       id-token: write
@@ -70,7 +72,7 @@ jobs:
           node tools/native-toolchain-receipt.mjs `
             --definition packaging/component-definition.json `
             --target "${{ inputs.target }}" `
-            --workflow-identity "${{ github.workflow_ref }}" `
+            --workflow-identity $env:RELEASE_WORKFLOW_IDENTITY `
             --primary-build-root native/build `
             --reproduction-build-root native/build-repro `
             --output release-receipts/native-toolchain.json
@@ -86,7 +88,7 @@ jobs:
             '--version', '${{ inputs.version }}',
             '--target', '${{ inputs.target }}',
             '--source-date-epoch', "$epoch",
-            '--workflow-identity', '${{ github.workflow_ref }}',
+            '--workflow-identity', $env:RELEASE_WORKFLOW_IDENTITY,
             '--test-receipt', 'release-receipts/${{ inputs.target }}.json'
           )
           if ('${{ inputs.target }}' -eq 'windows-x86_64') {
