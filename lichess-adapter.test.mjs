@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -1971,8 +1971,9 @@ test("terminal cancellation drain accepts null bestmove while foreground remains
   assert.throws(() => engine.parseBestmove("bestmove 0000"), /unusable bestmove/);
 });
 
-test("transport profile publishes only after ten games and two hundred successful moves", () => {
+test("transport profile publishes only after ten games and two hundred successful moves", (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-transport-profile-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
   const profilePath = path.join(directory, "transport.json");
   let clock = Date.parse("2026-07-20T00:00:00Z");
   const tracker = new TransportProfileTracker({
@@ -1982,7 +1983,13 @@ test("transport profile publishes only after ten games and two hundred successfu
   });
   for (let game = 0; game < 10; game += 1) {
     for (let move = 0; move < 20; move += 1) {
-      tracker.record(`game-${game}`, 500 + ((game * 20 + move) % 100));
+      const dispatchMs = 350 + ((game * 20 + move) % 100);
+      tracker.record(`game-${game}`, {
+        bestmove_to_ack_ms: dispatchMs + 150,
+        bestmove_to_legality_ms: 25,
+        move_queue_wait_ms: 125,
+        post_dispatch_to_ack_ms: dispatchMs,
+      });
     }
     tracker.finishGame(`game-${game}`);
     clock += 1_000;
@@ -1992,7 +1999,83 @@ test("transport profile publishes only after ten games and two hundred successfu
   assert.equal(loaded.reserveMs, 650);
   assert.equal(loaded.profile.sample_count, 200);
   assert.equal(loaded.profile.game_count, 10);
-  assert.equal(loadTransportProfile(profilePath, clock + 8 * 24 * 60 * 60 * 1_000).status, "stale");
+  assert.equal(loaded.coverage, "bestmove_to_ack");
+  assert.equal(loaded.profile.samples[0].bestmove_to_legality_ms, 25);
+  const later = loadTransportProfile(profilePath, clock + 8 * 24 * 60 * 60 * 1_000);
+  assert.equal(later.status, "accepted");
+  assert.ok(later.ageMs > 7 * 24 * 60 * 60 * 1_000);
+});
+
+test("qualified v1 transport profiles remain readable with legacy coverage", (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-transport-v1-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const profilePath = path.join(directory, "transport-v1.json");
+  const generatedAt = Date.parse("2026-07-20T00:00:00Z");
+  const samples = Array.from({ length: 200 }, (_, index) => ({
+    game_id: `game-${Math.floor(index / 20)}`,
+    post_dispatch_to_ack_ms: 500 + (index % 100),
+    recorded_at_ms: generatedAt,
+  }));
+  writeFileSync(profilePath, JSON.stringify({
+    schema: "uci_arena_lichess_transport_profile_v1",
+    generated_at: new Date(generatedAt).toISOString(),
+    qualified: true,
+    effective_reserve_ms: 650,
+    samples,
+  }));
+  const loaded = loadTransportProfile(profilePath, generatedAt + 1_000);
+  assert.equal(loaded.qualified, true);
+  assert.equal(loaded.coverage, "dispatch_to_ack_legacy");
+  assert.equal(loaded.reserveMs, 650);
+});
+
+test("legacy v1 transport authority is not overwritten by v2 collection", (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-transport-v1-read-only-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const profilePath = path.join(directory, "transport-v1.json");
+  const generatedAt = Date.parse("2026-07-20T00:00:00Z");
+  const samples = Array.from({ length: 200 }, (_, index) => ({
+    game_id: `game-${Math.floor(index / 20)}`,
+    post_dispatch_to_ack_ms: 500 + (index % 100),
+    recorded_at_ms: generatedAt,
+  }));
+  const original = `${JSON.stringify({
+    schema: "uci_arena_lichess_transport_profile_v1",
+    generated_at: new Date(generatedAt).toISOString(),
+    qualified: true,
+    effective_reserve_ms: 650,
+    samples,
+  }, null, 2)}\n`;
+  writeFileSync(profilePath, original);
+  const tracker = new TransportProfileTracker({ profilePath, now: () => generatedAt + 1_000 });
+  tracker.record("new-game", {
+    bestmove_to_ack_ms: 900,
+    bestmove_to_legality_ms: 25,
+    move_queue_wait_ms: 125,
+    post_dispatch_to_ack_ms: 750,
+  });
+  assert.equal(tracker.finishGame("new-game"), 650);
+  assert.equal(readFileSync(profilePath, "utf8"), original);
+});
+
+test("transport authority rejects invalid samples even when summary fields claim qualification", (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-transport-invalid-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const profilePath = path.join(directory, "transport-invalid.json");
+  const samples = Array.from({ length: 200 }, (_, index) => ({
+    game_id: `game-${Math.floor(index / 20)}`,
+    bestmove_to_ack_ms: index === 100 ? null : 500,
+  }));
+  writeFileSync(profilePath, JSON.stringify({
+    schema: "uci_arena_lichess_transport_profile_v2",
+    generated_at: "2026-07-20T00:00:00.000Z",
+    qualified: true,
+    effective_reserve_ms: 550,
+    samples,
+  }));
+  const loaded = loadTransportProfile(profilePath, Date.parse("2026-08-07T00:00:00Z"));
+  assert.equal(loaded.status, "rejected");
+  assert.match(loaded.reason, /invalid bestmove_to_ack_ms sample/);
 });
 
 test("stopped ponder bestmove is drained before the foreground waiter starts", async () => {

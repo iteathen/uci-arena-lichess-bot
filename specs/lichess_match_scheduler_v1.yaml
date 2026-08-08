@@ -317,7 +317,7 @@ opponent_turn_time_management_2026_07_20:
       opponent_turn_search: true
       foreground_preempts_ponder: true
       initial_transport_reserve_ms: 650
-      transport_profile_path: runtime_state/lichess/transport_profile_v1.json
+      transport_profile_path: runtime_state/lichess/transport_profile_v2.json
   authority:
     - "The streamed full move list, game status, clocks, side to move, and game id are authoritative. A locally predicted move never advances canonical game state."
     - "The adapter never submits a move before an authoritative state says it is the bot's turn. Lichess has no premove endpoint."
@@ -332,14 +332,25 @@ opponent_turn_time_management_2026_07_20:
   clock_contract:
     - "Subtract measured local state-processing delay before go and reserve the configured or qualified inbound-plus-submit transport tail through Move Overhead."
     - "Transport timing remains adapter-scoped and separate from model/provider timing calibration."
-    - "A uci_arena_lichess_transport_profile_v1 requires at least 200 successful move POST samples from at least ten completed games. Its reserve is p99 dispatch-to-ack plus 50 ms, rounded upward to 50 ms and clamped to 250 through 1500 ms."
-    - "A missing, stale, or unqualified transport profile selects the 650 ms bootstrap reserve. Profile changes apply only between games and expire after seven days or after three consecutive games whose rolling p95 differs by more than 25 percent."
+    - "A uci_arena_lichess_transport_profile_v2 requires at least 200 successful move samples from at least ten completed games. Each sample covers bestmove receipt through legality replay, serialized move-queue wait, request dispatch, and acknowledgement. Its reserve is p99 bestmove-to-ack plus 50 ms, rounded upward to 50 ms and clamped to 250 through 1500 ms."
+    - "A qualified v1 dispatch-to-ack profile remains readable as a read-only legacy authority, but is never rewritten as v2 and cannot claim coverage for legality or queue latency."
+    - "Compatible qualified transport evidence does not lose authority merely because wall-clock time passed. Its age remains visible provenance; only a measurement-contract incompatibility, invalid evidence, or replacement evidence from completed games can change transport authority."
+    - "A missing, incompatible, invalid, or unqualified transport profile selects the 650 ms bootstrap reserve. V2 retains a bounded rolling window of the latest 2000 valid samples, incorporates new observations only after a game completes, and changes the effective reserve only between games."
     - "Opponent-turn search is enabled only after the exact semantic timing authority is accepted and applied. Qualified-versus-current executable drift is retained as provenance and does not disable the curve when the timing/search contract, model semantics, provider/runtime, hardware, and effective topology still match. Missing or rejected timing evidence retains conservative foreground search and the bootstrap transport reserve, and disables ponder/opponent-root work before live play."
   telemetry:
     - state_received_to_go_ms
     - go_to_bestmove_ms
     - state_validated_to_post_ms
     - post_to_ack_ms
+    - authoritative_wtime_ms
+    - authoritative_btime_ms
+    - go_wtime_ms
+    - go_btime_ms
+    - bestmove_to_ack_ms
+    - timing_profile_status
+    - timing_profile_provider_safety_qualified
+    - timing_profile_forecast_shadow_qualified
+    - timing_profile_adaptive_play_qualified
     - ponder_mode
     - ponder_hit
     - ponder_miss_reason

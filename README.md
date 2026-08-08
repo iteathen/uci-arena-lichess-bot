@@ -135,6 +135,17 @@ Common path flags:
 Explicit flags override template values. Paths are normalized to absolute paths
 at the process boundary; stored path values never contain embedded quotes.
 
+Lichess transport evidence is stored separately from Engine timing evidence.
+New collection uses `uci_arena_lichess_transport_profile_v2`, whose reserve
+covers the complete bestmove-to-ack tail: legality replay, serialized request
+queueing, dispatch, and acknowledgement. Qualified compatible evidence remains
+authoritative regardless of age and rolls forward with new completed-game data;
+age is provenance, not an invalidation trigger. Qualified v1 dispatch-to-ack
+profiles remain readable as read-only legacy authority, while new collection
+uses v2. Missing, incompatible, invalid, or unqualified evidence selects the
+documented 650 ms bootstrap reserve. Transport evidence never regenerates or
+changes the Engine-owned timing authority.
+
 ## Status and health
 
 The credential-free status operation is the authoritative Manager health

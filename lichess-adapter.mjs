@@ -186,10 +186,10 @@ const DEFAULT_TIMING_CONFIG = Object.freeze({
   initial_transport_reserve_ms: 650,
   transport_profile_path: null,
 });
-const TRANSPORT_PROFILE_SCHEMA = "uci_arena_lichess_transport_profile_v1";
+const TRANSPORT_PROFILE_SCHEMA = "uci_arena_lichess_transport_profile_v2";
+const LEGACY_TRANSPORT_PROFILE_SCHEMA = "uci_arena_lichess_transport_profile_v1";
 const TRANSPORT_PROFILE_MINIMUM_SAMPLES = 200;
 const TRANSPORT_PROFILE_MINIMUM_GAMES = 10;
-const TRANSPORT_PROFILE_MAXIMUM_AGE_MS = 7 * 24 * 60 * 60 * 1_000;
 const TRANSPORT_PROFILE_MAXIMUM_SAMPLES = 2_000;
 const TRANSPORT_RESERVE_MINIMUM_MS = 250;
 const TRANSPORT_RESERVE_MAXIMUM_MS = 1_500;
@@ -241,11 +241,19 @@ export function loadTransportProfile(profilePath, now = Date.now()) {
   }
   try {
     const profile = JSON.parse(readFileSync(profilePath, "utf8"));
-    if (profile.schema !== TRANSPORT_PROFILE_SCHEMA) throw new Error("unsupported schema");
+    if (![TRANSPORT_PROFILE_SCHEMA, LEGACY_TRANSPORT_PROFILE_SCHEMA].includes(profile.schema)) {
+      throw new Error("unsupported schema");
+    }
     const generatedAt = Date.parse(profile.generated_at);
     if (!Number.isFinite(generatedAt)) throw new Error("generated_at is invalid");
     const samples = Array.isArray(profile.samples) ? profile.samples : [];
-    const values = samples.map((sample) => Number(sample?.post_dispatch_to_ack_ms));
+    const sampleField = profile.schema === TRANSPORT_PROFILE_SCHEMA
+      ? "bestmove_to_ack_ms"
+      : "post_dispatch_to_ack_ms";
+    const values = samples.map((sample) => sample?.[sampleField]);
+    if (values.some((value) => !Number.isFinite(value) || value < 0)) {
+      throw new Error(`transport profile contains an invalid ${sampleField} sample`);
+    }
     const gameCount = new Set(samples.map((sample) => String(sample?.game_id ?? "")).filter(Boolean)).size;
     const p99 = percentile(values, 0.99);
     const reserve = transportReserveFromP99(p99);
@@ -256,10 +264,16 @@ export function loadTransportProfile(profilePath, now = Date.now()) {
     if (!qualified) {
       return { status: "collecting", qualified: false, reason: "transport profile lacks qualified evidence", profile };
     }
-    if (now - generatedAt > TRANSPORT_PROFILE_MAXIMUM_AGE_MS) {
-      return { status: "stale", qualified: false, reason: "transport profile is older than seven days", profile };
-    }
-    return { status: "accepted", qualified: true, reserveMs: reserve, profile };
+    return {
+      status: "accepted",
+      qualified: true,
+      reserveMs: reserve,
+      ageMs: Math.max(0, now - generatedAt),
+      coverage: profile.schema === TRANSPORT_PROFILE_SCHEMA
+        ? "bestmove_to_ack"
+        : "dispatch_to_ack_legacy",
+      profile,
+    };
   } catch (error) {
     return { status: "rejected", qualified: false, reason: error.message };
   }
@@ -274,13 +288,17 @@ export class TransportProfileTracker {
     this.samples = [];
     this.pendingGames = new Set();
     this.effectiveReserveMs = bootstrapReserveMs;
+    this.legacyReadOnly = false;
     if (profilePath && existsSync(profilePath)) {
       try {
         const profile = JSON.parse(readFileSync(profilePath, "utf8"));
         if (profile.schema === TRANSPORT_PROFILE_SCHEMA && Array.isArray(profile.samples)) {
-          const cutoff = this.now() - TRANSPORT_PROFILE_MAXIMUM_AGE_MS;
-          this.samples = profile.samples.filter((sample) => Number(sample?.recorded_at_ms) >= cutoff)
-            .slice(-TRANSPORT_PROFILE_MAXIMUM_SAMPLES);
+          const valid = profile.samples.every((sample) =>
+            Number.isFinite(sample?.bestmove_to_ack_ms)
+              && sample.bestmove_to_ack_ms >= 0);
+          if (valid) this.samples = profile.samples.slice(-TRANSPORT_PROFILE_MAXIMUM_SAMPLES);
+        } else if (profile.schema === LEGACY_TRANSPORT_PROFILE_SCHEMA) {
+          this.legacyReadOnly = true;
         }
       } catch {
         this.samples = [];
@@ -290,11 +308,22 @@ export class TransportProfileTracker {
     if (accepted.qualified) this.effectiveReserveMs = accepted.reserveMs;
   }
 
-  record(gameId, durationMs) {
+  record(gameId, timing) {
+    const sample = typeof timing === "number" ? { bestmove_to_ack_ms: timing } : timing;
+    const durationMs = Number(sample?.bestmove_to_ack_ms);
     if (!gameId || !Number.isFinite(durationMs) || durationMs < 0) return;
     this.samples.push({
       game_id: String(gameId),
-      post_dispatch_to_ack_ms: Math.round(durationMs * 1_000) / 1_000,
+      bestmove_to_ack_ms: Math.round(durationMs * 1_000) / 1_000,
+      bestmove_to_legality_ms: Number.isFinite(sample?.bestmove_to_legality_ms)
+        ? Math.round(sample.bestmove_to_legality_ms * 1_000) / 1_000
+        : null,
+      move_queue_wait_ms: Number.isFinite(sample?.move_queue_wait_ms)
+        ? Math.round(sample.move_queue_wait_ms * 1_000) / 1_000
+        : null,
+      post_dispatch_to_ack_ms: Number.isFinite(sample?.post_dispatch_to_ack_ms)
+        ? Math.round(sample.post_dispatch_to_ack_ms * 1_000) / 1_000
+        : null,
       recorded_at_ms: this.now(),
     });
     this.samples = this.samples.slice(-TRANSPORT_PROFILE_MAXIMUM_SAMPLES);
@@ -303,7 +332,16 @@ export class TransportProfileTracker {
 
   finishGame(gameId) {
     if (!this.pendingGames.delete(String(gameId)) || !this.profilePath) return this.effectiveReserveMs;
-    const values = this.samples.map((sample) => sample.post_dispatch_to_ack_ms);
+    if (this.legacyReadOnly) {
+      this.telemetry({
+        event: "transport_profile_status",
+        qualified: true,
+        status: "legacy_read_only",
+        effective_reserve_ms: this.effectiveReserveMs,
+      });
+      return this.effectiveReserveMs;
+    }
+    const values = this.samples.map((sample) => sample.bestmove_to_ack_ms);
     const gameCount = new Set(this.samples.map((sample) => sample.game_id)).size;
     const p50 = percentile(values, 0.50);
     const p95 = percentile(values, 0.95);
@@ -319,7 +357,7 @@ export class TransportProfileTracker {
       qualified,
       sample_count: this.samples.length,
       game_count: gameCount,
-      dispatch_to_ack_ms: { p50, p95, p99 },
+      bestmove_to_ack_ms: { p50, p95, p99 },
       effective_reserve_ms: qualified ? reserve : this.bootstrapReserveMs,
       samples: this.samples,
     };
@@ -4112,6 +4150,7 @@ export class GameSession {
     let foregroundLeaseWaitMs = 0;
     let bestmoveToLegalityMs = 0;
     let moveQueueWaitMs = 0;
+    let goClock = null;
     let projectedSearchRequested = false;
     try {
       if (!this.observationIsCurrent(observation)) {
@@ -4136,6 +4175,7 @@ export class GameSession {
           this.color,
           performance.now() - receivedAt,
         );
+        goClock = clocks;
         result = await engine.search({
           moves,
           ...clocks,
@@ -4222,7 +4262,12 @@ export class GameSession {
       );
       const postAcknowledgedAt = performance.now();
       startProjectedSearch(postAcknowledgedAt);
-      this.onMoveTransportSample(this.gameId, postAcknowledgedAt - postDispatchedAt);
+      this.onMoveTransportSample(this.gameId, {
+        bestmove_to_ack_ms: postAcknowledgedAt - bestmoveAt,
+        bestmove_to_legality_ms: bestmoveToLegalityMs,
+        move_queue_wait_ms: moveQueueWaitMs,
+        post_dispatch_to_ack_ms: postAcknowledgedAt - postDispatchedAt,
+      });
       this.lastSubmittedRootKey = rootKey;
       log("move_played", {
         game_id: this.gameId,
@@ -4242,6 +4287,15 @@ export class GameSession {
         move_queue_wait_ms: moveQueueWaitMs,
         state_received_to_dispatch_ms: postDispatchedAt - receivedAt,
         post_dispatch_to_ack_ms: postAcknowledgedAt - postDispatchedAt,
+        bestmove_to_ack_ms: postAcknowledgedAt - bestmoveAt,
+        authoritative_wtime_ms: this.lastClock.wtime,
+        authoritative_btime_ms: this.lastClock.btime,
+        authoritative_winc_ms: this.lastClock.winc,
+        authoritative_binc_ms: this.lastClock.binc,
+        go_wtime_ms: goClock?.wtime ?? null,
+        go_btime_ms: goClock?.btime ?? null,
+        go_winc_ms: goClock?.winc ?? null,
+        go_binc_ms: goClock?.binc ?? null,
         ponder_mode: ponderHit
           ? "ponder"
           : opponentRootReroot ? "opponent_root_reroot" : "foreground",
@@ -4250,6 +4304,13 @@ export class GameSession {
         ponder_miss_reason: ponderMissReason,
         stale_bestmove_drained: Boolean(staleBestmoveDrained),
         transport_reserve_ms: this.config.timing.initial_transport_reserve_ms,
+        timing_profile_status: engine.timeProfileStatus?.status ?? "unavailable",
+        timing_profile_provider_safety_qualified:
+          engine.timeProfileStatus?.permissions?.provider_safety_qualified ?? false,
+        timing_profile_forecast_shadow_qualified:
+          engine.timeProfileStatus?.permissions?.forecast_shadow_qualified ?? false,
+        timing_profile_adaptive_play_qualified:
+          engine.timeProfileStatus?.permissions?.adaptive_play_qualified ?? false,
         root_legality_validation_ms: legality.elapsedMs,
         root_legality_sync_ms: observation.legalitySynchronization?.elapsedMs ?? null,
         root_legality_applied_plies: observation.legalitySynchronization?.appliedPlies ?? null,
@@ -4325,7 +4386,7 @@ export class BotController {
     this.tickRunning = false;
     this.schedulerFault = null;
     const transportProfilePath = this.config.timing.transport_profile_path
-      || path.join(runtimeDir, "transport_profile_v1.json");
+      || path.join(runtimeDir, "transport_profile_v2.json");
     this.transportProfile = new TransportProfileTracker({
       profilePath: transportProfilePath,
       bootstrapReserveMs: this.config.timing.bootstrap_transport_reserve_ms
@@ -4624,7 +4685,7 @@ export class BotController {
       slot,
       store: this.store,
       foregroundCoordinator: this.foregroundCoordinator,
-      onMoveTransportSample: (id, durationMs) => this.transportProfile.record(id, durationMs),
+      onMoveTransportSample: (id, timing) => this.transportProfile.record(id, timing),
     });
     this.gameSessions.set(gameId, session);
     const task = session.run().catch((error) => {
