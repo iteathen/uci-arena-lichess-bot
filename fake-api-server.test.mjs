@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   DEFAULT_TEMPLATE,
@@ -13,6 +16,20 @@ import {
 import { startFakeLichessApi } from "./fake-api-server.mjs";
 
 const FIXTURE_TOKEN = "uci-arena-non-secret-test-token";
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+
+async function waitFor(predicate, {
+  timeoutMs = 15_000,
+  intervalMs = 25,
+  message = "fixture condition was not observed",
+} = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  throw new Error(message);
+}
 
 async function temporaryToken(value = FIXTURE_TOKEN) {
   const root = await mkdtemp(path.join(os.tmpdir(), "uci-arena-fake-lichess-"));
@@ -207,6 +224,126 @@ test("loopback API server simulates NDJSON, challenges, and move submission", as
     assert.equal(JSON.stringify(api.requests).includes("authorization"), false);
     assert.equal(JSON.stringify(api.requests).includes(FIXTURE_TOKEN), false);
   } finally {
+    await api.close();
+  }
+});
+
+test("loopback API drives the complete adapter through a spawned UCI child and legal move POST", {
+  timeout: 30_000,
+}, async () => {
+  const gameId = "fixture-complete-game";
+  const api = await startFakeLichessApi({
+    fixtureToken: FIXTURE_TOKEN,
+    state: {
+      playing: [{
+        gameId,
+        opponent: {
+          id: "fixtureopponent",
+          username: "FixtureOpponent",
+          title: "BOT",
+        },
+      }],
+      gameStreams: {
+        [gameId]: [{
+          type: "gameFull",
+          id: gameId,
+          variant: { key: "standard" },
+          initialFen: "startpos",
+          white: { id: "fixturearenabot", username: "FixtureArenaBot" },
+          black: { id: "fixtureopponent", username: "FixtureOpponent" },
+          rated: false,
+          speed: "blitz",
+          clock: { initial: 180_000, increment: 2_000 },
+          state: {
+            type: "gameState",
+            moves: "",
+            status: "started",
+            wtime: 180_000,
+            btime: 180_000,
+            winc: 2_000,
+            binc: 2_000,
+          },
+        }],
+      },
+    },
+  });
+  const token = await temporaryToken();
+  const root = await mkdtemp(path.join(os.tmpdir(), "uci-arena-complete-lichess-"));
+  const configPath = path.join(root, "config.json");
+  const runtimeDir = path.join(root, "runtime");
+  const storePath = path.join(root, "matches.sqlite");
+  const config = JSON.parse(await readFile(DEFAULT_TEMPLATE, "utf8"));
+  config.url = api.origin;
+  config.engine = {
+    adapter: "standard_uci_v1",
+    executable: process.execPath,
+    arguments: [path.join(HERE, "test-fixtures", "fake-standard-uci-engine.mjs")],
+    working_directory: HERE,
+    search_timeout_grace_ms: 1_000,
+    shutdown_grace_ms: 1_000,
+    uci_options: {},
+  };
+  config.timing.opponent_turn_search = false;
+  config.capacity = {
+    total_slots: 1,
+    capacity_profile: null,
+    startup_parallelism: 1,
+    human: { slots: 0, allow_borrowing: false, accept_public: false },
+    bot: { slots: 1, target_active: 0 },
+  };
+  config.scheduler.enabled = false;
+  await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+
+  const child = spawn(process.execPath, [
+    path.join(HERE, "lichess-adapter.mjs"),
+    "run",
+    "--config", configPath,
+    "--token-file", token.tokenFile,
+    "--expected-account", "fixturearenabot",
+    "--runtime-dir", runtimeDir,
+    "--store", storePath,
+  ], {
+    cwd: root,
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  let output = "";
+  child.stdout.on("data", (chunk) => { output = `${output}${chunk}`.slice(-32_768); });
+  child.stderr.on("data", (chunk) => { output = `${output}${chunk}`.slice(-32_768); });
+  const exited = once(child, "exit");
+  try {
+    await Promise.race([
+      waitFor(() => api.state.moves.length === 1, {
+        message: `complete adapter did not submit a move; output=${output}`,
+      }),
+      exited.then(([code, signal]) => {
+        throw new Error(`complete adapter exited before move submission: ${code}/${signal}; ${output}`);
+      }),
+    ]);
+    assert.deepEqual(api.state.moves, [{
+      gameId,
+      move: "e2e4",
+      form: {},
+    }]);
+    assert.ok(api.requests.some((request) => (
+      request.method === "GET" && request.path === "/api/account/playing"
+    )));
+    assert.ok(api.requests.some((request) => (
+      request.method === "GET" && request.path === `/api/bot/game/stream/${gameId}`
+    )));
+    assert.ok(api.requests.some((request) => (
+      request.method === "POST" && request.path === `/api/bot/game/${gameId}/move/e2e4`
+    )));
+    assert.equal(JSON.stringify(api.requests).includes(FIXTURE_TOKEN), false);
+    child.stdin.end("shutdown\n");
+    const [code, signal] = await exited;
+    assert.equal(signal, null, output);
+    assert.equal(code, 0, output);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await Promise.allSettled([exited]);
+    await rm(root, { recursive: true, force: true });
+    await token.close();
     await api.close();
   }
 });

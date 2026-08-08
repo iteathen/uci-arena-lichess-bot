@@ -3548,7 +3548,12 @@ export class GameSession {
         if (consecutiveFailures >= 5) {
           throw new Error(`Game session failed ${consecutiveFailures} consecutive times: ${error.message}`);
         }
-        await delay(retryMs, this.signal);
+        try {
+          await delay(retryMs, this.signal);
+        } catch (retryError) {
+          if (this.signal.aborted) break;
+          throw retryError;
+        }
         reconnectDelay = Math.min(reconnectDelay * 2, 30_000);
       }
     }
@@ -4292,7 +4297,12 @@ export class BotController {
             : reconnectDelay;
           log("event_stream_error", { message: error.message, retry_ms: retryMs });
           await this.writeStatus();
-          await delay(retryMs, this.signal);
+          try {
+            await delay(retryMs, this.signal);
+          } catch (retryError) {
+            if (this.signal.aborted) break;
+            throw retryError;
+          }
           reconnectDelay = Math.min(reconnectDelay * 2, 30_000);
         }
       }

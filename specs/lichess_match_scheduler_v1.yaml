@@ -47,6 +47,7 @@ local_api_simulator:
     - POST /api/bot/game/{gameId}/move/{move}
   rules:
     - "Automated HTTP adapter integration tests use the simulator instead of a real Lichess credential or public API; narrow unit tests may retain in-memory boundaries."
+    - "At least one simulator test runs the complete adapter process, spawns a conforming UCI child, reconstructs an authoritative game stream, and observes the legal move POST at the HTTP boundary."
     - "The simulator rejects non-loopback binding, requires its explicit fixture bearer value on every API route, and never records Authorization."
     - "Request journals are bounded and retain only method, path, and bounded parsed form fields needed for assertions."
     - "NDJSON streams are finite deterministic fixtures so tests cannot hang while waiting for a live event."
