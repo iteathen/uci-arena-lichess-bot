@@ -652,6 +652,7 @@ installer_component_contract_2026_08_01:
     - "The install manifest declares the exact startup entrypoint, action arrays, runtime-directory/configuration flags, and response envelope. Installer may invoke credential-free uninstall from that contract but never fabricates Lichess arguments or reads a token."
     - "The outer provider result uses the shared suite field names and binds the exact artifact, install manifest, source repository and commit, source tree, dependency locks, toolchain, SBOM, licenses, build flags, and passing test receipt."
     - "The provider release remains component-only. It never claims suite composition authority and never packages, reads, hashes, or copies a credential."
+    - "After keyless verification, the same explicitly dispatched job publishes the exact archive, provider result, and Sigstore bundle directly to one private immutable candidate prerelease. Actions artifact storage is not candidate transport."
     - "Target triples use the suite-wide windows-x86_64 and linux-x86_64 identifiers; executable filenames may retain the conventional windows-x64 label but catalog keys never do."
   validation:
     - "Release verification independently recomputes the install manifest inventory, internal checksums, SBOM and license identities, source and test-receipt bindings, and credential-free packaged status smoke."
