@@ -296,6 +296,7 @@ function qualifiedRuntimeStatus(profile) {
     repetition_unbalanced_workers: 0,
     opening_book_enabled: true,
     opening_book_active: true,
+    opening_book_statistics_available: true,
     opening_book_entries: 1259,
     opening_book_identity: "123456789",
     opening_book_message: "loaded",
@@ -320,7 +321,7 @@ function installQualifiedBookFixture(engineConfig) {
   const bookFile = path.join(directory, "strong_rare_v1.bin");
   const statsFile = path.join(directory, "strong_rare_v1.stats");
   const policyFile = path.join(directory, "strong_rare_v1.policy");
-  writeFileSync(bookFile, Buffer.alloc(16));
+  writeFileSync(bookFile, Buffer.alloc(1259 * 16));
   writeFileSync(
     statsFile,
     "# uci_arena_book_stats_v1 book_fnv1a64=00000000075bcd15 rows=1259\n",
@@ -336,6 +337,28 @@ function installQualifiedBookFixture(engineConfig) {
     opening_book_file: bookFile,
     opening_book_stats_file: statsFile,
     opening_book_policy_file: policyFile,
+  };
+}
+
+function installBaseBookFixture(engineConfig) {
+  const directory = path.join(engineConfig.working_directory, "base-book-fixture");
+  mkdirSync(directory, { recursive: true });
+  const bookFile = path.join(directory, "external.bin");
+  writeFileSync(bookFile, Buffer.alloc(32));
+  Object.assign(engineConfig.uci_options, {
+    OwnBook: true,
+    BookFile: bookFile,
+    BookStatsFile: "",
+    BookPolicyFile: "",
+  });
+  return {
+    opening_book_file: bookFile,
+    opening_book_stats_file: "",
+    opening_book_policy_file: "",
+    opening_book_statistics_available: false,
+    opening_book_entries: 2,
+    opening_book_identity: "123456789",
+    opening_book_message: "active_polyglot",
   };
 }
 
@@ -1584,6 +1607,25 @@ test("runtime qualification rejects a configured book that did not reactivate", 
   };
 
   await assert.rejects(() => engine.qualifyRuntime(), /Opening book failed to activate: missing/);
+});
+
+test("runtime qualification accepts the Engine-owned base Polyglot capability", async () => {
+  const { config, profile } = qualifiedFixture();
+  const engineConfig = { ...config.engine, qualification_profile: profile };
+  const bookStatus = installBaseBookFixture(engineConfig);
+  const engine = new UciEngine(engineConfig);
+  engine.advertisedOptions.add("OwnBook");
+  engine.send = () => {};
+  engine.newGame = async () => {};
+  engine.exchange = async (command) => command.startsWith("go depth ") ? "bestmove e2e4" : "readyok";
+  engine.runtimeStatus = async () => ({ ...qualifiedRuntimeStatus(profile), ...bookStatus });
+
+  await engine.qualifyRuntime();
+  assert.equal(engine.qualificationStatus.live_runtime_status.opening_book_active, true);
+  assert.equal(
+    engine.qualificationStatus.live_runtime_status.opening_book_statistics_available,
+    false,
+  );
 });
 
 test("runtime qualification rejects a loaded opening book with the wrong content identity", async () => {

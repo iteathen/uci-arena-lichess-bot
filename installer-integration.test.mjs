@@ -67,9 +67,37 @@ test('installer integration binds complete suite evidence and bounded knowledge 
     path.join(books, 'strong_rare_v1.bin'));
   assert.equal(result.configuration.engine.uci_options.BookStatsFile,
     path.join(books, 'strong_rare_v1.stats'));
+  assert.equal(result.configuration.engine.uci_options.BookPolicyFile,
+    path.join(books, 'strong_rare_v1.policy'));
   assert.equal(result.configuration.engine.uci_options.SyzygyPath,
     path.join(root, 'tablebases'));
   assert.equal(result.configuration.scheduler.enabled, true);
+});
+
+test('installer integration binds a base Polyglot book without fabricating sidecars', (t) => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'arena-lichess-base-book-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const book = path.join(root, 'books', 'external.bin');
+  mkdirSync(path.dirname(book), { recursive: true });
+  writeFileSync(book, 'book', 'utf8');
+  const engineRoot = path.join(root, 'engine');
+  const result = renderInstallerConfiguration({
+    schema: 'arena_provider_install_context_v1',
+    schema_version: 1,
+    workspace: path.join(root, 'workspace'),
+    enabled: false,
+    bindings: {
+      default_engine: path.join(engineRoot, 'uci_arena_engine.exe'),
+      default_engine_root: engineRoot,
+      default_model_root: path.join(engineRoot, 'models', 'default'),
+    },
+    locators: { opening_book: book },
+  });
+
+  assert.equal(result.configuration.engine.uci_options.OwnBook, true);
+  assert.equal(result.configuration.engine.uci_options.BookFile, book);
+  assert.equal(result.configuration.engine.uci_options.BookStatsFile, '');
+  assert.equal(result.configuration.engine.uci_options.BookPolicyFile, '');
 });
 
 test('installer integration rejects a partial opening-book locator', (t) => {
@@ -90,5 +118,5 @@ test('installer integration rejects a partial opening-book locator', (t) => {
       default_model_root: path.join(root, 'engine', 'models', 'default'),
     },
     locators: { opening_book: books },
-  }), /missing required \.stats sidecar/);
+  }), /partial \.stats\/\.policy sidecar pair/);
 });

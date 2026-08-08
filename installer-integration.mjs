@@ -50,7 +50,13 @@ function openingBookOptions(locator) {
   } else if (!metadata.isFile()) {
     throw new Error('opening-book locator must be a regular file or directory');
   }
-  const options = { OwnBook: true, BookFile: book };
+  const options = {
+    OwnBook: true,
+    BookFile: book,
+    BookStatsFile: '',
+    BookPolicyFile: '',
+  };
+  const sidecars = [];
   for (const [suffix, option] of [['.stats', 'BookStatsFile'], ['.policy', 'BookPolicyFile']]) {
     const sidecar = path.join(path.dirname(book), `${path.basename(book, path.extname(book))}${suffix}`);
     try {
@@ -58,14 +64,16 @@ function openingBookOptions(locator) {
       if (!sidecarMetadata.isFile() || sidecarMetadata.isSymbolicLink()) {
         throw new Error(`opening-book ${suffix} sidecar is not a regular file`);
       }
-      options[option] = sidecar;
+      sidecars.push({ option, sidecar });
     } catch (error) {
-      if (error.code === 'ENOENT') {
-        throw new Error(`opening-book locator is missing required ${suffix} sidecar`);
-      }
+      if (error.code === 'ENOENT') continue;
       throw error;
     }
   }
+  if (sidecars.length === 1) {
+    throw new Error('opening-book locator has a partial .stats/.policy sidecar pair');
+  }
+  for (const { option, sidecar } of sidecars) options[option] = sidecar;
   return options;
 }
 

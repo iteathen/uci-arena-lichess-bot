@@ -382,6 +382,11 @@ function resolvedEngineDataPath(config, value, label) {
     : path.resolve(config.working_directory, value));
 }
 
+function optionalEngineDataPath(config, value, label) {
+  if (value === undefined || value === null || value === "") return "";
+  return resolvedEngineDataPath(config, value, label);
+}
+
 function openingBookContract(config, runtimeStatus) {
   const configured = config.uci_options ?? {};
   const bookFile = resolvedEngineDataPath(
@@ -389,12 +394,12 @@ function openingBookContract(config, runtimeStatus) {
     configured.BookFile ?? runtimeStatus.opening_book_file,
     "opening-book file",
   );
-  const statsFile = resolvedEngineDataPath(
+  const statsFile = optionalEngineDataPath(
     config,
     configured.BookStatsFile ?? runtimeStatus.opening_book_stats_file,
     "opening-book stats file",
   );
-  const policyFile = resolvedEngineDataPath(
+  const policyFile = optionalEngineDataPath(
     config,
     configured.BookPolicyFile ?? runtimeStatus.opening_book_policy_file,
     "opening-book policy file",
@@ -405,17 +410,49 @@ function openingBookContract(config, runtimeStatus) {
     ["BookPolicyFile", "opening_book_policy_file", policyFile],
   ]) {
     if (configured[configuredName] !== undefined) {
-      const observed = resolvedEngineDataPath(config, runtimeStatus[runtimeName], runtimeName);
+      const observed = configuredName === "BookFile"
+        ? resolvedEngineDataPath(config, runtimeStatus[runtimeName], runtimeName)
+        : optionalEngineDataPath(config, runtimeStatus[runtimeName], runtimeName);
       if (observed !== expected) {
         throw new Error(`Opening book runtime path mismatch for ${configuredName}`);
       }
     }
   }
-  for (const [filePath, label] of [
-    [bookFile, "book"],
-    [statsFile, "stats"],
-    [policyFile, "policy"],
-  ]) {
+  for (const [filePath, label] of [[bookFile, "book"]]) {
+    if (!existsSync(filePath) || !statSync(filePath).isFile()) {
+      throw new Error(`Opening book ${label} file is missing: ${filePath}`);
+    }
+  }
+  if (Boolean(statsFile) !== Boolean(policyFile)) {
+    throw new Error("Opening book has a partial stats/policy sidecar pair");
+  }
+  if (typeof runtimeStatus.opening_book_statistics_available !== "boolean") {
+    throw new Error("Opening book runtime omitted its statistics capability");
+  }
+  const statisticsAvailable = Boolean(statsFile);
+  if (runtimeStatus.opening_book_statistics_available !== statisticsAvailable) {
+    throw new Error("Opening book runtime statistics capability mismatch");
+  }
+  const bookMetadata = statSync(bookFile);
+  if (bookMetadata.size <= 0 || bookMetadata.size % 16 !== 0) {
+    throw new Error("Opening book Polyglot framing is invalid");
+  }
+  const bookRows = bookMetadata.size / 16;
+  if (!statisticsAvailable) {
+    const identity = String(runtimeStatus.opening_book_identity ?? "");
+    if (!/^\d+$/u.test(identity) || !Number.isSafeInteger(bookRows)) {
+      throw new Error("Opening book base runtime identity is invalid");
+    }
+    return {
+      book_file: bookFile,
+      stats_file: "",
+      policy_file: "",
+      statistics_available: false,
+      identity,
+      rows: bookRows,
+    };
+  }
+  for (const [filePath, label] of [[statsFile, "stats"], [policyFile, "policy"]]) {
     if (!existsSync(filePath) || !statSync(filePath).isFile()) {
       throw new Error(`Opening book ${label} file is missing: ${filePath}`);
     }
@@ -436,11 +473,14 @@ function openingBookContract(config, runtimeStatus) {
   );
   if (!header) throw new Error("Opening book stats header is invalid");
   const rows = Number(header[2]);
-  if (!Number.isSafeInteger(rows)) throw new Error("Opening book row count is unsafe");
+  if (!Number.isSafeInteger(rows) || rows !== bookRows) {
+    throw new Error("Opening book stats row count does not match Polyglot framing");
+  }
   return {
     book_file: bookFile,
     stats_file: statsFile,
     policy_file: policyFile,
+    statistics_available: true,
     identity: BigInt(`0x${header[1]}`).toString(10),
     rows,
   };
@@ -2813,6 +2853,10 @@ export class UciEngine {
               + `${liveRuntimeStatus.opening_book_entries}!=${expectedBook.rows}`,
             );
           }
+          if (liveRuntimeStatus.opening_book_statistics_available
+              !== expectedBook.statistics_available) {
+            throw new Error("Opening book statistics capability mismatch");
+          }
         }
         this.qualificationStatus = {
           ...this.qualificationStatus,
@@ -3223,6 +3267,8 @@ function bookConfigurationIdentity(config) {
   const value = JSON.stringify({
     OwnBook: Object.hasOwn(options, "OwnBook") ? options.OwnBook : null,
     BookFile: options.BookFile ?? "",
+    BookStatsFile: options.BookStatsFile ?? "",
+    BookPolicyFile: options.BookPolicyFile ?? "",
     BookSelectionPolicy: options.BookSelectionPolicy ?? "",
   });
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
@@ -3335,6 +3381,8 @@ export function gameRuntimeProvenance(config, engine) {
       configured_enabled: configuredBook,
       observed_enabled: liveRuntime.opening_book_enabled ?? null,
       observed_active: liveRuntime.opening_book_active ?? null,
+      observed_statistics_available:
+        liveRuntime.opening_book_statistics_available ?? null,
       observed_entries: liveRuntime.opening_book_entries ?? null,
       observed_identity: liveRuntime.opening_book_identity ?? "",
       mcgs_prior_blend_permille:
