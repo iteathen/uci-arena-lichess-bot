@@ -54,6 +54,20 @@ function safeRelative(value) {
   return normalized;
 }
 
+export function safeWorkspaceRelative(value) {
+  if (value === ".") return value;
+  return safeRelative(value);
+}
+
+function isSafeWorkspaceRelative(value) {
+  try {
+    safeWorkspaceRelative(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function listFiles(directory, relative = "") {
   const rows = [];
   for (const name of readdirSync(path.join(directory, relative)).sort()) {
@@ -239,7 +253,7 @@ function installerManifest(componentContract, version, target, staging) {
       || JSON.stringify(startupControl.actions?.install) !== JSON.stringify(["startup", "install"])
       || JSON.stringify(startupControl.actions?.uninstall) !== JSON.stringify(["startup", "uninstall"])
       || startupControl.workspace_argument?.flag !== "--runtime-dir"
-      || startupControl.workspace_argument?.relative_path !== "runtime"
+      || !isSafeWorkspaceRelative(startupControl.workspace_argument?.relative_path)
       || startupControl.configuration_argument !== "--config"
       || startupControl.result?.envelope !== "startup"
       || startupControl.result?.require_configuration_match_on_install !== false
@@ -484,9 +498,11 @@ function build(args) {
   process.stdout.write(`${JSON.stringify({ artifact, result: resultPath, ...result })}\n`);
 }
 
-try {
-  build(parseArguments(process.argv.slice(2)));
-} catch (error) {
-  process.stderr.write(`component release failed: ${error.message}\n`);
-  process.exitCode = 1;
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  try {
+    build(parseArguments(process.argv.slice(2)));
+  } catch (error) {
+    process.stderr.write(`component release failed: ${error.message}\n`);
+    process.exitCode = 1;
+  }
 }

@@ -7,6 +7,8 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { safeWorkspaceRelative } from "./tools/build-component-release.mjs";
+
 const root = path.dirname(fileURLToPath(import.meta.url));
 
 test("component definition packages runtime contracts without test or source-tree coupling", () => {
@@ -42,6 +44,20 @@ test("component manifest separates operator engine overrides from managed suite 
   assert.deepEqual(bindings.lichess_transport_profile, ["saved_locator"]);
   assert.deepEqual(bindings.opening_book, ["saved_locator", "install_receipt"]);
   assert.deepEqual(bindings.syzygy, ["saved_locator", "install_receipt"]);
+  assert.equal(
+    manifest.installation.installer_integration.startup_control
+      .workspace_argument.relative_path,
+    ".",
+  );
+  assert.deepEqual(manifest.installation.external_user_data, ["provider_workspace"]);
+});
+
+test("component release accepts safe declarative workspace mappings", () => {
+  assert.equal(safeWorkspaceRelative("."), ".");
+  assert.equal(safeWorkspaceRelative("runtime"), "runtime");
+  assert.equal(safeWorkspaceRelative("provider/runtime"), "provider/runtime");
+  assert.throws(() => safeWorkspaceRelative(".."), /unsafe component path/);
+  assert.throws(() => safeWorkspaceRelative("C:\\provider"), /unsafe component path/);
 });
 
 test("Manager configuration and status contracts are closed and separate requests from responses", () => {

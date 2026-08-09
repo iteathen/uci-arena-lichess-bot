@@ -13,7 +13,7 @@ meta:
 authority:
   transport_and_scheduler: iteathen/uci-arena-lichess-bot
   engine_move_selection: selected_external_uci_process
-  durable_runtime_store: runtime_state/lichess/matches.sqlite
+  durable_runtime_store: provider_workspace/matches.sqlite
   timing_profile_consumption_contract:
     package: '@uci-arena/time-profile-contract'
     minimum_version: 1.2.0
@@ -58,7 +58,7 @@ configuration:
   schema: uci_arena_lichess_adapter_v7
   backward_compatibility: "v2/v3/v4/v5/v6 retain their declared migrations; new configuration is emitted as v7. Legacy documents without engine.adapter retain uci_arena_extended_v1 behavior."
   path_independence:
-    - "Provider source and runtime paths resolve from the provider component root, never the process current working directory or a former engine-repository location."
+    - "Provider source paths resolve from the provider component root. Persistent runtime paths resolve first from an explicit runtime-directory argument, then from the parent of an explicitly supplied provider configuration, and otherwise use the component-root development fallback. An installed configuration must therefore keep mutable runtime state in its preserved provider workspace, never the immutable component root, process current working directory, or a former engine-repository location."
     - "Engine executable, engine working directory, model, timing, capacity, and qualification paths enter explicitly from installed component discovery or invocation options."
     - "Path precedence is explicit invocation, then an absolute path authored in the supplied configuration document, then an ambient development fallback, then a portable template value. Placeholder expansion does not promote a template value into authored absolute authority, and ambient variables never replace installer-composed absolute model, single-game, timing, or temporal-curve authority."
     - "The tracked template uses an engine-component placeholder and does not name an engine source-tree layout."
@@ -604,6 +604,7 @@ manager_account_and_options_contract_2026_07_31:
       - provider_status
     rules:
       - "Owner, reservation, and pause state remain in the adapter-owned WAL-mode SQLite store and survive restart. They are never copied into tracked config."
+      - "The provider owns runtime-path resolution. An explicit runtime-directory argument takes precedence; otherwise an explicit configuration path anchors the same preserved workspace used by Manager. Manager does not know or supply the SQLite filename."
       - "Manager invokes only the fixed provider command and action set with separately validated scalar arguments; browser input never becomes an executable, script, shell fragment, store path, or runtime path."
       - "Responses are bounded typed JSON and omit credentials, engine child details, raw config, filesystem discovery, and database internals."
       - "Account controls do not require or read the bot token and cannot interrupt an active game."
@@ -651,6 +652,8 @@ installer_component_contract_2026_08_01:
     - "Every locator binding declares its accepted authority sources. Timing, single-game, capacity, and transport evidence accept only saved locators; opening-book and Syzygy knowledge may also accept receipt-managed assets."
     - "Installer supplies only declared dependency paths and locator paths selected from each binding's accepted authority sources through the versioned installation context; it does not interpret Lichess configuration fields, engine-adapter semantics, qualification combinations, or knowledge-source UCI options."
     - "The install manifest declares the exact startup entrypoint, action arrays, runtime-directory/configuration flags, and response envelope. Installer may invoke credential-free uninstall from that contract but never fabricates Lichess arguments or reads a token."
+    - "The startup runtime-directory contract names the provider workspace root so startup, account probe, status, and local controls cannot create parallel persistence authorities."
+    - "The component release builder validates the declared startup workspace path structurally and does not hard-code the current workspace layout; changing a safe relative workspace mapping is manifest data, not release-builder control flow."
     - "The outer provider result uses the shared suite field names and binds the exact artifact, install manifest, source repository and commit, source tree, dependency locks, toolchain, SBOM, licenses, build flags, and passing test receipt."
     - "The provider release remains component-only. It never claims suite composition authority and never packages, reads, hashes, or copies a credential."
     - "After keyless verification, the same explicitly dispatched job publishes the exact archive, provider result, and Sigstore bundle directly to one private immutable candidate prerelease. Actions artifact storage is not candidate transport."

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -36,6 +36,7 @@ import {
   probeAccount,
   providerStatusProjection,
   resolveExternalTokenFile,
+  resolveProviderRuntimeDirectory,
   managerOptionsProjection,
   main,
   updateManagerOptions,
@@ -314,6 +315,67 @@ function qualifiedRuntimeStatus(profile) {
     } : {}),
   };
 }
+
+test("provider persistence follows runtime then configuration workspace authority", async (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-runtime-authority-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const componentRoot = path.join(directory, "immutable-component");
+  const workspace = path.join(directory, "preserved-workspace");
+  const explicitRuntime = path.join(directory, "explicit-runtime");
+  const configPath = path.join(workspace, "manager-config.json");
+  mkdirSync(componentRoot, { recursive: true });
+  mkdirSync(workspace, { recursive: true });
+  writeFileSync(configPath, "{}", "utf8");
+
+  assert.equal(
+    resolveProviderRuntimeDirectory({ config: configPath }, componentRoot),
+    workspace,
+  );
+  assert.equal(
+    resolveProviderRuntimeDirectory(
+      { config: configPath, runtime_dir: explicitRuntime },
+      componentRoot,
+    ),
+    explicitRuntime,
+  );
+  assert.equal(
+    resolveProviderRuntimeDirectory({}, componentRoot),
+    path.join(componentRoot, "runtime_state", "lichess"),
+  );
+  assert.throws(
+    () => resolveProviderRuntimeDirectory({ runtime_dir: " " }, componentRoot),
+    /--runtime-dir must be a non-empty path/,
+  );
+
+  const messages = [];
+  const originalLog = console.log;
+  console.log = (message) => messages.push(message);
+  try {
+    assert.equal(await main(["owner", "list", "--config", configPath]), 0);
+  } finally {
+    console.log = originalLog;
+  }
+  assert.equal(JSON.parse(messages.at(-1)).status, "ready");
+  assert.equal(existsSync(path.join(workspace, "matches.sqlite")), true);
+  assert.equal(existsSync(path.join(componentRoot, "runtime_state")), false);
+
+  messages.length = 0;
+  console.log = (message) => messages.push(message);
+  try {
+    assert.equal(await main([
+      "owner",
+      "list",
+      "--config",
+      configPath,
+      "--runtime-dir",
+      explicitRuntime,
+    ]), 0);
+  } finally {
+    console.log = originalLog;
+  }
+  assert.equal(JSON.parse(messages.at(-1)).status, "ready");
+  assert.equal(existsSync(path.join(explicitRuntime, "matches.sqlite")), true);
+});
 
 function installQualifiedBookFixture(engineConfig) {
   const directory = path.join(engineConfig.working_directory, "book-fixture");

@@ -309,6 +309,13 @@ Rate-limit cooldowns survive restart and cannot be shortened by local config.
 Runtime NDJSON logging retains a bounded current log and one rotated predecessor
 inside the persistent provider workspace.
 
+Runtime-path authority is explicit and stable: `--runtime-dir` wins when it is
+supplied; otherwise an explicit `--config` path anchors persistence in that
+configuration file's parent workspace. Only a development invocation with
+neither option uses the component-local `runtime_state/lichess` fallback. An
+installed account probe therefore cannot write into the immutable component
+root, and Manager never needs to know the provider-private SQLite filename.
+
 `backfill-game-provenance.mjs` can apply an explicitly supplied historical
 evidence manifest in dry-run-first mode. Historical evidence is not committed
 to this provider repository; it belongs in qualified Evidence Service output or

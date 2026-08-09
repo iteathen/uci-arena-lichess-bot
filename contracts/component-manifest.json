@@ -3,7 +3,7 @@
   "component": {
     "id": "lichess.adapter",
     "product_id": "uci_arena.lichess_bot",
-    "version": "1.0.5",
+    "version": "1.0.6",
     "repository": "iteathen/uci-arena-lichess-bot"
   },
   "runtime": {
@@ -79,7 +79,7 @@
           "install": ["startup", "install"],
           "uninstall": ["startup", "uninstall"]
         },
-        "workspace_argument": {"flag": "--runtime-dir", "relative_path": "runtime"},
+        "workspace_argument": {"flag": "--runtime-dir", "relative_path": "."},
         "configuration_argument": "--config",
         "result": {
           "envelope": "startup",
@@ -103,7 +103,7 @@
     "preserved_paths": [],
     "optional_paths": ["native/lichess_adapter_launcher.exe"],
     "generated_paths": [],
-    "external_user_data": ["manager_data/lichess"],
+    "external_user_data": ["provider_workspace"],
     "external_credentials": ["operator_selected_token_file"],
     "uninstall_preserves_user_data": true
   },

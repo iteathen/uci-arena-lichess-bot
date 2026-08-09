@@ -5299,8 +5299,24 @@ function integerOption(value, label, fallback) {
   return parsed;
 }
 
+export function resolveProviderRuntimeDirectory(options = {}, componentRoot = ROOT) {
+  if (options.runtime_dir !== undefined) {
+    if (typeof options.runtime_dir !== "string" || !options.runtime_dir.trim()) {
+      throw new Error("--runtime-dir must be a non-empty path");
+    }
+    return path.resolve(options.runtime_dir);
+  }
+  if (options.config !== undefined) {
+    if (typeof options.config !== "string" || !options.config.trim()) {
+      throw new Error("--config must be a non-empty path");
+    }
+    return path.dirname(path.resolve(options.config));
+  }
+  return path.join(path.resolve(componentRoot), "runtime_state", "lichess");
+}
+
 function runStoreCommand(options) {
-  const runtimeDir = path.resolve(options.runtime_dir ?? DEFAULT_RUNTIME_DIR);
+  const runtimeDir = resolveProviderRuntimeDirectory(options);
   const store = new LichessStore(path.resolve(options.store ?? path.join(runtimeDir, "matches.sqlite")));
   try {
     let result;
@@ -5348,7 +5364,7 @@ export async function main(argv = process.argv.slice(2)) {
       || new Set(["owner", "reservation", "scheduler"]).has(options.command)) {
     return runStoreCommand(options);
   }
-  const runtimeDir = path.resolve(options.runtime_dir ?? DEFAULT_RUNTIME_DIR);
+  const runtimeDir = resolveProviderRuntimeDirectory(options);
   if (options.command === "run") configureRuntimeLog(runtimeDir);
   if (options.command === "status") {
     const { runtime, error: runtimeError } = boundedRuntimeMetadata(runtimeDir);
