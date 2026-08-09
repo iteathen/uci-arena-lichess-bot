@@ -1,6 +1,6 @@
 # Shared Agent Operating Standard
 
-Version: `2026-08-09.v1`
+Version: `2026-08-09.v2`
 
 This is the reusable operating core for AI coding agents. Project-local `AGENTS.md` files add product identity, authority order, commands, and non-negotiable constraints. A project may strengthen this standard but should not casually fork its language or duplicate it elsewhere.
 
@@ -33,7 +33,23 @@ When code, specs, tests, plans, or history disagree, classify the disagreement b
 
 Do not silently obey stale prose. Do not silently ignore an active contract. Resolve the authority question or stop at the smallest safe boundary when it cannot be resolved.
 
-Deleting stale active guidance is preferred to keeping a second "legacy instruction" copy in the live tree; Git history already preserves history. If historical material must remain in-tree, mark it non-authoritative and keep it out of startup routes.
+### Archive instead of deleting project evidence
+
+When obsolete tracked guidance, specifications, plans, decisions, reports, migration records, or other potentially useful project evidence must leave an active authority path, archive it instead of deleting it.
+
+The same change that removes material from active use must record:
+
+- `archived_at`: the date of archival;
+- `original_path`: where the material lived while active;
+- `archive_path`: where the preserved copy now lives;
+- `reason`: why it is no longer active;
+- `superseded_by`: the current authority or replacement, when one exists;
+- `removed_from_active_authority`: what startup route, index, registry, or ownership surface stopped selecting it;
+- `change_reference`: the PR, commit, issue, or other durable change reference when available.
+
+Archive locations must be clearly non-authoritative and excluded from normal agent/spec routing. Preserve the original content unless the archive format itself requires a mechanical wrapper or manifest. If content is transformed during archival, preserve the original revision identity and explain the transformation.
+
+Use `.agents/archive-policy.md` for the canonical record shape and archive procedure. This archival rule does not require preservation of secrets, generated caches, disposable build output, corrupted transient files, or other material whose owning policy explicitly requires destruction or regeneration.
 
 ## 3. Outcome, ownership, and reuse first
 
