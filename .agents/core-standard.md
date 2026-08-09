@@ -4,6 +4,8 @@ Version: `2026-08-09.v1`
 
 This is the reusable operating core for AI coding agents. Project-local `AGENTS.md` files add product identity, authority order, commands, and non-negotiable constraints. A project may strengthen this standard but should not casually fork its language or duplicate it elsewhere.
 
+Synchronization rule: every repository carrying this version must keep this file byte-identical. Project-specific additions belong in the local `AGENTS.md` or routed local specifications. A shared-rule change bumps the version and is propagated as one coordinated cross-repository change.
+
 ## 1. Load only current authority
 
 At session start:
