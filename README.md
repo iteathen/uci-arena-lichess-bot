@@ -251,6 +251,15 @@ commands, and unknown fields are not editable through this projection.
 Rated games and automatic outbound scheduling require their distinct explicit
 confirmation values. A generic Save action is not sufficient.
 
+The catalog also publishes `qualification_run` for Manager's authenticated
+desktop workflow. It is credential-free and accepts only the installer-authored
+configuration and provider workspace paths that Manager appends to the fixed
+operation. The provider reuses semantically compatible timing authority, runs
+the installed Evidence Runtime against the exact installed Engine, publishes
+content-addressed single-game and capacity evidence, and removes an incomplete
+run. Manager validates the returned files under the provider workspace and
+commits their locators through Suite Setup; raw paths never reach the dashboard.
+
 ## Startup
 
 Windows uses a GUI-subsystem native launcher and a least-privilege, hidden,

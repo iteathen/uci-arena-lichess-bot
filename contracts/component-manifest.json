@@ -3,7 +3,7 @@
   "component": {
     "id": "lichess.adapter",
     "product_id": "uci_arena.lichess_bot",
-    "version": "1.0.7",
+    "version": "1.0.8",
     "repository": "iteathen/uci-arena-lichess-bot"
   },
   "runtime": {
@@ -34,6 +34,7 @@
       "manager_operations",
       "provider_configuration",
       "provider_status",
+      "installed_qualification",
       "startup_install",
       "startup_uninstall"
     ],
@@ -60,7 +61,10 @@
       "dependency_bindings": [
         {"name": "default_engine", "component_id": "uci_arena.engine", "source": "entrypoint", "entrypoint": "uci", "required": false},
         {"name": "default_engine_root", "component_id": "uci_arena.engine", "source": "active_root", "required": false},
-        {"name": "default_model_root", "component_id": "uci_arena.engine", "source": "component_path", "path": "models/default", "required": false}
+        {"name": "default_model_root", "component_id": "uci_arena.engine", "source": "component_path", "path": "models/default", "required": false},
+        {"name": "complete_game_entrypoint", "component_id": "uci_arena_evidence.runtime", "source": "entrypoint", "entrypoint": "complete_game", "required": false},
+        {"name": "referee", "component_id": "uci_arena_evidence.runtime", "source": "entrypoint", "entrypoint": "referee", "required": false},
+        {"name": "stockfish", "component_id": "stockfish.engine", "source": "entrypoint", "entrypoint": "stockfish", "required": false}
       ],
       "locator_bindings": [
         {"name": "uci_engine", "kind": "uci_engine", "required": false, "accepted_sources": ["saved_locator"]},
@@ -120,6 +124,10 @@
     "required_components": [],
     "required_capabilities": ["uci.engine.process"],
     "compatible_default_components": ["uci_arena.engine"],
-    "optional_components": ["opening_book.standard"]
+    "optional_components": [
+      "opening_book.standard",
+      "uci_arena_evidence.runtime",
+      "stockfish.engine"
+    ]
   }
 }

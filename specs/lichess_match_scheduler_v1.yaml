@@ -603,12 +603,22 @@ manager_account_and_options_contract_2026_07_31:
       - startup_install
       - startup_uninstall
       - provider_status
+      - qualification_run
     rules:
       - "Owner, reservation, and pause state remain in the adapter-owned WAL-mode SQLite store and survive restart. They are never copied into tracked config."
       - "The provider owns runtime-path resolution. An explicit runtime-directory argument takes precedence; otherwise an explicit configuration path anchors the same preserved workspace used by Manager. Manager does not know or supply the SQLite filename."
       - "Manager invokes only the fixed provider command and action set with separately validated scalar arguments; browser input never becomes an executable, script, shell fragment, store path, or runtime path."
       - "Responses are bounded typed JSON and omit credentials, engine child details, raw config, filesystem discovery, and database internals."
       - "Account controls do not require or read the bot token and cannot interrupt an active game."
+  installed_qualification:
+    operation: qualification_run
+    rules:
+      - "The provider owns one credential-free installed requalification workflow for the extended UCI Arena Engine. Manager supplies no executable, path, command, UCI option, or evidence identity."
+      - "The workflow consumes only absolute paths authored by Installer from receipt-declared optional bindings for Engine, Evidence Runtime complete-game/referee entrypoints, Stockfish, the selected timing profile, opening book, and Syzygy assets. Ambient development paths are disabled."
+      - "A timing-compatible Engine rebuild reuses the selected qualified timing profile as semantic timing authority while fresh complete-game, single-game, and concurrent-capacity evidence bind the exact current executable."
+      - "The complete-game tool remains Engine-owned runtime authority. The Lichess provider owns validation, single-game and capacity publication, content-addressed workspace retention, bounded subprocess output, and cleanup of an uncommitted failed run."
+      - "Requalification is rejected while provider startup is enabled. A successful result returns only bounded validated profile paths beneath the provider workspace; it never reads a credential or changes active locator authority by itself."
+      - "An exact completed content-addressed result is idempotently reusable. Interrupted output without a completion marker has no authority and is removed before the same identity is retried."
   provider_status:
     schema: uci_arena_lichess_status_v3
     rules:
@@ -627,6 +637,7 @@ manager_account_and_options_contract_2026_07_31:
     - "Provider status tests cover missing state, stale/dead process evidence, active disconnected state, and active ready state without reading a credential."
     - "Runtime NDJSON logs rotate into one bounded retained predecessor; logging failures remain observable only through lost diagnostics and never interrupt a live game."
     - "Installed headless acceptance proves the configured bot is discoverable, its activity and blockers are visible, and account/options controls are reachable without opening a terminal."
+    - "Installed qualification tests prove the command is built only from Installer-authored dependency/configuration bindings, disables ambient path fallback, retains selected timing authority, and publishes exact current Engine single-game and capacity evidence without a token."
     - "Release packaging includes only provider runtime files and the vendored contract runtime closure; provider tests, fabricated APIs, fixtures, source provenance history, and repository-only vendor locks are excluded."
     - "Release verification binds the outer provider result to the artifact and binds the internal provenance, component definition, component manifest, exact source identity, and exact passing test receipt before signing."
 
@@ -652,6 +663,7 @@ installer_component_contract_2026_08_01:
     - "The provider publishes a bounded installer-integration entrypoint that owns Lichess configuration composition, accepts only an operator-saved locator as the generic UCI-engine override, and otherwise uses the suite-declared compatible default engine binding. Receipt-managed default-engine discovery must not be projected through that override binding."
     - "Every locator binding declares its accepted authority sources. Timing, single-game, capacity, and transport evidence accept only saved locators; opening-book and Syzygy knowledge may also accept receipt-managed assets."
     - "Installer supplies only declared dependency paths and locator paths selected from each binding's accepted authority sources through the versioned installation context; it does not interpret Lichess configuration fields, engine-adapter semantics, qualification combinations, or knowledge-source UCI options."
+    - "Optional installed-qualification bindings name Evidence Runtime's complete-game and referee entrypoints plus Stockfish through component declarations. Their absence keeps ordinary adapter use available and makes the qualification operation explicitly unavailable; no repository-relative fallback is permitted."
     - "The install manifest declares the exact startup entrypoint, action arrays, runtime-directory/configuration flags, and response envelope. Installer may invoke credential-free uninstall from that contract but never fabricates Lichess arguments or reads a token."
     - "The startup runtime-directory contract names the provider workspace root so startup, account probe, status, and local controls cannot create parallel persistence authorities."
     - "The component release builder validates the declared startup workspace path structurally and does not hard-code the current workspace layout; changing a safe relative workspace mapping is manifest data, not release-builder control flow."

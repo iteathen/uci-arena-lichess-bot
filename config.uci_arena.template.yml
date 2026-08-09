@@ -21,6 +21,11 @@
       "OwnBook": true
     }
   },
+  "qualification": {
+    "complete_game_entrypoint": "<UCI_ARENA_EVIDENCE_RUNTIME_ROOT>/arena/run_complete_game_matrix.mjs",
+    "referee": "<UCI_ARENA_EVIDENCE_RUNTIME_ROOT>/bin/uci_arena_complete_game_referee.exe",
+    "stockfish": "<STOCKFISH_ROOT>/bin/stockfish.exe"
+  },
   "timing": {
     "opponent_turn_search": true,
     "foreground_preempts_ponder": true,

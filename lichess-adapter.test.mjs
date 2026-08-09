@@ -3140,6 +3140,9 @@ test("nested local control commands parse without touching credentials", () => {
   assert.deepEqual(parseArguments(["config", "update", "--config", "local.json", "--settings", "{}"]), {
     command: "config", action: "update", config: "local.json", settings: "{}",
   });
+  assert.deepEqual(parseArguments(["qualification", "run", "--config", "local.json"]), {
+    command: "qualification", action: "run", config: "local.json",
+  });
 });
 
 test("private stdin shutdown command aborts the adapter cooperatively", async () => {

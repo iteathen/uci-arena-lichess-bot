@@ -49,6 +49,9 @@ test('installer integration binds complete suite evidence and bounded knowledge 
       default_engine: path.join(engineRoot, 'bin', 'uci_arena_engine.exe'),
       default_engine_root: engineRoot,
       default_model_root: path.join(engineRoot, 'models', 'default'),
+      complete_game_entrypoint: path.join(root, 'evidence', 'arena', 'run_complete_game_matrix.mjs'),
+      referee: path.join(root, 'evidence', 'bin', 'referee.exe'),
+      stockfish: path.join(root, 'stockfish', 'bin', 'stockfish.exe'),
     },
     locators: {
       timing_profile: path.join(root, 'profiles', 'timing.json'),
@@ -71,7 +74,29 @@ test('installer integration binds complete suite evidence and bounded knowledge 
     path.join(books, 'strong_rare_v1.policy'));
   assert.equal(result.configuration.engine.uci_options.SyzygyPath,
     path.join(root, 'tablebases'));
+  assert.deepEqual(result.configuration.qualification, {
+    complete_game_entrypoint: path.join(root, 'evidence', 'arena', 'run_complete_game_matrix.mjs'),
+    referee: path.join(root, 'evidence', 'bin', 'referee.exe'),
+    stockfish: path.join(root, 'stockfish', 'bin', 'stockfish.exe'),
+  });
   assert.equal(result.configuration.scheduler.enabled, true);
+});
+
+test('installer integration rejects partial installed qualification bindings', () => {
+  const root = path.resolve(os.tmpdir(), 'arena-lichess-partial-qualification');
+  assert.throws(() => renderInstallerConfiguration({
+    schema: 'arena_provider_install_context_v1',
+    schema_version: 1,
+    workspace: path.join(root, 'workspace'),
+    enabled: false,
+    bindings: {
+      default_engine: path.join(root, 'engine', 'uci_arena_engine.exe'),
+      default_engine_root: path.join(root, 'engine'),
+      default_model_root: path.join(root, 'engine', 'models', 'default'),
+      complete_game_entrypoint: path.join(root, 'evidence', 'run_complete_game_matrix.mjs'),
+    },
+    locators: {},
+  }), /qualification bindings are incomplete/);
 });
 
 test('installer integration binds a base Polyglot book without fabricating sidecars', (t) => {

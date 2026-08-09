@@ -115,9 +115,29 @@ export function renderInstallerConfiguration(context) {
     configuration.capacity.bot.target_active = 0;
     delete configuration.capacity.capacity_profile;
     configuration.timing.opponent_turn_search = false;
+    delete configuration.qualification;
   } else {
     const engineRoot = requireAbsolutePath(bindings.default_engine_root, 'bindings.default_engine_root');
     const modelRoot = requireAbsolutePath(bindings.default_model_root, 'bindings.default_model_root');
+    const completeGame = optionalAbsolutePath(
+      bindings.complete_game_entrypoint,
+      'bindings.complete_game_entrypoint',
+    );
+    const referee = optionalAbsolutePath(bindings.referee, 'bindings.referee');
+    const stockfish = optionalAbsolutePath(bindings.stockfish, 'bindings.stockfish');
+    const qualificationBindings = [completeGame, referee, stockfish];
+    if (qualificationBindings.some(Boolean) && !qualificationBindings.every(Boolean)) {
+      throw new Error('installed Lichess qualification bindings are incomplete');
+    }
+    if (qualificationBindings.every(Boolean)) {
+      configuration.qualification = {
+        complete_game_entrypoint: completeGame,
+        referee,
+        stockfish,
+      };
+    } else {
+      delete configuration.qualification;
+    }
     configuration.engine.adapter = 'uci_arena_extended_v1';
     configuration.engine.executable = defaultEngine;
     configuration.engine.working_directory = engineRoot;

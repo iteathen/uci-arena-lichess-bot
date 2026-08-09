@@ -6,11 +6,13 @@ import {
   appendFileSync,
   closeSync,
   existsSync,
+  lstatSync,
   openSync,
   mkdirSync,
   readFileSync,
   readSync,
   renameSync,
+  rmSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -46,9 +48,11 @@ import {
 import {
   loadTimeProfile,
   timeProfileFallbackStatus,
+  validateStoredProfile,
   validateAppliedTimeProfileReserve,
   validateProfileRuntimeSnapshot,
 } from "@uci-arena/time-profile-contract";
+import { publishSingleGameProfile } from "./publish-single-game-profile.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT = HERE;
@@ -1139,6 +1143,7 @@ export function loadRuntimeConfig({
   profilePath,
   timeProfilePath,
   temporalCurvePath,
+  requireSingleGameProfile = true,
   environment = process.env,
 } = {}) {
   const config = loadConfigDocument({ templatePath, engineRoot });
@@ -1196,7 +1201,7 @@ export function loadRuntimeConfig({
     config[CONFIGURED_RUNTIME_PATH_AUTHORITY].singleGameProfile,
   );
   if (selectedProfile) config.engine.single_game_profile = selectedProfile;
-  if (!config.engine.single_game_profile) {
+  if (requireSingleGameProfile && !config.engine.single_game_profile) {
     throw new Error("Lichess adapter config is missing engine.single_game_profile");
   }
   const selectedTimeProfile = selectRuntimePath(
@@ -1707,7 +1712,13 @@ export function loadCapacityProfile(
   return { ...capacity, profile_path: resolvedPath };
 }
 
-function publishCapacityProfile(targetPath, maximumConcurrency, config, singleGameProfile, statuses) {
+export function publishCapacityProfile(
+  targetPath,
+  maximumConcurrency,
+  config,
+  singleGameProfile,
+  statuses,
+) {
   const target = path.resolve(targetPath);
   mkdirSync(path.dirname(target), { recursive: true });
   if (config.engine.adapter === "standard_uci_v1") {
@@ -5205,7 +5216,8 @@ export function parseArguments(argv) {
   if (!command) throw new Error("Expected a Lichess adapter command");
   const rest = [...argumentsList];
   const options = { command };
-  if (new Set(["owner", "reservation", "scheduler", "startup", "config"]).has(command)
+  if (new Set(["owner", "reservation", "scheduler", "startup", "config", "qualification"])
+    .has(command)
       && rest[0] && !rest[0].startsWith("--")) {
     options.action = rest.shift();
   }
@@ -5276,6 +5288,357 @@ async function preflightQualifiedEngines(config, count) {
     return engines.map((engine) => engine.qualificationStatus);
   } finally {
     await Promise.allSettled(engines.map((engine) => engine.close()));
+  }
+}
+
+function qualificationRegularFile(value, label) {
+  requireString(value, label);
+  const resolved = path.resolve(value);
+  if (!path.isAbsolute(value)) throw new Error(`${label} must be an absolute path`);
+  const metadata = lstatSync(resolved);
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    throw new Error(`${label} must be a regular non-link file`);
+  }
+  return resolved;
+}
+
+function qualificationDirectory(value, label) {
+  requireString(value, label);
+  const resolved = path.resolve(value);
+  if (!path.isAbsolute(value)) throw new Error(`${label} must be an absolute path`);
+  const metadata = lstatSync(resolved);
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    throw new Error(`${label} must be a non-link directory`);
+  }
+  return resolved;
+}
+
+function readQualificationJson(filename, label, maximumBytes = 16 * 1024 * 1024) {
+  const resolved = qualificationRegularFile(filename, label);
+  const metadata = statSync(resolved);
+  if (metadata.size < 2 || metadata.size > maximumBytes) {
+    throw new Error(`${label} is not a bounded JSON file`);
+  }
+  try {
+    return JSON.parse(readFileSync(resolved, "utf8"));
+  } catch (error) {
+    throw new Error(`${label} is not valid JSON: ${error.message}`);
+  }
+}
+
+function qualificationBoolean(value, fallback) {
+  return value === undefined ? fallback : value === true || value === "true";
+}
+
+export function installedQualificationCommand(config, outputPath) {
+  if (config.engine.adapter !== "uci_arena_extended_v1") {
+    throw new Error("Installed qualification requires the extended UCI Arena Engine adapter");
+  }
+  const qualification = config.qualification;
+  if (!qualification || typeof qualification !== "object" || Array.isArray(qualification)) {
+    throw new Error("Installed Lichess qualification dependencies are unavailable");
+  }
+  const completeGameEntrypoint = qualificationRegularFile(
+    qualification.complete_game_entrypoint,
+    "qualification.complete_game_entrypoint",
+  );
+  const referee = qualificationRegularFile(qualification.referee, "qualification.referee");
+  const stockfish = qualificationRegularFile(qualification.stockfish, "qualification.stockfish");
+  const engine = qualificationRegularFile(config.engine.executable, "engine.executable");
+  const modelRoot = qualificationDirectory(config.engine.uci_options.ModelRoot, "engine ModelRoot");
+  const timeProfilePath = qualificationRegularFile(
+    config.engine.time_profile,
+    "engine.time_profile",
+  );
+  const timingProfile = validateStoredProfile(
+    readQualificationJson(timeProfilePath, "timing profile"),
+  );
+  const search = timingProfile.identity?.search;
+  const model = timingProfile.identity?.model;
+  if (!search || !model) throw new Error("Timing profile identity is incomplete");
+  const argumentsList = [
+    completeGameEntrypoint,
+    "--engine", engine,
+    "--stockfish", stockfish,
+    "--referee", referee,
+    "--model-root", modelRoot,
+    "--time-profile", timeProfilePath,
+    "--output", path.resolve(outputPath),
+    "--time-ms", "25,100,500",
+    "--hard-ply-cap", "600",
+    "--search-core", String(search.search_core),
+    "--threads", String(search.threads),
+    "--root-workers", String(search.root_workers),
+    "--split-depth", String(search.split_depth),
+    "--expected-batch-size", String(search.batch_size_effective),
+    "--batch-wait-us", String(search.batch_wait_us_effective),
+    "--activation-depth", String(Math.max(6, Number(search.split_depth))),
+    "--activation-movetime-ms", "2000",
+    "--max-overrun-ratio", "1.5",
+    "--max-overrun-grace-ms", "50",
+    "--background-search", "false",
+    "--root-worker-cache-reuse", "false",
+    "--expected-model-id", String(model.model_id),
+    "--expected-model-fingerprint", String(model.model_fingerprint),
+    "--expected-provider", String(search.provider_effective),
+  ];
+  if (search.search_core === "mcgs") {
+    const mcgs = search.mcgs;
+    if (!mcgs) throw new Error("Timing profile MCGS identity is incomplete");
+    argumentsList.push(
+      "--search-graph-mb", String(mcgs.search_graph_mb),
+      "--mcgs-cpuct-permille", String(mcgs.cpuct_permille),
+      "--mcgs-outstanding-batches", String(mcgs.outstanding_batches),
+      "--mcgs-book-prior-blend-permille", String(mcgs.book_prior_blend_permille),
+      "--mcgs-time-policy", String(mcgs.time_policy),
+    );
+  }
+  for (const name of ["BehaviorProfile", "McgsTemporalWeightProfile", "ModelBackend"]) {
+    const value = config.engine.uci_options[name];
+    if (["string", "number", "boolean"].includes(typeof value)) {
+      argumentsList.push("--model-option", `${name}=${value}`);
+    }
+  }
+  const syzygyPath = config.engine.uci_options.SyzygyPath;
+  if (syzygyPath) {
+    const tablebaseRoot = qualificationDirectory(syzygyPath, "SyzygyPath");
+    const manifestPath = qualificationRegularFile(
+      config.engine.uci_options.SyzygyManifest
+        ?? path.join(tablebaseRoot, "syzygy_manifest_v1.json"),
+      "SyzygyManifest",
+    );
+    const manifest = readQualificationJson(manifestPath, "Syzygy manifest");
+    const cardinality = Number(manifest.cardinality);
+    requireInteger(cardinality, "Syzygy manifest cardinality", 3, 7);
+    const probeLimit = Number(config.engine.uci_options.SyzygyProbeLimit ?? Math.min(6, cardinality));
+    const probeThreads = Number(config.engine.uci_options.SyzygyProbeThreads ?? 4);
+    argumentsList.push(
+      "--syzygy-path", tablebaseRoot,
+      "--syzygy-manifest", manifestPath,
+      "--syzygy-probe-limit", String(probeLimit),
+      "--syzygy-probe-threads", String(probeThreads),
+      "--syzygy-rule50", String(qualificationBoolean(
+        config.engine.uci_options.Syzygy50MoveRule,
+        true,
+      )),
+      "--syzygy-root-probe", String(qualificationBoolean(
+        config.engine.uci_options.SyzygyRootProbe,
+        true,
+      )),
+      "--syzygy-internal-probe", String(qualificationBoolean(
+        config.engine.uci_options.SyzygyInternalProbe,
+        true,
+      )),
+    );
+  }
+  argumentsList.push("--allow-shared-gpu-diagnostic", "--no-resume");
+  return {
+    executable: process.execPath,
+    workingDirectory: path.dirname(completeGameEntrypoint),
+    arguments: argumentsList,
+    engine,
+    modelRoot,
+    timeProfilePath,
+    timingProfile,
+  };
+}
+
+async function runBoundedQualificationTool(
+  executable,
+  workingDirectory,
+  argumentsList,
+  timeoutMs = 20 * 60 * 1000,
+) {
+  await new Promise((resolve, reject) => {
+    const child = spawn(executable, argumentsList, {
+      cwd: workingDirectory,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+      shell: false,
+    });
+    let stdout = Buffer.alloc(0);
+    let stderr = Buffer.alloc(0);
+    let settled = false;
+    let timer;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      error ? reject(error) : resolve();
+    };
+    const append = (current, chunk, label) => {
+      const next = Buffer.concat([current, Buffer.from(chunk)]);
+      if (next.length > 1024 * 1024) {
+        child.kill();
+        finish(new Error(`Complete-game qualifier ${label} exceeded 1 MiB`));
+      }
+      return next;
+    };
+    child.stdout.on("data", (chunk) => { stdout = append(stdout, chunk, "stdout"); });
+    child.stderr.on("data", (chunk) => { stderr = append(stderr, chunk, "stderr"); });
+    child.once("error", (error) => finish(error));
+    child.once("exit", (code, signal) => {
+      if (code === 0) {
+        finish();
+        return;
+      }
+      const diagnostic = stderr.toString("utf8").trim().slice(-4096);
+      finish(new Error(
+        `Complete-game qualifier failed (${signal ?? code ?? "unknown"})${diagnostic ? `: ${diagnostic}` : ""}`,
+      ));
+    });
+    timer = setTimeout(() => {
+      child.kill();
+      finish(new Error("Complete-game qualifier exceeded the 20 minute limit"));
+    }, timeoutMs);
+    timer.unref();
+  });
+}
+
+export async function runInstalledQualificationWorkflow({
+  configPath,
+  runtimeDir,
+  maximumConcurrency,
+  runTool = runBoundedQualificationTool,
+} = {}) {
+  const resolvedConfig = qualificationRegularFile(configPath, "qualification config");
+  const resolvedRuntime = path.resolve(runtimeDir);
+  mkdirSync(resolvedRuntime, { recursive: true });
+  const baseConfig = loadRuntimeConfig({
+    templatePath: resolvedConfig,
+    engineRoot: path.dirname(resolvedConfig),
+    requireSingleGameProfile: false,
+    environment: {},
+  });
+  const concurrency = maximumConcurrency ?? baseConfig.capacity.total_slots;
+  requireInteger(concurrency, "qualification maximum concurrency", 1, 64);
+  const engineSha = sha256File(baseConfig.engine.executable);
+  const timingSha = sha256File(baseConfig.engine.time_profile);
+  const qualificationDependencies = baseConfig.qualification;
+  if (!qualificationDependencies || typeof qualificationDependencies !== "object") {
+    throw new Error("Installed Lichess qualification dependencies are unavailable");
+  }
+  const qualificationToolIdentity = {
+    complete_game_entrypoint_sha256: sha256File(
+      qualificationRegularFile(
+        qualificationDependencies.complete_game_entrypoint,
+        "qualification.complete_game_entrypoint",
+      ),
+    ),
+    referee_sha256: sha256File(qualificationRegularFile(
+      qualificationDependencies.referee,
+      "qualification.referee",
+    )),
+    stockfish_sha256: sha256File(qualificationRegularFile(
+      qualificationDependencies.stockfish,
+      "qualification.stockfish",
+    )),
+    syzygy_manifest_sha256: baseConfig.engine.uci_options.SyzygyPath
+      ? sha256File(qualificationRegularFile(
+        baseConfig.engine.uci_options.SyzygyManifest
+          ?? path.join(baseConfig.engine.uci_options.SyzygyPath, "syzygy_manifest_v1.json"),
+        "SyzygyManifest",
+      ))
+      : null,
+    temporal_curve_sha256: baseConfig.engine.temporal_curve_profile
+      ? sha256File(qualificationRegularFile(
+        baseConfig.engine.temporal_curve_profile,
+        "engine.temporal_curve_profile",
+      ))
+      : null,
+  };
+  const runKey = createHash("sha256").update(JSON.stringify({
+    schema: "uci_arena_lichess_qualification_key_v1",
+    engine_sha256: engineSha,
+    timing_sha256: timingSha,
+    maximum_concurrency: concurrency,
+    qualification_tools: qualificationToolIdentity,
+  })).digest("hex");
+  const outputDirectory = path.join(resolvedRuntime, "qualification", runKey);
+  const completeGamePath = path.join(outputDirectory, "complete-game.json");
+  const singleGamePath = path.join(outputDirectory, "uci_arena_single_game_profile_v1.json");
+  const capacityPath = path.join(outputDirectory, "uci_arena_lichess_capacity_profile_v2.json");
+  const markerPath = path.join(outputDirectory, "qualification-result.json");
+  if (existsSync(markerPath)) {
+    const marker = readQualificationJson(markerPath, "qualification result");
+    if (marker.schema !== "uci_arena_lichess_qualification_result_v1"
+        || marker.engine_sha256 !== engineSha
+        || marker.timing_sha256 !== timingSha
+        || marker.maximum_concurrency !== concurrency
+        || marker.single_game_profile_sha256 !== sha256File(singleGamePath)
+        || marker.capacity_profile_sha256 !== sha256File(capacityPath)) {
+      throw new Error("Existing installed qualification result is inconsistent");
+    }
+    return {
+      ...marker,
+      status: "qualified",
+      single_game_profile: singleGamePath,
+      capacity_profile: capacityPath,
+      reused: true,
+    };
+  }
+  if (existsSync(outputDirectory)) rmSync(outputDirectory, { recursive: true, force: true });
+  mkdirSync(outputDirectory, { recursive: true });
+  try {
+    const command = installedQualificationCommand(baseConfig, completeGamePath);
+    await runTool(
+      command.executable,
+      command.workingDirectory,
+      command.arguments,
+    );
+    qualificationRegularFile(completeGamePath, "complete-game evidence");
+    publishSingleGameProfile({
+      engine: command.engine,
+      model_root: command.modelRoot,
+      time_profile: command.timeProfilePath,
+      complete_game_evidence: completeGamePath,
+      output: singleGamePath,
+      qualification_scope: "local_live_safety",
+      probe_depth: Math.max(6, Number(command.timingProfile.identity.search.split_depth)),
+      probe_timeout_ms: 240_000,
+    });
+    const qualifiedConfig = loadRuntimeConfig({
+      templatePath: resolvedConfig,
+      engineRoot: path.dirname(resolvedConfig),
+      profilePath: singleGamePath,
+      timeProfilePath: command.timeProfilePath,
+      environment: {},
+    });
+    const singleGameProfile = applySingleGameProfile(qualifiedConfig);
+    const statuses = await preflightQualifiedEngines(qualifiedConfig, concurrency);
+    const capacityProfile = publishCapacityProfile(
+      capacityPath,
+      concurrency,
+      qualifiedConfig,
+      singleGameProfile,
+      statuses,
+    );
+    const marker = {
+      schema: "uci_arena_lichess_qualification_result_v1",
+      engine_sha256: engineSha,
+      timing_sha256: timingSha,
+      timing_identity_sha256: command.timingProfile.identity_sha256,
+      maximum_concurrency: concurrency,
+      single_game_profile_sha256: sha256File(singleGamePath),
+      capacity_profile_sha256: sha256File(capacityPath),
+      search_core: singleGameProfile.search_core,
+      model_id: singleGameProfile.model_id,
+      provider: singleGameProfile.provider,
+      completed_at: new Date().toISOString(),
+    };
+    const temporaryMarker = `${markerPath}.tmp-${process.pid}`;
+    writeFileSync(temporaryMarker, `${JSON.stringify(marker, null, 2)}\n`, "utf8");
+    renameSync(temporaryMarker, markerPath);
+    return {
+      ...marker,
+      status: "qualified",
+      single_game_profile: singleGamePath,
+      capacity_profile: capacityProfile.profile_path,
+      reused: false,
+    };
+  } catch (error) {
+    rmSync(outputDirectory, { recursive: true, force: true });
+    throw error;
   }
 }
 
@@ -5429,6 +5792,7 @@ export async function main(argv = process.argv.slice(2)) {
   if (options.command === "config") {
     throw new Error(`Unknown config action: ${options.action ?? "missing"}`);
   }
+  const qualificationRun = options.command === "qualification" && options.action === "run";
   const config = options.command === "probe"
     ? loadManagerConfig({
       templatePath: configPath,
@@ -5443,7 +5807,33 @@ export async function main(argv = process.argv.slice(2)) {
       profilePath: options.profile,
       timeProfilePath: options.time_profile,
       temporalCurvePath: options.temporal_curve_profile,
+      requireSingleGameProfile: !qualificationRun,
+      environment: qualificationRun ? {} : process.env,
     });
+  if (qualificationRun) {
+    const startup = process.platform === "win32"
+      ? await queryWindowsStartup()
+      : process.platform === "linux"
+        ? await queryLinuxStartup()
+        : { installed: false };
+    if (startup.installed === true) {
+      throw new Error("Disable Lichess Bot startup before requalifying the installed engine");
+    }
+    const result = await runInstalledQualificationWorkflow({
+      configPath,
+      runtimeDir,
+      maximumConcurrency: integerOption(
+        options.max_concurrency,
+        "--max-concurrency",
+        config.capacity.total_slots,
+      ),
+    });
+    console.log(JSON.stringify(result));
+    return 0;
+  }
+  if (options.command === "qualification") {
+    throw new Error(`Unknown qualification action: ${options.action ?? "missing"}`);
+  }
   if (options.command === "startup" && options.action === "install") {
     const tokenFile = resolveExternalTokenFile(options);
     const { qualificationProfile, qualificationStatus } = await preflightDeploymentBundle(config);

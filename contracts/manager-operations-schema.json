@@ -88,6 +88,12 @@
       "credential": "forbidden",
       "response": "uci_arena_lichess_status_v3"
     },
+    "qualification_run": {
+      "arguments": ["qualification", "run"],
+      "mutates": true,
+      "credential": "forbidden",
+      "response": "uci_arena_lichess_qualification_result_v1"
+    },
     "account_probe": {
       "arguments": ["probe"],
       "mutates": false,
