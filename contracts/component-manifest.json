@@ -3,7 +3,7 @@
   "component": {
     "id": "lichess.adapter",
     "product_id": "uci_arena.lichess_bot",
-    "version": "1.0.4",
+    "version": "1.0.5",
     "repository": "iteathen/uci-arena-lichess-bot"
   },
   "runtime": {
@@ -63,13 +63,13 @@
         {"name": "default_model_root", "component_id": "uci_arena.engine", "source": "component_path", "path": "models/default", "required": false}
       ],
       "locator_bindings": [
-        {"name": "uci_engine", "kind": "uci_engine", "required": false},
-        {"name": "timing_profile", "kind": "timing_profile", "required": false},
-        {"name": "lichess_single_game_profile", "kind": "lichess_single_game_profile", "required": false},
-        {"name": "lichess_capacity_profile", "kind": "lichess_capacity_profile", "required": false},
-        {"name": "lichess_transport_profile", "kind": "lichess_transport_profile", "required": false},
-        {"name": "opening_book", "kind": "opening_book", "required": false},
-        {"name": "syzygy", "kind": "syzygy", "required": false}
+        {"name": "uci_engine", "kind": "uci_engine", "required": false, "accepted_sources": ["saved_locator"]},
+        {"name": "timing_profile", "kind": "timing_profile", "required": false, "accepted_sources": ["saved_locator"]},
+        {"name": "lichess_single_game_profile", "kind": "lichess_single_game_profile", "required": false, "accepted_sources": ["saved_locator"]},
+        {"name": "lichess_capacity_profile", "kind": "lichess_capacity_profile", "required": false, "accepted_sources": ["saved_locator"]},
+        {"name": "lichess_transport_profile", "kind": "lichess_transport_profile", "required": false, "accepted_sources": ["saved_locator"]},
+        {"name": "opening_book", "kind": "opening_book", "required": false, "accepted_sources": ["saved_locator", "install_receipt"]},
+        {"name": "syzygy", "kind": "syzygy", "required": false, "accepted_sources": ["saved_locator", "install_receipt"]}
       ],
       "startup_control": {
         "schema": "arena_provider_startup_control_v1",

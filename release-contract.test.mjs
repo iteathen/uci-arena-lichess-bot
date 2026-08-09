@@ -28,6 +28,22 @@ test("component definition packages runtime contracts without test or source-tre
   assert.deepEqual(Object.keys(definition.native_toolchain_by_target), ["windows-x86_64"]);
 });
 
+test("component manifest separates operator engine overrides from managed suite defaults", () => {
+  const manifest = JSON.parse(readFileSync(
+    path.join(root, "contracts", "component-manifest.json"), "utf8"));
+  const bindings = Object.fromEntries(
+    manifest.installation.installer_integration.locator_bindings
+      .map((binding) => [binding.name, binding.accepted_sources]),
+  );
+  assert.deepEqual(bindings.uci_engine, ["saved_locator"]);
+  assert.deepEqual(bindings.timing_profile, ["saved_locator"]);
+  assert.deepEqual(bindings.lichess_single_game_profile, ["saved_locator"]);
+  assert.deepEqual(bindings.lichess_capacity_profile, ["saved_locator"]);
+  assert.deepEqual(bindings.lichess_transport_profile, ["saved_locator"]);
+  assert.deepEqual(bindings.opening_book, ["saved_locator", "install_receipt"]);
+  assert.deepEqual(bindings.syzygy, ["saved_locator", "install_receipt"]);
+});
+
 test("Manager configuration and status contracts are closed and separate requests from responses", () => {
   const configuration = JSON.parse(readFileSync(path.join(root, "contracts", "configuration-schema.json"), "utf8"));
   const update = JSON.parse(readFileSync(path.join(root, "contracts", "configuration-update-schema.json"), "utf8"));

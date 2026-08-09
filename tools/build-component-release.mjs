@@ -246,6 +246,20 @@ function installerManifest(componentContract, version, target, staging) {
       || startupControl.result?.require_live_on_install !== false) {
     throw new Error("component installer-integration contract is invalid");
   }
+  const acceptedLocatorSources = new Set(["saved_locator", "install_receipt"]);
+  for (const binding of installerIntegration.locator_bindings) {
+    const sources = binding?.accepted_sources;
+    if (typeof binding?.name !== "string"
+        || typeof binding?.kind !== "string"
+        || typeof binding?.required !== "boolean"
+        || !Array.isArray(sources)
+        || sources.length === 0
+        || sources.length > acceptedLocatorSources.size
+        || new Set(sources).size !== sources.length
+        || sources.some((source) => !acceptedLocatorSources.has(source))) {
+      throw new Error("component locator authority-source contract is invalid");
+    }
+  }
   const contractManifest = safeRelative(installation.contract_manifest);
   const configurationTemplate = safeRelative(installation.configuration_template);
   const files = listFiles(staging).map((relative) => {
