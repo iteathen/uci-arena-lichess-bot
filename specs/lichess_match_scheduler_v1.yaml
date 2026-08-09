@@ -237,6 +237,111 @@ storage:
     - "Reservation consumption is one SQLite transaction so a concurrent Manager cancellation or replacement cannot decrement or delete a different reservation."
     - "Persisting API safety state never shortens cooldown or replaces a newer strike observation with stale state."
 
+future_game_archive_and_training_export_2026_08_09:
+  status: architecture_reserved_not_runtime_implemented
+  purpose: >
+    Preserve completed Lichess games once as provider-owned canonical records
+    so future Manager history/replay and optional Restaurant training ingestion
+    can consume typed projections without reading matches.sqlite or inventing a
+    second game-capture path.
+  activation:
+    - "This section reserves a compatibility contract only. It does not enable capture, export, retention, Manager operations, or training ingestion in the current provider."
+    - "Implementation requires a later explicit spec-first change, bounded storage policy, contract schemas, migration behavior, tests, and operator-visible controls."
+  ownership:
+    provider:
+      - canonical streamed game and move-sequence capture
+      - immutable completed-game archive records
+      - export cursor, segmentation, compression, checksums, and deduplication
+      - redaction or pseudonymization selected by the export policy
+    manager:
+      - bounded live-game, game-history, replay, and export-status projections through declared typed provider operations
+    restaurant:
+      - source eligibility, sampling, weighting, optional reanalysis, feature and target construction, CCR materialization, and dataset lineage
+    forbidden:
+      - "Manager or Restaurant opening provider SQLite, logs, or runtime-private files directly."
+      - "The provider emitting CCR rows or importing Restaurant source, model, feature, or training types."
+      - "Installer interpreting game, evaluation, model, or training semantics."
+  canonical_capture:
+    rules:
+      - "One provider-owned canonical game record is the source for future live-game projection, completed-game history/replay, and training export; UI-specific DTOs and export-specific recapture are derived views, not competing authorities."
+      - "Remote game id plus canonical move sequence is the idempotency key. Reconnect, gameFull replay, and startup reconciliation may complete the same record but never create a second logical game."
+      - "A game becomes export-eligible only after an authoritative terminal state. In-progress, abandoned-local, or transport-failed sessions remain nonterminal operational records until Lichess supplies terminal truth."
+      - "The archive retains the initial position, complete legal UCI move sequence, result, termination, variant, rated state, time control, per-ply clocks when supplied, color assignment, and the immutable engine/runtime provenance already bound to the game row."
+      - "Search observations are optional per-ply evidence. Missing observations remain absent and are never reconstructed from a later engine default or fabricated from the game result."
+  export_bundle:
+    schema: uci_arena_lichess_training_export_v1
+    media_type: application/vnd.uci-arena.lichess-training-export.v1
+    compression: zstandard
+    logical_members:
+      manifest: manifest.json
+      games: games.pgn.zst
+      positions: positions.jsonl.zst
+    rules:
+      - "Each bundle covers a bounded UTC or byte-size segment, is immutable after publication, and is named or indexed by content identity. New games create new bundles; an existing bundle is never appended in place."
+      - "manifest.json binds schema major, provider component identity, export-policy identity, source time/id range, record and game counts, logical member names, uncompressed and compressed byte counts, and SHA-256 for every compressed member."
+      - "games.pgn.zst contains complete terminal games for replay and ecosystem interoperability. positions.jsonl.zst contains one UTF-8 JSON object per line for streaming ingestion without full decompression to disk."
+      - "A durable provider-owned cursor and remote-game-id/content-hash ledger make retry idempotent. Cursor advancement occurs only after every member and manifest is fsynced, hashed, validated, and atomically published."
+      - "A corrupt, partial, unsupported-major, digest-mismatched, or count-mismatched bundle is non-authoritative and must not advance the export cursor."
+  position_stream:
+    compatibility_goal: lichess_db_eval_jsonl_zst_envelope
+    authoritative_reference: https://database.lichess.org/#evals
+    record_boundary: one_pre_move_position_per_played_ply
+    top_level_fields:
+      required:
+        - fen
+        - arena
+      optional:
+        - evals
+    rules:
+      - "fen uses the four-field Lichess evaluation-stream shape for reader compatibility. arena.full_fen retains the six-field rule state used for canonical replay."
+      - "evals is emitted only when its depth, knodes, PV, cp, and mate fields have genuine Lichess-compatible engine-analysis semantics. Game outcomes, MCGS simulations, model logits, and visit counts must never masquerade as eval depth, knodes, cp, mate, or PV evidence."
+      - "Provider-specific information is confined to the versioned arena namespace so a generic Lichess evaluation reader may ignore it. Unknown additive arena fields are ignorable within one major; an unknown major fails closed for Arena-aware consumers."
+    arena_required_fields:
+      - schema
+      - remote_game_id
+      - ply_index
+      - full_fen
+      - played_move_uci
+      - actor
+      - result
+      - termination
+      - engine_adapter
+      - runtime_provenance_sha256
+    field_semantics:
+      ply_index: zero_based_index_of_played_move
+      full_fen: six_field_position_before_played_move
+      played_move_uci: canonical_legal_move_applied_from_full_fen
+      actor: local_engine_or_remote_opponent
+      result:
+        perspective: white
+        values: ["1-0", "0-1", "1/2-1/2"]
+      runtime_provenance_sha256: immutable_game_runtime_provenance_identity
+    optional_fields:
+      - clocks_before_move
+      - remote_game_url
+      - local_engine_search
+      - source_account_pseudonym
+      - opponent_pseudonym
+    local_engine_search:
+      rules:
+        - "Search data is present only when captured from the exact local engine decision for this ply and binds its search/evaluation generation."
+        - "Perspective is explicit and defaults to side_to_move only when declared; consumers never infer perspective from sign or actor."
+        - "MCGS evidence uses typed simulations, WDL/value, proof state, and sparse legal-move policy or visit entries. It never uses depth or knodes as aliases."
+        - "Sparse entries use canonical UCI moves and numeric weights/counts. A dense model-width vector such as 1858 or 4162 is not part of this provider boundary; Restaurant's selected model adapter owns policy-index mapping."
+  privacy_and_reuse_gate:
+    rules:
+      - "Operational game history may retain the account identifiers needed for provider behavior, but a training export pseudonymizes or removes user names by default and never includes credentials, token paths, chat, private messages, request headers, IP data, or raw logs."
+      - "The export manifest records the applied redaction policy and whether remote account identifiers remain."
+      - "Future training reuse requires an explicit operator-approved policy covering applicable Lichess terms, licenses, privacy, retention, deletion, and redistribution. This contract makes no legal conclusion and grants no automatic training authority."
+      - "Engine/model provenance and actor remain distinguishable after redaction so Restaurant can prevent self-label feedback loops and report source composition truthfully."
+  future_validation:
+    - "Reconnect, reconciliation, and duplicate gameStart fixtures produce one canonical completed game and byte-identical logical exports."
+    - "PGN replay and every positions record reconstruct the same legal move sequence, six-field rule state, result, and termination."
+    - "Streaming readers verify bounded lines, Zstandard integrity, member digests, counts, cursor crash recovery, and no full-archive temporary decompression."
+    - "Fixtures prove missing analysis remains absent, genuine evals retain Lichess semantics, and MCGS/search extensions cannot be mistaken for evals."
+    - "Manager projections and training exports derive from the same canonical game identity without Manager or Restaurant reading provider-private storage."
+    - "Privacy fixtures prove default pseudonymization and absence of credentials, headers, chat, logs, token paths, and unrelated provider state."
+
 windows_supervision:
   task_name: UCI Arena Lichess Adapter
   installed_launcher: native/lichess_adapter_launcher.exe
