@@ -35,6 +35,7 @@ import {
   parseRuntimeStatus,
   probeAccount,
   providerStatusProjection,
+  qualificationFailureProjection,
   resolveExternalTokenFile,
   resolveProviderRuntimeDirectory,
   managerOptionsProjection,
@@ -3143,6 +3144,61 @@ test("nested local control commands parse without touching credentials", () => {
   assert.deepEqual(parseArguments(["qualification", "run", "--config", "local.json"]), {
     command: "qualification", action: "run", config: "local.json",
   });
+});
+
+test("installed qualification failures are bounded typed and path-redacted", () => {
+  const result = qualificationFailureProjection(
+    new Error("Complete-game qualifier failed at C:\\private workspace\\engine.exe: contract mismatch"),
+    "complete_game",
+  );
+  assert.deepEqual(Object.keys(result).sort(), ["failure", "schema", "status"]);
+  assert.equal(result.schema, "uci_arena_lichess_qualification_result_v1");
+  assert.equal(result.status, "failed");
+  assert.equal(result.failure.code, "qualification_complete_game_failed");
+  assert.equal(result.failure.stage, "complete_game");
+  assert.match(result.failure.detail, /<path>/u);
+  assert.doesNotMatch(result.failure.detail, /private workspace|engine\.exe/u);
+  assert.ok(result.failure.detail.length <= 1024);
+  const posix = qualificationFailureProjection(
+    new Error("Complete-game qualifier failed at /private/workspace/engine: mismatch"),
+    "complete_game",
+  );
+  assert.match(posix.failure.detail, /<path>/u);
+  assert.doesNotMatch(posix.failure.detail, /\/private|workspace\/engine/u);
+});
+
+test("installed qualification failure projection suppresses sensitive diagnostics", () => {
+  const result = qualificationFailureProjection(
+    new Error("Authorization token should never cross this boundary"),
+  );
+  assert.equal(result.failure.code, "qualification_preflight_failed");
+  assert.equal(
+    result.failure.detail,
+    "Qualification failed; sensitive provider diagnostics were redacted.",
+  );
+  assert.doesNotMatch(JSON.stringify(result), /Authorization token/u);
+});
+
+test("qualification command emits one typed JSON failure document", { concurrency: false }, async (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-qualification-command-"));
+  const output = [];
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  t.mock.method(console, "log", (value) => output.push(value));
+  const exitCode = await main([
+    "qualification",
+    "run",
+    "--config",
+    path.join(directory, "missing-config.json"),
+    "--runtime-dir",
+    path.join(directory, "runtime"),
+  ]);
+  assert.equal(exitCode, 1);
+  assert.equal(output.length, 1);
+  const result = JSON.parse(output[0]);
+  assert.equal(result.status, "failed");
+  assert.equal(result.failure.stage, "preflight");
+  assert.equal(result.failure.code, "qualification_preflight_failed");
+  assert.doesNotMatch(output[0], /missing-config|uci-arena-qualification-command/u);
 });
 
 test("private stdin shutdown command aborts the adapter cooperatively", async () => {

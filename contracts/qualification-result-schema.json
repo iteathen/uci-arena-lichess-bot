@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "uci_arena_lichess_qualification_result_v1",
+  "title": "UCI Arena Lichess installed qualification result",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "status",
+        "engine_sha256",
+        "timing_sha256",
+        "timing_identity_sha256",
+        "maximum_concurrency",
+        "single_game_profile_sha256",
+        "capacity_profile_sha256",
+        "search_core",
+        "model_id",
+        "provider",
+        "completed_at",
+        "single_game_profile",
+        "capacity_profile",
+        "reused"
+      ],
+      "properties": {
+        "schema": { "const": "uci_arena_lichess_qualification_result_v1" },
+        "status": { "const": "qualified" },
+        "engine_sha256": { "$ref": "#/$defs/prefixed_sha256" },
+        "timing_sha256": { "$ref": "#/$defs/prefixed_sha256" },
+        "timing_identity_sha256": { "$ref": "#/$defs/prefixed_sha256" },
+        "maximum_concurrency": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "single_game_profile_sha256": { "$ref": "#/$defs/prefixed_sha256" },
+        "capacity_profile_sha256": { "$ref": "#/$defs/prefixed_sha256" },
+        "search_core": { "enum": ["mcgs", "v2"] },
+        "model_id": { "$ref": "#/$defs/identifier" },
+        "provider": { "enum": ["directml", "cuda"] },
+        "completed_at": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "single_game_profile": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "capacity_profile": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "reused": { "type": "boolean" }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "status", "failure"],
+      "properties": {
+        "schema": { "const": "uci_arena_lichess_qualification_result_v1" },
+        "status": { "const": "failed" },
+        "failure": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code", "stage", "detail"],
+          "properties": {
+            "code": {
+              "enum": [
+                "qualification_startup_safety_failed",
+                "qualification_preflight_failed",
+                "qualification_complete_game_failed",
+                "qualification_single_game_publication_failed",
+                "qualification_capacity_probe_failed",
+                "qualification_commit_failed"
+              ]
+            },
+            "stage": {
+              "enum": [
+                "startup_safety",
+                "preflight",
+                "complete_game",
+                "single_game_publication",
+                "capacity_probe",
+                "commit"
+              ]
+            },
+            "detail": { "type": "string", "minLength": 1, "maxLength": 1024 }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_.-]{0,127}$"
+    },
+    "prefixed_sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    }
+  }
+}

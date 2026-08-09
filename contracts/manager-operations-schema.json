@@ -92,7 +92,8 @@
       "arguments": ["qualification", "run"],
       "mutates": true,
       "credential": "forbidden",
-      "response": "uci_arena_lichess_qualification_result_v1"
+      "response": "uci_arena_lichess_qualification_result_v1",
+      "response_schema": "contracts/qualification-result-schema.json"
     },
     "account_probe": {
       "arguments": ["probe"],

@@ -82,6 +82,26 @@ test("Manager configuration and status contracts are closed and separate request
   assert.equal(status.properties.games.required.includes("cancelling"), true);
 });
 
+test("installed qualification contract separates authoritative success from bounded failure", () => {
+  const operations = JSON.parse(readFileSync(
+    path.join(root, "contracts", "manager-operations-schema.json"), "utf8"));
+  const schema = JSON.parse(readFileSync(
+    path.join(root, "contracts", "qualification-result-schema.json"), "utf8"));
+  assert.equal(
+    operations.operations.qualification_run.response_schema,
+    "contracts/qualification-result-schema.json",
+  );
+  assert.equal(schema.$id, "uci_arena_lichess_qualification_result_v1");
+  assert.equal(schema.oneOf.length, 2);
+  const failure = schema.oneOf.find((variant) =>
+    variant.properties?.status?.const === "failed");
+  assert.deepEqual(failure.required, ["schema", "status", "failure"]);
+  assert.equal(failure.additionalProperties, false);
+  assert.equal(failure.properties.failure.additionalProperties, false);
+  assert.equal(failure.properties.failure.properties.detail.maxLength, 1024);
+  assert.equal(failure.properties.failure.properties.detail.pattern, undefined);
+});
+
 test("manual workflow uses free OIDC Cosign provenance and no automatic trigger", () => {
   const workflow = readFileSync(path.join(root, ".github", "workflows", "component-release.yml"), "utf8");
   assert.match(workflow, /^  workflow_dispatch:/m);

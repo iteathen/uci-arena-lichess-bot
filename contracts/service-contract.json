@@ -55,6 +55,7 @@
   "configuration_schema": "contracts/configuration-schema.json",
   "configuration_update_schema": "contracts/configuration-update-schema.json",
   "status_schema": "contracts/status-schema.json",
+  "qualification_result_schema": "contracts/qualification-result-schema.json",
   "error_contract": {
     "format": "bounded_typed_json",
     "secrets": "redacted",

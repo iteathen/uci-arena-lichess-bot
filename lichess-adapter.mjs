@@ -5495,6 +5495,56 @@ async function runBoundedQualificationTool(
   });
 }
 
+const QUALIFICATION_FAILURE_DETAIL_LIMIT = 1024;
+const QUALIFICATION_FAILURE_STAGES = new Set([
+  "startup_safety",
+  "preflight",
+  "complete_game",
+  "single_game_publication",
+  "capacity_probe",
+  "commit",
+]);
+
+class InstalledQualificationFailure extends Error {
+  constructor(stage, cause) {
+    super(cause instanceof Error ? cause.message : String(cause ?? "Qualification failed"));
+    this.name = "InstalledQualificationFailure";
+    this.stage = QUALIFICATION_FAILURE_STAGES.has(stage) ? stage : "preflight";
+  }
+}
+
+function qualificationFailureDetail(error) {
+  let detail = error instanceof Error ? error.message : String(error ?? "Qualification failed");
+  detail = detail.replace(/[\u0000-\u001f\u007f]+/gu, " ").replace(/\s+/gu, " ").trim();
+  if (/\b(?:authorization|bearer|password|secret|token)\b/iu.test(detail)) {
+    return "Qualification failed; sensitive provider diagnostics were redacted.";
+  }
+  detail = detail
+    .replace(/(?:[A-Za-z]:[\\/]|\\\\)[^,;|]*/gu, "<path>")
+    .replace(
+      /(?:^|[\s("'=])\/(?:[^\s,;:)"']+\/?)+/gu,
+      (match) => match.startsWith("/") ? "<path>" : `${match[0]}<path>`,
+    )
+    .trim();
+  if (!detail) return "Qualification failed without a safe provider diagnostic.";
+  return detail.slice(0, QUALIFICATION_FAILURE_DETAIL_LIMIT);
+}
+
+export function qualificationFailureProjection(error, fallbackStage = "preflight") {
+  const stage = error instanceof InstalledQualificationFailure
+    ? error.stage
+    : QUALIFICATION_FAILURE_STAGES.has(fallbackStage) ? fallbackStage : "preflight";
+  return {
+    schema: "uci_arena_lichess_qualification_result_v1",
+    status: "failed",
+    failure: {
+      code: `qualification_${stage}_failed`,
+      stage,
+      detail: qualificationFailureDetail(error),
+    },
+  };
+}
+
 export async function runInstalledQualificationWorkflow({
   configPath,
   runtimeDir,
@@ -5579,6 +5629,7 @@ export async function runInstalledQualificationWorkflow({
   }
   if (existsSync(outputDirectory)) rmSync(outputDirectory, { recursive: true, force: true });
   mkdirSync(outputDirectory, { recursive: true });
+  let stage = "complete_game";
   try {
     const command = installedQualificationCommand(baseConfig, completeGamePath);
     await runTool(
@@ -5586,6 +5637,7 @@ export async function runInstalledQualificationWorkflow({
       command.workingDirectory,
       command.arguments,
     );
+    stage = "single_game_publication";
     qualificationRegularFile(completeGamePath, "complete-game evidence");
     publishSingleGameProfile({
       engine: command.engine,
@@ -5604,6 +5656,7 @@ export async function runInstalledQualificationWorkflow({
       timeProfilePath: command.timeProfilePath,
       environment: {},
     });
+    stage = "capacity_probe";
     const singleGameProfile = applySingleGameProfile(qualifiedConfig);
     const statuses = await preflightQualifiedEngines(qualifiedConfig, concurrency);
     const capacityProfile = publishCapacityProfile(
@@ -5613,6 +5666,7 @@ export async function runInstalledQualificationWorkflow({
       singleGameProfile,
       statuses,
     );
+    stage = "commit";
     const marker = {
       schema: "uci_arena_lichess_qualification_result_v1",
       engine_sha256: engineSha,
@@ -5638,7 +5692,7 @@ export async function runInstalledQualificationWorkflow({
     };
   } catch (error) {
     rmSync(outputDirectory, { recursive: true, force: true });
-    throw error;
+    throw new InstalledQualificationFailure(stage, error);
   }
 }
 
@@ -5793,43 +5847,61 @@ export async function main(argv = process.argv.slice(2)) {
     throw new Error(`Unknown config action: ${options.action ?? "missing"}`);
   }
   const qualificationRun = options.command === "qualification" && options.action === "run";
-  const config = options.command === "probe"
-    ? loadManagerConfig({
-      templatePath: configPath,
-      engineRoot: path.resolve(options.engine_root ?? ROOT),
-    })
-    : loadRuntimeConfig({
-      templatePath: configPath,
-      engineRoot: path.resolve(options.engine_root ?? ROOT),
-      enginePath: options.engine,
-      workingDirectory: options.working_directory,
-      modelRoot: options.model_root,
-      profilePath: options.profile,
-      timeProfilePath: options.time_profile,
-      temporalCurvePath: options.temporal_curve_profile,
-      requireSingleGameProfile: !qualificationRun,
-      environment: qualificationRun ? {} : process.env,
-    });
+  let config;
+  try {
+    config = options.command === "probe"
+      ? loadManagerConfig({
+        templatePath: configPath,
+        engineRoot: path.resolve(options.engine_root ?? ROOT),
+      })
+      : loadRuntimeConfig({
+        templatePath: configPath,
+        engineRoot: path.resolve(options.engine_root ?? ROOT),
+        enginePath: options.engine,
+        workingDirectory: options.working_directory,
+        modelRoot: options.model_root,
+        profilePath: options.profile,
+        timeProfilePath: options.time_profile,
+        temporalCurvePath: options.temporal_curve_profile,
+        requireSingleGameProfile: !qualificationRun,
+        environment: qualificationRun ? {} : process.env,
+      });
+  } catch (error) {
+    if (!qualificationRun) throw error;
+    console.log(JSON.stringify(qualificationFailureProjection(error, "preflight")));
+    return 1;
+  }
   if (qualificationRun) {
-    const startup = process.platform === "win32"
-      ? await queryWindowsStartup()
-      : process.platform === "linux"
-        ? await queryLinuxStartup()
-        : { installed: false };
-    if (startup.installed === true) {
-      throw new Error("Disable Lichess Bot startup before requalifying the installed engine");
-    }
-    const result = await runInstalledQualificationWorkflow({
-      configPath,
-      runtimeDir,
-      maximumConcurrency: integerOption(
+    let failureStage = "preflight";
+    try {
+      const maximumConcurrency = integerOption(
         options.max_concurrency,
         "--max-concurrency",
         config.capacity.total_slots,
-      ),
-    });
-    console.log(JSON.stringify(result));
-    return 0;
+      );
+      failureStage = "startup_safety";
+      const startup = process.platform === "win32"
+        ? await queryWindowsStartup()
+        : process.platform === "linux"
+          ? await queryLinuxStartup()
+          : { installed: false };
+      if (startup.installed === true) {
+        throw new InstalledQualificationFailure(
+          "startup_safety",
+          new Error("Disable Lichess Bot startup before requalifying the installed engine"),
+        );
+      }
+      const result = await runInstalledQualificationWorkflow({
+        configPath,
+        runtimeDir,
+        maximumConcurrency,
+      });
+      console.log(JSON.stringify(result));
+      return 0;
+    } catch (error) {
+      console.log(JSON.stringify(qualificationFailureProjection(error, failureStage)));
+      return 1;
+    }
   }
   if (options.command === "qualification") {
     throw new Error(`Unknown qualification action: ${options.action ?? "missing"}`);

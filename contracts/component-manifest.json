@@ -116,6 +116,7 @@
     "configuration": "contracts/configuration-schema.json",
     "configuration_update": "contracts/configuration-update-schema.json",
     "status": "contracts/status-schema.json",
+    "qualification_result": "contracts/qualification-result-schema.json",
     "manager_operations": "contracts/manager-operations-schema.json"
   },
   "compatibility": {

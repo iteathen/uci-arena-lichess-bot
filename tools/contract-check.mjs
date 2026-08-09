@@ -17,6 +17,7 @@ const operations = readJson("contracts/manager-operations-schema.json");
 const configuration = readJson("contracts/configuration-schema.json");
 const configurationUpdate = readJson("contracts/configuration-update-schema.json");
 const status = readJson("contracts/status-schema.json");
+const qualificationResult = readJson("contracts/qualification-result-schema.json");
 const template = readFileSync(path.join(root, "config.uci_arena.template.yml"), "utf8");
 const errors = [];
 
@@ -117,6 +118,14 @@ if (service.configuration_update_schema !== "contracts/configuration-update-sche
     || component.contracts?.configuration_update !== service.configuration_update_schema
     || operations.operations?.config_update?.request !== service.configuration_update_schema) {
   errors.push("configuration update contract bindings differ");
+}
+if (service.qualification_result_schema !== "contracts/qualification-result-schema.json"
+    || component.contracts?.qualification_result !== service.qualification_result_schema
+    || operations.operations?.qualification_run?.response_schema
+      !== service.qualification_result_schema
+    || qualificationResult.$id !== "uci_arena_lichess_qualification_result_v1"
+    || qualificationResult.oneOf?.length !== 2) {
+  errors.push("installed qualification result contract bindings differ");
 }
 const projectedConfiguration = managerOptionsProjection(loadManagerConfig({
   templatePath: path.join(root, "config.uci_arena.template.yml"),
