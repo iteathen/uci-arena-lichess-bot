@@ -992,8 +992,35 @@ test("Manager options remain usable while live-engine onboarding is incomplete",
     console.log = originalLog;
   }
   const response = JSON.parse(messages.at(-1));
-  assert.equal(response.status, "ready");
-  assert.equal(response.editable.scheduler.discovery_interval_seconds, 75);
+  assert.equal(response.schema, MANAGER_OPTIONS_SCHEMA);
+  assert.deepEqual(Object.keys(response), [
+    "schema",
+    "capacity",
+    "inbound_challenges",
+    "outbound_challenge",
+    "scheduler",
+    "opponent_selection",
+  ]);
+  assert.equal(response.scheduler.discovery_interval_seconds, 75);
+
+  messages.length = 0;
+  console.log = (message) => messages.push(message);
+  try {
+    assert.equal(await main([
+      "config",
+      "update",
+      "--config",
+      configPath,
+      "--settings",
+      JSON.stringify({ scheduler: { discovery_interval_seconds: 80 } }),
+    ]), 0);
+  } finally {
+    console.log = originalLog;
+  }
+  const updateResponse = JSON.parse(messages.at(-1));
+  assert.equal(updateResponse.schema, MANAGER_OPTIONS_SCHEMA);
+  assert.equal(updateResponse.scheduler.discovery_interval_seconds, 80);
+  assert.equal(Object.hasOwn(updateResponse, "editable"), false);
 });
 
 test("Manager capacity projection publishes the standard-UCI startup evidence state", () => {

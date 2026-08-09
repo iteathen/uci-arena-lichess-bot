@@ -5415,7 +5415,7 @@ export async function main(argv = process.argv.slice(2)) {
       ratedConfirmation: options.confirm_rated,
       outboundConfirmation: options.confirm_outbound,
     });
-    console.log(JSON.stringify({ status: "ready", editable }));
+    console.log(JSON.stringify(editable));
     return 0;
   }
   if (options.command === "config" && (!options.action || options.action === "get")) {
@@ -5423,16 +5423,7 @@ export async function main(argv = process.argv.slice(2)) {
       templatePath: configPath,
       engineRoot: path.resolve(options.engine_root ?? ROOT),
     });
-    console.log(JSON.stringify({
-      status: "ready",
-      schema: config.schema,
-      engine: config.engine?.executable ?? null,
-      time_profile: config.engine?.time_profile ?? null,
-      temporal_curve_profile: config.engine?.temporal_curve_profile ?? null,
-      capacity: config.capacity,
-      scheduler: config.scheduler,
-      editable: managerOptionsProjection(config),
-    }));
+    console.log(JSON.stringify(managerOptionsProjection(config)));
     return 0;
   }
   if (options.command === "config") {
