@@ -583,6 +583,7 @@ manager_account_and_options_contract_2026_07_31:
       - "Editable operations use a strict allowlist. Engine paths, model/profile paths, URL, runtime directory, store path, startup definition, arbitrary UCI options, and unknown fields are not writable through the Manager projection."
       - "Configuration updates require an explicit local config path and preserve unedited provider-owned fields and portable path placeholders."
       - "A proposed update is fully validated before atomic replacement; failure leaves the prior file byte-for-byte authoritative."
+      - "A running adapter owns an immutable configuration snapshot for the lifetime of that process. A successful config update becomes next-start authority and never restarts the provider or interrupts an active game; Manager must distinguish saved configuration from currently effective runtime behavior."
       - "Capacity changes cannot exceed a present qualified capacity profile. The adapter validates the complete profile, exact engine and single-game identity bindings, timing-profile file and identity bindings, and concurrent evidence before accepting the change; a schema/qualified/max-concurrency summary alone has no authority."
       - "An update that leaves the qualified capacity shape unchanged does not reclassify unrelated onboarding blockers as configuration-write failures; changing the capacity shape always re-runs the complete capacity-evidence gate."
       - "Missing, malformed, unqualified, identity-mismatched, or undersized capacity evidence rejects a capacity change."
