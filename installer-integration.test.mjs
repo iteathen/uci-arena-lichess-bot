@@ -1,10 +1,82 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
+} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
 import { renderInstallerConfiguration } from './installer-integration.mjs';
+
+const DEFAULT_TEMPLATE = new URL('./config.uci_arena.template.yml', import.meta.url);
+
+test('installer integration preserves validated Manager policy while refreshing bindings', (t) => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'arena-lichess-policy-preservation-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const workspace = path.join(root, 'workspace');
+  mkdirSync(workspace, { recursive: true });
+  const existing = JSON.parse(readFileSync(DEFAULT_TEMPLATE, 'utf8'));
+  existing.outbound_challenge.rated = true;
+  existing.outbound_challenge.color = 'black';
+  existing.scheduler.max_games_per_opponent_per_day = 1;
+  existing.engine.executable = path.join(root, 'old-engine', 'engine.exe');
+  writeFileSync(
+    path.join(workspace, 'manager-config.json'),
+    `${JSON.stringify(existing, null, 2)}\n`,
+    'utf8',
+  );
+
+  const engineRoot = path.join(root, 'new-engine');
+  const result = renderInstallerConfiguration({
+    schema: 'arena_provider_install_context_v1',
+    schema_version: 1,
+    workspace,
+    enabled: true,
+    bindings: {
+      default_engine: path.join(engineRoot, 'bin', 'uci_arena_engine.exe'),
+      default_engine_root: engineRoot,
+      default_model_root: path.join(engineRoot, 'models', 'default'),
+    },
+    locators: {
+      timing_profile: path.join(root, 'profiles', 'timing.json'),
+      lichess_single_game_profile: path.join(root, 'profiles', 'single.json'),
+      lichess_capacity_profile: path.join(root, 'profiles', 'capacity.json'),
+    },
+  });
+
+  assert.equal(result.configuration.outbound_challenge.rated, true);
+  assert.equal(result.configuration.outbound_challenge.color, 'black');
+  assert.equal(result.configuration.scheduler.max_games_per_opponent_per_day, 1);
+  assert.equal(
+    result.configuration.engine.executable,
+    path.join(engineRoot, 'bin', 'uci_arena_engine.exe'),
+  );
+  assert.equal(
+    result.configuration.engine.uci_options.ModelRoot,
+    path.join(engineRoot, 'models', 'default'),
+  );
+});
+
+test('installer integration rejects an invalid existing policy instead of resetting it', (t) => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'arena-lichess-invalid-policy-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const workspace = path.join(root, 'workspace');
+  mkdirSync(workspace, { recursive: true });
+  writeFileSync(path.join(workspace, 'manager-config.json'), '{}', 'utf8');
+
+  assert.throws(() => renderInstallerConfiguration({
+    schema: 'arena_provider_install_context_v1',
+    schema_version: 1,
+    workspace,
+    enabled: false,
+    bindings: {
+      default_engine: path.join(root, 'engine', 'uci_arena_engine.exe'),
+      default_engine_root: path.join(root, 'engine'),
+      default_model_root: path.join(root, 'engine', 'models', 'default'),
+    },
+    locators: {},
+  }), /Unsupported Lichess adapter config schema/);
+});
 
 test('installer integration prefers a discovered conforming UCI engine without suite assumptions', (t) => {
   const root = mkdtempSync(path.join(os.tmpdir(), 'arena-lichess-installer-'));

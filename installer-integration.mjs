@@ -2,7 +2,14 @@ import { lstatSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import {
+  applyManagerOptionsPatch,
+  editableManagerOptionsProjection,
+  loadManagerConfig,
+} from './lichess-adapter.mjs';
+
 const MAXIMUM_CONTEXT_BYTES = 1024 * 1024;
+const MAXIMUM_EXISTING_CONFIGURATION_BYTES = 1024 * 1024;
 const DEFAULT_TEMPLATE = fileURLToPath(new URL('./config.uci_arena.template.yml', import.meta.url));
 
 function requireObject(value, label) {
@@ -83,6 +90,23 @@ function disabled(configuration) {
   return configuration;
 }
 
+function preserveManagerOptions(configuration, workspace, engineRoot) {
+  const existingPath = path.join(workspace, 'manager-config.json');
+  let metadata;
+  try {
+    metadata = lstatSync(existingPath);
+  } catch (error) {
+    if (error.code === 'ENOENT') return configuration;
+    throw error;
+  }
+  if (!metadata.isFile() || metadata.isSymbolicLink()
+      || metadata.size < 2 || metadata.size > MAXIMUM_EXISTING_CONFIGURATION_BYTES) {
+    throw new Error('existing managed configuration is not a bounded regular file');
+  }
+  const current = loadManagerConfig({ templatePath: existingPath, engineRoot });
+  return applyManagerOptionsPatch(configuration, editableManagerOptionsProjection(current));
+}
+
 export function renderInstallerConfiguration(context) {
   requireObject(context, 'installer context');
   if (context.schema !== 'arena_provider_install_context_v1'
@@ -90,14 +114,19 @@ export function renderInstallerConfiguration(context) {
       || typeof context.enabled !== 'boolean') {
     throw new Error('unsupported installer context');
   }
-  requireAbsolutePath(context.workspace, 'workspace');
+  const workspace = requireAbsolutePath(context.workspace, 'workspace');
   const bindings = requireObject(context.bindings ?? {}, 'bindings');
   const locators = requireObject(context.locators ?? {}, 'locators');
-  const configuration = JSON.parse(readFileSync(DEFAULT_TEMPLATE, 'utf8'));
+  let configuration = JSON.parse(readFileSync(DEFAULT_TEMPLATE, 'utf8'));
   const importedEngine = optionalAbsolutePath(locators.uci_engine, 'locators.uci_engine');
   const defaultEngine = optionalAbsolutePath(bindings.default_engine, 'bindings.default_engine');
   const engine = importedEngine ?? defaultEngine;
   if (!engine) throw new Error('no conforming UCI engine binding is available');
+  const policyEngineRoot = optionalAbsolutePath(
+    bindings.default_engine_root,
+    'bindings.default_engine_root',
+  ) ?? path.dirname(engine);
+  configuration = preserveManagerOptions(configuration, workspace, policyEngineRoot);
 
   if (importedEngine) {
     configuration.engine.adapter = 'standard_uci_v1';
