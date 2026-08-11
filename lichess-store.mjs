@@ -392,10 +392,20 @@ export class LichessStore {
     `).all();
   }
 
-  acquireApiLease(key, ownerId, pid, now = Date.now(), ttlMs = 60_000) {
+  acquireApiLease(
+    key,
+    ownerId,
+    pid,
+    now = Date.now(),
+    ttlMs = 60_000,
+    ownerProcessAlive = null,
+  ) {
     const normalized = authorityKey(key);
     const owner = String(ownerId ?? "").trim();
     if (!owner) throw new Error("Lichess API lease owner id is required");
+    if (ownerProcessAlive !== null && typeof ownerProcessAlive !== "function") {
+      throw new Error("Lichess API lease owner liveness probe is invalid");
+    }
     const expiresAt = now + integer(ttlMs, 60_000);
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -403,7 +413,14 @@ export class LichessStore {
         SELECT owner_id, pid, heartbeat_at, expires_at
         FROM api_client_leases WHERE authority_key=?
       `).get(normalized);
-      if (active && active.owner_id !== owner && Number(active.expires_at) > now) {
+      const activePid = Number(active?.pid);
+      const ownerProvenDead = active
+        && active.owner_id !== owner
+        && Number.isSafeInteger(activePid)
+        && activePid > 0
+        && ownerProcessAlive?.(activePid) === false;
+      if (active && active.owner_id !== owner && Number(active.expires_at) > now
+          && !ownerProvenDead) {
         const error = new Error(
           `Lichess API authority ${normalized} is already leased by process ${active.pid}`,
         );
