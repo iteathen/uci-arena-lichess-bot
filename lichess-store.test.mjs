@@ -164,6 +164,41 @@ test("API client lease excludes a second process and permits stale takeover", ()
   }
 });
 
+test("API client lease permits fresh takeover only when the recorded owner PID is proven dead", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-lichess-dead-lease-"));
+  const file = path.join(directory, "matches.sqlite");
+  const first = new LichessStore(file);
+  const second = new LichessStore(file);
+  const key = "https://lichess.org|arena-bot";
+  try {
+    first.acquireApiLease(key, "owner-one", 101, 1_000, 60_000);
+    assert.throws(
+      () => second.acquireApiLease(key, "owner-two", 202, 2_000, 60_000, () => true),
+      (error) => error.code === "LICHESS_API_LEASE_HELD",
+    );
+    assert.throws(
+      () => second.acquireApiLease(key, "owner-two", 202, 2_000, 60_000, () => undefined),
+      (error) => error.code === "LICHESS_API_LEASE_HELD",
+    );
+
+    const replacement = second.acquireApiLease(
+      key,
+      "owner-two",
+      202,
+      2_000,
+      60_000,
+      (pid) => pid === 101 ? false : true,
+    );
+
+    assert.equal(replacement.owner_id, "owner-two");
+    assert.equal(replacement.pid, 202);
+    assert.equal(first.releaseApiLease(key, "owner-one"), false);
+  } finally {
+    first.close();
+    second.close();
+  }
+});
+
 test("owners and expiring reservations are durable control state", () => {
   const store = storeFixture();
   try {

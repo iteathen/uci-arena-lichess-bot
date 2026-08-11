@@ -6224,7 +6224,14 @@ export async function main(argv = process.argv.slice(2)) {
   const leaseOwner = randomUUID();
   let leaseHeartbeat = null;
   try {
-    store.acquireApiLease(authority, leaseOwner, process.pid);
+    store.acquireApiLease(
+      authority,
+      leaseOwner,
+      process.pid,
+      Date.now(),
+      60_000,
+      processIsAlive,
+    );
     const safetyCoordinator = new ApiSafetyCoordinator({
       initialState: store.apiSafetyState(authority),
       persistSafetyState: (state) => store.saveApiSafetyState(authority, state),

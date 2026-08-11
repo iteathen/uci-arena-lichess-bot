@@ -230,6 +230,7 @@ storage:
   tables: [schema_meta, owners, reservations, scheduler_control, opponents, challenge_attempts, games, api_safety_state, api_client_leases]
   invariants:
     - "Opening an existing schema-v3 store idempotently materializes every required table. A superseded api_rate_limit singleton is imported as a conservative legacy-global safety row so a branch or adapter upgrade cannot erase or shorten an unexpired 429 cooldown."
+    - "The API-client lease excludes every different live or unverifiable local owner until its TTL expires. A replacement process may take over a still-fresh lease early only when an injected OS liveness probe proves the exact recorded owner PID is absent; PID liveness uncertainty fails closed."
     - "Game id and challenge id ingestion are idempotent."
     - "Every game immutably binds opponent, color, time control, result, engine build, model id/fingerprint/checkpoint/adapter, provider/numeric/runtime/hardware identity, complete search and batching options, timing-profile identity and permissions, semantic timing-authority match, qualified-versus-current engine provenance comparison, and configured plus observed opening-book state."
     - "When AdaptiveCurveV1 is active, every game additionally binds the validated temporal-curve artifact revision, file sha256, evidence-manifest sha256, formula identity, and complete applied coefficient UCI options."
