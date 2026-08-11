@@ -356,6 +356,7 @@ windows_supervision:
     - "A missing task is idempotent success. Access denial, an unknown task state, or failure to reach stopped and deleted states within the bounded deadline fails closed and preserves the provider payload for retry."
     - "Startup-control v2 exposes credential-free pre_replace and post_replace actions. Before any receipt-owned dependency root can change, the staged provider disables restart, terminates and waits for the exact prior launcher process tree, retargets the existing startup definition from the exact receipt-owned root to the exact replacement root without reading credential contents, and leaves it disabled until the installed replacement explicitly resumes it."
     - "Windows replacement rewrites only the validated task XML root references, preserves the external token-file path and other arguments, and requires a stopped disabled task before payload replacement. Linux applies the equivalent bounded rewrite to the user unit. Post-replacement must prove the provider is active."
+    - "Task Scheduler may omit the task-level Enabled element when its value is the schema default true. Replacement accepts that exact form, preserves trigger enablement, explicitly disables the recreated task through Task Scheduler, and proves the resulting task is stopped before reporting replacement-ready."
 
 local_ephemeral_release:
   scope: private_component_candidate_only
