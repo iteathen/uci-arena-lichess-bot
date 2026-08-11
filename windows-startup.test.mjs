@@ -106,7 +106,9 @@ test("two-phase replacement stops, retargets, and resumes the existing task", as
       timeoutMilliseconds: 100,
     });
     assert.equal(completed.active, true);
-    assert.deepEqual(commands, ["/Query", "/End", "/Delete", "/Create", "/Change", "/Run"]);
+    assert.deepEqual(commands, [
+      "/Query", "/Change", "--terminate-owned-tree", "/Delete", "/Create", "/Change", "/Run",
+    ]);
   } finally {
     rmSync(runtimeDir, { recursive: true, force: true });
   }
@@ -144,8 +146,8 @@ test("startup teardown waits for launcher exit before deleting the task", async 
     pollMilliseconds: 10,
     timeoutMilliseconds: 100,
   });
-  assert.deepEqual(commands, ["/End", "/Delete"]);
-  assert.equal(delays, 2);
+  assert.deepEqual(commands, ["/Change", "--terminate-owned-tree", "/Delete"]);
+  assert.equal(delays, 1);
   assert.equal(result.installed, false);
   assert.equal(result.teardownComplete, true);
 });
@@ -162,7 +164,44 @@ test("startup teardown fails closed while the launcher remains running", async (
     pollMilliseconds: 10,
     timeoutMilliseconds: 20,
   }), /Timed out waiting for the Lichess startup launcher to exit/);
-  assert.deepEqual(commands, ["/End"]);
+  assert.deepEqual(commands, ["/Change", "--terminate-owned-tree"]);
+});
+
+test("startup teardown fails closed when exact process-tree termination fails", async () => {
+  const commands = [];
+  await assert.rejects(stopAndDeleteWindowsTask({
+    execute: async (file, argumentsList) => {
+      commands.push(argumentsList[0]);
+      if (file !== "schtasks.exe") throw new Error("owned tree remained active");
+      return { stdout: "" };
+    },
+    query: async () => ({ installed: true, taskStatus: "Running" }),
+    delay: async () => {},
+    pollMilliseconds: 10,
+    timeoutMilliseconds: 20,
+  }), /Could not terminate the Lichess startup process tree/);
+  assert.deepEqual(commands, ["/Change", "--terminate-owned-tree"]);
+});
+
+test("startup teardown proves the owned tree even when Task Scheduler already reports ready", async () => {
+  const states = [
+    { installed: true, taskStatus: "Ready" },
+    { installed: true, taskStatus: "Ready" },
+    { installed: false },
+  ];
+  const commands = [];
+  const result = await stopAndDeleteWindowsTask({
+    execute: async (_file, argumentsList) => {
+      commands.push(argumentsList[0]);
+      return { stdout: "" };
+    },
+    query: async () => states.shift(),
+    delay: async () => {},
+    pollMilliseconds: 10,
+    timeoutMilliseconds: 20,
+  });
+  assert.equal(result.teardownComplete, true);
+  assert.deepEqual(commands, ["/Change", "--terminate-owned-tree", "/Delete"]);
 });
 
 test("startup teardown never hides an unknown scheduler state", async () => {
