@@ -73,8 +73,10 @@ test("two-phase replacement stops, retargets, and resumes the existing task", as
   const runtimeDir = mkdtempSync(path.join(os.tmpdir(), "lichess-startup-replace-"));
   const commands = [];
   const execute = async (_file, argumentsList) => {
-    commands.push(argumentsList[0]);
-    return { stdout: argumentsList[0] === "/Query" ? buildTaskXml(options(), "S-1-5-21-1") : "" };
+    commands.push(argumentsList);
+    const taskXml = buildTaskXml(options(), "S-1-5-21-1")
+      .replace(/(<Settings>[\s\S]*?)<Enabled>true<\/Enabled>/u, "$1");
+    return { stdout: argumentsList[0] === "/Query" ? taskXml : "" };
   };
   const prepareStates = [
     { installed: true, active: true, taskStatus: "Running" },
@@ -106,9 +108,11 @@ test("two-phase replacement stops, retargets, and resumes the existing task", as
       timeoutMilliseconds: 100,
     });
     assert.equal(completed.active, true);
-    assert.deepEqual(commands, [
-      "/Query", "/Change", "--terminate-owned-tree", "/Delete", "/Create", "/Change", "/Run",
+    assert.deepEqual(commands.map(([operation]) => operation), [
+      "/Query", "/Change", "--terminate-owned-tree", "/Delete", "/Create", "/Change", "/Change", "/Run",
     ]);
+    assert.deepEqual(commands[5], ["/Change", "/TN", STARTUP_TASK_NAME, "/DISABLE"]);
+    assert.deepEqual(commands[6], ["/Change", "/TN", STARTUP_TASK_NAME, "/ENABLE"]);
   } finally {
     rmSync(runtimeDir, { recursive: true, force: true });
   }
@@ -124,6 +128,18 @@ test("startup replacement retargets the owned task paths while preserving creden
   assert.match(updated, new RegExp(replacementRoot.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "iu"));
   assert.match(updated, new RegExp(tokenFile.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "iu"));
   assert.match(updated, /<Settings>[\s\S]*?<Enabled>false<\/Enabled>/u);
+  assert.match(updated, /<LogonTrigger><Enabled>true<\/Enabled>/u);
+});
+
+test("startup replacement accepts the Task Scheduler default when task enablement is omitted", () => {
+  const previousRoot = path.dirname(path.dirname(NATIVE_LAUNCHER));
+  const replacementRoot = path.join(path.dirname(previousRoot), "lichess.adapter", "1.0.10");
+  const original = buildTaskXml(options(), "S-1-5-21-1")
+    .replace(/(<Settings>[\s\S]*?)<Enabled>true<\/Enabled>/u, "$1");
+  const updated = retargetWindowsTaskXml(original, previousRoot, replacementRoot);
+  assert.doesNotMatch(updated, new RegExp(previousRoot.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "iu"));
+  assert.match(updated, new RegExp(replacementRoot.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "iu"));
+  assert.doesNotMatch(updated, /<Settings>[\s\S]*?<Enabled>false<\/Enabled>/u);
   assert.match(updated, /<LogonTrigger><Enabled>true<\/Enabled>/u);
 });
 

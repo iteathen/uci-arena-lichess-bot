@@ -246,10 +246,9 @@ export function retargetWindowsTaskXml(taskXml, previousRoot, replacementRoot) {
   }
   let updated = taskXml.replace(rootPattern, () => replacement);
   const settingsPattern = /(<Settings>[\s\S]*?<Enabled>)true(<\/Enabled>)/iu;
-  if (!settingsPattern.test(updated)) {
-    throw new Error("Existing Lichess startup task has no controllable enabled setting");
+  if (settingsPattern.test(updated)) {
+    updated = updated.replace(settingsPattern, "$1false$2");
   }
-  updated = updated.replace(settingsPattern, "$1false$2");
   return updated;
 }
 
@@ -296,6 +295,9 @@ export async function prepareWindowsStartupReplacement({
     });
     await execute("schtasks.exe", ["/Create", "/TN", STARTUP_TASK_NAME, "/XML", temporaryXml, "/F"], {
       windowsHide: true, timeout: 20_000, maxBuffer: 1024 * 1024,
+    });
+    await execute("schtasks.exe", ["/Change", "/TN", STARTUP_TASK_NAME, "/DISABLE"], {
+      windowsHide: true, timeout: 10_000, maxBuffer: 1024 * 1024,
     });
   } finally {
     await rm(temporaryXml, { force: true });
