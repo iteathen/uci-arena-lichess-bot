@@ -60,6 +60,20 @@ if (component.installation?.install_manifest_schema !== "arena_install_component
     || !service.required_capabilities?.includes("uci.engine.process")) {
   errors.push("Installer component projection is incomplete or inconsistent");
 }
+const startupControl = component.installation?.installer_integration?.startup_control;
+if (startupControl?.schema !== "arena_provider_startup_control_v2"
+    || startupControl.schema_version !== 2
+    || JSON.stringify(startupControl.actions?.install) !== JSON.stringify(["startup", "install"])
+    || JSON.stringify(startupControl.actions?.uninstall) !== JSON.stringify(["startup", "uninstall"])
+    || JSON.stringify(startupControl.actions?.pre_replace)
+      !== JSON.stringify(["startup", "prepare_replace"])
+    || JSON.stringify(startupControl.actions?.post_replace)
+      !== JSON.stringify(["startup", "complete_replace"])
+    || startupControl.replacement_arguments?.previous_root !== "--previous-root"
+    || startupControl.replacement_arguments?.replacement_root !== "--replacement-root"
+    || startupControl.result?.require_live_on_post_replace !== true) {
+  errors.push("Installer startup-control v2 projection is incomplete");
+}
 if (service.startup?.credential_gated !== true
     || service.persistence?.upgrade !== "preserve_and_migrate"
     || service.persistence?.repair !== "preserve"

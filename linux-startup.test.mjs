@@ -5,6 +5,7 @@ import test from "node:test";
 import {
   SYSTEMD_UNIT_NAME,
   buildSystemdUnit,
+  retargetSystemdUnit,
   startupAction,
   startupUnitPath,
   systemdEscapeArgument,
@@ -34,6 +35,17 @@ test("Linux startup action runs the foreground adapter with path-only credential
     action.arguments[action.arguments.indexOf("--token-file") + 1],
     path.resolve(options().tokenFile),
   );
+});
+
+test("systemd replacement retargets only the receipt-owned component root", () => {
+  const previousRoot = path.resolve("test-components", "lichess.adapter", "1.0.9");
+  const replacementRoot = path.resolve("test-components", "lichess.adapter", "1.0.10");
+  const tokenFile = path.resolve("operator-private", "lichess.token");
+  const original = `WorkingDirectory=${previousRoot}\nExecStart=/usr/bin/node ${previousRoot}/lichess-adapter.mjs --token-file ${tokenFile}\n`;
+  const updated = retargetSystemdUnit(original, previousRoot, replacementRoot);
+  assert.equal(updated.includes(previousRoot), false);
+  assert.equal(updated.includes(replacementRoot), true);
+  assert.equal(updated.includes(tokenFile), true);
 });
 
 test("systemd user unit is network ordered, restartable, and non-root", () => {
