@@ -14,6 +14,14 @@ on:
         options:
           - windows-x86_64
           - linux-x86_64
+      runner:
+        description: Release runner authority
+        type: choice
+        required: true
+        default: github-hosted
+        options:
+          - github-hosted
+          - ephemeral-self-hosted-windows
 
 permissions:
   contents: read
@@ -25,13 +33,34 @@ concurrency:
 
 jobs:
   build-sign-verify:
-    runs-on: ${{ inputs.target == 'windows-x86_64' && 'windows-2025' || 'ubuntu-24.04' }}
+    runs-on: ${{ inputs.runner == 'ephemeral-self-hosted-windows' && fromJSON('["self-hosted","Windows","X64","ephemeral","uci-suite","lichess-release"]') || (inputs.target == 'windows-x86_64' && 'windows-2025' || 'ubuntu-24.04') }}
     env:
       RELEASE_WORKFLOW_IDENTITY: ${{ github.workflow_ref }}#${{ github.run_id }}.${{ github.run_attempt }}
     permissions:
       contents: write
       id-token: write
     steps:
+      - name: Validate ephemeral Windows release environment
+        if: inputs.runner == 'ephemeral-self-hosted-windows'
+        shell: pwsh
+        run: |
+          if ('${{ inputs.target }}' -ne 'windows-x86_64') {
+            throw 'The ephemeral self-hosted release runner is Windows-only'
+          }
+          foreach ($command in @(
+            'cl.exe', 'msbuild.exe', 'cmake.exe', 'git.exe', 'gh.exe',
+            'node.exe', 'bash.exe', 'powershell.exe'
+          )) {
+            if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
+              throw "ephemeral release runner is missing $command"
+            }
+          }
+          Get-Command Get-FileHash -ErrorAction Stop | Out-Null
+          bash.exe -lc 'powershell.exe -NoProfile -NonInteractive -Command "Get-Command Get-FileHash -ErrorAction Stop | Out-Null"'
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Git Bash cannot resolve required Windows PowerShell modules'
+          }
+
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020

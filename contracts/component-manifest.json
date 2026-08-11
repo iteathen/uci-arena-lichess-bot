@@ -3,7 +3,7 @@
   "component": {
     "id": "lichess.adapter",
     "product_id": "uci_arena.lichess_bot",
-    "version": "1.0.9",
+    "version": "1.0.10",
     "repository": "iteathen/uci-arena-lichess-bot"
   },
   "runtime": {
@@ -76,19 +76,26 @@
         {"name": "syzygy", "kind": "syzygy", "required": false, "accepted_sources": ["saved_locator", "install_receipt"]}
       ],
       "startup_control": {
-        "schema": "arena_provider_startup_control_v1",
-        "schema_version": 1,
+        "schema": "arena_provider_startup_control_v2",
+        "schema_version": 2,
         "entrypoint": "startup",
         "actions": {
           "install": ["startup", "install"],
-          "uninstall": ["startup", "uninstall"]
+          "uninstall": ["startup", "uninstall"],
+          "pre_replace": ["startup", "prepare_replace"],
+          "post_replace": ["startup", "complete_replace"]
+        },
+        "replacement_arguments": {
+          "previous_root": "--previous-root",
+          "replacement_root": "--replacement-root"
         },
         "workspace_argument": {"flag": "--runtime-dir", "relative_path": "."},
         "configuration_argument": "--config",
         "result": {
           "envelope": "startup",
           "require_configuration_match_on_install": false,
-          "require_live_on_install": false
+          "require_live_on_install": false,
+          "require_live_on_post_replace": true
         }
       }
     },

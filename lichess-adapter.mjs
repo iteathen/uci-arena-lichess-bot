@@ -33,12 +33,16 @@ import {
 } from "./lichess-scheduler.mjs";
 import { LichessStore, normalizedUsername } from "./lichess-store.mjs";
 import {
+  completeWindowsStartupReplacement,
   installWindowsStartup,
+  prepareWindowsStartupReplacement,
   queryWindowsStartup,
   uninstallWindowsStartup,
 } from "./windows-startup.mjs";
 import {
+  completeLinuxStartupReplacement,
   installLinuxStartup,
+  prepareLinuxStartupReplacement,
   queryLinuxStartup,
   uninstallLinuxStartup,
 } from "./linux-startup.mjs";
@@ -5813,13 +5817,42 @@ export async function main(argv = process.argv.slice(2)) {
     console.log(JSON.stringify({ status: "ready", startup }));
     return 0;
   }
-  if (options.command === "startup" && options.action === "uninstall") {
+  if (options.command === "startup"
+      && options.action === "uninstall") {
     const startup = process.platform === "win32"
       ? await uninstallWindowsStartup(runtimeDir)
       : process.platform === "linux"
         ? await uninstallLinuxStartup(runtimeDir)
         : (() => { throw new Error(`Unsupported startup platform: ${process.platform}`); })();
     console.log(JSON.stringify({ status: "ready", startup }));
+    return 0;
+  }
+  if (options.command === "startup" && options.action === "prepare_replace") {
+    if (!options.previous_root || !options.replacement_root) {
+      throw new Error("startup prepare_replace requires exact previous and replacement roots");
+    }
+    const replacement = process.platform === "win32"
+      ? await prepareWindowsStartupReplacement({
+        previousRoot: options.previous_root,
+        replacementRoot: options.replacement_root,
+        runtimeDir,
+      })
+      : process.platform === "linux"
+        ? await prepareLinuxStartupReplacement({
+          previousRoot: options.previous_root,
+          replacementRoot: options.replacement_root,
+        })
+        : (() => { throw new Error(`Unsupported startup platform: ${process.platform}`); })();
+    console.log(JSON.stringify({ status: "ready", startup: replacement }));
+    return 0;
+  }
+  if (options.command === "startup" && options.action === "complete_replace") {
+    const replacement = process.platform === "win32"
+      ? await completeWindowsStartupReplacement()
+      : process.platform === "linux"
+        ? await completeLinuxStartupReplacement()
+        : (() => { throw new Error(`Unsupported startup platform: ${process.platform}`); })();
+    console.log(JSON.stringify({ status: "ready", startup: replacement }));
     return 0;
   }
   const configPath = path.resolve(options.config ?? DEFAULT_TEMPLATE);

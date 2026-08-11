@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -189,4 +189,53 @@ export async function uninstallLinuxStartup(runtimeDir) {
   } catch {}
   await rm(path.join(path.resolve(runtimeDir), "startup-systemd.json"), { force: true });
   return { installed: false, unitName: SYSTEMD_UNIT_NAME, unitPath };
+}
+
+export function retargetSystemdUnit(unit, previousRoot, replacementRoot) {
+  const previous = path.resolve(previousRoot);
+  const replacement = path.resolve(replacementRoot);
+  const occurrences = unit.split(previous).length - 1;
+  if (occurrences < 2) {
+    throw new Error("Existing Lichess systemd unit does not match the receipt-owned component root");
+  }
+  return unit.split(previous).join(replacement);
+}
+
+export async function prepareLinuxStartupReplacement({
+  previousRoot,
+  replacementRoot,
+} = {}) {
+  requireLinux();
+  if (!previousRoot || !replacementRoot) {
+    throw new Error("startup replacement requires previous and replacement roots");
+  }
+  const unitPath = startupUnitPath();
+  if (!existsSync(unitPath)) throw new Error(`${SYSTEMD_UNIT_NAME} is unavailable for replacement`);
+  const updated = retargetSystemdUnit(
+    await readFile(unitPath, "utf8"), previousRoot, replacementRoot,
+  );
+  await systemctl(["stop", SYSTEMD_UNIT_NAME]);
+  if (await systemctlState("is-active") === "active") {
+    throw new Error(`${SYSTEMD_UNIT_NAME} did not stop for replacement`);
+  }
+  const temporaryUnitPath = `${unitPath}.replacement-${process.pid}`;
+  await writeFile(temporaryUnitPath, updated, { encoding: "utf8", mode: 0o600 });
+  await rename(temporaryUnitPath, unitPath);
+  await systemctl(["daemon-reload"]);
+  return {
+    ...(await queryLinuxStartup()),
+    installed: true,
+    active: false,
+    replacementReady: true,
+  };
+}
+
+export async function completeLinuxStartupReplacement() {
+  requireLinux();
+  await systemctl(["enable", "--now", SYSTEMD_UNIT_NAME]);
+  const state = await queryLinuxStartup();
+  if (state.active !== "active") {
+    throw new Error(`${SYSTEMD_UNIT_NAME} did not resume after replacement`);
+  }
+  return { ...state, installed: true, active: true, replacementReady: false };
 }

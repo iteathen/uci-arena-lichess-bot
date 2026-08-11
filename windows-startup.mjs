@@ -4,6 +4,7 @@ import { mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+import { setTimeout as wait } from "node:timers/promises";
 
 const execFileAsync = promisify(execFile);
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -102,21 +103,218 @@ async function currentUserSid() {
   return match[1];
 }
 
-export async function queryWindowsStartup() {
-  requireWindows();
+function missingTaskError(error) {
+  const detail = `${error?.stderr ?? ""}\n${error?.stdout ?? ""}\n${error?.message ?? ""}`;
+  return /cannot find|not found|does not exist|specified task name does not exist/iu.test(detail);
+}
+
+async function queryStartupTask(execute = execFileAsync) {
   try {
-    const { stdout } = await execFileAsync("schtasks.exe", ["/Query", "/TN", STARTUP_TASK_NAME, "/FO", "LIST", "/V"], {
+    const { stdout } = await execute("schtasks.exe", ["/Query", "/TN", STARTUP_TASK_NAME, "/FO", "LIST", "/V"], {
       windowsHide: true,
       timeout: 10_000,
       maxBuffer: 1024 * 1024,
     });
     const status = /Status:\s*([^\r\n]+)/i.exec(stdout)?.[1]?.trim() ?? "unknown";
     const lastResult = /Last Result:\s*([^\r\n]+)/i.exec(stdout)?.[1]?.trim() ?? "unknown";
-    return { installed: true, taskName: STARTUP_TASK_NAME, taskStatus: status, lastResult };
+    return {
+      installed: true,
+      active: /^running$/iu.test(status),
+      taskName: STARTUP_TASK_NAME,
+      taskStatus: status,
+      lastResult,
+    };
   } catch (error) {
-    if (error.code === 1) return { installed: false, taskName: STARTUP_TASK_NAME };
+    if (missingTaskError(error)) return { installed: false, taskName: STARTUP_TASK_NAME };
     throw new Error(`Could not query Lichess startup task: ${error.stderr?.trim() || error.message}`);
   }
+}
+
+export async function queryWindowsStartup() {
+  requireWindows();
+  return queryStartupTask();
+}
+
+async function stopWindowsTask({
+  execute = execFileAsync,
+  query = () => queryStartupTask(execute),
+  delay = wait,
+  pollMilliseconds = 100,
+  timeoutMilliseconds = 20_000,
+} = {}) {
+  if (!Number.isSafeInteger(pollMilliseconds) || pollMilliseconds < 10
+      || !Number.isSafeInteger(timeoutMilliseconds)
+      || timeoutMilliseconds < pollMilliseconds || timeoutMilliseconds > 60_000) {
+    throw new Error("Lichess startup teardown timing policy is invalid");
+  }
+  let state = await query();
+  if (!state.installed) return { installed: false, taskName: STARTUP_TASK_NAME };
+  if (typeof state.taskStatus !== "string" || state.taskStatus === "unknown") {
+    throw new Error("Could not prove the Lichess startup task state before teardown");
+  }
+  if (/^running$/iu.test(state.taskStatus)) {
+    try {
+      await execute("schtasks.exe", ["/End", "/TN", STARTUP_TASK_NAME], {
+        windowsHide: true,
+        timeout: 10_000,
+        maxBuffer: 1024 * 1024,
+      });
+    } catch (error) {
+      state = await query();
+      if (state.installed && /^running$/iu.test(state.taskStatus ?? "")) {
+        throw new Error(`Could not stop Lichess startup task: ${error.stderr?.trim() || error.message}`);
+      }
+    }
+  }
+
+  const attempts = Math.ceil(timeoutMilliseconds / pollMilliseconds);
+  for (let attempt = 0; state.installed && /^running$/iu.test(state.taskStatus); attempt += 1) {
+    if (attempt >= attempts) {
+      throw new Error("Timed out waiting for the Lichess startup launcher to exit");
+    }
+    await delay(pollMilliseconds);
+    state = await query();
+  }
+  if (state.installed
+      && (typeof state.taskStatus !== "string" || state.taskStatus === "unknown")) {
+    throw new Error("Could not prove the Lichess startup launcher exited");
+  }
+  return { ...state, active: false };
+}
+
+export async function stopAndDeleteWindowsTask(options = {}) {
+  const {
+    execute = execFileAsync,
+    query = () => queryStartupTask(execute),
+    delay = wait,
+    pollMilliseconds = 100,
+    timeoutMilliseconds = 20_000,
+  } = options;
+  let state = await stopWindowsTask({
+    execute, query, delay, pollMilliseconds, timeoutMilliseconds,
+  });
+  if (!state.installed) return state;
+  const attempts = Math.ceil(timeoutMilliseconds / pollMilliseconds);
+  if (state.installed) {
+    try {
+      await execute("schtasks.exe", ["/Delete", "/TN", STARTUP_TASK_NAME, "/F"], {
+        windowsHide: true,
+        timeout: 10_000,
+        maxBuffer: 1024 * 1024,
+      });
+    } catch (error) {
+      state = await query();
+      if (state.installed) {
+        throw new Error(`Could not uninstall Lichess startup task: ${error.stderr?.trim() || error.message}`);
+      }
+    }
+  }
+  for (let attempt = 0; attempt <= attempts; attempt += 1) {
+    state = await query();
+    if (!state.installed) {
+      return { installed: false, taskName: STARTUP_TASK_NAME, teardownComplete: true };
+    }
+    if (attempt === attempts) {
+      throw new Error("Timed out waiting for Lichess startup task deletion");
+    }
+    await delay(pollMilliseconds);
+  }
+  throw new Error("Lichess startup task teardown did not complete");
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+export function retargetWindowsTaskXml(taskXml, previousRoot, replacementRoot) {
+  const previous = xmlEscape(path.resolve(previousRoot));
+  const replacement = xmlEscape(path.resolve(replacementRoot));
+  const rootPattern = new RegExp(escapeRegExp(previous), "giu");
+  const matches = taskXml.match(rootPattern) ?? [];
+  if (matches.length < 2) {
+    throw new Error("Existing Lichess startup task does not match the receipt-owned component root");
+  }
+  let updated = taskXml.replace(rootPattern, () => replacement);
+  const settingsPattern = /(<Settings>[\s\S]*?<Enabled>)true(<\/Enabled>)/iu;
+  if (!settingsPattern.test(updated)) {
+    throw new Error("Existing Lichess startup task has no controllable enabled setting");
+  }
+  updated = updated.replace(settingsPattern, "$1false$2");
+  return updated;
+}
+
+export async function prepareWindowsStartupReplacement({
+  previousRoot,
+  replacementRoot,
+  runtimeDir,
+  execute = execFileAsync,
+  query = () => queryStartupTask(execute),
+  delay = wait,
+  pollMilliseconds = 100,
+  timeoutMilliseconds = 20_000,
+} = {}) {
+  requireWindows();
+  if (!previousRoot || !replacementRoot || !runtimeDir) {
+    throw new Error("startup replacement requires previous, replacement, and runtime roots");
+  }
+  const before = await query();
+  if (!before.installed) throw new Error("Lichess startup task is unavailable for replacement");
+  const { stdout } = await execute(
+    "schtasks.exe", ["/Query", "/TN", STARTUP_TASK_NAME, "/XML"],
+    { windowsHide: true, timeout: 10_000, maxBuffer: 1024 * 1024 },
+  );
+  const updatedXml = retargetWindowsTaskXml(stdout, previousRoot, replacementRoot);
+  await stopWindowsTask({ execute, query, delay, pollMilliseconds, timeoutMilliseconds });
+  const resolvedRuntime = path.resolve(runtimeDir);
+  await mkdir(resolvedRuntime, { recursive: true });
+  const temporaryXml = path.join(resolvedRuntime, `startup-replacement-${process.pid}.xml`);
+  await writeFile(
+    temporaryXml,
+    Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(updatedXml, "utf16le")]),
+  );
+  try {
+    await execute("schtasks.exe", ["/Delete", "/TN", STARTUP_TASK_NAME, "/F"], {
+      windowsHide: true, timeout: 10_000, maxBuffer: 1024 * 1024,
+    });
+    await execute("schtasks.exe", ["/Create", "/TN", STARTUP_TASK_NAME, "/XML", temporaryXml, "/F"], {
+      windowsHide: true, timeout: 20_000, maxBuffer: 1024 * 1024,
+    });
+  } finally {
+    await rm(temporaryXml, { force: true });
+  }
+  const state = await query();
+  if (!state.installed || state.active) {
+    throw new Error("Lichess startup task did not enter replacement-ready state");
+  }
+  return { ...state, installed: true, active: false, replacementReady: true };
+}
+
+export async function completeWindowsStartupReplacement({
+  execute = execFileAsync,
+  query = () => queryStartupTask(execute),
+  delay = wait,
+  pollMilliseconds = 100,
+  timeoutMilliseconds = 20_000,
+} = {}) {
+  requireWindows();
+  let state = await query();
+  if (!state.installed) throw new Error("Lichess startup task is unavailable after replacement");
+  await execute("schtasks.exe", ["/Change", "/TN", STARTUP_TASK_NAME, "/ENABLE"], {
+    windowsHide: true, timeout: 10_000, maxBuffer: 1024 * 1024,
+  });
+  await execute("schtasks.exe", ["/Run", "/TN", STARTUP_TASK_NAME], {
+    windowsHide: true, timeout: 10_000, maxBuffer: 1024 * 1024,
+  });
+  const attempts = Math.ceil(timeoutMilliseconds / pollMilliseconds);
+  for (let attempt = 0; attempt <= attempts; attempt += 1) {
+    state = await query();
+    if (state.installed && state.active) {
+      return { ...state, installed: true, active: true, replacementReady: false };
+    }
+    if (attempt === attempts) break;
+    await delay(pollMilliseconds);
+  }
+  throw new Error("Timed out waiting for the replacement Lichess startup launcher");
 }
 
 export async function installWindowsStartup(options) {
@@ -158,17 +356,7 @@ export async function installWindowsStartup(options) {
 
 export async function uninstallWindowsStartup(runtimeDir) {
   requireWindows();
-  try {
-    await execFileAsync("schtasks.exe", ["/End", "/TN", STARTUP_TASK_NAME], { windowsHide: true, timeout: 10_000 });
-  } catch {}
-  try {
-    await execFileAsync("schtasks.exe", ["/Delete", "/TN", STARTUP_TASK_NAME, "/F"], {
-      windowsHide: true,
-      timeout: 10_000,
-    });
-  } catch (error) {
-    if (error.code !== 1) throw new Error(`Could not uninstall Lichess startup task: ${error.stderr?.trim() || error.message}`);
-  }
+  const teardown = await stopAndDeleteWindowsTask();
   await rm(path.join(path.resolve(runtimeDir), "startup-task.json"), { force: true });
-  return { installed: false, taskName: STARTUP_TASK_NAME };
+  return teardown;
 }

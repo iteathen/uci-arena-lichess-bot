@@ -246,18 +246,23 @@ function installerManifest(componentContract, version, target, staging) {
       )
       || !Array.isArray(installerIntegration.dependency_bindings)
       || !Array.isArray(installerIntegration.locator_bindings)
-      || startupControl?.schema !== "arena_provider_startup_control_v1"
-      || startupControl.schema_version !== 1
+      || startupControl?.schema !== "arena_provider_startup_control_v2"
+      || startupControl.schema_version !== 2
       || startupControl.entrypoint !== "startup"
       || !Object.hasOwn(entrypoints, startupControl.entrypoint)
       || JSON.stringify(startupControl.actions?.install) !== JSON.stringify(["startup", "install"])
       || JSON.stringify(startupControl.actions?.uninstall) !== JSON.stringify(["startup", "uninstall"])
+      || JSON.stringify(startupControl.actions?.pre_replace) !== JSON.stringify(["startup", "prepare_replace"])
+      || JSON.stringify(startupControl.actions?.post_replace) !== JSON.stringify(["startup", "complete_replace"])
+      || startupControl.replacement_arguments?.previous_root !== "--previous-root"
+      || startupControl.replacement_arguments?.replacement_root !== "--replacement-root"
       || startupControl.workspace_argument?.flag !== "--runtime-dir"
       || !isSafeWorkspaceRelative(startupControl.workspace_argument?.relative_path)
       || startupControl.configuration_argument !== "--config"
       || startupControl.result?.envelope !== "startup"
       || startupControl.result?.require_configuration_match_on_install !== false
-      || startupControl.result?.require_live_on_install !== false) {
+      || startupControl.result?.require_live_on_install !== false
+      || startupControl.result?.require_live_on_post_replace !== true) {
     throw new Error("component installer-integration contract is invalid");
   }
   const acceptedLocatorSources = new Set(["saved_locator", "install_receipt"]);

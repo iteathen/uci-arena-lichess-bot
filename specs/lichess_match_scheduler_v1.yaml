@@ -352,6 +352,17 @@ windows_supervision:
     - "The Node adapter remains the foreground child of the launcher so Task Scheduler observes its real exit code; no detached intermediate process is permitted."
     - "The adapter writes runtime_state/lichess/adapter.ndjson and runtime.json because supervised stdout and stderr are intentionally attached to NUL."
     - "Startup registration may persist only the token-file path, never token contents, and must validate engine/capacity evidence before registration."
+    - "Uninstall first ends the registered task, then polls Task Scheduler until the GUI launcher and its kill-on-close child job are no longer running. Only after that proof may it delete the task and startup evidence."
+    - "A missing task is idempotent success. Access denial, an unknown task state, or failure to reach stopped and deleted states within the bounded deadline fails closed and preserves the provider payload for retry."
+    - "Startup-control v2 exposes credential-free pre_replace and post_replace actions. The staged provider stops the registered launcher, retargets the existing startup definition from the exact receipt-owned root to the exact replacement root without reading credential contents, and leaves it disabled until the installed replacement explicitly resumes it."
+    - "Windows replacement rewrites only the validated task XML root references, preserves the external token-file path and other arguments, and requires a stopped disabled task before payload replacement. Linux applies the equivalent bounded rewrite to the user unit. Post-replacement must prove the provider is active."
+
+local_ephemeral_release:
+  scope: private_component_candidate_only
+  rules:
+    - "The explicitly dispatched Windows workflow accepts only the repository-scoped ephemeral runner selection and the exact self-hosted, Windows, X64, ephemeral, uci-suite, and lichess-release labels."
+    - "The checked-in Installer-owned runner command validates the exact remote head, source and contract versions, workflow signing permissions, Visual Studio environment, Git Bash, and PowerShell module resolution before one dispatch. It never retries a component build automatically."
+    - "A local physical runner is diagnostic private-candidate transport only. It is not stable suite publication or protected acceptance authority."
 
 telemetry:
   runtime_schema: uci_arena_lichess_runtime_v3
@@ -387,6 +398,7 @@ validation:
   - "Reconnect tests exceed the former retry threshold without ending the active session or releasing its authority."
   - "Transport tests reject oversized JSON, NDJSON records, and finite collections before unbounded buffering."
   - "Packaged Windows startup tests resolve the launcher at native/lichess_adapter_launcher.exe rather than a source-build directory."
+  - "Windows lifecycle tests prove End precedes stopped-state polling, Delete follows stopped proof, deletion reaches absent state, and timeout or access failure cannot report uninstall success."
 
 adaptive_temporal_curve_profile_2026_07_25:
   status: active
@@ -772,7 +784,7 @@ installer_component_contract_2026_08_01:
     - "Every locator binding declares its accepted authority sources. Timing, single-game, capacity, and transport evidence accept only saved locators; opening-book and Syzygy knowledge may also accept receipt-managed assets."
     - "Installer supplies only declared dependency paths and locator paths selected from each binding's accepted authority sources through the versioned installation context; it does not interpret Lichess configuration fields, engine-adapter semantics, qualification combinations, or knowledge-source UCI options."
     - "Optional installed-qualification bindings name Evidence Runtime's complete-game and referee entrypoints plus Stockfish through component declarations. Their absence keeps ordinary adapter use available and makes the qualification operation explicitly unavailable; no repository-relative fallback is permitted."
-    - "The install manifest declares the exact startup entrypoint, action arrays, runtime-directory/configuration flags, and response envelope. Installer may invoke credential-free uninstall from that contract but never fabricates Lichess arguments or reads a token."
+    - "The install manifest declares the exact startup entrypoint, action arrays, runtime-directory/configuration flags, previous/replacement-root flags, and response envelope. Installer may invoke credential-free uninstall or two-phase replacement from that contract but never fabricates Lichess arguments or reads a token."
     - "The startup runtime-directory contract names the provider workspace root so startup, account probe, status, and local controls cannot create parallel persistence authorities."
     - "The component release builder validates the declared startup workspace path structurally and does not hard-code the current workspace layout; changing a safe relative workspace mapping is manifest data, not release-builder control flow."
     - "The outer provider result uses the shared suite field names and binds the exact artifact, install manifest, source repository and commit, source tree, dependency locks, toolchain, SBOM, licenses, build flags, and passing test receipt."
