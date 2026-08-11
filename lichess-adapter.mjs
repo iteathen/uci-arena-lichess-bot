@@ -812,10 +812,8 @@ function capacityEvidenceSummary(config) {
   }
 }
 
-export function managerOptionsProjection(config) {
-  const capacityEvidence = capacityEvidenceSummary(config);
+export function editableManagerOptionsProjection(config) {
   return {
-    schema: MANAGER_OPTIONS_SCHEMA,
     capacity: {
       total_slots: config.capacity.total_slots,
       startup_parallelism: config.capacity.startup_parallelism,
@@ -828,7 +826,6 @@ export function managerOptionsProjection(config) {
         slots: config.capacity.bot.slots,
         target_active: config.capacity.bot.target_active,
       },
-      evidence: capacityEvidence,
     },
     inbound_challenges: { ...config.challenges },
     outbound_challenge: { ...config.outbound_challenge },
@@ -849,7 +846,22 @@ export function managerOptionsProjection(config) {
   };
 }
 
-function applyManagerOptionsPatch(rawConfig, patch) {
+export function managerOptionsProjection(config) {
+  const editable = editableManagerOptionsProjection(config);
+  return {
+    schema: MANAGER_OPTIONS_SCHEMA,
+    capacity: {
+      ...editable.capacity,
+      evidence: capacityEvidenceSummary(config),
+    },
+    inbound_challenges: editable.inbound_challenges,
+    outbound_challenge: editable.outbound_challenge,
+    scheduler: editable.scheduler,
+    opponent_selection: editable.opponent_selection,
+  };
+}
+
+export function applyManagerOptionsPatch(rawConfig, patch) {
   requireOnlyKeys(
     patch,
     "settings",
