@@ -6013,7 +6013,16 @@ export async function main(argv = process.argv.slice(2)) {
   }
   if (options.command === "startup" && options.action === "complete_replace") {
     const replacement = process.platform === "win32"
-      ? await completeWindowsStartupReplacement()
+      ? await completeWindowsStartupReplacement({
+        ready: async () => {
+          const { runtime, error: runtimeError } = boundedRuntimeMetadata(runtimeDir);
+          return providerStatusProjection({
+            runtime,
+            runtimeError,
+            startup: { installed: true, active: true },
+          }).ready;
+        },
+      })
       : process.platform === "linux"
         ? await completeLinuxStartupReplacement()
         : (() => { throw new Error(`Unsupported startup platform: ${process.platform}`); })();

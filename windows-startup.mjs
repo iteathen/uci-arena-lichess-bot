@@ -312,29 +312,83 @@ export async function prepareWindowsStartupReplacement({
 export async function completeWindowsStartupReplacement({
   execute = execFileAsync,
   query = () => queryStartupTask(execute),
+  ready = async () => true,
   delay = wait,
   pollMilliseconds = 100,
   timeoutMilliseconds = 20_000,
+  stabilityMilliseconds = 3_000,
+  launchGraceMilliseconds = 2_000,
+  maximumLaunchAttempts = 3,
 } = {}) {
   requireWindows();
+  for (const [name, value, minimum, maximum] of [
+    ["pollMilliseconds", pollMilliseconds, 10, 1_000],
+    ["timeoutMilliseconds", timeoutMilliseconds, pollMilliseconds, 60_000],
+    ["stabilityMilliseconds", stabilityMilliseconds, pollMilliseconds, timeoutMilliseconds],
+    ["launchGraceMilliseconds", launchGraceMilliseconds, pollMilliseconds, timeoutMilliseconds],
+    ["maximumLaunchAttempts", maximumLaunchAttempts, 1, 5],
+  ]) {
+    if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+      throw new Error(`Lichess replacement ${name} policy is invalid`);
+    }
+  }
+  if (typeof ready !== "function") {
+    throw new Error("Lichess replacement readiness probe is invalid");
+  }
   let state = await query();
   if (!state.installed) throw new Error("Lichess startup task is unavailable after replacement");
   await execute("schtasks.exe", ["/Change", "/TN", STARTUP_TASK_NAME, "/ENABLE"], {
     windowsHide: true, timeout: 10_000, maxBuffer: 1024 * 1024,
   });
-  await execute("schtasks.exe", ["/Run", "/TN", STARTUP_TASK_NAME], {
-    windowsHide: true, timeout: 10_000, maxBuffer: 1024 * 1024,
-  });
+  let launchAttempts = 0;
+  let pollsSinceLaunch = 0;
+  let observedActiveForLaunch = false;
+  const launch = async () => {
+    await execute("schtasks.exe", ["/Run", "/TN", STARTUP_TASK_NAME], {
+      windowsHide: true, timeout: 10_000, maxBuffer: 1024 * 1024,
+    });
+    launchAttempts += 1;
+    pollsSinceLaunch = 0;
+    observedActiveForLaunch = false;
+  };
+  await launch();
   const attempts = Math.ceil(timeoutMilliseconds / pollMilliseconds);
+  const stablePollsRequired = Math.ceil(stabilityMilliseconds / pollMilliseconds);
+  const launchGracePolls = Math.ceil(launchGraceMilliseconds / pollMilliseconds);
+  let consecutiveReadyPolls = 0;
   for (let attempt = 0; attempt <= attempts; attempt += 1) {
     state = await query();
-    if (state.installed && state.active) {
-      return { ...state, installed: true, active: true, replacementReady: false };
+    if (!state.installed) {
+      throw new Error("Lichess startup task disappeared during replacement completion");
+    }
+    if (state.active) {
+      observedActiveForLaunch = true;
+      if (await ready()) {
+        consecutiveReadyPolls += 1;
+        if (consecutiveReadyPolls >= stablePollsRequired) {
+          return {
+            ...state,
+            installed: true,
+            active: true,
+            providerReady: true,
+            replacementReady: false,
+            launchAttempts,
+            stabilityMilliseconds,
+          };
+        }
+      } else {
+        consecutiveReadyPolls = 0;
+      }
+    } else {
+      consecutiveReadyPolls = 0;
+      const launchFailed = observedActiveForLaunch || pollsSinceLaunch >= launchGracePolls;
+      if (launchFailed && launchAttempts < maximumLaunchAttempts) await launch();
     }
     if (attempt === attempts) break;
     await delay(pollMilliseconds);
+    pollsSinceLaunch += 1;
   }
-  throw new Error("Timed out waiting for the replacement Lichess startup launcher");
+  throw new Error("Timed out waiting for stable replacement Lichess provider readiness");
 }
 
 export async function installWindowsStartup(options) {

@@ -99,6 +99,7 @@ test("two-phase replacement stops, retargets, and resumes the existing task", as
     const completeStates = [
       { installed: true, active: false, taskStatus: "Disabled" },
       { installed: true, active: true, taskStatus: "Running" },
+      { installed: true, active: true, taskStatus: "Running" },
     ];
     const completed = await completeWindowsStartupReplacement({
       execute,
@@ -106,8 +107,12 @@ test("two-phase replacement stops, retargets, and resumes the existing task", as
       delay: async () => {},
       pollMilliseconds: 10,
       timeoutMilliseconds: 100,
+      stabilityMilliseconds: 20,
+      launchGraceMilliseconds: 20,
     });
     assert.equal(completed.active, true);
+    assert.equal(completed.providerReady, true);
+    assert.equal(completed.launchAttempts, 1);
     assert.deepEqual(commands.map(([operation]) => operation), [
       "/Query", "/Change", "--terminate-owned-tree", "/Delete", "/Create", "/Change", "/Change", "/Run",
     ]);
@@ -116,6 +121,63 @@ test("two-phase replacement stops, retargets, and resumes the existing task", as
   } finally {
     rmSync(runtimeDir, { recursive: true, force: true });
   }
+});
+
+test("replacement immediately retries a child that exits during readiness stabilization", async (t) => {
+  if (process.platform !== "win32") return t.skip("Windows Task Scheduler contract");
+  const commands = [];
+  const execute = async (_file, argumentsList) => {
+    commands.push(argumentsList);
+    return { stdout: "" };
+  };
+  const states = [
+    { installed: true, active: false, taskStatus: "Disabled" },
+    { installed: true, active: true, taskStatus: "Running" },
+    { installed: true, active: false, taskStatus: "Ready", lastResult: "1" },
+    { installed: true, active: true, taskStatus: "Running" },
+    { installed: true, active: true, taskStatus: "Running" },
+  ];
+
+  const completed = await completeWindowsStartupReplacement({
+    execute,
+    query: async () => states.shift(),
+    ready: async () => true,
+    delay: async () => {},
+    pollMilliseconds: 10,
+    timeoutMilliseconds: 100,
+    stabilityMilliseconds: 20,
+    launchGraceMilliseconds: 20,
+  });
+
+  assert.equal(completed.active, true);
+  assert.equal(completed.providerReady, true);
+  assert.equal(completed.launchAttempts, 2);
+  assert.equal(commands.filter(([operation]) => operation === "/Run").length, 2);
+});
+
+test("replacement does not accept Task Scheduler Running before provider readiness", async (t) => {
+  if (process.platform !== "win32") return t.skip("Windows Task Scheduler contract");
+  const states = [
+    { installed: true, active: false, taskStatus: "Disabled" },
+    { installed: true, active: true, taskStatus: "Running" },
+    { installed: true, active: true, taskStatus: "Running" },
+    { installed: true, active: true, taskStatus: "Running" },
+  ];
+  const readiness = [false, true, true];
+
+  const completed = await completeWindowsStartupReplacement({
+    execute: async () => ({ stdout: "" }),
+    query: async () => states.shift(),
+    ready: async () => readiness.shift(),
+    delay: async () => {},
+    pollMilliseconds: 10,
+    timeoutMilliseconds: 100,
+    stabilityMilliseconds: 20,
+    launchGraceMilliseconds: 20,
+  });
+
+  assert.equal(completed.providerReady, true);
+  assert.equal(readiness.length, 0);
 });
 
 test("startup replacement retargets the owned task paths while preserving credentials", () => {
