@@ -220,6 +220,8 @@ test("loopback API server simulates NDJSON, challenges, and move submission", as
     assert.equal(created.challenge.opponent, "FixtureOpponent");
     await client.post("api/challenge/inbound/accept", {});
     await client.post("api/challenge/inbound/decline", { reason: "later" });
+    await client.post("api/bot/game/fixture-game/abort");
+    assert.deepEqual(api.state.aborts, [{ gameId: "fixture-game", form: {} }]);
     await client.post("api/challenge/outbound/cancel", {});
     await client.post(
       "api/bot/game/fixture-game/move/e2e4",
