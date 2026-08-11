@@ -150,9 +150,13 @@ test("manual workflow uses free OIDC Cosign provenance and no automatic trigger"
   }
   assert.doesNotMatch(workflow, /actions\/(?:upload|download)-artifact/u);
   assert.match(workflow, /Expected exactly three candidate assets/u);
-  assert.match(workflow, /gh release create[\s\S]*?--target \$env:GITHUB_SHA/u);
+  assert.match(workflow, /gh release view[\s\S]*?targetCommitish/u);
+  assert.match(workflow, /targetCommitish -ne \$env:GITHUB_SHA/u);
+  assert.match(workflow, /assets\)\.Count -ne 0/u);
+  assert.match(workflow, /gh release upload/u);
+  assert.doesNotMatch(workflow, /gh release create/u);
   assert.ok(workflow.indexOf("provider-attestation.mjs verify-bundle")
-    < workflow.indexOf("gh release create"));
+    < workflow.indexOf("gh release upload"));
   const nativeCmake = readFileSync(path.join(root, "native", "CMakeLists.txt"), "utf8");
   assert.match(nativeCmake, /target_link_options\(lichess_adapter_launcher PRIVATE \/Brepro\)/u);
   assert.doesNotMatch(workflow, /actions\/attest-build-provenance|attestations:\s*write/u);
