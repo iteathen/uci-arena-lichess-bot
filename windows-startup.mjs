@@ -141,6 +141,8 @@ async function stopWindowsTask({
   delay = wait,
   pollMilliseconds = 100,
   timeoutMilliseconds = 20_000,
+  controlLauncher = NATIVE_LAUNCHER,
+  ownedLauncher = NATIVE_LAUNCHER,
 } = {}) {
   if (!Number.isSafeInteger(pollMilliseconds) || pollMilliseconds < 10
       || !Number.isSafeInteger(timeoutMilliseconds)
@@ -152,20 +154,26 @@ async function stopWindowsTask({
   if (typeof state.taskStatus !== "string" || state.taskStatus === "unknown") {
     throw new Error("Could not prove the Lichess startup task state before teardown");
   }
-  if (/^running$/iu.test(state.taskStatus)) {
-    try {
-      await execute("schtasks.exe", ["/End", "/TN", STARTUP_TASK_NAME], {
-        windowsHide: true,
-        timeout: 10_000,
-        maxBuffer: 1024 * 1024,
-      });
-    } catch (error) {
-      state = await query();
-      if (state.installed && /^running$/iu.test(state.taskStatus ?? "")) {
-        throw new Error(`Could not stop Lichess startup task: ${error.stderr?.trim() || error.message}`);
-      }
-    }
+  try {
+    await execute("schtasks.exe", ["/Change", "/TN", STARTUP_TASK_NAME, "/DISABLE"], {
+      windowsHide: true,
+      timeout: 10_000,
+      maxBuffer: 1024 * 1024,
+    });
+    await execute(path.resolve(controlLauncher), [
+      "--terminate-owned-tree",
+      path.resolve(ownedLauncher),
+      "--timeout-ms",
+      String(timeoutMilliseconds),
+    ], {
+      windowsHide: true,
+      timeout: timeoutMilliseconds + 5_000,
+      maxBuffer: 1024 * 1024,
+    });
+  } catch (error) {
+    throw new Error(`Could not terminate the Lichess startup process tree: ${error.stderr?.trim() || error.message}`);
   }
+  state = await query();
 
   const attempts = Math.ceil(timeoutMilliseconds / pollMilliseconds);
   for (let attempt = 0; state.installed && /^running$/iu.test(state.taskStatus); attempt += 1) {
@@ -189,9 +197,11 @@ export async function stopAndDeleteWindowsTask(options = {}) {
     delay = wait,
     pollMilliseconds = 100,
     timeoutMilliseconds = 20_000,
+    controlLauncher = NATIVE_LAUNCHER,
+    ownedLauncher = NATIVE_LAUNCHER,
   } = options;
   let state = await stopWindowsTask({
-    execute, query, delay, pollMilliseconds, timeoutMilliseconds,
+    execute, query, delay, pollMilliseconds, timeoutMilliseconds, controlLauncher, ownedLauncher,
   });
   if (!state.installed) return state;
   const attempts = Math.ceil(timeoutMilliseconds / pollMilliseconds);
@@ -264,7 +274,15 @@ export async function prepareWindowsStartupReplacement({
     { windowsHide: true, timeout: 10_000, maxBuffer: 1024 * 1024 },
   );
   const updatedXml = retargetWindowsTaskXml(stdout, previousRoot, replacementRoot);
-  await stopWindowsTask({ execute, query, delay, pollMilliseconds, timeoutMilliseconds });
+  await stopWindowsTask({
+    execute,
+    query,
+    delay,
+    pollMilliseconds,
+    timeoutMilliseconds,
+    controlLauncher: NATIVE_LAUNCHER,
+    ownedLauncher: path.join(path.resolve(previousRoot), "native", "lichess_adapter_launcher.exe"),
+  });
   const resolvedRuntime = path.resolve(runtimeDir);
   await mkdir(resolvedRuntime, { recursive: true });
   const temporaryXml = path.join(resolvedRuntime, `startup-replacement-${process.pid}.xml`);

@@ -352,9 +352,9 @@ windows_supervision:
     - "The Node adapter remains the foreground child of the launcher so Task Scheduler observes its real exit code; no detached intermediate process is permitted."
     - "The adapter writes runtime_state/lichess/adapter.ndjson and runtime.json because supervised stdout and stderr are intentionally attached to NUL."
     - "Startup registration may persist only the token-file path, never token contents, and must validate engine/capacity evidence before registration."
-    - "Uninstall first ends the registered task, then polls Task Scheduler until the GUI launcher and its kill-on-close child job are no longer running. Only after that proof may it delete the task and startup evidence."
+    - "Uninstall first disables restart, then invokes the staged native supervisor to terminate and wait for every process in the exact receipt-owned launcher tree. It additionally polls Task Scheduler until the GUI launcher is no longer running. Only after both proofs may it delete the task and startup evidence."
     - "A missing task is idempotent success. Access denial, an unknown task state, or failure to reach stopped and deleted states within the bounded deadline fails closed and preserves the provider payload for retry."
-    - "Startup-control v2 exposes credential-free pre_replace and post_replace actions. The staged provider stops the registered launcher, retargets the existing startup definition from the exact receipt-owned root to the exact replacement root without reading credential contents, and leaves it disabled until the installed replacement explicitly resumes it."
+    - "Startup-control v2 exposes credential-free pre_replace and post_replace actions. Before any receipt-owned dependency root can change, the staged provider disables restart, terminates and waits for the exact prior launcher process tree, retargets the existing startup definition from the exact receipt-owned root to the exact replacement root without reading credential contents, and leaves it disabled until the installed replacement explicitly resumes it."
     - "Windows replacement rewrites only the validated task XML root references, preserves the external token-file path and other arguments, and requires a stopped disabled task before payload replacement. Linux applies the equivalent bounded rewrite to the user unit. Post-replacement must prove the provider is active."
 
 local_ephemeral_release:
@@ -398,7 +398,7 @@ validation:
   - "Reconnect tests exceed the former retry threshold without ending the active session or releasing its authority."
   - "Transport tests reject oversized JSON, NDJSON records, and finite collections before unbounded buffering."
   - "Packaged Windows startup tests resolve the launcher at native/lichess_adapter_launcher.exe rather than a source-build directory."
-  - "Windows lifecycle tests prove End precedes stopped-state polling, Delete follows stopped proof, deletion reaches absent state, and timeout or access failure cannot report uninstall success."
+  - "Windows lifecycle tests prove restart-disable precedes exact owned-tree termination, Task Scheduler stopped-state proof precedes Delete, deletion reaches absent state, and timeout or access failure cannot report uninstall success."
 
 adaptive_temporal_curve_profile_2026_07_25:
   status: active
