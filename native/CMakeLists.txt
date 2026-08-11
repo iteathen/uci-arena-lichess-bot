@@ -16,6 +16,7 @@ if(MSVC)
         PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
     )
     target_compile_options(lichess_adapter_launcher PRIVATE /W4 /permissive- /EHsc)
+    target_link_options(lichess_adapter_launcher PRIVATE /Brepro)
 else()
     target_compile_options(lichess_adapter_launcher PRIVATE -Wall -Wextra -Wpedantic)
 endif()

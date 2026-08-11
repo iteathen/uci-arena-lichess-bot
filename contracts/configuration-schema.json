@@ -42,7 +42,16 @@
           "type": "object",
           "required": ["status", "qualified", "maximum_concurrency"],
           "properties": {
-            "status": {"enum": ["legacy_shared", "missing", "qualified", "rejected"]},
+            "status": {
+              "enum": [
+                "legacy_shared",
+                "standard_uci_startup_probe_required",
+                "runtime_revalidation_required",
+                "missing",
+                "qualified",
+                "rejected"
+              ]
+            },
             "qualified": {"type": "boolean"},
             "maximum_concurrency": {
               "oneOf": [

@@ -17,6 +17,7 @@ const operations = readJson("contracts/manager-operations-schema.json");
 const configuration = readJson("contracts/configuration-schema.json");
 const configurationUpdate = readJson("contracts/configuration-update-schema.json");
 const status = readJson("contracts/status-schema.json");
+const qualificationResult = readJson("contracts/qualification-result-schema.json");
 const template = readFileSync(path.join(root, "config.uci_arena.template.yml"), "utf8");
 const errors = [];
 
@@ -53,7 +54,10 @@ if (component.installation?.install_manifest_schema !== "arena_install_component
     || component.installation?.startup?.credential_gated !== true
     || component.installation?.entrypoints?.cli !== service.service?.entrypoint
     || !component.installation?.dependencies?.includes("node_runtime.private")
-    || !component.installation?.dependencies?.includes("uci_arena.engine")) {
+    || component.installation?.dependencies?.includes("uci_arena.engine")
+    || !component.compatibility?.required_capabilities?.includes("uci.engine.process")
+    || !component.compatibility?.compatible_default_components?.includes("uci_arena.engine")
+    || !service.required_capabilities?.includes("uci.engine.process")) {
   errors.push("Installer component projection is incomplete or inconsistent");
 }
 if (service.startup?.credential_gated !== true
@@ -89,6 +93,20 @@ for (const [name, operation] of Object.entries(operations.operations ?? {})) {
 if (configuration.properties?.schema?.const !== "uci_arena_lichess_manager_options_v1") {
   errors.push("configuration projection schema is incompatible");
 }
+const capacityEvidenceStatuses = configuration.properties?.capacity
+  ?.properties?.evidence?.properties?.status?.enum ?? [];
+for (const expected of [
+  "legacy_shared",
+  "standard_uci_startup_probe_required",
+  "runtime_revalidation_required",
+  "missing",
+  "qualified",
+  "rejected",
+]) {
+  if (!capacityEvidenceStatuses.includes(expected)) {
+    errors.push(`configuration projection omits capacity evidence status ${expected}`);
+  }
+}
 if (configurationUpdate.required?.[0] !== "settings"
     || configurationUpdate.properties?.settings?.additionalProperties !== false) {
   errors.push("configuration update schema is not a closed settings request");
@@ -100,6 +118,14 @@ if (service.configuration_update_schema !== "contracts/configuration-update-sche
     || component.contracts?.configuration_update !== service.configuration_update_schema
     || operations.operations?.config_update?.request !== service.configuration_update_schema) {
   errors.push("configuration update contract bindings differ");
+}
+if (service.qualification_result_schema !== "contracts/qualification-result-schema.json"
+    || component.contracts?.qualification_result !== service.qualification_result_schema
+    || operations.operations?.qualification_run?.response_schema
+      !== service.qualification_result_schema
+    || qualificationResult.$id !== "uci_arena_lichess_qualification_result_v1"
+    || qualificationResult.oneOf?.length !== 2) {
+  errors.push("installed qualification result contract bindings differ");
 }
 const projectedConfiguration = managerOptionsProjection(loadManagerConfig({
   templatePath: path.join(root, "config.uci_arena.template.yml"),

@@ -3,14 +3,21 @@
 import { createHash } from "node:crypto";
 import {
   copyFileSync,
+  existsSync,
   mkdirSync,
   readFileSync,
   renameSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+
+import {
+  PROFILE_SCHEMA,
+  validateStoredProfile,
+} from "@uci-arena/time-profile-contract";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const LOCAL_SCOPE = "local_live_safety";
@@ -40,6 +47,11 @@ function same(value, expected, label) {
   requireValue(String(value) === String(expected), `${label} mismatch`);
 }
 
+function requireInteger(value, label, minimum = 0, maximum = Number.MAX_SAFE_INTEGER) {
+  requireValue(Number.isSafeInteger(value) && value >= minimum && value <= maximum,
+    `${label} must be an integer in ${minimum}..${maximum}`);
+}
+
 function parseArguments(argv) {
   const options = {};
   for (let index = 0; index < argv.length; index += 2) {
@@ -53,7 +65,7 @@ function parseArguments(argv) {
   for (const name of [
     "engine",
     "model_root",
-    "diagnostic_evidence",
+    "time_profile",
     "complete_game_evidence",
     "output",
   ]) {
@@ -72,36 +84,185 @@ function parseArguments(argv) {
   return { ...options, qualification_scope: scope, probe_depth: depth, probe_timeout_ms: timeoutMs };
 }
 
-function validateDiagnostic(diagnostic, executableSha, checkpoint) {
-  requireValue(diagnostic.schema === "uci_time_profile_attempt_v3",
-    "Diagnostic evidence schema is not uci_time_profile_attempt_v3");
-  requireValue(diagnostic.phase === "diagnostic"
-    && diagnostic.outcome === "accepted_for_calibration",
-  "Diagnostic evidence was not accepted for calibration");
+function validateTimingProfile(input, checkpoint) {
+  const profile = validateStoredProfile(input);
+  requireValue(profile.schema === PROFILE_SCHEMA,
+    "Timing evidence schema is not uci_time_profile_v3");
+  requireInteger(
+    profile.qualification?.repetitions_per_case,
+    "Timing-profile repetitions per case",
+    30,
+    100,
+  );
   for (const gate of [
     "legal_moves",
-    "provider_activity_positive",
-    "provider_safety_passed",
+    "nonterminal_null_moves",
+    "controller_disabled",
+    "provider_timing_captured",
+    "provider_service_reserve_valid",
+    "applied_provider_service_reserve_covered",
+    "applied_backup_emit_reserve_covered",
     "p99_deadline_overshoot_passed",
     "maximum_deadline_overshoot_passed",
     "passed",
   ]) {
-    requireValue(diagnostic.gates?.[gate] === true, `Diagnostic gate ${gate} did not pass`);
+    requireValue(profile.gates?.[gate] === true, `Timing-profile gate ${gate} did not pass`);
   }
-  const identity = diagnostic.identity;
-  requireValue(identity?.search?.search_core === "v2", "Diagnostic did not qualify SearchCore v2");
+  const identity = profile.identity;
+  requireValue(new Set(["v2", "mcgs"]).has(identity?.search?.search_core),
+    "Timing profile did not qualify a supported search core");
   requireValue(new Set(["directml", "cuda"]).has(identity.search.provider_effective),
-    "Diagnostic did not retain a supported GPU provider");
+    "Timing profile did not retain a supported GPU provider");
   requireValue(identity.search.provider_requested === identity.search.provider_effective,
-    "Diagnostic provider request/effective identity differs");
+    "Timing-profile provider request/effective identity differs");
   requireValue(identity.search.background_search === false,
-    "Diagnostic must disable background search");
-  same(identity.engine.executable_sha256, executableSha, "Diagnostic executable");
-  same(identity.model.model_id, checkpoint.model_id, "Diagnostic model id");
+    "Timing profile must disable background search");
+  same(identity.model.model_id, checkpoint.model_id, "Timing-profile model id");
+  if (identity.search.search_core === "mcgs") {
+    for (const gate of [
+      "mcgs_root_coverage_passed",
+      "mcgs_policy_only_fallback_passed",
+      "mcgs_graph_population_passed",
+      "mcgs_async_overlap_passed",
+      "mcgs_single_owner_passed",
+      "mcgs_low_budget_fallback_passed",
+      "mcgs_deterministic_fallback_passed",
+      "mcgs_completion_integrity_passed",
+      "mcgs_temporal_policy_passed",
+      "mcgs_deadline_tail_telemetry_passed",
+    ]) {
+      requireValue(profile.gates?.[gate] === true,
+        `Timing-profile MCGS gate ${gate} did not pass`);
+    }
+    const mcgs = identity.search.mcgs;
+    requireValue(mcgs?.time_policy === "RelativeClockTemporalV1",
+      "Timing-profile MCGS temporal policy is not RelativeClockTemporalV1");
+    requireInteger(mcgs.search_graph_mb, "Timing-profile MCGS graph size", 64, 4_096);
+    requireInteger(mcgs.cpuct_permille, "Timing-profile MCGS Cpuct", 100, 10_000);
+    requireInteger(mcgs.outstanding_batches, "Timing-profile MCGS outstanding batches", 1, 4);
+    requireInteger(mcgs.book_prior_blend_permille,
+      "Timing-profile MCGS book-prior blend", 0, 500);
+  }
   return identity;
 }
 
-function validateCompleteGame(completeGame, identity, executableSha, scope) {
+function validateMcgsCompleteGame(runtime) {
+  for (const [value, label] of [
+    [runtime.mcgs_graph_nodes, "graph nodes"],
+    [runtime.mcgs_graph_edges, "graph edges"],
+    [runtime.mcgs_completed_simulations, "completed simulations"],
+    [runtime.mcgs_async_admissions, "asynchronous admissions"],
+    [runtime.mcgs_outstanding_peak, "outstanding peak"],
+  ]) requireValue(Number(value) > 0, `Complete-game MCGS ${label} is not positive`);
+  requireValue(Number(runtime.mcgs_root_legal_moves) > 0
+    && runtime.mcgs_root_seeded_moves === runtime.mcgs_root_legal_moves,
+  "Complete-game MCGS legal-root coverage is incomplete");
+  requireValue(runtime.mcgs_stale_backups_discarded === 0,
+    "Complete-game MCGS stale backups were discarded");
+  requireValue(runtime.mcgs_reservation_leaks === 0,
+    "Complete-game MCGS reservations leaked");
+  const deadlineTail = [
+    runtime.mcgs_provider_admission_denials,
+    runtime.mcgs_cache_completions_after_admission_close,
+    runtime.mcgs_nonprovider_backups_after_admission_close,
+  ];
+  requireValue(deadlineTail.every((value) => Number.isSafeInteger(value) && value >= 0),
+    "Complete-game MCGS deadline-tail telemetry is missing");
+  requireValue(deadlineTail.every((value) => value === 0)
+    || runtime.mcgs_neural_admission_closed === true,
+  "Complete-game MCGS deadline-tail work lacks an admission-close observation");
+}
+
+function validateCompleteGameTablebase(tablebase, runtime) {
+  if (tablebase === null || tablebase === undefined) return null;
+  requireValue(tablebase && typeof tablebase === "object",
+    "Complete-game tablebase contract is not an object");
+  requireValue(path.isAbsolute(tablebase.path) && existsSync(tablebase.path),
+    "Complete-game Syzygy path is not an available absolute path");
+  requireValue(path.isAbsolute(tablebase.manifest) && existsSync(tablebase.manifest),
+    "Complete-game Syzygy manifest is not an available absolute path");
+  requireValue(/^sha256:[0-9a-f]{64}$/.test(tablebase.manifest_identity ?? ""),
+    "Complete-game Syzygy manifest identity is invalid");
+  requireValue(/^sha256:[0-9a-f]{64}$/.test(tablebase.manifest_file_sha256 ?? ""),
+    "Complete-game Syzygy manifest file SHA-256 is invalid");
+  same(sha256File(tablebase.manifest), tablebase.manifest_file_sha256,
+    "Complete-game Syzygy manifest file");
+  const manifest = readJson(tablebase.manifest, "Complete-game Syzygy manifest");
+  requireValue(manifest.schema === "uci_arena_syzygy_manifest_v1"
+    && manifest.identity_sha256 === tablebase.manifest_identity
+    && manifest.cardinality === tablebase.loaded_cardinality
+    && Array.isArray(manifest.files) && manifest.files.length > 0,
+  "Complete-game Syzygy manifest contract mismatch");
+  requireInteger(tablebase.loaded_cardinality, "Complete-game Syzygy cardinality", 3, 7);
+  requireInteger(tablebase.probe_limit, "Complete-game Syzygy probe limit", 3, 7);
+  requireValue(tablebase.probe_limit <= tablebase.loaded_cardinality,
+    "Complete-game Syzygy probe limit exceeds loaded cardinality");
+  requireInteger(tablebase.probe_threads, "Complete-game Syzygy probe threads", 2, 8);
+  for (const field of ["rule50", "root_probe", "internal_probe"]) {
+    requireValue(typeof tablebase[field] === "boolean",
+      `Complete-game Syzygy ${field} must be boolean`);
+  }
+  for (const [actual, expected, label] of [
+    [runtime.syzygy_active, true, "active state"],
+    [runtime.syzygy_loaded_cardinality, tablebase.loaded_cardinality, "cardinality"],
+    [runtime.syzygy_manifest_identity, tablebase.manifest_identity, "manifest identity"],
+    [runtime.syzygy_probe_limit, tablebase.probe_limit, "probe limit"],
+    [runtime.syzygy_probe_threads, tablebase.probe_threads, "probe threads"],
+    [runtime.syzygy_rule50, tablebase.rule50, "rule-50 policy"],
+    [runtime.syzygy_root_probe, tablebase.root_probe, "root activation"],
+    [runtime.syzygy_internal_probe, tablebase.internal_probe, "internal activation"],
+  ]) same(actual, expected, `Complete-game Syzygy ${label}`);
+  return {
+    path: tablebase.path,
+    manifest: tablebase.manifest,
+    manifest_identity: tablebase.manifest_identity,
+    manifest_file_sha256: tablebase.manifest_file_sha256,
+    loaded_cardinality: tablebase.loaded_cardinality,
+    probe_limit: tablebase.probe_limit,
+    probe_threads: tablebase.probe_threads,
+    rule50: tablebase.rule50,
+    root_probe: tablebase.root_probe,
+    internal_probe: tablebase.internal_probe,
+  };
+}
+
+function validateCompleteGameTimingProfile(completeGame, timeProfile, timeProfileSha) {
+  const configured = completeGame.config?.timing_profile;
+  const applied = completeGame.runtime_contract?.timing_profile;
+  requireValue(configured && applied,
+    "Complete-game timing-profile application evidence is missing");
+  for (const [actual, expected, label] of [
+    [configured.profile_schema, timeProfile.schema, "configured schema"],
+    [configured.profile_sha256, timeProfileSha, "configured file SHA-256"],
+    [configured.identity_sha256, timeProfile.identity_sha256, "configured identity"],
+    [applied.profile_schema, timeProfile.schema, "applied schema"],
+    [applied.profile_sha256, timeProfileSha, "applied file SHA-256"],
+    [applied.identity_sha256, timeProfile.identity_sha256, "applied identity"],
+    [applied.provider_service_reserve_us,
+      timeProfile.calibration.provider_service_reserve_us, "provider reserve"],
+    [applied.backup_emit_reserve_us,
+      timeProfile.calibration.backup_emit_reserve_us, "backup/emission reserve"],
+    [applied.iteration_forecast_scale_permille,
+      timeProfile.calibration.iteration_forecast_scale_permille, "forecast scale"],
+  ]) same(actual, expected, `Complete-game timing profile ${label}`);
+  requireValue(applied.schema === "uci_arena_complete_game_time_profile_v1"
+    && applied.accepted === true
+    && applied.applied === true
+    && applied.timing_authority_match === true
+    && applied.predictive_controller_enabled === false,
+  "Complete-game timing profile was not admitted and applied exactly");
+  requireValue(applied.engine_provenance && typeof applied.engine_provenance === "object",
+    "Complete-game timing profile has no engine provenance comparison");
+}
+
+function validateCompleteGame(
+  completeGame,
+  identity,
+  executableSha,
+  scope,
+  timeProfile,
+  timeProfileSha,
+) {
   requireValue(completeGame.schema === "uci_arena_complete_game_matrix_v3",
     "Complete-game evidence schema is not uci_arena_complete_game_matrix_v3");
   requireValue(completeGame.completed === true
@@ -122,6 +283,7 @@ function validateCompleteGame(completeGame, identity, executableSha, scope) {
   }
   same(`sha256:${completeGame.config?.executable_sha256?.model_engine}`,
     executableSha, "Complete-game executable");
+  validateCompleteGameTimingProfile(completeGame, timeProfile, timeProfileSha);
   const topology = completeGame.runtime_contract?.expected_parallel_topology;
   const runtime = completeGame.runtime_contract?.activation_probe?.runtime;
   requireValue(topology && runtime, "Complete-game activation runtime is missing");
@@ -143,22 +305,48 @@ function validateCompleteGame(completeGame, identity, executableSha, scope) {
   ]) same(actual, expected, `Complete-game ${label}`);
   for (const [value, label] of [
     [runtime.actual_active_workers, "active workers"],
-    [runtime.v2_cursor_admissions, "cursor admissions"],
-    [runtime.v2_cursor_async_pending, "cursor asynchronous pending"],
-    [runtime.v2_cursor_ready_resumes, "cursor ready resumes"],
     [runtime.provider_batches_delta, "provider batches"],
     [runtime.provider_rows_delta, "provider rows"],
   ]) requireValue(Number(value) > 0, `Complete-game ${label} is not positive`);
+  if (identity.search.search_core === "mcgs") {
+    const mcgs = identity.search.mcgs;
+    for (const [actual, expected, label] of [
+      [topology.search_graph_mb, mcgs.search_graph_mb, "MCGS graph size"],
+      [topology.mcgs_cpuct_permille, mcgs.cpuct_permille, "MCGS Cpuct"],
+      [topology.mcgs_outstanding_batches,
+        mcgs.outstanding_batches, "MCGS outstanding batches"],
+      [topology.mcgs_book_prior_blend_permille,
+        mcgs.book_prior_blend_permille, "MCGS book-prior blend"],
+      [runtime.search_graph_mb_configured, mcgs.search_graph_mb,
+        "runtime MCGS graph size"],
+      [runtime.mcgs_cpuct_permille_configured, mcgs.cpuct_permille,
+        "runtime MCGS Cpuct"],
+      [runtime.mcgs_outstanding_batches_configured, mcgs.outstanding_batches,
+        "runtime MCGS outstanding batches"],
+      [runtime.mcgs_book_prior_blend_permille_configured,
+        mcgs.book_prior_blend_permille, "runtime MCGS book-prior blend"],
+      [runtime.mcgs_time_policy_configured,
+        mcgs.time_policy, "runtime MCGS temporal policy"],
+    ]) same(actual, expected, `Complete-game ${label}`);
+    validateMcgsCompleteGame(runtime);
+  } else {
+    for (const [value, label] of [
+      [runtime.v2_cursor_admissions, "cursor admissions"],
+      [runtime.v2_cursor_async_pending, "cursor asynchronous pending"],
+      [runtime.v2_cursor_ready_resumes, "cursor ready resumes"],
+    ]) requireValue(Number(value) > 0, `Complete-game ${label} is not positive`);
+  }
   requireValue(runtime.stale_publications_delta === 0
     && runtime.bestmove_active_tickets === 0
     && runtime.bestmove_active_async_leases === 0,
   "Complete-game activation did not drain cleanly");
+  return validateCompleteGameTablebase(topology.tablebase, runtime);
 }
 
 export function publishSingleGameProfile(options) {
   const engine = path.resolve(options.engine);
   const modelRoot = path.resolve(options.model_root);
-  const diagnosticPath = path.resolve(options.diagnostic_evidence);
+  const timeProfilePath = path.resolve(options.time_profile);
   const completeGamePath = path.resolve(options.complete_game_evidence);
   const output = path.resolve(options.output);
   const scope = options.qualification_scope ?? LOCAL_SCOPE;
@@ -167,30 +355,35 @@ export function publishSingleGameProfile(options) {
     "Checkpoint manifest");
   requireValue(/^[0-9a-f]{64}$/.test(checkpoint.checkpoint_hash ?? ""),
     "Checkpoint manifest has no lowercase SHA-256 checkpoint_hash");
-  const diagnostic = readJson(diagnosticPath, "Diagnostic evidence");
-  const identity = validateDiagnostic(diagnostic, executableSha, checkpoint);
-  validateCompleteGame(
+  const timeProfile = validateStoredProfile(readJson(timeProfilePath, "Timing profile"));
+  const identity = validateTimingProfile(timeProfile, checkpoint);
+  const timeProfileSha = sha256File(timeProfilePath);
+  const tablebase = validateCompleteGame(
     readJson(completeGamePath, "Complete-game evidence"),
     identity,
     executableSha,
     scope,
+    timeProfile,
+    timeProfileSha,
   );
 
-  const evidenceDirectory = path.join(path.dirname(output), "evidence");
-  mkdirSync(evidenceDirectory, { recursive: true });
-  const diagnosticTarget = path.join(evidenceDirectory, "time-diagnostic.json");
+  const completeGameSha = sha256File(completeGamePath);
+  const evidenceRoot = path.join(path.dirname(output), "evidence");
+  const evidenceDirectory = path.join(
+    evidenceRoot,
+    `${timeProfileSha.slice("sha256:".length)}-${completeGameSha.slice("sha256:".length)}`,
+  );
+  const timeProfileTarget = path.join(evidenceDirectory, "time-profile.json");
   const completeGameTarget = path.join(evidenceDirectory, "complete-game.json");
-  copyFileSync(diagnosticPath, diagnosticTarget);
-  copyFileSync(completeGamePath, completeGameTarget);
-  const diagnosticEvidence = {
+  const timingProfileEvidence = {
     passed: true,
-    artifact: path.relative(path.dirname(output), diagnosticTarget).replaceAll("\\", "/"),
-    artifact_sha256: sha256File(diagnosticTarget),
+    artifact: path.relative(path.dirname(output), timeProfileTarget).replaceAll("\\", "/"),
+    artifact_sha256: timeProfileSha,
   };
   const completeGameEvidence = {
     passed: true,
     artifact: path.relative(path.dirname(output), completeGameTarget).replaceAll("\\", "/"),
-    artifact_sha256: sha256File(completeGameTarget),
+    artifact_sha256: completeGameSha,
   };
   const profile = {
     schema: "uci_arena_single_game_profile_v1",
@@ -219,18 +412,63 @@ export function publishSingleGameProfile(options) {
     },
     evidence: {
       cursor_correctness: completeGameEvidence,
-      provider_parity: diagnosticEvidence,
-      deadline: diagnosticEvidence,
+      provider_parity: timingProfileEvidence,
+      deadline: timingProfileEvidence,
       topology: completeGameEvidence,
       complete_game: completeGameEvidence,
     },
   };
+  if (identity.search.search_core === "mcgs") {
+    Object.assign(profile, {
+      search_graph_mb: identity.search.mcgs.search_graph_mb,
+      mcgs_cpuct_permille: identity.search.mcgs.cpuct_permille,
+      mcgs_outstanding_batches: identity.search.mcgs.outstanding_batches,
+      mcgs_book_prior_blend_permille:
+        identity.search.mcgs.book_prior_blend_permille,
+    });
+  }
+  if (tablebase) profile.tablebase = tablebase;
   requireValue(profile.qualification_probe.depth >= profile.split_depth,
     "Qualification probe depth must be at least split depth");
   mkdirSync(path.dirname(output), { recursive: true });
+  mkdirSync(evidenceRoot, { recursive: true });
+  let createdEvidence = false;
+  if (existsSync(evidenceDirectory)) {
+    requireValue(existsSync(timeProfileTarget) && sha256File(timeProfileTarget) === timeProfileSha,
+      "Existing immutable timing-profile evidence does not match its digest path");
+    requireValue(existsSync(completeGameTarget)
+      && sha256File(completeGameTarget) === completeGameSha,
+    "Existing immutable complete-game evidence does not match its digest path");
+  } else {
+    const temporaryEvidence = `${evidenceDirectory}.tmp-${process.pid}`;
+    rmSync(temporaryEvidence, { recursive: true, force: true });
+    try {
+      mkdirSync(temporaryEvidence);
+      copyFileSync(timeProfilePath, path.join(temporaryEvidence, "time-profile.json"));
+      copyFileSync(completeGamePath, path.join(temporaryEvidence, "complete-game.json"));
+      requireValue(
+        sha256File(path.join(temporaryEvidence, "time-profile.json")) === timeProfileSha,
+        "Staged timing-profile evidence digest mismatch",
+      );
+      requireValue(
+        sha256File(path.join(temporaryEvidence, "complete-game.json")) === completeGameSha,
+        "Staged complete-game evidence digest mismatch",
+      );
+      renameSync(temporaryEvidence, evidenceDirectory);
+      createdEvidence = true;
+    } finally {
+      rmSync(temporaryEvidence, { recursive: true, force: true });
+    }
+  }
   const temporary = `${output}.tmp-${process.pid}`;
-  writeFileSync(temporary, `${JSON.stringify(profile, null, 2)}\n`, "utf8");
-  renameSync(temporary, output);
+  try {
+    writeFileSync(temporary, `${JSON.stringify(profile, null, 2)}\n`, "utf8");
+    renameSync(temporary, output);
+  } catch (error) {
+    rmSync(temporary, { force: true });
+    if (createdEvidence) rmSync(evidenceDirectory, { recursive: true, force: true });
+    throw error;
+  }
   return { ...profile, profile_path: output };
 }
 

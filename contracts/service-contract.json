@@ -2,7 +2,7 @@
   "schema": "uci_arena_service_contract_v1",
   "service": {
     "component_id": "lichess.adapter",
-    "component_version": "1.0.0",
+    "component_version": "1.0.9",
     "product_id": "uci_arena.lichess_bot",
     "contract_version": "1.0",
     "transport": "cli_json",
@@ -21,12 +21,20 @@
     "lichess.owner_reservations",
     "lichess.provider_configuration",
     "lichess.provider_status",
+    "lichess.installed_qualification",
     "lichess.startup"
   ],
   "required_capabilities": [
-    "uci.engine.process",
+    "uci.engine.process"
+  ],
+  "optional_capabilities": [
+    "uci.runtime_status.v1",
     "uci.time_profile.contract.v3"
   ],
+  "engine_adapters": {
+    "standard_uci_v1": "provider-neutral UCI process with fresh legal-move qualification",
+    "uci_arena_extended_v1": "UCI Arena Engine extensions with model, runtime-status, timing, and capacity evidence"
+  },
   "credential_contract": {
     "input": "external_absolute_file_path",
     "contents_visible_to": "provider_transport_only",
@@ -47,6 +55,7 @@
   "configuration_schema": "contracts/configuration-schema.json",
   "configuration_update_schema": "contracts/configuration-update-schema.json",
   "status_schema": "contracts/status-schema.json",
+  "qualification_result_schema": "contracts/qualification-result-schema.json",
   "error_contract": {
     "format": "bounded_typed_json",
     "secrets": "redacted",

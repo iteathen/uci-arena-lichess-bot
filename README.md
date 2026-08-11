@@ -9,7 +9,7 @@ It consumes any conforming UCI executable as an external process. It does not
 import UCI Arena Engine source and does not require the UCI Arena Engine in
 particular. UCI Arena suite compositions select the LatticeKnight model by
 default, while Stockfish, LCZero, and other conforming UCI engines remain valid
-substitutions when their required qualification evidence is supplied.
+substitutions through the provider-neutral `standard_uci_v1` adapter.
 
 The complete product architecture is governed by
 [`UCI_ARENA_COMPLETE_LEGO_ARCHITECTURE.md`](https://github.com/iteathen/uci-arena-installer/blob/main/docs/architecture/UCI_ARENA_COMPLETE_LEGO_ARCHITECTURE.md).
@@ -35,6 +35,9 @@ node .\lichess-adapter.mjs probe `
   --config C:\ProgramData\UCI Arena\lichess\config.json
 ```
 
+`probe` loads only provider policy and the external token path; it does not
+require an engine executable, model, timing profile, or capacity qualification.
+
 Do not put the token in an argument, environment variable, configuration file,
 log, test fixture, or release artifact.
 
@@ -53,6 +56,10 @@ The provider release artifact contains:
 - `vendor/` — digest-locked engine-owned contract packages;
 - Node runtime dependency metadata;
 - checksums, test receipt, and release provenance.
+
+The provider manifest requires the neutral `uci.engine.process` capability.
+`uci_arena.engine` is the suite composition's compatible default, not a hard
+provider dependency.
 
 The component owns installed program files. Manager-owned persistent data,
 including SQLite state, runtime status, logs, reservations, opponent history,
@@ -83,7 +90,7 @@ timing contracts, startup definitions, and Manager controls.
 ## Configuration
 
 `config.uci_arena.template.yml` is JSON syntax with the current
-`uci_arena_lichess_adapter_v6` schema. The `.yml` name is retained for installed
+`uci_arena_lichess_adapter_v7` schema. The `.yml` name is retained for installed
 compatibility.
 
 `<UCI_ARENA_ENGINE_ROOT>` is an explicit installed component binding. It is not
@@ -91,7 +98,16 @@ the provider repository, caller working directory, or an assumed source tree.
 Installer or Manager should resolve it from the installed Engine component
 receipt. The tracked suite default uses `models/latticeknight`.
 
-Live execution remains fail-closed until these exact bindings are present:
+`engine.adapter` selects one of two explicit contracts:
+
+- `standard_uci_v1` requires an executable, optional literal argument array,
+  working directory, successful `uci`/`isready` interrogation, and a fresh legal
+  depth-one move from the initial position. A freshly qualified engine owns one
+  game slot; greater concurrency requires a matching capacity artifact.
+- `uci_arena_extended_v1` additionally binds the UCI Arena Engine model,
+  runtime-status, timing, and capacity evidence described below.
+
+Extended live execution remains fail-closed until these exact bindings are present:
 
 - engine executable and working directory;
 - model root;
@@ -119,6 +135,20 @@ Common path flags:
 Explicit flags override template values. Paths are normalized to absolute paths
 at the process boundary; stored path values never contain embedded quotes.
 
+Lichess transport evidence is stored separately from Engine timing evidence.
+New collection uses `uci_arena_lichess_transport_profile_v2`, whose reserve
+covers the complete bestmove-to-ack tail: legality replay, serialized request
+queueing, dispatch, and acknowledgement. Qualified compatible evidence remains
+authoritative regardless of age and rolls forward with new completed-game data;
+age is provenance, not an invalidation trigger. Qualified v1 dispatch-to-ack
+profiles remain readable as read-only legacy authority, while new collection
+uses v2. Missing, incompatible, invalid, or unqualified evidence selects the
+documented 650 ms bootstrap reserve. Transport evidence never regenerates or
+changes the Engine-owned timing authority. Per-move transport observations stay
+non-authoritative and isolated by game until authoritative terminal game state
+is observed; failed, interrupted, or abandoned games discard their pending
+observations rather than changing either profile.
+
 ## Status and health
 
 The credential-free status operation is the authoritative Manager health
@@ -137,6 +167,26 @@ credential data, logs, SQLite rows, or engine command lines.
 
 ## Qualification and execution
 
+Publish a single-game profile only from the exact qualified timing profile and
+matching complete-game artifact. Intermediate diagnostic attempts are retained
+for investigation but are not deployment authority:
+
+```powershell
+node .\publish-single-game-profile.mjs `
+  --engine C:\Program Files\UCI Arena\components\engine\bin\uci_arena_engine.exe `
+  --model-root C:\Program Files\UCI Arena\components\engine\models\latticeknight `
+  --time-profile C:\ProgramData\UCI Arena\profiles\uci_time_profile_v3.json `
+  --complete-game-evidence C:\ProgramData\UCI Arena\evidence\complete-game.json `
+  --output C:\ProgramData\UCI Arena\profiles\single-game.json
+```
+
+The timing profile must contain at least thirty repetitions per declared case.
+The complete-game runner must have validated and applied that exact semantic
+timing authority before its timed work; a provenance-only engine rebuild is
+recorded but does not invalidate compatible timing. The publisher copies both
+immutable inputs beside the generated profile and never replaces prior
+authority when validation fails.
+
 Validate the exact engine package before using credentials:
 
 ```powershell
@@ -148,6 +198,15 @@ node .\lichess-adapter.mjs qualify `
   --model-root C:\Program Files\UCI Arena\components\engine\models\latticeknight `
   --profile C:\ProgramData\UCI Arena\profiles\single-game.json `
   --time-profile C:\ProgramData\UCI Arena\profiles\time.json
+```
+
+The packaged engine smoke uses the same selected adapter and literal process
+argument array as live games:
+
+```powershell
+node .\smoke-uci-startup.mjs `
+  --config C:\ProgramData\UCI Arena\lichess\config.json `
+  --engine-root C:\Program Files\UCI Arena\components\engine
 ```
 
 Run after qualification and capacity validation:
@@ -192,6 +251,15 @@ commands, and unknown fields are not editable through this projection.
 Rated games and automatic outbound scheduling require their distinct explicit
 confirmation values. A generic Save action is not sufficient.
 
+The catalog also publishes `qualification_run` for Manager's authenticated
+desktop workflow. It is credential-free and accepts only the installer-authored
+configuration and provider workspace paths that Manager appends to the fixed
+operation. The provider reuses semantically compatible timing authority, runs
+the installed Evidence Runtime against the exact installed Engine, publishes
+content-addressed single-game and capacity evidence, and removes an incomplete
+run. Manager validates the returned files under the provider workspace and
+commits their locators through Suite Setup; raw paths never reach the dashboard.
+
 ## Startup
 
 Windows uses a GUI-subsystem native launcher and a least-privilege, hidden,
@@ -214,8 +282,15 @@ node .\lichess-adapter.mjs startup status
 node .\lichess-adapter.mjs startup uninstall --runtime-dir C:\ProgramData\UCI Arena\lichess
 ```
 
-Startup installation qualifies the exact engine, model, timing, and capacity
-before registering anything and before reading credentials.
+Startup installation qualifies the exact engine, model, timing contract, and
+capacity required by the selected adapter before registering anything and
+before reading credentials. Timing-profile executable drift is reported as
+provenance and is accepted only when the Engine-owned semantic timing identity
+still matches exactly. Runtime status and per-game provenance retain both that
+semantic match and the qualified-versus-current engine provenance comparison.
+The packaged Windows launcher is `native/lichess_adapter_launcher.exe`;
+`native/build/Release` is only a development build location and is never stored
+in installed startup registration.
 
 ## Protected live acceptance
 
@@ -240,6 +315,15 @@ The provider owns a WAL-mode SQLite store. It persists owners, reservations,
 scheduler controls, opponents, challenge attempts, games, API safety state, and
 single-client leases. Restart reconciles active games before admitting new work.
 Rate-limit cooldowns survive restart and cannot be shortened by local config.
+Runtime NDJSON logging retains a bounded current log and one rotated predecessor
+inside the persistent provider workspace.
+
+Runtime-path authority is explicit and stable: `--runtime-dir` wins when it is
+supplied; otherwise an explicit `--config` path anchors persistence in that
+configuration file's parent workspace. Only a development invocation with
+neither option uses the component-local `runtime_state/lichess` fallback. An
+installed account probe therefore cannot write into the immutable component
+root, and Manager never needs to know the provider-private SQLite filename.
 
 `backfill-game-provenance.mjs` can apply an explicitly supplied historical
 evidence manifest in dry-run-first mode. Historical evidence is not committed

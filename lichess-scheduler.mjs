@@ -66,28 +66,32 @@ export class SlotPool {
     return slot;
   }
 
-  attachEngine(slot, engine, expectedGeneration = slot?.generation) {
+  attachEngine(slot, engine, expectedGeneration) {
     this.requireOwned(slot, "preparing", expectedGeneration);
     slot.engine = engine;
     return slot;
   }
 
-  pending(slot, challengeId) {
-    this.requireOwned(slot, "preparing");
+  pending(slot, challengeId, expectedGeneration) {
+    this.requireOwned(slot, "preparing", expectedGeneration);
     slot.challengeId = String(challengeId);
     slot.state = "pending";
     return slot;
   }
 
-  cancelling(slot) {
-    this.requireOwned(slot, ["pending", "cancelling"]);
+  cancelling(slot, expectedGeneration) {
+    this.requireOwned(slot, ["pending", "cancelling"], expectedGeneration);
     slot.state = "cancelling";
     slot.cancelInFlight = true;
     return slot;
   }
 
-  active(slot, gameId) {
-    this.requireOwned(slot, ["preparing", "pending", "cancelling", "active"]);
+  active(slot, gameId, expectedGeneration) {
+    this.requireOwned(
+      slot,
+      ["preparing", "pending", "cancelling", "active"],
+      expectedGeneration,
+    );
     slot.gameId = String(gameId);
     slot.state = "active";
     return slot;
@@ -96,18 +100,20 @@ export class SlotPool {
   findPending(game) {
     const gameId = String(game?.gameId ?? game?.id ?? "");
     const challengeId = String(game?.challengeId ?? gameId);
-    const exact = this.slots.find((slot) => ["pending", "cancelling"].includes(slot.state)
+    const exact = this.slots.find((slot) => ["preparing", "pending", "cancelling"].includes(slot.state)
       && (slot.challengeId === challengeId || slot.challengeId === gameId));
     if (exact) return exact;
     const opponent = String(game?.opponent?.id ?? game?.opponent?.username
       ?? game?.opponent?.name ?? "").toLocaleLowerCase();
     if (opponent) {
       return this.slots
-        .filter((slot) => ["pending", "cancelling"].includes(slot.state)
+        .filter((slot) => ["preparing", "pending", "cancelling"].includes(slot.state)
           && slot.opponent === opponent)
         .sort((left, right) => left.createdAt - right.createdAt)[0] ?? null;
     }
-    const pending = this.slots.filter((slot) => ["pending", "cancelling"].includes(slot.state));
+    const pending = this.slots.filter((slot) => (
+      ["preparing", "pending", "cancelling"].includes(slot.state)
+    ));
     return pending.length === 1 ? pending[0] : null;
   }
 
@@ -141,7 +147,10 @@ export class SlotPool {
       && (!audience || slot.audience === audience));
   }
 
-  async release(slot, expectedGeneration = slot?.generation) {
+  async release(slot, expectedGeneration) {
+    if (!Number.isSafeInteger(expectedGeneration)) {
+      throw new Error("Lichess slot release requires its captured generation");
+    }
     if (!slot || !this.slots.includes(slot) || slot.state === "empty" || slot.state === "draining"
         || slot.generation !== expectedGeneration) return false;
     slot.state = "draining";
@@ -166,7 +175,12 @@ export class SlotPool {
   }
 
   async drainAll() {
-    await Promise.allSettled(this.slots.map((slot) => this.release(slot)));
+    const owned = this.slots
+      .filter((slot) => slot.state !== "empty")
+      .map((slot) => ({ slot, generation: slot.generation }));
+    await Promise.allSettled(owned.map(({ slot, generation }) => (
+      this.release(slot, generation)
+    )));
   }
 
   snapshot() {
@@ -194,8 +208,11 @@ export class SlotPool {
     };
   }
 
-  requireOwned(slot, expectedState, expectedGeneration = slot?.generation) {
+  requireOwned(slot, expectedState, expectedGeneration) {
     if (!slot || !this.slots.includes(slot)) throw new Error("Lichess slot is not owned by this pool");
+    if (!Number.isSafeInteger(expectedGeneration)) {
+      throw new Error(`Lichess slot ${slot.id} transition requires its captured generation`);
+    }
     if (slot.generation !== expectedGeneration) {
       throw new Error(`Lichess slot ${slot.id} generation changed from ${expectedGeneration} to ${slot.generation}`);
     }

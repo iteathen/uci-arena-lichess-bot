@@ -4,10 +4,15 @@ import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   appendFileSync,
+  closeSync,
   existsSync,
+  lstatSync,
+  openSync,
   mkdirSync,
   readFileSync,
+  readSync,
   renameSync,
+  rmSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -43,14 +48,17 @@ import {
 import {
   loadTimeProfile,
   timeProfileFallbackStatus,
+  validateStoredProfile,
   validateAppliedTimeProfileReserve,
   validateProfileRuntimeSnapshot,
 } from "@uci-arena/time-profile-contract";
+import { publishSingleGameProfile } from "./publish-single-game-profile.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT = HERE;
 export const ENGINE_ROOT_PLACEHOLDER = "<UCI_ARENA_ENGINE_ROOT>";
 export const DEFAULT_TEMPLATE = path.join(HERE, "config.uci_arena.template.yml");
+const CONFIGURED_RUNTIME_PATH_AUTHORITY = Symbol("configuredRuntimePathAuthority");
 export const DEFAULT_RUNTIME_DIR = path.join(ROOT, "runtime_state", "lichess");
 export const DEFAULT_STORE_FILE = path.join(DEFAULT_RUNTIME_DIR, "matches.sqlite");
 export const LIVE_ACCEPTANCE_CONFIRMATION = "I_ACCEPT_ONE_BOT_GAME";
@@ -80,6 +88,7 @@ const PROFILE_OWNED_UCI_OPTIONS = Object.freeze({
   syzygy_root_probe: "SyzygyRootProbe",
   syzygy_internal_probe: "SyzygyInternalProbe",
 });
+const PROFILE_PATH_UCI_OPTIONS = new Set(["SyzygyPath", "SyzygyManifest"]);
 const ADAPTIVE_CURVE_SCHEMA = "uci_arena_mcgs_adaptive_temporal_curve_v1";
 const ADAPTIVE_CURVE_FORMULA = "adaptive_curve_v1_fixed_point";
 const ADAPTIVE_CURVE_STATUS = new Set(["qualified_live_authority"]);
@@ -158,27 +167,50 @@ const REQUIRED_PROFILE_EVIDENCE = Object.freeze([
   "topology",
   "complete_game",
 ]);
-const CURRENT_CONFIG_SCHEMA = "uci_arena_lichess_adapter_v6";
+const CURRENT_CONFIG_SCHEMA = "uci_arena_lichess_adapter_v7";
 const LEGACY_CONFIG_SCHEMAS = new Set([
   "uci_arena_lichess_adapter_v2",
   "uci_arena_lichess_adapter_v3",
   "uci_arena_lichess_adapter_v4",
   "uci_arena_lichess_adapter_v5",
+  "uci_arena_lichess_adapter_v6",
 ]);
+const ENGINE_ADAPTERS = new Set(["standard_uci_v1", "uci_arena_extended_v1"]);
+
+function usesExtendedEngineAdapter(config) {
+  return config.engine?.adapter !== "standard_uci_v1";
+}
+
+function usesMcgs(config) {
+  return usesExtendedEngineAdapter(config)
+    && String(config.engine?.uci_options?.SearchCore ?? "").toLocaleLowerCase() === "mcgs";
+}
 const DEFAULT_TIMING_CONFIG = Object.freeze({
   opponent_turn_search: true,
   foreground_preempts_ponder: true,
   initial_transport_reserve_ms: 650,
   transport_profile_path: null,
 });
-const TRANSPORT_PROFILE_SCHEMA = "uci_arena_lichess_transport_profile_v1";
+const TRANSPORT_PROFILE_SCHEMA = "uci_arena_lichess_transport_profile_v2";
+const LEGACY_TRANSPORT_PROFILE_SCHEMA = "uci_arena_lichess_transport_profile_v1";
 const TRANSPORT_PROFILE_MINIMUM_SAMPLES = 200;
 const TRANSPORT_PROFILE_MINIMUM_GAMES = 10;
-const TRANSPORT_PROFILE_MAXIMUM_AGE_MS = 7 * 24 * 60 * 60 * 1_000;
 const TRANSPORT_PROFILE_MAXIMUM_SAMPLES = 2_000;
 const TRANSPORT_RESERVE_MINIMUM_MS = 250;
 const TRANSPORT_RESERVE_MAXIMUM_MS = 1_500;
 const CHALLENGE_RESPONSE_MAX_AGE_MS = 20_000;
+const MAX_API_JSON_BYTES = 1024 * 1024;
+const MAX_API_ERROR_BYTES = 16 * 1024;
+const MAX_NDJSON_RECORD_BYTES = 1024 * 1024;
+const MAX_FINITE_NDJSON_ITEMS = 1024;
+const RUNTIME_STATUS_MAXIMUM_AGE_MS = 15_000;
+const MAX_UCI_LINE_BYTES = 64 * 1024;
+const MAX_UCI_ID_LINES = 16;
+const MAX_UCI_OPTION_LINES = 512;
+const MAX_ENGINE_STDERR_MESSAGE_BYTES = 4 * 1024;
+const MAX_TOKEN_FILE_BYTES = 4 * 1024;
+const MAX_RUNTIME_LOG_BYTES = 10 * 1024 * 1024;
+const MAX_RUNTIME_LOG_RECORD_BYTES = 64 * 1024;
 const UCI_MOVE_PATTERN = /^[a-h][1-8][a-h][1-8][qrbn]?$/;
 const TIME_PROFILE_RESERVED_OPTIONS = new Set([
   "SearchCore", "Threads", "RootWorkers", "V2SplitDepth", "BackgroundSearch",
@@ -214,11 +246,19 @@ export function loadTransportProfile(profilePath, now = Date.now()) {
   }
   try {
     const profile = JSON.parse(readFileSync(profilePath, "utf8"));
-    if (profile.schema !== TRANSPORT_PROFILE_SCHEMA) throw new Error("unsupported schema");
+    if (![TRANSPORT_PROFILE_SCHEMA, LEGACY_TRANSPORT_PROFILE_SCHEMA].includes(profile.schema)) {
+      throw new Error("unsupported schema");
+    }
     const generatedAt = Date.parse(profile.generated_at);
     if (!Number.isFinite(generatedAt)) throw new Error("generated_at is invalid");
     const samples = Array.isArray(profile.samples) ? profile.samples : [];
-    const values = samples.map((sample) => Number(sample?.post_dispatch_to_ack_ms));
+    const sampleField = profile.schema === TRANSPORT_PROFILE_SCHEMA
+      ? "bestmove_to_ack_ms"
+      : "post_dispatch_to_ack_ms";
+    const values = samples.map((sample) => sample?.[sampleField]);
+    if (values.some((value) => !Number.isFinite(value) || value < 0)) {
+      throw new Error(`transport profile contains an invalid ${sampleField} sample`);
+    }
     const gameCount = new Set(samples.map((sample) => String(sample?.game_id ?? "")).filter(Boolean)).size;
     const p99 = percentile(values, 0.99);
     const reserve = transportReserveFromP99(p99);
@@ -229,10 +269,16 @@ export function loadTransportProfile(profilePath, now = Date.now()) {
     if (!qualified) {
       return { status: "collecting", qualified: false, reason: "transport profile lacks qualified evidence", profile };
     }
-    if (now - generatedAt > TRANSPORT_PROFILE_MAXIMUM_AGE_MS) {
-      return { status: "stale", qualified: false, reason: "transport profile is older than seven days", profile };
-    }
-    return { status: "accepted", qualified: true, reserveMs: reserve, profile };
+    return {
+      status: "accepted",
+      qualified: true,
+      reserveMs: reserve,
+      ageMs: Math.max(0, now - generatedAt),
+      coverage: profile.schema === TRANSPORT_PROFILE_SCHEMA
+        ? "bestmove_to_ack"
+        : "dispatch_to_ack_legacy",
+      profile,
+    };
   } catch (error) {
     return { status: "rejected", qualified: false, reason: error.message };
   }
@@ -245,15 +291,19 @@ export class TransportProfileTracker {
     this.now = now;
     this.telemetry = telemetry;
     this.samples = [];
-    this.pendingGames = new Set();
+    this.pendingSamples = new Map();
     this.effectiveReserveMs = bootstrapReserveMs;
+    this.legacyReadOnly = false;
     if (profilePath && existsSync(profilePath)) {
       try {
         const profile = JSON.parse(readFileSync(profilePath, "utf8"));
         if (profile.schema === TRANSPORT_PROFILE_SCHEMA && Array.isArray(profile.samples)) {
-          const cutoff = this.now() - TRANSPORT_PROFILE_MAXIMUM_AGE_MS;
-          this.samples = profile.samples.filter((sample) => Number(sample?.recorded_at_ms) >= cutoff)
-            .slice(-TRANSPORT_PROFILE_MAXIMUM_SAMPLES);
+          const valid = profile.samples.every((sample) =>
+            Number.isFinite(sample?.bestmove_to_ack_ms)
+              && sample.bestmove_to_ack_ms >= 0);
+          if (valid) this.samples = profile.samples.slice(-TRANSPORT_PROFILE_MAXIMUM_SAMPLES);
+        } else if (profile.schema === LEGACY_TRANSPORT_PROFILE_SCHEMA) {
+          this.legacyReadOnly = true;
         }
       } catch {
         this.samples = [];
@@ -263,20 +313,53 @@ export class TransportProfileTracker {
     if (accepted.qualified) this.effectiveReserveMs = accepted.reserveMs;
   }
 
-  record(gameId, durationMs) {
+  record(gameId, timing) {
+    const sample = typeof timing === "number" ? { bestmove_to_ack_ms: timing } : timing;
+    const durationMs = Number(sample?.bestmove_to_ack_ms);
     if (!gameId || !Number.isFinite(durationMs) || durationMs < 0) return;
-    this.samples.push({
+    const key = String(gameId);
+    const pending = this.pendingSamples.get(key) ?? [];
+    pending.push({
       game_id: String(gameId),
-      post_dispatch_to_ack_ms: Math.round(durationMs * 1_000) / 1_000,
+      bestmove_to_ack_ms: Math.round(durationMs * 1_000) / 1_000,
+      bestmove_to_legality_ms: Number.isFinite(sample?.bestmove_to_legality_ms)
+        ? Math.round(sample.bestmove_to_legality_ms * 1_000) / 1_000
+        : null,
+      move_queue_wait_ms: Number.isFinite(sample?.move_queue_wait_ms)
+        ? Math.round(sample.move_queue_wait_ms * 1_000) / 1_000
+        : null,
+      post_dispatch_to_ack_ms: Number.isFinite(sample?.post_dispatch_to_ack_ms)
+        ? Math.round(sample.post_dispatch_to_ack_ms * 1_000) / 1_000
+        : null,
       recorded_at_ms: this.now(),
     });
-    this.samples = this.samples.slice(-TRANSPORT_PROFILE_MAXIMUM_SAMPLES);
-    this.pendingGames.add(String(gameId));
+    this.pendingSamples.set(
+      key,
+      pending.slice(-TRANSPORT_PROFILE_MAXIMUM_SAMPLES),
+    );
+  }
+
+  abandonGame(gameId) {
+    this.pendingSamples.delete(String(gameId));
   }
 
   finishGame(gameId) {
-    if (!this.pendingGames.delete(String(gameId)) || !this.profilePath) return this.effectiveReserveMs;
-    const values = this.samples.map((sample) => sample.post_dispatch_to_ack_ms);
+    const key = String(gameId);
+    const completedSamples = this.pendingSamples.get(key) ?? [];
+    this.pendingSamples.delete(key);
+    if (completedSamples.length === 0 || !this.profilePath) return this.effectiveReserveMs;
+    if (this.legacyReadOnly) {
+      this.telemetry({
+        event: "transport_profile_status",
+        qualified: true,
+        status: "legacy_read_only",
+        effective_reserve_ms: this.effectiveReserveMs,
+      });
+      return this.effectiveReserveMs;
+    }
+    this.samples.push(...completedSamples);
+    this.samples = this.samples.slice(-TRANSPORT_PROFILE_MAXIMUM_SAMPLES);
+    const values = this.samples.map((sample) => sample.bestmove_to_ack_ms);
     const gameCount = new Set(this.samples.map((sample) => sample.game_id)).size;
     const p50 = percentile(values, 0.50);
     const p95 = percentile(values, 0.95);
@@ -292,7 +375,7 @@ export class TransportProfileTracker {
       qualified,
       sample_count: this.samples.length,
       game_count: gameCount,
-      dispatch_to_ack_ms: { p50, p95, p99 },
+      bestmove_to_ack_ms: { p50, p95, p99 },
       effective_reserve_ms: qualified ? reserve : this.bootstrapReserveMs,
       samples: this.samples,
     };
@@ -349,6 +432,172 @@ function sha256Json(value) {
   return `sha256:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`;
 }
 
+function resolvedEngineDataPath(config, value, label) {
+  requireString(value, label);
+  return path.normalize(path.isAbsolute(value)
+    ? value
+    : path.resolve(config.working_directory, value));
+}
+
+function optionalEngineDataPath(config, value, label) {
+  if (value === undefined || value === null || value === "") return "";
+  return resolvedEngineDataPath(config, value, label);
+}
+
+function openingBookContract(config, runtimeStatus) {
+  const configured = config.uci_options ?? {};
+  const bookFile = resolvedEngineDataPath(
+    config,
+    configured.BookFile ?? runtimeStatus.opening_book_file,
+    "opening-book file",
+  );
+  const statsFile = optionalEngineDataPath(
+    config,
+    configured.BookStatsFile ?? runtimeStatus.opening_book_stats_file,
+    "opening-book stats file",
+  );
+  const policyFile = optionalEngineDataPath(
+    config,
+    configured.BookPolicyFile ?? runtimeStatus.opening_book_policy_file,
+    "opening-book policy file",
+  );
+  for (const [configuredName, runtimeName, expected] of [
+    ["BookFile", "opening_book_file", bookFile],
+    ["BookStatsFile", "opening_book_stats_file", statsFile],
+    ["BookPolicyFile", "opening_book_policy_file", policyFile],
+  ]) {
+    if (configured[configuredName] !== undefined) {
+      const observed = configuredName === "BookFile"
+        ? resolvedEngineDataPath(config, runtimeStatus[runtimeName], runtimeName)
+        : optionalEngineDataPath(config, runtimeStatus[runtimeName], runtimeName);
+      if (observed !== expected) {
+        throw new Error(`Opening book runtime path mismatch for ${configuredName}`);
+      }
+    }
+  }
+  for (const [filePath, label] of [[bookFile, "book"]]) {
+    if (!existsSync(filePath) || !statSync(filePath).isFile()) {
+      throw new Error(`Opening book ${label} file is missing: ${filePath}`);
+    }
+  }
+  if (Boolean(statsFile) !== Boolean(policyFile)) {
+    throw new Error("Opening book has a partial stats/policy sidecar pair");
+  }
+  if (typeof runtimeStatus.opening_book_statistics_available !== "boolean") {
+    throw new Error("Opening book runtime omitted its statistics capability");
+  }
+  const statisticsAvailable = Boolean(statsFile);
+  if (runtimeStatus.opening_book_statistics_available !== statisticsAvailable) {
+    throw new Error("Opening book runtime statistics capability mismatch");
+  }
+  const bookMetadata = statSync(bookFile);
+  if (bookMetadata.size <= 0 || bookMetadata.size % 16 !== 0) {
+    throw new Error("Opening book Polyglot framing is invalid");
+  }
+  const bookRows = bookMetadata.size / 16;
+  if (!statisticsAvailable) {
+    const identity = String(runtimeStatus.opening_book_identity ?? "");
+    if (!/^\d+$/u.test(identity) || !Number.isSafeInteger(bookRows)) {
+      throw new Error("Opening book base runtime identity is invalid");
+    }
+    return {
+      book_file: bookFile,
+      stats_file: "",
+      policy_file: "",
+      statistics_available: false,
+      identity,
+      rows: bookRows,
+    };
+  }
+  for (const [filePath, label] of [[statsFile, "stats"], [policyFile, "policy"]]) {
+    if (!existsSync(filePath) || !statSync(filePath).isFile()) {
+      throw new Error(`Opening book ${label} file is missing: ${filePath}`);
+    }
+  }
+  const descriptor = openSync(statsFile, "r");
+  let firstLine;
+  try {
+    const buffer = Buffer.allocUnsafe(4_096);
+    const bytes = readSync(descriptor, buffer, 0, buffer.length, 0);
+    const newline = buffer.subarray(0, bytes).indexOf(0x0a);
+    if (newline < 0) throw new Error("Opening book stats header exceeds 4095 bytes");
+    firstLine = buffer.subarray(0, newline).toString("utf8").replace(/\r$/u, "");
+  } finally {
+    closeSync(descriptor);
+  }
+  const header = firstLine.match(
+    /^# uci_arena_book_stats_v1 book_fnv1a64=([0-9a-fA-F]{16}) rows=([1-9][0-9]*)$/u,
+  );
+  if (!header) throw new Error("Opening book stats header is invalid");
+  const rows = Number(header[2]);
+  if (!Number.isSafeInteger(rows) || rows !== bookRows) {
+    throw new Error("Opening book stats row count does not match Polyglot framing");
+  }
+  return {
+    book_file: bookFile,
+    stats_file: statsFile,
+    policy_file: policyFile,
+    statistics_available: true,
+    identity: BigInt(`0x${header[1]}`).toString(10),
+    rows,
+  };
+}
+
+function validateEngineArguments(value) {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 32
+      || value.some((entry) => typeof entry !== "string"
+        || entry.length > 4_096
+        || /[\0\r\n]/u.test(entry))) {
+    throw new Error("engine.arguments must be a bounded array of literal process arguments");
+  }
+  return [...value];
+}
+
+function assertCredentialFreeConfiguration(value, location = "configuration") {
+  if (Array.isArray(value)) {
+    value.forEach((entry, index) => assertCredentialFreeConfiguration(entry, `${location}[${index}]`));
+    return;
+  }
+  if (!value || typeof value !== "object") {
+    if (typeof value === "string" && /\bbearer\s+\S/iu.test(value)) {
+      throw new Error(`Tracked Lichess config contains a bearer credential at ${location}`);
+    }
+    return;
+  }
+  for (const [key, entry] of Object.entries(value)) {
+    if (/(?:^|[_-])(?:authorization|credential|oauth[_-]?token|password|secret|token)(?:$|[_-])/iu.test(key)) {
+      throw new Error(`Tracked Lichess config contains a credential field at ${location}.${key}`);
+    }
+    assertCredentialFreeConfiguration(entry, `${location}.${key}`);
+  }
+}
+
+function uciProtocolScalar(value, label, { allowEmpty = false } = {}) {
+  const text = String(value);
+  if ((!allowEmpty && !text) || Buffer.byteLength(text, "utf8") > 4_096 || /[\0\r\n]/u.test(text)) {
+    throw new Error(`${label} must be a bounded single-line UCI value`);
+  }
+  return text;
+}
+
+function engineLaunchIdentity(config) {
+  const argumentsList = validateEngineArguments(config.arguments);
+  const argumentFiles = argumentsList.map((argument) => {
+    const candidate = path.isAbsolute(argument)
+      ? argument
+      : path.resolve(config.working_directory, argument);
+    return existsSync(candidate) && statSync(candidate).isFile()
+      ? { argument, sha256: sha256File(candidate) }
+      : { argument, sha256: null };
+  });
+  return {
+    executable_sha256: sha256File(config.executable),
+    arguments: argumentsList,
+    argument_files: argumentFiles,
+  };
+}
+
 function requireString(value, label, pattern) {
   if (typeof value !== "string" || !value || (pattern && !pattern.test(value))) {
     throw new Error(`Single-game profile ${label} is invalid`);
@@ -400,7 +649,9 @@ function validateCapacityConfig(config) {
       || typeof capacity.human.accept_public !== "boolean") {
     throw new Error("Lichess adapter human capacity flags must be boolean");
   }
-  if (!capacity.legacy_shared && !capacity.capacity_profile) {
+  const singleStandardUciSlot = config.engine?.adapter === "standard_uci_v1"
+    && capacity.total_slots === 1;
+  if (!capacity.legacy_shared && !capacity.capacity_profile && !singleStandardUciSlot) {
     throw new Error("Lichess adapter config is missing capacity.capacity_profile");
   }
   const scheduler = config.scheduler;
@@ -504,7 +755,32 @@ function capacityEvidenceSummary(config) {
     return { status: "legacy_shared", qualified: true, maximum_concurrency: 1 };
   }
   const configured = config.capacity.capacity_profile;
+  if (config.engine.adapter === "standard_uci_v1" && !configured
+      && config.capacity.total_slots === 1) {
+    return {
+      status: "standard_uci_startup_probe_required",
+      qualified: true,
+      maximum_concurrency: 1,
+    };
+  }
   if (!configured) return { status: "missing", qualified: false, maximum_concurrency: null };
+  if (config.engine.adapter === "standard_uci_v1") {
+    try {
+      const resolved = path.isAbsolute(configured)
+        ? configured
+        : path.resolve(config.engine.working_directory, configured);
+      const profile = JSON.parse(readFileSync(resolved, "utf8"));
+      return {
+        status: "runtime_revalidation_required",
+        qualified: false,
+        maximum_concurrency: Number.isSafeInteger(profile.maximum_concurrency)
+          ? profile.maximum_concurrency
+          : null,
+      };
+    } catch {
+      return { status: "rejected", qualified: false, maximum_concurrency: null };
+    }
+  }
   const resolved = path.isAbsolute(configured)
     ? configured
     : path.resolve(config.engine.working_directory, configured);
@@ -819,12 +1095,23 @@ function loadConfigDocument({ templatePath = DEFAULT_TEMPLATE, engineRoot = ROOT
   if (parsed.schema !== CURRENT_CONFIG_SCHEMA && !LEGACY_CONFIG_SCHEMAS.has(parsed.schema)) {
     throw new Error(`Unsupported Lichess adapter config schema: ${parsed.schema ?? "missing"}`);
   }
-  const serialized = JSON.stringify(parsed).toLowerCase();
-  if (serialized.includes("oauth_token") || serialized.includes("bearer ")) {
-    throw new Error("Tracked Lichess config must not contain credentials");
-  }
+  assertCredentialFreeConfiguration(parsed);
+  const configuredRuntimePathAuthority = {
+    modelRoot: path.isAbsolute(parsed.engine?.uci_options?.ModelRoot ?? ""),
+    singleGameProfile: path.isAbsolute(parsed.engine?.single_game_profile ?? ""),
+    timeProfile: path.isAbsolute(parsed.engine?.time_profile ?? ""),
+    temporalCurveProfile: path.isAbsolute(parsed.engine?.temporal_curve_profile ?? ""),
+  };
   const config = replaceEngineRootPlaceholder(parsed, path.resolve(engineRoot));
+  Object.defineProperty(config, CONFIGURED_RUNTIME_PATH_AUTHORITY, {
+    value: Object.freeze(configuredRuntimePathAuthority),
+  });
   if (config.schema === "uci_arena_lichess_adapter_v2") migrateV2Config(config);
+  config.engine ??= {};
+  config.engine.adapter ??= "uci_arena_extended_v1";
+  if (!ENGINE_ADAPTERS.has(config.engine.adapter)) {
+    throw new Error(`Unsupported Lichess engine adapter: ${config.engine.adapter}`);
+  }
   if (config.schema !== CURRENT_CONFIG_SCHEMA) {
     config.timing ??= {};
     config.timing.initial_transport_reserve_ms ??= 250;
@@ -836,6 +1123,17 @@ export function loadManagerConfig(options = {}) {
   return validateBotPolicyConfig(validateCapacityConfig(loadConfigDocument(options)));
 }
 
+function selectRuntimePath(
+  explicitPath,
+  configuredPath,
+  environmentPath,
+  configuredIsAuthoritative,
+) {
+  if (explicitPath) return explicitPath;
+  if (configuredIsAuthoritative) return configuredPath;
+  return environmentPath?.trim() || configuredPath;
+}
+
 export function loadRuntimeConfig({
   templatePath = DEFAULT_TEMPLATE,
   engineRoot = ROOT,
@@ -845,31 +1143,80 @@ export function loadRuntimeConfig({
   profilePath,
   timeProfilePath,
   temporalCurvePath,
+  requireSingleGameProfile = true,
   environment = process.env,
 } = {}) {
   const config = loadConfigDocument({ templatePath, engineRoot });
+  if (enginePath) config.engine.executable = path.resolve(enginePath);
+  if (workingDirectory) config.engine.working_directory = path.resolve(workingDirectory);
   if (!config.engine?.executable || !config.engine?.working_directory) {
     throw new Error("Lichess adapter config is missing engine paths");
   }
-  if (enginePath) config.engine.executable = path.resolve(enginePath);
-  if (workingDirectory) config.engine.working_directory = path.resolve(workingDirectory);
+  config.engine.arguments = validateEngineArguments(config.engine.arguments);
   if (!config.engine.uci_options || typeof config.engine.uci_options !== "object") {
     throw new Error("Lichess adapter config is missing engine UCI options");
   }
   if (config.engine.fallback_bundle !== null && config.engine.fallback_bundle !== undefined) {
     throw new Error("engine.fallback_bundle is disabled; live search authority is MCGS only");
   }
-  const selectedModelRoot = modelRoot || environment.UCI_ARENA_MODEL_ROOT?.trim();
+  if (config.engine.adapter === "standard_uci_v1") {
+    config.schema = CURRENT_CONFIG_SCHEMA;
+    config.timing = { ...DEFAULT_TIMING_CONFIG, ...(config.timing ?? {}) };
+    if (typeof config.timing.opponent_turn_search !== "boolean"
+        || typeof config.timing.foreground_preempts_ponder !== "boolean") {
+      throw new Error("Lichess adapter timing search/preemption flags must be boolean");
+    }
+    requireInteger(
+      config.timing.initial_transport_reserve_ms,
+      "timing.initial_transport_reserve_ms",
+      0,
+      5_000,
+    );
+    if (config.timing.transport_profile_path) {
+      config.timing.transport_profile_path = path.isAbsolute(config.timing.transport_profile_path)
+        ? config.timing.transport_profile_path
+        : path.resolve(config.engine.working_directory, config.timing.transport_profile_path);
+    }
+    const transportProfile = loadTransportProfile(config.timing.transport_profile_path);
+    config.timing.transport_profile_status = transportProfile;
+    if (transportProfile.qualified) {
+      config.timing.initial_transport_reserve_ms = transportProfile.reserveMs;
+    }
+    config.timing.bootstrap_transport_reserve_ms = config.timing.initial_transport_reserve_ms;
+    config.engine.timing = config.timing;
+    config.engine.selected_bundle = "standard_uci";
+    return validateBotPolicyConfig(validateCapacityConfig(config));
+  }
+  const selectedModelRoot = selectRuntimePath(
+    modelRoot,
+    config.engine.uci_options.ModelRoot,
+    environment.UCI_ARENA_MODEL_ROOT,
+    config[CONFIGURED_RUNTIME_PATH_AUTHORITY].modelRoot,
+  );
   if (selectedModelRoot) config.engine.uci_options.ModelRoot = selectedModelRoot;
-  const selectedProfile = profilePath || environment.UCI_ARENA_SINGLE_GAME_PROFILE?.trim();
+  const selectedProfile = selectRuntimePath(
+    profilePath,
+    config.engine.single_game_profile,
+    environment.UCI_ARENA_SINGLE_GAME_PROFILE,
+    config[CONFIGURED_RUNTIME_PATH_AUTHORITY].singleGameProfile,
+  );
   if (selectedProfile) config.engine.single_game_profile = selectedProfile;
-  if (!config.engine.single_game_profile) {
+  if (requireSingleGameProfile && !config.engine.single_game_profile) {
     throw new Error("Lichess adapter config is missing engine.single_game_profile");
   }
-  const selectedTimeProfile = timeProfilePath || environment.UCI_ARENA_TIME_PROFILE?.trim();
+  const selectedTimeProfile = selectRuntimePath(
+    timeProfilePath,
+    config.engine.time_profile,
+    environment.UCI_ARENA_TIME_PROFILE,
+    config[CONFIGURED_RUNTIME_PATH_AUTHORITY].timeProfile,
+  );
   if (selectedTimeProfile) config.engine.time_profile = selectedTimeProfile;
-  const selectedTemporalCurve = temporalCurvePath
-    || environment.UCI_ARENA_TEMPORAL_CURVE_PROFILE?.trim();
+  const selectedTemporalCurve = selectRuntimePath(
+    temporalCurvePath,
+    config.engine.temporal_curve_profile,
+    environment.UCI_ARENA_TEMPORAL_CURVE_PROFILE,
+    config[CONFIGURED_RUNTIME_PATH_AUTHORITY].temporalCurveProfile,
+  );
   if (selectedTemporalCurve) {
     config.engine.temporal_curve_profile = selectedTemporalCurve;
   }
@@ -1216,10 +1563,27 @@ export function applySingleGameProfile(config) {
       SyzygyInternalProbe: profile.tablebase.internal_probe,
     });
   }
+  const equivalentProfileValue = (optionName, configured, selected) => {
+    if (!PROFILE_PATH_UCI_OPTIONS.has(optionName)) {
+      return String(configured) === String(selected);
+    }
+    const canonical = (value) => {
+      const absolutePath = path.isAbsolute(String(value))
+        ? path.resolve(String(value))
+        : path.resolve(config.engine.working_directory, String(value));
+      const normalized = path.normalize(absolutePath);
+      return process.platform === "win32" ? normalized.toLocaleLowerCase() : normalized;
+    };
+    return canonical(configured) === canonical(selected);
+  };
   for (const optionName of Object.values(PROFILE_OWNED_UCI_OPTIONS)
     .filter((name) => Object.hasOwn(profileValues, name))) {
     if (Object.hasOwn(config.engine.uci_options, optionName)
-        && String(config.engine.uci_options[optionName]) !== String(profileValues[optionName])) {
+        && !equivalentProfileValue(
+          optionName,
+          config.engine.uci_options[optionName],
+          profileValues[optionName],
+        )) {
       throw new Error(`Tracked config conflicts with profile-owned UCI option ${optionName}`);
     }
   }
@@ -1241,8 +1605,56 @@ export function applySingleGameProfile(config) {
   return profile;
 }
 
-export function loadCapacityProfile(profilePath, config, singleGameProfile) {
+export function loadCapacityProfile(
+  profilePath,
+  config,
+  singleGameProfile,
+  qualificationStatus = null,
+) {
   if (config.capacity.legacy_shared) return null;
+  if (config.engine.adapter === "standard_uci_v1") {
+    if (!profilePath && config.capacity.total_slots === 1) {
+      return {
+        schema: "uci_arena_lichess_standard_uci_single_slot_v1",
+        qualified: true,
+        maximum_concurrency: 1,
+        qualification: qualificationStatus,
+      };
+    }
+    if (!profilePath) {
+      throw new Error("Standard UCI concurrency above one requires a capacity profile");
+    }
+    const resolvedStandardPath = path.resolve(profilePath);
+    const standard = JSON.parse(readFileSync(resolvedStandardPath, "utf8"));
+    if (standard.schema !== "uci_arena_lichess_standard_uci_capacity_profile_v1"
+        || standard.qualified !== true) {
+      throw new Error("Standard UCI capacity profile is not qualified");
+    }
+    requireInteger(standard.maximum_concurrency, "capacity.maximum_concurrency", 1, 64);
+    if (config.capacity.total_slots > standard.maximum_concurrency) {
+      throw new Error(
+        `Configured Lichess capacity ${config.capacity.total_slots} exceeds qualified maximum ${standard.maximum_concurrency}`,
+      );
+    }
+    const bindings = {
+      engine_build_fingerprint: sha256File(config.engine.executable),
+      engine_launch_identity_sha256: qualificationStatus?.engine_launch_identity_sha256,
+      uci_identity_sha256: qualificationStatus?.uci_identity_sha256,
+      applied_options_sha256: qualificationStatus?.applied_options_sha256,
+    };
+    for (const [name, expected] of Object.entries(bindings)) {
+      if (!expected || standard[name] !== expected) {
+        throw new Error(`Standard UCI capacity profile ${name} mismatch`);
+      }
+    }
+    if (!Array.isArray(standard.evidence)
+        || standard.evidence.length !== standard.maximum_concurrency
+        || standard.evidence.some((entry) => entry?.qualified !== true
+          || entry.uci_identity_sha256 !== standard.uci_identity_sha256)) {
+      throw new Error("Standard UCI capacity profile concurrent evidence is incomplete");
+    }
+    return { ...standard, profile_path: resolvedStandardPath };
+  }
   const resolvedPath = path.resolve(profilePath);
   const capacity = JSON.parse(readFileSync(resolvedPath, "utf8"));
   if (!new Set([
@@ -1300,9 +1712,45 @@ export function loadCapacityProfile(profilePath, config, singleGameProfile) {
   return { ...capacity, profile_path: resolvedPath };
 }
 
-function publishCapacityProfile(targetPath, maximumConcurrency, config, singleGameProfile, statuses) {
+export function publishCapacityProfile(
+  targetPath,
+  maximumConcurrency,
+  config,
+  singleGameProfile,
+  statuses,
+) {
   const target = path.resolve(targetPath);
   mkdirSync(path.dirname(target), { recursive: true });
+  if (config.engine.adapter === "standard_uci_v1") {
+    const identity = statuses[0];
+    if (!identity || statuses.some((status) => status?.qualified !== true
+        || status.engine_build_fingerprint !== identity.engine_build_fingerprint
+        || status.engine_launch_identity_sha256 !== identity.engine_launch_identity_sha256
+        || status.uci_identity_sha256 !== identity.uci_identity_sha256
+        || status.applied_options_sha256 !== identity.applied_options_sha256)) {
+      throw new Error("Standard UCI concurrent qualification identities differ");
+    }
+    const profile = {
+      schema: "uci_arena_lichess_standard_uci_capacity_profile_v1",
+      qualified: true,
+      published_at: new Date().toISOString(),
+      maximum_concurrency: maximumConcurrency,
+      engine_build_fingerprint: identity.engine_build_fingerprint,
+      engine_launch_identity_sha256: identity.engine_launch_identity_sha256,
+      uci_identity_sha256: identity.uci_identity_sha256,
+      applied_options_sha256: identity.applied_options_sha256,
+      evidence: statuses.map((status, index) => ({
+        child: index + 1,
+        qualified: true,
+        uci_identity_sha256: status.uci_identity_sha256,
+        bestmove: status.bestmove,
+      })),
+    };
+    const temporary = `${target}.tmp-${process.pid}`;
+    writeFileSync(temporary, `${JSON.stringify(profile, null, 2)}\n`, "utf8");
+    renameSync(temporary, target);
+    return { ...profile, profile_path: target };
+  }
   if (config.engine.time_profile_status?.accepted !== true) {
     throw new Error("Capacity qualification requires an accepted timing profile");
   }
@@ -1344,7 +1792,10 @@ function publishCapacityProfile(targetPath, maximumConcurrency, config, singleGa
   return { ...profile, profile_path: target };
 }
 
-export function parseNdjsonStream(stream) {
+export function parseNdjsonStream(
+  stream,
+  { maximumRecordBytes = MAX_NDJSON_RECORD_BYTES } = {},
+) {
   return (async function* parse() {
     const decoder = new TextDecoder();
     let buffered = "";
@@ -1354,11 +1805,24 @@ export function parseNdjsonStream(stream) {
       while ((newline = buffered.indexOf("\n")) >= 0) {
         const line = buffered.slice(0, newline).trim();
         buffered = buffered.slice(newline + 1);
-        if (line) yield JSON.parse(line);
+        if (line) {
+          if (Buffer.byteLength(line, "utf8") > maximumRecordBytes) {
+            throw new Error(`Lichess NDJSON record exceeds ${maximumRecordBytes} bytes`);
+          }
+          yield JSON.parse(line);
+        }
+      }
+      if (Buffer.byteLength(buffered, "utf8") > maximumRecordBytes) {
+        throw new Error(`Lichess NDJSON record exceeds ${maximumRecordBytes} bytes`);
       }
     }
     const finalLine = `${buffered}${decoder.decode()}`.trim();
-    if (finalLine) yield JSON.parse(finalLine);
+    if (finalLine) {
+      if (Buffer.byteLength(finalLine, "utf8") > maximumRecordBytes) {
+        throw new Error(`Lichess NDJSON record exceeds ${maximumRecordBytes} bytes`);
+      }
+      yield JSON.parse(finalLine);
+    }
   })();
 }
 
@@ -1382,34 +1846,66 @@ function delay(milliseconds, signal) {
 }
 
 function readTokenForRuntime(tokenFile) {
+  const tokenStat = statSync(tokenFile);
+  if (!tokenStat.isFile() || tokenStat.size <= 0 || tokenStat.size > MAX_TOKEN_FILE_BYTES) {
+    throw new Error(`Lichess token file must be a nonempty regular file no larger than ${MAX_TOKEN_FILE_BYTES} bytes`);
+  }
   const token = readFileSync(tokenFile, "utf8").trim();
-  if (!token) throw new Error("Lichess token file is empty");
+  if (!token || /\s/u.test(token)) {
+    throw new Error("Lichess token file must contain exactly one non-whitespace token");
+  }
   return token;
 }
 
 async function discardResponseBody(response) {
-  if (typeof response?.arrayBuffer === "function") {
-    await response.arrayBuffer();
-    return;
-  }
-  if (typeof response?.text === "function") {
-    await response.text();
-    return;
-  }
   if (typeof response?.body?.cancel === "function") await response.body.cancel();
+}
+
+async function boundedResponseText(response, maximumBytes = MAX_API_JSON_BYTES) {
+  const declaredLength = Number(response?.headers?.get?.("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > maximumBytes) {
+    await response?.body?.cancel?.().catch?.(() => {});
+    throw new Error(`Lichess response body exceeds ${maximumBytes} bytes`);
+  }
+  if (response?.body && typeof response.body[Symbol.asyncIterator] === "function") {
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of response.body) {
+      const bytes = Buffer.from(chunk);
+      size += bytes.length;
+      if (size > maximumBytes) {
+        await response.body.cancel?.().catch?.(() => {});
+        throw new Error(`Lichess response body exceeds ${maximumBytes} bytes`);
+      }
+      chunks.push(bytes);
+    }
+    return Buffer.concat(chunks, size).toString("utf8");
+  }
+  const text = typeof response?.text === "function"
+    ? await response.text()
+    : typeof response?.arrayBuffer === "function"
+      ? new TextDecoder().decode(await response.arrayBuffer())
+      : typeof response?.json === "function"
+        ? JSON.stringify(await response.json())
+        : "";
+  if (Buffer.byteLength(text, "utf8") > maximumBytes) {
+    throw new Error(`Lichess response body exceeds ${maximumBytes} bytes`);
+  }
+  return text;
+}
+
+async function boundedJsonResponse(response) {
+  return JSON.parse(await boundedResponseText(response));
 }
 
 async function boundedApiErrorDetail(response) {
   let text = "";
   try {
     if (typeof response?.text === "function") {
-      text = await response.text();
+      text = await boundedResponseText(response, MAX_API_ERROR_BYTES);
     } else if (typeof response?.arrayBuffer === "function") {
-      text = new TextDecoder().decode(await response.arrayBuffer());
-    } else {
-      if (typeof response?.body?.cancel === "function") await response.body.cancel();
-      return "";
-    }
+      text = await boundedResponseText(response, MAX_API_ERROR_BYTES);
+    } else return "";
   } catch {
     return "";
   }
@@ -1534,7 +2030,7 @@ export class LichessClient {
   }
 
   json(endpoint, options = {}) {
-    return this.dispatch(endpoint, options, (response) => response.json());
+    return this.dispatch(endpoint, options, boundedJsonResponse);
   }
 
   async post(endpoint, form, signal, priority, beforeDispatch) {
@@ -1558,7 +2054,7 @@ export class LichessClient {
       priority,
       beforeDispatch,
       requestClass: "challenge_create",
-    }, (response) => response.json());
+    }, boundedJsonResponse);
   }
 
   async openStream(endpoint, signal) {
@@ -1599,7 +2095,15 @@ export class LichessClient {
       requestClass: "discovery",
     }, async (response) => {
       const items = [];
-      for await (const item of parseNdjsonStream(response.body)) items.push(item);
+      for await (const item of parseNdjsonStream(response.body)) {
+        if (items.length >= MAX_FINITE_NDJSON_ITEMS) {
+          await response.body?.cancel?.().catch?.(() => {});
+          throw new Error(
+            `Lichess finite NDJSON response exceeds ${MAX_FINITE_NDJSON_ITEMS} items`,
+          );
+        }
+        items.push(item);
+      }
       return items;
     });
   }
@@ -1907,6 +2411,22 @@ export function validateRuntimeStatus(profile, status) {
       status.syzygy_probe_threads === profile.tablebase.probe_threads,
       "Syzygy worker topology mismatch",
     );
+    requireRuntimeStatus(
+      status.syzygy_probe_limit === profile.tablebase.probe_limit,
+      "Syzygy probe limit mismatch",
+    );
+    requireRuntimeStatus(
+      status.syzygy_rule50 === profile.tablebase.rule50,
+      "Syzygy rule-50 policy mismatch",
+    );
+    requireRuntimeStatus(
+      status.syzygy_root_probe === profile.tablebase.root_probe,
+      "Syzygy root activation mismatch",
+    );
+    requireRuntimeStatus(
+      status.syzygy_internal_probe === profile.tablebase.internal_probe,
+      "Syzygy internal activation mismatch",
+    );
   }
   requireRuntimeStatus(status.threads_configured === profile.threads, "thread topology mismatch");
   if (profile.search_core === "mcgs") {
@@ -2054,6 +2574,7 @@ export class UciEngine {
     this.uciIdLines = [];
     this.uciOptionLines = [];
     this.latestInfo = {};
+    this.appliedUciOptions = {};
     this.timing = { ...DEFAULT_TIMING_CONFIG, ...(config.timing ?? {}) };
     this.searchSequence = 0;
     this.runtimeGeneration = 0;
@@ -2069,7 +2590,7 @@ export class UciEngine {
     if (!existsSync(this.config.executable)) {
       throw new Error(`UCI executable not found: ${this.config.executable}`);
     }
-    this.child = spawn(this.config.executable, [], {
+    this.child = spawn(this.config.executable, this.config.arguments ?? [], {
       cwd: this.config.working_directory,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
@@ -2077,7 +2598,7 @@ export class UciEngine {
     this.lines = createInterface({ input: this.child.stdout, crlfDelay: Infinity });
     this.lines.on("line", (line) => this.onLine(line));
     this.child.stderr.on("data", (chunk) => {
-      const text = String(chunk).trim();
+      const text = Buffer.from(chunk).subarray(0, MAX_ENGINE_STDERR_MESSAGE_BYTES).toString("utf8").trim();
       if (text) this.telemetry({ event: "engine_stderr", message: text });
     });
     this.child.once("error", (error) => this.rejectWaiters(error));
@@ -2087,8 +2608,16 @@ export class UciEngine {
     this.configureUciOptions();
     await this.exchange("isready", (line) => line === "readyok", 30_000);
     this.runtimeGeneration += 1;
-    await this.configureTimeProfile();
-    if (this.config.qualification_profile) await this.qualifyRuntime();
+    if (usesExtendedEngineAdapter({ engine: this.config })) {
+      await this.configureTimeProfile();
+      if (this.config.qualification_profile) await this.qualifyRuntime();
+    } else {
+      this.timeProfileStatus = timeProfileFallbackStatus(
+        "missing",
+        "the selected standard UCI engine owns its time management",
+      );
+      this.qualificationStatus = await this.qualifyStandardRuntime();
+    }
     if (this.qualificationStatus) this.qualificationStatus.time_profile = this.timeProfileStatus;
   }
 
@@ -2096,6 +2625,24 @@ export class UciEngine {
     const unknown = Object.keys(this.config.uci_options)
       .filter((name) => !this.advertisedOptions.has(name));
     if (unknown.length) throw new Error(`Configured UCI options are not advertised: ${unknown.join(", ")}`);
+    if (this.config.adapter === "standard_uci_v1") {
+      for (const [name, value] of Object.entries(this.config.uci_options)) {
+        this.setOption(name, value);
+      }
+      if (this.advertisedOptions.has("Move Overhead")
+          && !Object.hasOwn(this.config.uci_options, "Move Overhead")) {
+        this.setOption("Move Overhead", this.timing.initial_transport_reserve_ms);
+      }
+      if (this.timing.opponent_turn_search) {
+        if (!this.advertisedOptions.has("Ponder")
+            || String(this.config.uci_options.Ponder ?? "true").toLocaleLowerCase() !== "true") {
+          this.disableUnqualifiedOpponentTurnSearch("ponder_not_supported");
+        } else if (!Object.hasOwn(this.config.uci_options, "Ponder")) {
+          this.setOption("Ponder", true);
+        }
+      }
+      return;
+    }
     const requiredTimingOptions = [
       "Move Overhead",
       "IterativeTimeController",
@@ -2119,19 +2666,33 @@ export class UciEngine {
           || name === "TimeProfileProviderReserveUs"
           || name === "TimeProfileBackupEmitReserveUs"
           || name === "TimeProfileIterationForecastScalePermille") continue;
-      this.send(`setoption name ${name} value ${String(value)}`);
+      this.setOption(name, value);
     }
-    this.send(`setoption name Move Overhead value ${this.timing.initial_transport_reserve_ms}`);
-    this.send("setoption name IterativeTimeController value false");
-    this.send("setoption name TimeProfileProviderReserveUs value 0");
-    this.send("setoption name TimeProfileBackupEmitReserveUs value 1000");
-    this.send("setoption name TimeProfileIterationForecastScalePermille value 1000");
-    if (this.timing.opponent_turn_search) this.send("setoption name Ponder value true");
+    this.setOption("Move Overhead", this.timing.initial_transport_reserve_ms);
+    this.setOption("IterativeTimeController", false);
+    this.setOption("TimeProfileProviderReserveUs", 0);
+    this.setOption("TimeProfileBackupEmitReserveUs", 1000);
+    this.setOption("TimeProfileIterationForecastScalePermille", 1000);
+    if (this.timing.opponent_turn_search) this.setOption("Ponder", true);
   }
 
   onLine(line) {
-    if (line.startsWith("id ")) this.uciIdLines.push(line);
+    if (Buffer.byteLength(line, "utf8") > MAX_UCI_LINE_BYTES) {
+      const error = new Error(`UCI response line exceeds ${MAX_UCI_LINE_BYTES} bytes`);
+      this.rejectWaiters(error);
+      this.child?.kill();
+      return;
+    }
+    if (line.startsWith("id ") && this.uciIdLines.length < MAX_UCI_ID_LINES) {
+      this.uciIdLines.push(line);
+    }
     if (line.startsWith("option name ") && line.includes(" type ")) {
+      if (this.uciOptionLines.length >= MAX_UCI_OPTION_LINES) {
+        const error = new Error(`UCI option catalog exceeds ${MAX_UCI_OPTION_LINES} entries`);
+        this.rejectWaiters(error);
+        this.child?.kill();
+        return;
+      }
       this.uciOptionLines.push(line);
       this.advertisedOptions.add(line.slice("option name ".length).split(" type ", 1)[0]);
     }
@@ -2244,13 +2805,13 @@ export class UciEngine {
     };
   }
 
-  disableUnqualifiedOpponentTurnSearch() {
+  disableUnqualifiedOpponentTurnSearch(reason = "timing_profile_not_applied") {
     if (!this.timing.opponent_turn_search) return;
     this.timing.opponent_turn_search = false;
     if (this.config.timing) this.config.timing.opponent_turn_search = false;
     this.telemetry({
       event: "opponent_turn_search_disabled",
-      reason: "timing_profile_not_applied",
+      reason,
     });
   }
 
@@ -2297,23 +2858,23 @@ export class UciEngine {
         profile,
         status: initialStatus,
         executable: this.config.executable,
-        engineArgs: [],
+        engineArgs: this.config.arguments ?? [],
         cwd: this.config.working_directory,
         uciIdLines: this.uciIdLines,
         uciOptionLines: this.uciOptionLines,
         configuration,
       });
       for (const option of accepted.uci_options) {
-        this.send(`setoption name ${option.name} value ${option.value}`);
+        this.setOption(option.name, option.value);
       }
       reserveWasSet = true;
       await this.exchange("isready", (line) => line === "readyok", 30_000);
       const appliedStatus = await this.runtimeStatus();
-      validateProfileRuntimeSnapshot({
+      const appliedAcceptance = validateProfileRuntimeSnapshot({
         profile,
         status: appliedStatus,
         executable: this.config.executable,
-        engineArgs: [],
+        engineArgs: this.config.arguments ?? [],
         cwd: this.config.working_directory,
         uciIdLines: this.uciIdLines,
         uciOptionLines: this.uciOptionLines,
@@ -2325,12 +2886,16 @@ export class UciEngine {
           iterationForecastScalePermille: accepted.iteration_forecast_scale_permille,
         },
       });
-      this.timeProfileStatus = validateAppliedTimeProfileReserve(profile, appliedStatus);
+      this.timeProfileStatus = {
+        ...appliedAcceptance,
+        ...validateAppliedTimeProfileReserve(profile, appliedStatus),
+        permissions: profile.permissions ?? {},
+      };
     } catch (error) {
       if (reserveWasSet) {
-        this.send("setoption name TimeProfileProviderReserveUs value 0");
-        this.send("setoption name TimeProfileBackupEmitReserveUs value 1000");
-        this.send("setoption name TimeProfileIterationForecastScalePermille value 1000");
+        this.setOption("TimeProfileProviderReserveUs", 0);
+        this.setOption("TimeProfileBackupEmitReserveUs", 1000);
+        this.setOption("TimeProfileIterationForecastScalePermille", 1000);
         await this.exchange("isready", (line) => line === "readyok", 30_000);
         const resetStatus = await this.runtimeStatus();
         if (resetStatus.time_profile_provider_reserve_us !== 0) {
@@ -2360,7 +2925,7 @@ export class UciEngine {
     const restoredOwnBook = Object.hasOwn(this.config.uci_options, "OwnBook")
       ? String(this.config.uci_options.OwnBook)
       : "true";
-    this.send("setoption name OwnBook value false");
+    this.setOption("OwnBook", false);
     await this.exchange("isready", (line) => line === "readyok", 30_000);
     try {
       await this.newGame();
@@ -2374,13 +2939,16 @@ export class UciEngine {
       if (!/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(bestmove)) {
         throw new Error(`Qualification search returned unusable bestmove: ${bestmove ?? "missing"}`);
       }
-      this.qualificationStatus = validateRuntimeStatus(
-        profile,
-        await this.runtimeStatusAfterInferenceDrain(),
-      );
+      this.qualificationStatus = {
+        ...validateRuntimeStatus(
+          profile,
+          await this.runtimeStatusAfterInferenceDrain(),
+        ),
+        bestmove,
+      };
       return this.qualificationStatus;
     } finally {
-      this.send(`setoption name OwnBook value ${restoredOwnBook}`);
+      this.setOption("OwnBook", restoredOwnBook);
       await this.exchange("isready", (line) => line === "readyok", 30_000);
       if (this.qualificationStatus) {
         const liveRuntimeStatus = await this.runtimeStatus();
@@ -2391,6 +2959,25 @@ export class UciEngine {
         if (bookExpected && liveRuntimeStatus.opening_book_active !== true) {
           throw new Error(`Opening book failed to activate: ${liveRuntimeStatus.opening_book_message}`);
         }
+        if (bookExpected) {
+          const expectedBook = openingBookContract(this.config, liveRuntimeStatus);
+          if (liveRuntimeStatus.opening_book_identity !== expectedBook.identity) {
+            throw new Error(
+              `Opening book content identity mismatch: `
+              + `${liveRuntimeStatus.opening_book_identity}!=${expectedBook.identity}`,
+            );
+          }
+          if (liveRuntimeStatus.opening_book_entries !== expectedBook.rows) {
+            throw new Error(
+              `Opening book entry count mismatch: `
+              + `${liveRuntimeStatus.opening_book_entries}!=${expectedBook.rows}`,
+            );
+          }
+          if (liveRuntimeStatus.opening_book_statistics_available
+              !== expectedBook.statistics_available) {
+            throw new Error("Opening book statistics capability mismatch");
+          }
+        }
         this.qualificationStatus = {
           ...this.qualificationStatus,
           live_runtime_status: liveRuntimeStatus,
@@ -2398,6 +2985,71 @@ export class UciEngine {
       }
     }
     return this.qualificationStatus;
+  }
+
+  setOption(name, value) {
+    const optionName = uciProtocolScalar(name, "UCI option name");
+    const optionValue = uciProtocolScalar(value, `UCI option ${optionName}`, { allowEmpty: true });
+    this.send(`setoption name ${optionName} value ${optionValue}`);
+    this.appliedUciOptions[optionName] = optionValue;
+  }
+
+  async qualifyStandardRuntime() {
+    await this.newGame();
+    this.latestInfo = {};
+    this.send("position startpos");
+    const line = await this.exchange(
+      "go depth 1",
+      (candidate) => candidate.startsWith("bestmove "),
+      Number(this.config.qualification_timeout_ms ?? 30_000),
+    );
+    const result = this.parseBestmove(line);
+    const legality = new AuthoritativeChessState("startpos");
+    legality.synchronize([]);
+    if (!legality.validateCandidate([], result.bestmove).legal) {
+      throw new Error(`Standard UCI qualification returned an illegal bestmove: ${result.bestmove}`);
+    }
+    const appliedOptions = Object.fromEntries(
+      Object.entries(this.config.uci_options)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([name, value]) => [name, String(value)]),
+    );
+    const uciIdentity = {
+      id_lines: [...this.uciIdLines],
+      option_lines: [...this.uciOptionLines],
+    };
+    return {
+      schema: "uci_arena_standard_uci_qualification_v1",
+      qualified: true,
+      engine_adapter: "standard_uci_v1",
+      engine_build_fingerprint: sha256File(this.config.executable),
+      engine_launch_identity_sha256: sha256Json(engineLaunchIdentity(this.config)),
+      uci_identity_sha256: sha256Json(uciIdentity),
+      applied_options_sha256: sha256Json(appliedOptions),
+      uci_id_lines: uciIdentity.id_lines,
+      advertised_option_count: this.advertisedOptions.size,
+      bestmove: result.bestmove,
+    };
+  }
+
+  async fixedDepthProbe(depth = 1, timeoutMs = 30_000) {
+    requireInteger(depth, "UCI smoke depth", 1, 128);
+    requireInteger(timeoutMs, "UCI smoke timeout_ms", 100, 300_000);
+    await this.newGame();
+    this.latestInfo = {};
+    this.send("position startpos");
+    const line = await this.exchange(
+      `go depth ${depth}`,
+      (candidate) => candidate.startsWith("bestmove "),
+      timeoutMs,
+    );
+    const result = this.parseBestmove(line);
+    const legality = new AuthoritativeChessState("startpos");
+    legality.synchronize([]);
+    if (!legality.validateCandidate([], result.bestmove).legal) {
+      throw new Error(`UCI smoke returned an illegal bestmove: ${result.bestmove}`);
+    }
+    return result;
   }
 
   parseBestmove(line, { allowNullBestmove = false } = {}) {
@@ -2575,7 +3227,10 @@ export class UciEngine {
       );
     }
     this.send(this.formatPosition(moves));
-    return this.beginSearch("opponent_root", "go infinite opponentroot", { rootMoves: moves });
+    const command = this.config.adapter === "standard_uci_v1"
+      ? "go infinite"
+      : "go infinite opponentroot";
+    return this.beginSearch("opponent_root", command, { rootMoves: moves });
   }
 
   async ponderHit({ timeoutMs, signal }) {
@@ -2684,18 +3339,43 @@ export function challengeFromSelf(challenge, account) {
 }
 
 let runtimeLogFile = null;
+let runtimeLogBytes = 0;
+
+function rotateRuntimeLog() {
+  if (!runtimeLogFile || !existsSync(runtimeLogFile)) return;
+  const previous = `${runtimeLogFile}.1`;
+  if (existsSync(previous)) unlinkSync(previous);
+  renameSync(runtimeLogFile, previous);
+  runtimeLogBytes = 0;
+}
 
 function configureRuntimeLog(runtimeDir) {
   mkdirSync(runtimeDir, { recursive: true });
   runtimeLogFile = path.join(runtimeDir, "adapter.ndjson");
+  runtimeLogBytes = existsSync(runtimeLogFile) ? statSync(runtimeLogFile).size : 0;
+  if (runtimeLogBytes >= MAX_RUNTIME_LOG_BYTES) rotateRuntimeLog();
 }
 
 function log(event, details = {}) {
-  const line = JSON.stringify({ timestamp: new Date().toISOString(), event, ...details });
+  const timestamp = new Date().toISOString();
+  let line = JSON.stringify({ timestamp, event, ...details });
+  const originalBytes = Buffer.byteLength(line, "utf8");
+  if (originalBytes > MAX_RUNTIME_LOG_RECORD_BYTES) {
+    line = JSON.stringify({
+      timestamp,
+      event,
+      detail_truncated: true,
+      original_bytes: originalBytes,
+    });
+  }
   console.log(line);
   if (runtimeLogFile) {
     try {
-      appendFileSync(runtimeLogFile, `${line}\n`, "utf8");
+      const record = `${line}\n`;
+      const recordBytes = Buffer.byteLength(record, "utf8");
+      if (runtimeLogBytes + recordBytes > MAX_RUNTIME_LOG_BYTES) rotateRuntimeLog();
+      appendFileSync(runtimeLogFile, record, "utf8");
+      runtimeLogBytes += recordBytes;
     } catch {
       // Runtime logging must not interrupt move submission or game handling.
     }
@@ -2705,8 +3385,10 @@ function log(event, details = {}) {
 function bookConfigurationIdentity(config) {
   const options = config.engine.uci_options;
   const value = JSON.stringify({
-    OwnBook: options.OwnBook ?? true,
+    OwnBook: Object.hasOwn(options, "OwnBook") ? options.OwnBook : null,
     BookFile: options.BookFile ?? "",
+    BookStatsFile: options.BookStatsFile ?? "",
+    BookPolicyFile: options.BookPolicyFile ?? "",
     BookSelectionPolicy: options.BookSelectionPolicy ?? "",
   });
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
@@ -2723,12 +3405,17 @@ function optionalFileFingerprint(filePath, workingDirectory) {
 
 export function gameRuntimeProvenance(config, engine) {
   const profile = config.engine.qualification_profile ?? {};
+  const qualification = engine.qualificationStatus ?? {};
+  const extended = usesExtendedEngineAdapter(config);
   const liveRuntime = engine.qualificationStatus?.live_runtime_status ?? {};
   const timeProfile = engine.timeProfileStatus ?? config.engine.time_profile_status ?? {};
-  const configuredBook = String(config.engine.uci_options?.OwnBook ?? "true").toLocaleLowerCase() === "true";
+  const configuredBook = Object.hasOwn(config.engine.uci_options ?? {}, "OwnBook")
+    ? String(config.engine.uci_options.OwnBook).toLocaleLowerCase() === "true"
+    : extended ? true : null;
   const transitionProfile = timeProfile.iteration_transition_p95_ms ?? Array(48).fill(0);
-  const appliedOptions = {
+  const appliedOptions = extended ? {
     ...(config.engine.uci_options ?? {}),
+    ...(engine.appliedUciOptions ?? {}),
     "Move Overhead": config.timing?.initial_transport_reserve_ms ?? 0,
     Ponder: config.timing?.opponent_turn_search ?? false,
     OwnBook: configuredBook,
@@ -2739,7 +3426,7 @@ export function gameRuntimeProvenance(config, engine) {
       timeProfile.iteration_forecast_scale_permille ?? 1000,
     TimeProfileIterationTransitionP95Ms:
       Array.isArray(transitionProfile) ? transitionProfile.join(",") : String(transitionProfile),
-  };
+  } : { ...(engine.appliedUciOptions ?? config.engine.uci_options ?? {}) };
   const uciOptions = Object.fromEntries(
     Object.entries(appliedOptions)
       .sort(([left], [right]) => left.localeCompare(right))
@@ -2748,7 +3435,13 @@ export function gameRuntimeProvenance(config, engine) {
   const provenance = {
     schema: "uci_arena_game_runtime_provenance_v1",
     engine: {
-      build_fingerprint: profile.engine_build_fingerprint ?? "",
+      adapter: config.engine.adapter,
+      build_fingerprint: profile.engine_build_fingerprint
+        ?? qualification.engine_build_fingerprint
+        ?? "",
+      launch_identity_sha256: qualification.engine_launch_identity_sha256 ?? "",
+      uci_identity_sha256: qualification.uci_identity_sha256 ?? "",
+      uci_id_lines: qualification.uci_id_lines ?? [],
     },
     model: {
       id: profile.model_id ?? "",
@@ -2763,7 +3456,7 @@ export function gameRuntimeProvenance(config, engine) {
       onnx_runtime_version: profile.onnx_runtime_version ?? "",
     },
     search: {
-      core: profile.search_core ?? "",
+      core: profile.search_core ?? (extended ? "" : "engine_owned"),
       threads: profile.threads ?? 0,
       root_workers: profile.root_workers ?? 0,
       split_depth: profile.split_depth ?? 0,
@@ -2783,6 +3476,8 @@ export function gameRuntimeProvenance(config, engine) {
       accepted: timeProfile.accepted ?? false,
       applied: timeProfile.applied ?? false,
       permissions: timeProfile.permissions ?? {},
+      timing_authority_match: timeProfile.timing_authority_match ?? false,
+      engine_provenance: timeProfile.engine_provenance ?? null,
       provider_service_reserve_us: timeProfile.provider_service_reserve_us ?? 0,
       backup_emit_reserve_us: timeProfile.backup_emit_reserve_us ?? 1000,
       iteration_forecast_scale_permille:
@@ -2806,6 +3501,8 @@ export function gameRuntimeProvenance(config, engine) {
       configured_enabled: configuredBook,
       observed_enabled: liveRuntime.opening_book_enabled ?? null,
       observed_active: liveRuntime.opening_book_active ?? null,
+      observed_statistics_available:
+        liveRuntime.opening_book_statistics_available ?? null,
       observed_entries: liveRuntime.opening_book_entries ?? null,
       observed_identity: liveRuntime.opening_book_identity ?? "",
       mcgs_prior_blend_permille:
@@ -2967,6 +3664,7 @@ export class GameSession {
     store,
     foregroundCoordinator,
     onMoveTransportSample = () => {},
+    waitForReconnect = delay,
   }) {
     this.client = client;
     this.config = { ...config, timing: { ...DEFAULT_TIMING_CONFIG, ...(config.timing ?? {}) } };
@@ -2991,6 +3689,7 @@ export class GameSession {
     this.staleBestmoveDrained = false;
     this.opponentSearchDrainMs = 0;
     this.onMoveTransportSample = onMoveTransportSample;
+    this.waitForReconnect = waitForReconnect;
     this.reconnecting = false;
     this.opponentOperation = Promise.resolve();
   }
@@ -3021,11 +3720,14 @@ export class GameSession {
           game_id: this.gameId,
           message: error.message,
           retry_ms: retryMs,
+          consecutive_failures: consecutiveFailures,
         });
-        if (consecutiveFailures >= 5) {
-          throw new Error(`Game session failed ${consecutiveFailures} consecutive times: ${error.message}`);
+        try {
+          await this.waitForReconnect(retryMs, this.signal);
+        } catch (retryError) {
+          if (this.signal.aborted) break;
+          throw retryError;
         }
-        await delay(retryMs, this.signal);
         reconnectDelay = Math.min(reconnectDelay * 2, 30_000);
       }
     }
@@ -3130,7 +3832,8 @@ export class GameSession {
     this.slot.opponent = this.opponent;
     this.defaultIncrementMs = clockMilliseconds(event.clock?.increment);
     await engine.newGame();
-    const profile = this.config.engine.qualification_profile;
+    const profile = this.config.engine.qualification_profile ?? {};
+    const qualification = engine.qualificationStatus ?? {};
     const runtimeProvenance = gameRuntimeProvenance(this.config, engine);
     this.store.beginGame({
       id: this.gameId,
@@ -3141,21 +3844,23 @@ export class GameSession {
       speed: event.speed,
       clockLimit: event.clock?.initial,
       clockIncrement: event.clock?.increment,
-      engineBuildFingerprint: profile.engine_build_fingerprint,
-      modelId: profile.model_id,
-      modelFingerprint: profile.model_fingerprint,
-      checkpointHash: profile.checkpoint_hash,
-      adapterId: profile.adapter_id,
-      provider: profile.provider,
-      providerFingerprint: profile.provider_numeric_fingerprint,
-      hardwareDriverFingerprint: profile.hardware_driver_fingerprint,
-      onnxRuntimeVersion: profile.onnx_runtime_version,
-      searchCore: profile.search_core,
-      threads: profile.threads,
-      rootWorkers: profile.root_workers,
-      splitDepth: profile.split_depth,
-      batchSize: profile.batch_size,
-      batchWaitUs: profile.batch_wait_us,
+      engineBuildFingerprint: profile.engine_build_fingerprint
+        ?? qualification.engine_build_fingerprint
+        ?? "",
+      modelId: profile.model_id ?? "",
+      modelFingerprint: profile.model_fingerprint ?? "",
+      checkpointHash: profile.checkpoint_hash ?? "",
+      adapterId: profile.adapter_id ?? this.config.engine.adapter,
+      provider: profile.provider ?? "",
+      providerFingerprint: profile.provider_numeric_fingerprint ?? "",
+      hardwareDriverFingerprint: profile.hardware_driver_fingerprint ?? "",
+      onnxRuntimeVersion: profile.onnx_runtime_version ?? "",
+      searchCore: profile.search_core ?? "engine_owned",
+      threads: profile.threads ?? 0,
+      rootWorkers: profile.root_workers ?? 0,
+      splitDepth: profile.split_depth ?? 0,
+      batchSize: profile.batch_size ?? 0,
+      batchWaitUs: profile.batch_wait_us ?? 0,
       timeProfileIdentity: engine.timeProfileStatus?.identity_sha256 ?? "",
       bookIdentity: bookConfigurationIdentity(this.config),
       runtimeProvenanceSha256: runtimeProvenance.sha256,
@@ -3213,7 +3918,7 @@ export class GameSession {
       let clocks = this.lastClock;
       if (this.pendingOwnMove) {
         moves = this.pendingOwnMove.projectedMoves;
-        predictedMove = String(this.config.engine.uci_options.SearchCore).toLowerCase() === "mcgs"
+        predictedMove = usesMcgs(this.config)
           ? null
           : this.pendingOwnMove.predictedMove;
         clocks = this.pendingOwnMove.estimatedClock;
@@ -3509,6 +4214,7 @@ export class GameSession {
     let foregroundLeaseWaitMs = 0;
     let bestmoveToLegalityMs = 0;
     let moveQueueWaitMs = 0;
+    let goClock = null;
     let projectedSearchRequested = false;
     try {
       if (!this.observationIsCurrent(observation)) {
@@ -3533,6 +4239,7 @@ export class GameSession {
           this.color,
           performance.now() - receivedAt,
         );
+        goClock = clocks;
         result = await engine.search({
           moves,
           ...clocks,
@@ -3548,11 +4255,13 @@ export class GameSession {
       if (result.rootKey !== rootKey || result.runtimeGeneration !== engine.runtimeGeneration) {
         throw new Error(`UCI bestmove belongs to a stale root or runtime generation for ${this.gameId}`);
       }
-      requireQualifiedSearchIdentity(this.config.engine.qualification_profile, result.telemetry ?? {});
-      requireQualifiedMcgsTimeTelemetry(
-        this.config.engine.qualification_profile,
-        result.telemetry ?? {},
-      );
+      if (usesExtendedEngineAdapter(this.config)) {
+        requireQualifiedSearchIdentity(this.config.engine.qualification_profile, result.telemetry ?? {});
+        requireQualifiedMcgsTimeTelemetry(
+          this.config.engine.qualification_profile,
+          result.telemetry ?? {},
+        );
+      }
       if (!UCI_MOVE_PATTERN.test(result.bestmove)) {
         throw new Error(`UCI bestmove failed legal-root syntax validation: ${result.bestmove ?? "missing"}`);
       }
@@ -3585,7 +4294,7 @@ export class GameSession {
         this.pendingOwnMove = {
           baseRootKey: rootKey,
           projectedMoves: [...moves, result.bestmove],
-          predictedMove: String(this.config.engine.uci_options.SearchCore).toLowerCase() === "mcgs"
+          predictedMove: usesMcgs(this.config)
             ? null
             : result.ponder,
           runtimeGeneration: result.runtimeGeneration,
@@ -3617,7 +4326,12 @@ export class GameSession {
       );
       const postAcknowledgedAt = performance.now();
       startProjectedSearch(postAcknowledgedAt);
-      this.onMoveTransportSample(this.gameId, postAcknowledgedAt - postDispatchedAt);
+      this.onMoveTransportSample(this.gameId, {
+        bestmove_to_ack_ms: postAcknowledgedAt - bestmoveAt,
+        bestmove_to_legality_ms: bestmoveToLegalityMs,
+        move_queue_wait_ms: moveQueueWaitMs,
+        post_dispatch_to_ack_ms: postAcknowledgedAt - postDispatchedAt,
+      });
       this.lastSubmittedRootKey = rootKey;
       log("move_played", {
         game_id: this.gameId,
@@ -3637,6 +4351,15 @@ export class GameSession {
         move_queue_wait_ms: moveQueueWaitMs,
         state_received_to_dispatch_ms: postDispatchedAt - receivedAt,
         post_dispatch_to_ack_ms: postAcknowledgedAt - postDispatchedAt,
+        bestmove_to_ack_ms: postAcknowledgedAt - bestmoveAt,
+        authoritative_wtime_ms: this.lastClock.wtime,
+        authoritative_btime_ms: this.lastClock.btime,
+        authoritative_winc_ms: this.lastClock.winc,
+        authoritative_binc_ms: this.lastClock.binc,
+        go_wtime_ms: goClock?.wtime ?? null,
+        go_btime_ms: goClock?.btime ?? null,
+        go_winc_ms: goClock?.winc ?? null,
+        go_binc_ms: goClock?.binc ?? null,
         ponder_mode: ponderHit
           ? "ponder"
           : opponentRootReroot ? "opponent_root_reroot" : "foreground",
@@ -3645,6 +4368,13 @@ export class GameSession {
         ponder_miss_reason: ponderMissReason,
         stale_bestmove_drained: Boolean(staleBestmoveDrained),
         transport_reserve_ms: this.config.timing.initial_transport_reserve_ms,
+        timing_profile_status: engine.timeProfileStatus?.status ?? "unavailable",
+        timing_profile_provider_safety_qualified:
+          engine.timeProfileStatus?.permissions?.provider_safety_qualified ?? false,
+        timing_profile_forecast_shadow_qualified:
+          engine.timeProfileStatus?.permissions?.forecast_shadow_qualified ?? false,
+        timing_profile_adaptive_play_qualified:
+          engine.timeProfileStatus?.permissions?.adaptive_play_qualified ?? false,
         root_legality_validation_ms: legality.elapsedMs,
         root_legality_sync_ms: observation.legalitySynchronization?.elapsedMs ?? null,
         root_legality_applied_plies: observation.legalitySynchronization?.appliedPlies ?? null,
@@ -3705,6 +4435,7 @@ export class BotController {
     this.slots = new SlotPool(config.capacity);
     this.engineStarts = new AsyncSemaphore(config.capacity.startup_parallelism);
     this.activeGames = new Map();
+    this.startingGames = new Map();
     this.gameSessions = new Map();
     this.foregroundCoordinator = new ForegroundSearchCoordinator({
       enabled: this.config.timing.foreground_preempts_ponder,
@@ -3719,7 +4450,7 @@ export class BotController {
     this.tickRunning = false;
     this.schedulerFault = null;
     const transportProfilePath = this.config.timing.transport_profile_path
-      || path.join(runtimeDir, "transport_profile_v1.json");
+      || path.join(runtimeDir, "transport_profile_v2.json");
     this.transportProfile = new TransportProfileTracker({
       profilePath: transportProfilePath,
       bootstrapReserveMs: this.config.timing.bootstrap_transport_reserve_ms
@@ -3733,6 +4464,11 @@ export class BotController {
     this.manualOpponent = opponent ? normalizedUsername(opponent) : null;
     await this.recoverPlayingGames();
     const schedulerTask = this.schedulerLoop();
+    const statusHeartbeat = setInterval(() => {
+      void this.writeStatus().catch((error) => {
+        log("runtime_status_write_error", { message: error.message });
+      });
+    }, 5_000);
     let reconnectDelay = 1_000;
     try {
       while (!this.signal.aborted) {
@@ -3758,11 +4494,17 @@ export class BotController {
             : reconnectDelay;
           log("event_stream_error", { message: error.message, retry_ms: retryMs });
           await this.writeStatus();
-          await delay(retryMs, this.signal);
+          try {
+            await delay(retryMs, this.signal);
+          } catch (retryError) {
+            if (this.signal.aborted) break;
+            throw retryError;
+          }
           reconnectDelay = Math.min(reconnectDelay * 2, 30_000);
         }
       }
     } finally {
+      clearInterval(statusHeartbeat);
       await Promise.allSettled(this.activeGames.values());
       await this.slots.drainAll();
       await schedulerTask;
@@ -3809,12 +4551,7 @@ export class BotController {
         recovered += 1;
         return;
       }
-      const opponent = normalizedUsername(game.opponent?.id ?? game.opponent?.username ?? game.opponent?.name);
-      const audience = await this.resolveAudience(opponent, game.opponent?.title);
-      const slot = this.slots.acquireStarted(audience, { opponent, direction: "recovered" });
-      if (!slot) throw new Error(`Configured ${audience} capacity cannot recover active game ${game.gameId ?? game.id}`);
-      await this.prepareSlot(slot);
-      await this.startGame(game, slot);
+      await this.startGame(game);
       recovered += 1;
     }));
     this.lastReconciliationAt = Date.now();
@@ -3928,7 +4665,10 @@ export class BotController {
           throw new StaleApiOperationError("accept", "challenge response window expired");
         }
       });
-      this.slots.pending(slot, challenge.id);
+      this.slots.requireOwned(slot, ["preparing", "active"], slotGeneration);
+      if (slot.state === "preparing") {
+        this.slots.pending(slot, challenge.id, slotGeneration);
+      }
       this.store.recordChallenge({
         id: challenge.id,
         opponent,
@@ -3941,7 +4681,9 @@ export class BotController {
       });
       log("challenge_accepted", { challenge_id: challenge.id, opponent, audience, slot_id: slot.id });
     } catch (error) {
-      await this.slots.release(slot);
+      if (slot.generation === slotGeneration && slot.state !== "active") {
+        await this.slots.release(slot, slotGeneration);
+      }
       if (error instanceof StaleApiOperationError) {
         log("stale_challenge_response_skipped", {
           challenge_id: challenge.id,
@@ -3964,13 +4706,28 @@ export class BotController {
         ? this.config.scheduler.decline_cooldown_minutes
         : 0,
     });
-    if (["pending", "cancelling", "preparing"].includes(slot?.state)) await this.slots.release(slot);
+    if (["pending", "cancelling", "preparing"].includes(slot?.state)) {
+      await this.slots.release(slot, slot.generation);
+    }
     log("challenge_terminal", { challenge_id: challengeId, status: declined ? "declined" : "canceled" });
   }
 
   async startGame(game, suppliedSlot = null) {
     const gameId = String(game?.gameId ?? game?.id ?? "");
-    if (!gameId || this.activeGames.has(gameId)) return;
+    if (!gameId) return;
+    if (this.activeGames.has(gameId)) return;
+    const existingStart = this.startingGames.get(gameId);
+    if (existingStart) return existingStart;
+    const start = this.startGameOnce(game, suppliedSlot, gameId);
+    this.startingGames.set(gameId, start);
+    try {
+      return await start;
+    } finally {
+      if (this.startingGames.get(gameId) === start) this.startingGames.delete(gameId);
+    }
+  }
+
+  async startGameOnce(game, suppliedSlot, gameId) {
     let slot = suppliedSlot ?? this.slots.findPending(game);
     if (!slot) {
       const opponent = normalizedUsername(game?.opponent?.id ?? game?.opponent?.username ?? game?.opponent?.name);
@@ -3979,7 +4736,8 @@ export class BotController {
       if (!slot) throw new Error(`No ${audience} slot is available for started game ${gameId}`);
       await this.prepareSlot(slot);
     }
-    this.slots.active(slot, gameId);
+    const slotGeneration = slot.generation;
+    this.slots.active(slot, gameId, slotGeneration);
     if (slot.challengeId) this.store.updateChallenge(slot.challengeId, "accepted");
     if (slot.audience === "human" && slot.opponent) this.store.consumeReservation(slot.opponent);
     const session = new GameSession({
@@ -3991,7 +4749,7 @@ export class BotController {
       slot,
       store: this.store,
       foregroundCoordinator: this.foregroundCoordinator,
-      onMoveTransportSample: (id, durationMs) => this.transportProfile.record(id, durationMs),
+      onMoveTransportSample: (id, timing) => this.transportProfile.record(id, timing),
     });
     this.gameSessions.set(gameId, session);
     const task = session.run().catch((error) => {
@@ -3999,14 +4757,20 @@ export class BotController {
     }).finally(async () => {
       this.activeGames.delete(gameId);
       this.gameSessions.delete(gameId);
-      await this.slots.release(slot);
-      const reserve = this.transportProfile.finishGame(gameId);
+      await this.slots.release(slot, slotGeneration);
+      let reserve = this.transportProfile.effectiveReserveMs;
+      if (session.finished) {
+        reserve = this.transportProfile.finishGame(gameId);
+      } else {
+        this.transportProfile.abandonGame(gameId);
+      }
       this.config.timing.initial_transport_reserve_ms = reserve;
       this.config.engine.timing.initial_transport_reserve_ms = reserve;
       await this.writeStatus();
     });
     this.activeGames.set(gameId, task);
     log("game_started", { game_id: gameId, audience: slot.audience, opponent: slot.opponent, slot_id: slot.id });
+    return slot;
   }
 
   async createChallenge(opponent, audience) {
@@ -4035,13 +4799,17 @@ export class BotController {
       });
       const challengeId = challenge.id ?? challenge.challenge?.id;
       if (!challengeId) throw new Error(`Lichess challenge response for ${normalized} has no id`);
-      this.slots.pending(slot, challengeId);
+      this.slots.requireOwned(slot, ["preparing", "active"], slotGeneration);
+      if (slot.state === "preparing") {
+        this.slots.pending(slot, challengeId, slotGeneration);
+      }
+      else if (!slot.challengeId) slot.challengeId = String(challengeId);
       this.store.recordChallenge({
         id: challengeId,
         opponent: normalized,
         audience,
         direction: "outbound",
-        status: "pending",
+        status: slot.state === "active" ? "accepted" : "pending",
         color: outbound.color,
         clockLimit: outbound.clock_limit,
         clockIncrement: outbound.clock_increment,
@@ -4056,7 +4824,9 @@ export class BotController {
       });
       return true;
     } catch (error) {
-      await this.slots.release(slot);
+      if (slot.generation === slotGeneration && slot.state !== "active") {
+        await this.slots.release(slot, slotGeneration);
+      }
       if (error instanceof StaleApiOperationError) return false;
       if (!(error instanceof LichessHttpError && error.status === 429) && audience === "bot") {
         this.store.setOpponentCooldown(normalized, this.config.scheduler.timeout_cooldown_minutes);
@@ -4164,7 +4934,7 @@ export class BotController {
       const challengeId = slot.challengeId;
       if (!challengeId) continue;
       const generation = slot.generation;
-      this.slots.cancelling(slot);
+      this.slots.cancelling(slot, generation);
       slot.cancelRetryAt = Number.POSITIVE_INFINITY;
       try {
         await this.client.post(
@@ -4307,15 +5077,16 @@ export class BotController {
       },
       opponents: this.store.opponentStats(),
       engine: this.config.engine.executable,
-      deployment_bundle: "mcgs",
-      model_root: this.config.engine.uci_options.ModelRoot,
-      qualification_profile: this.config.engine.qualification_profile.profile_path,
+      engine_adapter: this.config.engine.adapter,
+      deployment_bundle: this.config.engine.selected_bundle,
+      model_root: this.config.engine.uci_options.ModelRoot ?? null,
+      qualification_profile: this.config.engine.qualification_profile?.profile_path ?? null,
       timing_profile_path: this.config.engine.time_profile ?? null,
       timing_profile: this.config.engine.time_profile_status
         ?? timeProfileFallbackStatus("missing", "timing-profile preflight status is unavailable"),
       capacity_profile: this.config.capacity_profile?.profile_path ?? null,
-      model_id: this.config.engine.qualification_profile.model_id,
-      provider: this.config.engine.qualification_profile.provider,
+      model_id: this.config.engine.qualification_profile?.model_id ?? null,
+      provider: this.config.engine.qualification_profile?.provider ?? null,
       updated_at: new Date().toISOString(),
     });
   }
@@ -4362,7 +5133,17 @@ export function providerStatusProjection({
   startup = { installed: false },
   active = runtime ? processIsAlive(runtime.pid) : false,
   startupError = null,
+  now = Date.now(),
+  runtimeMaximumAgeMs = RUNTIME_STATUS_MAXIMUM_AGE_MS,
 } = {}) {
+  const updatedAt = Date.parse(runtime?.updated_at ?? "");
+  const freshnessError = runtime && (!Number.isFinite(updatedAt)
+    || now - updatedAt > runtimeMaximumAgeMs
+    || updatedAt - now > runtimeMaximumAgeMs)
+    ? "runtime_status_stale"
+    : null;
+  const effectiveRuntimeError = runtimeError ?? freshnessError;
+  const effectiveActive = Boolean(active && !effectiveRuntimeError);
   const slots = Array.isArray(runtime?.slots) ? runtime.slots : [];
   const slotCounts = Object.fromEntries(
     ["empty", "preparing", "pending", "cancelling", "active", "draining"].map((state) => [
@@ -4370,20 +5151,20 @@ export function providerStatusProjection({
       slots.filter((slot) => slot?.state === state).length,
     ]),
   );
-  const streamConnected = active && runtime?.stream_connected === true;
+  const streamConnected = effectiveActive && runtime?.stream_connected === true;
   const schedulerFault = runtime?.scheduler?.fault ?? null;
   const blockers = [];
-  if (runtimeError) blockers.push(runtimeError);
-  if (!active) blockers.push("provider_process_inactive");
-  if (active && !streamConnected) blockers.push("event_stream_disconnected");
+  if (effectiveRuntimeError) blockers.push(effectiveRuntimeError);
+  if (!effectiveActive) blockers.push("provider_process_inactive");
+  if (effectiveActive && !streamConnected) blockers.push("event_stream_disconnected");
   if (schedulerFault) blockers.push("scheduler_fault");
   if (startupError) blockers.push("startup_status_unavailable");
   return {
     schema: "uci_arena_lichess_status_v3",
     installed: true,
     registered: startup?.installed === true,
-    active,
-    ready: active && streamConnected && !schedulerFault,
+    active: effectiveActive,
+    ready: effectiveActive && streamConnected && !schedulerFault,
     stream_connected: streamConnected,
     runtime_updated_at: typeof runtime?.updated_at === "string" ? runtime.updated_at : null,
     account: runtime?.account
@@ -4435,7 +5216,8 @@ export function parseArguments(argv) {
   if (!command) throw new Error("Expected a Lichess adapter command");
   const rest = [...argumentsList];
   const options = { command };
-  if (new Set(["owner", "reservation", "scheduler", "startup", "config"]).has(command)
+  if (new Set(["owner", "reservation", "scheduler", "startup", "config", "qualification"])
+    .has(command)
       && rest[0] && !rest[0].startsWith("--")) {
     options.action = rest.shift();
   }
@@ -4509,10 +5291,418 @@ async function preflightQualifiedEngines(config, count) {
   }
 }
 
+function qualificationRegularFile(value, label) {
+  requireString(value, label);
+  const resolved = path.resolve(value);
+  if (!path.isAbsolute(value)) throw new Error(`${label} must be an absolute path`);
+  const metadata = lstatSync(resolved);
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    throw new Error(`${label} must be a regular non-link file`);
+  }
+  return resolved;
+}
+
+function qualificationDirectory(value, label) {
+  requireString(value, label);
+  const resolved = path.resolve(value);
+  if (!path.isAbsolute(value)) throw new Error(`${label} must be an absolute path`);
+  const metadata = lstatSync(resolved);
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    throw new Error(`${label} must be a non-link directory`);
+  }
+  return resolved;
+}
+
+function readQualificationJson(filename, label, maximumBytes = 16 * 1024 * 1024) {
+  const resolved = qualificationRegularFile(filename, label);
+  const metadata = statSync(resolved);
+  if (metadata.size < 2 || metadata.size > maximumBytes) {
+    throw new Error(`${label} is not a bounded JSON file`);
+  }
+  try {
+    return JSON.parse(readFileSync(resolved, "utf8"));
+  } catch (error) {
+    throw new Error(`${label} is not valid JSON: ${error.message}`);
+  }
+}
+
+function qualificationBoolean(value, fallback) {
+  return value === undefined ? fallback : value === true || value === "true";
+}
+
+export function installedQualificationCommand(config, outputPath) {
+  if (config.engine.adapter !== "uci_arena_extended_v1") {
+    throw new Error("Installed qualification requires the extended UCI Arena Engine adapter");
+  }
+  const qualification = config.qualification;
+  if (!qualification || typeof qualification !== "object" || Array.isArray(qualification)) {
+    throw new Error("Installed Lichess qualification dependencies are unavailable");
+  }
+  const completeGameEntrypoint = qualificationRegularFile(
+    qualification.complete_game_entrypoint,
+    "qualification.complete_game_entrypoint",
+  );
+  const referee = qualificationRegularFile(qualification.referee, "qualification.referee");
+  const stockfish = qualificationRegularFile(qualification.stockfish, "qualification.stockfish");
+  const engine = qualificationRegularFile(config.engine.executable, "engine.executable");
+  const modelRoot = qualificationDirectory(config.engine.uci_options.ModelRoot, "engine ModelRoot");
+  const timeProfilePath = qualificationRegularFile(
+    config.engine.time_profile,
+    "engine.time_profile",
+  );
+  const timingProfile = validateStoredProfile(
+    readQualificationJson(timeProfilePath, "timing profile"),
+  );
+  const search = timingProfile.identity?.search;
+  const model = timingProfile.identity?.model;
+  if (!search || !model) throw new Error("Timing profile identity is incomplete");
+  const argumentsList = [
+    completeGameEntrypoint,
+    "--engine", engine,
+    "--stockfish", stockfish,
+    "--referee", referee,
+    "--model-root", modelRoot,
+    "--time-profile", timeProfilePath,
+    "--output", path.resolve(outputPath),
+    "--time-ms", "25,100,500",
+    "--hard-ply-cap", "600",
+    "--search-core", String(search.search_core),
+    "--threads", String(search.threads),
+    "--root-workers", String(search.root_workers),
+    "--split-depth", String(search.split_depth),
+    "--expected-batch-size", String(search.batch_size_effective),
+    "--batch-wait-us", String(search.batch_wait_us_effective),
+    "--activation-depth", String(Math.max(6, Number(search.split_depth))),
+    "--activation-movetime-ms", "2000",
+    "--max-overrun-ratio", "1.5",
+    "--max-overrun-grace-ms", "50",
+    "--background-search", "false",
+    "--root-worker-cache-reuse", "false",
+    "--expected-model-id", String(model.model_id),
+    "--expected-model-fingerprint", String(model.model_fingerprint),
+    "--expected-provider", String(search.provider_effective),
+  ];
+  if (search.search_core === "mcgs") {
+    const mcgs = search.mcgs;
+    if (!mcgs) throw new Error("Timing profile MCGS identity is incomplete");
+    argumentsList.push(
+      "--search-graph-mb", String(mcgs.search_graph_mb),
+      "--mcgs-cpuct-permille", String(mcgs.cpuct_permille),
+      "--mcgs-outstanding-batches", String(mcgs.outstanding_batches),
+      "--mcgs-book-prior-blend-permille", String(mcgs.book_prior_blend_permille),
+      "--mcgs-time-policy", String(mcgs.time_policy),
+    );
+  }
+  for (const name of ["BehaviorProfile", "McgsTemporalWeightProfile", "ModelBackend"]) {
+    const value = config.engine.uci_options[name];
+    if (["string", "number", "boolean"].includes(typeof value)) {
+      argumentsList.push("--model-option", `${name}=${value}`);
+    }
+  }
+  const syzygyPath = config.engine.uci_options.SyzygyPath;
+  if (syzygyPath) {
+    const tablebaseRoot = qualificationDirectory(syzygyPath, "SyzygyPath");
+    const manifestPath = qualificationRegularFile(
+      config.engine.uci_options.SyzygyManifest
+        ?? path.join(tablebaseRoot, "syzygy_manifest_v1.json"),
+      "SyzygyManifest",
+    );
+    const manifest = readQualificationJson(manifestPath, "Syzygy manifest");
+    const cardinality = Number(manifest.cardinality);
+    requireInteger(cardinality, "Syzygy manifest cardinality", 3, 7);
+    const probeLimit = Number(config.engine.uci_options.SyzygyProbeLimit ?? Math.min(6, cardinality));
+    const probeThreads = Number(config.engine.uci_options.SyzygyProbeThreads ?? 4);
+    argumentsList.push(
+      "--syzygy-path", tablebaseRoot,
+      "--syzygy-manifest", manifestPath,
+      "--syzygy-probe-limit", String(probeLimit),
+      "--syzygy-probe-threads", String(probeThreads),
+      "--syzygy-rule50", String(qualificationBoolean(
+        config.engine.uci_options.Syzygy50MoveRule,
+        true,
+      )),
+      "--syzygy-root-probe", String(qualificationBoolean(
+        config.engine.uci_options.SyzygyRootProbe,
+        true,
+      )),
+      "--syzygy-internal-probe", String(qualificationBoolean(
+        config.engine.uci_options.SyzygyInternalProbe,
+        true,
+      )),
+    );
+  }
+  argumentsList.push("--allow-shared-gpu-diagnostic", "--no-resume");
+  return {
+    executable: process.execPath,
+    workingDirectory: path.dirname(completeGameEntrypoint),
+    arguments: argumentsList,
+    engine,
+    modelRoot,
+    timeProfilePath,
+    timingProfile,
+  };
+}
+
+async function runBoundedQualificationTool(
+  executable,
+  workingDirectory,
+  argumentsList,
+  timeoutMs = 20 * 60 * 1000,
+) {
+  await new Promise((resolve, reject) => {
+    const child = spawn(executable, argumentsList, {
+      cwd: workingDirectory,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+      shell: false,
+    });
+    let stdout = Buffer.alloc(0);
+    let stderr = Buffer.alloc(0);
+    let settled = false;
+    let timer;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      error ? reject(error) : resolve();
+    };
+    const append = (current, chunk, label) => {
+      const next = Buffer.concat([current, Buffer.from(chunk)]);
+      if (next.length > 1024 * 1024) {
+        child.kill();
+        finish(new Error(`Complete-game qualifier ${label} exceeded 1 MiB`));
+      }
+      return next;
+    };
+    child.stdout.on("data", (chunk) => { stdout = append(stdout, chunk, "stdout"); });
+    child.stderr.on("data", (chunk) => { stderr = append(stderr, chunk, "stderr"); });
+    child.once("error", (error) => finish(error));
+    child.once("exit", (code, signal) => {
+      if (code === 0) {
+        finish();
+        return;
+      }
+      const diagnostic = stderr.toString("utf8").trim().slice(-4096);
+      finish(new Error(
+        `Complete-game qualifier failed (${signal ?? code ?? "unknown"})${diagnostic ? `: ${diagnostic}` : ""}`,
+      ));
+    });
+    timer = setTimeout(() => {
+      child.kill();
+      finish(new Error("Complete-game qualifier exceeded the 20 minute limit"));
+    }, timeoutMs);
+    timer.unref();
+  });
+}
+
+const QUALIFICATION_FAILURE_DETAIL_LIMIT = 1024;
+const QUALIFICATION_FAILURE_STAGES = new Set([
+  "startup_safety",
+  "preflight",
+  "complete_game",
+  "single_game_publication",
+  "capacity_probe",
+  "commit",
+]);
+
+class InstalledQualificationFailure extends Error {
+  constructor(stage, cause) {
+    super(cause instanceof Error ? cause.message : String(cause ?? "Qualification failed"));
+    this.name = "InstalledQualificationFailure";
+    this.stage = QUALIFICATION_FAILURE_STAGES.has(stage) ? stage : "preflight";
+  }
+}
+
+function qualificationFailureDetail(error) {
+  let detail = error instanceof Error ? error.message : String(error ?? "Qualification failed");
+  detail = detail.replace(/[\u0000-\u001f\u007f]+/gu, " ").replace(/\s+/gu, " ").trim();
+  if (/\b(?:authorization|bearer|password|secret|token)\b/iu.test(detail)) {
+    return "Qualification failed; sensitive provider diagnostics were redacted.";
+  }
+  detail = detail
+    .replace(/(?:[A-Za-z]:[\\/]|\\\\)[^,;|]*/gu, "<path>")
+    .replace(
+      /(?:^|[\s("'=])\/(?:[^\s,;:)"']+\/?)+/gu,
+      (match) => match.startsWith("/") ? "<path>" : `${match[0]}<path>`,
+    )
+    .trim();
+  if (!detail) return "Qualification failed without a safe provider diagnostic.";
+  return detail.slice(0, QUALIFICATION_FAILURE_DETAIL_LIMIT);
+}
+
+export function qualificationFailureProjection(error, fallbackStage = "preflight") {
+  const stage = error instanceof InstalledQualificationFailure
+    ? error.stage
+    : QUALIFICATION_FAILURE_STAGES.has(fallbackStage) ? fallbackStage : "preflight";
+  return {
+    schema: "uci_arena_lichess_qualification_result_v1",
+    status: "failed",
+    failure: {
+      code: `qualification_${stage}_failed`,
+      stage,
+      detail: qualificationFailureDetail(error),
+    },
+  };
+}
+
+export async function runInstalledQualificationWorkflow({
+  configPath,
+  runtimeDir,
+  maximumConcurrency,
+  runTool = runBoundedQualificationTool,
+} = {}) {
+  const resolvedConfig = qualificationRegularFile(configPath, "qualification config");
+  const resolvedRuntime = path.resolve(runtimeDir);
+  mkdirSync(resolvedRuntime, { recursive: true });
+  const baseConfig = loadRuntimeConfig({
+    templatePath: resolvedConfig,
+    engineRoot: path.dirname(resolvedConfig),
+    requireSingleGameProfile: false,
+    environment: {},
+  });
+  const concurrency = maximumConcurrency ?? baseConfig.capacity.total_slots;
+  requireInteger(concurrency, "qualification maximum concurrency", 1, 64);
+  const engineSha = sha256File(baseConfig.engine.executable);
+  const timingSha = sha256File(baseConfig.engine.time_profile);
+  const qualificationDependencies = baseConfig.qualification;
+  if (!qualificationDependencies || typeof qualificationDependencies !== "object") {
+    throw new Error("Installed Lichess qualification dependencies are unavailable");
+  }
+  const qualificationToolIdentity = {
+    complete_game_entrypoint_sha256: sha256File(
+      qualificationRegularFile(
+        qualificationDependencies.complete_game_entrypoint,
+        "qualification.complete_game_entrypoint",
+      ),
+    ),
+    referee_sha256: sha256File(qualificationRegularFile(
+      qualificationDependencies.referee,
+      "qualification.referee",
+    )),
+    stockfish_sha256: sha256File(qualificationRegularFile(
+      qualificationDependencies.stockfish,
+      "qualification.stockfish",
+    )),
+    syzygy_manifest_sha256: baseConfig.engine.uci_options.SyzygyPath
+      ? sha256File(qualificationRegularFile(
+        baseConfig.engine.uci_options.SyzygyManifest
+          ?? path.join(baseConfig.engine.uci_options.SyzygyPath, "syzygy_manifest_v1.json"),
+        "SyzygyManifest",
+      ))
+      : null,
+    temporal_curve_sha256: baseConfig.engine.temporal_curve_profile
+      ? sha256File(qualificationRegularFile(
+        baseConfig.engine.temporal_curve_profile,
+        "engine.temporal_curve_profile",
+      ))
+      : null,
+  };
+  const runKey = createHash("sha256").update(JSON.stringify({
+    schema: "uci_arena_lichess_qualification_key_v1",
+    engine_sha256: engineSha,
+    timing_sha256: timingSha,
+    maximum_concurrency: concurrency,
+    qualification_tools: qualificationToolIdentity,
+  })).digest("hex");
+  const outputDirectory = path.join(resolvedRuntime, "qualification", runKey);
+  const completeGamePath = path.join(outputDirectory, "complete-game.json");
+  const singleGamePath = path.join(outputDirectory, "uci_arena_single_game_profile_v1.json");
+  const capacityPath = path.join(outputDirectory, "uci_arena_lichess_capacity_profile_v2.json");
+  const markerPath = path.join(outputDirectory, "qualification-result.json");
+  if (existsSync(markerPath)) {
+    const marker = readQualificationJson(markerPath, "qualification result");
+    if (marker.schema !== "uci_arena_lichess_qualification_result_v1"
+        || marker.engine_sha256 !== engineSha
+        || marker.timing_sha256 !== timingSha
+        || marker.maximum_concurrency !== concurrency
+        || marker.single_game_profile_sha256 !== sha256File(singleGamePath)
+        || marker.capacity_profile_sha256 !== sha256File(capacityPath)) {
+      throw new Error("Existing installed qualification result is inconsistent");
+    }
+    return {
+      ...marker,
+      status: "qualified",
+      single_game_profile: singleGamePath,
+      capacity_profile: capacityPath,
+      reused: true,
+    };
+  }
+  if (existsSync(outputDirectory)) rmSync(outputDirectory, { recursive: true, force: true });
+  mkdirSync(outputDirectory, { recursive: true });
+  let stage = "complete_game";
+  try {
+    const command = installedQualificationCommand(baseConfig, completeGamePath);
+    await runTool(
+      command.executable,
+      command.workingDirectory,
+      command.arguments,
+    );
+    stage = "single_game_publication";
+    qualificationRegularFile(completeGamePath, "complete-game evidence");
+    publishSingleGameProfile({
+      engine: command.engine,
+      model_root: command.modelRoot,
+      time_profile: command.timeProfilePath,
+      complete_game_evidence: completeGamePath,
+      output: singleGamePath,
+      qualification_scope: "local_live_safety",
+      probe_depth: Math.max(6, Number(command.timingProfile.identity.search.split_depth)),
+      probe_timeout_ms: 240_000,
+    });
+    const qualifiedConfig = loadRuntimeConfig({
+      templatePath: resolvedConfig,
+      engineRoot: path.dirname(resolvedConfig),
+      profilePath: singleGamePath,
+      timeProfilePath: command.timeProfilePath,
+      environment: {},
+    });
+    stage = "capacity_probe";
+    const singleGameProfile = applySingleGameProfile(qualifiedConfig);
+    const statuses = await preflightQualifiedEngines(qualifiedConfig, concurrency);
+    const capacityProfile = publishCapacityProfile(
+      capacityPath,
+      concurrency,
+      qualifiedConfig,
+      singleGameProfile,
+      statuses,
+    );
+    stage = "commit";
+    const marker = {
+      schema: "uci_arena_lichess_qualification_result_v1",
+      engine_sha256: engineSha,
+      timing_sha256: timingSha,
+      timing_identity_sha256: command.timingProfile.identity_sha256,
+      maximum_concurrency: concurrency,
+      single_game_profile_sha256: sha256File(singleGamePath),
+      capacity_profile_sha256: sha256File(capacityPath),
+      search_core: singleGameProfile.search_core,
+      model_id: singleGameProfile.model_id,
+      provider: singleGameProfile.provider,
+      completed_at: new Date().toISOString(),
+    };
+    const temporaryMarker = `${markerPath}.tmp-${process.pid}`;
+    writeFileSync(temporaryMarker, `${JSON.stringify(marker, null, 2)}\n`, "utf8");
+    renameSync(temporaryMarker, markerPath);
+    return {
+      ...marker,
+      status: "qualified",
+      single_game_profile: singleGamePath,
+      capacity_profile: capacityProfile.profile_path,
+      reused: false,
+    };
+  } catch (error) {
+    rmSync(outputDirectory, { recursive: true, force: true });
+    throw new InstalledQualificationFailure(stage, error);
+  }
+}
+
 async function preflightDeploymentBundle(config) {
-  const qualificationProfile = applySingleGameProfile(config);
+  const qualificationProfile = usesExtendedEngineAdapter(config)
+    ? applySingleGameProfile(config)
+    : null;
   const qualificationStatus = await preflightQualifiedEngine(config);
-  if (config.engine.time_profile_status?.accepted !== true) {
+  if (usesExtendedEngineAdapter(config)
+      && config.engine.time_profile_status?.accepted !== true) {
     throw new Error(
       `MCGS timing profile was rejected: ${config.engine.time_profile_status?.reason ?? "unknown reason"}`,
     );
@@ -4526,8 +5716,24 @@ function integerOption(value, label, fallback) {
   return parsed;
 }
 
+export function resolveProviderRuntimeDirectory(options = {}, componentRoot = ROOT) {
+  if (options.runtime_dir !== undefined) {
+    if (typeof options.runtime_dir !== "string" || !options.runtime_dir.trim()) {
+      throw new Error("--runtime-dir must be a non-empty path");
+    }
+    return path.resolve(options.runtime_dir);
+  }
+  if (options.config !== undefined) {
+    if (typeof options.config !== "string" || !options.config.trim()) {
+      throw new Error("--config must be a non-empty path");
+    }
+    return path.dirname(path.resolve(options.config));
+  }
+  return path.join(path.resolve(componentRoot), "runtime_state", "lichess");
+}
+
 function runStoreCommand(options) {
-  const runtimeDir = path.resolve(options.runtime_dir ?? DEFAULT_RUNTIME_DIR);
+  const runtimeDir = resolveProviderRuntimeDirectory(options);
   const store = new LichessStore(path.resolve(options.store ?? path.join(runtimeDir, "matches.sqlite")));
   try {
     let result;
@@ -4575,7 +5781,7 @@ export async function main(argv = process.argv.slice(2)) {
       || new Set(["owner", "reservation", "scheduler"]).has(options.command)) {
     return runStoreCommand(options);
   }
-  const runtimeDir = path.resolve(options.runtime_dir ?? DEFAULT_RUNTIME_DIR);
+  const runtimeDir = resolveProviderRuntimeDirectory(options);
   if (options.command === "run") configureRuntimeLog(runtimeDir);
   if (options.command === "status") {
     const { runtime, error: runtimeError } = boundedRuntimeMetadata(runtimeDir);
@@ -4626,7 +5832,7 @@ export async function main(argv = process.argv.slice(2)) {
       ratedConfirmation: options.confirm_rated,
       outboundConfirmation: options.confirm_outbound,
     });
-    console.log(JSON.stringify({ status: "ready", editable }));
+    console.log(JSON.stringify(editable));
     return 0;
   }
   if (options.command === "config" && (!options.action || options.action === "get")) {
@@ -4634,38 +5840,80 @@ export async function main(argv = process.argv.slice(2)) {
       templatePath: configPath,
       engineRoot: path.resolve(options.engine_root ?? ROOT),
     });
-    console.log(JSON.stringify({
-      status: "ready",
-      schema: config.schema,
-      engine: config.engine?.executable ?? null,
-      time_profile: config.engine?.time_profile ?? null,
-      temporal_curve_profile: config.engine?.temporal_curve_profile ?? null,
-      capacity: config.capacity,
-      scheduler: config.scheduler,
-      editable: managerOptionsProjection(config),
-    }));
+    console.log(JSON.stringify(managerOptionsProjection(config)));
     return 0;
   }
   if (options.command === "config") {
     throw new Error(`Unknown config action: ${options.action ?? "missing"}`);
   }
-  const config = loadRuntimeConfig({
-    templatePath: configPath,
-    engineRoot: path.resolve(options.engine_root ?? ROOT),
-    enginePath: options.engine,
-    workingDirectory: options.working_directory,
-    modelRoot: options.model_root,
-    profilePath: options.profile,
-    timeProfilePath: options.time_profile,
-    temporalCurvePath: options.temporal_curve_profile,
-  });
+  const qualificationRun = options.command === "qualification" && options.action === "run";
+  let config;
+  try {
+    config = options.command === "probe"
+      ? loadManagerConfig({
+        templatePath: configPath,
+        engineRoot: path.resolve(options.engine_root ?? ROOT),
+      })
+      : loadRuntimeConfig({
+        templatePath: configPath,
+        engineRoot: path.resolve(options.engine_root ?? ROOT),
+        enginePath: options.engine,
+        workingDirectory: options.working_directory,
+        modelRoot: options.model_root,
+        profilePath: options.profile,
+        timeProfilePath: options.time_profile,
+        temporalCurvePath: options.temporal_curve_profile,
+        requireSingleGameProfile: !qualificationRun,
+        environment: qualificationRun ? {} : process.env,
+      });
+  } catch (error) {
+    if (!qualificationRun) throw error;
+    console.log(JSON.stringify(qualificationFailureProjection(error, "preflight")));
+    return 1;
+  }
+  if (qualificationRun) {
+    let failureStage = "preflight";
+    try {
+      const maximumConcurrency = integerOption(
+        options.max_concurrency,
+        "--max-concurrency",
+        config.capacity.total_slots,
+      );
+      failureStage = "startup_safety";
+      const startup = process.platform === "win32"
+        ? await queryWindowsStartup()
+        : process.platform === "linux"
+          ? await queryLinuxStartup()
+          : { installed: false };
+      if (startup.installed === true) {
+        throw new InstalledQualificationFailure(
+          "startup_safety",
+          new Error("Disable Lichess Bot startup before requalifying the installed engine"),
+        );
+      }
+      const result = await runInstalledQualificationWorkflow({
+        configPath,
+        runtimeDir,
+        maximumConcurrency,
+      });
+      console.log(JSON.stringify(result));
+      return 0;
+    } catch (error) {
+      console.log(JSON.stringify(qualificationFailureProjection(error, failureStage)));
+      return 1;
+    }
+  }
+  if (options.command === "qualification") {
+    throw new Error(`Unknown qualification action: ${options.action ?? "missing"}`);
+  }
   if (options.command === "startup" && options.action === "install") {
     const tokenFile = resolveExternalTokenFile(options);
-    const { qualificationProfile } = await preflightDeploymentBundle(config);
+    const { qualificationProfile, qualificationStatus } = await preflightDeploymentBundle(config);
     loadCapacityProfile(
       options.capacity_profile ?? config.capacity.capacity_profile,
       config,
       qualificationProfile,
+      qualificationStatus,
     );
     const startupOptions = {
       config: path.resolve(options.config ?? DEFAULT_TEMPLATE),
@@ -4694,7 +5942,9 @@ export async function main(argv = process.argv.slice(2)) {
     : null;
   let qualificationStatus;
   if (new Set(["qualify", "capacity-qualify", "run"]).has(options.command)) {
-    let qualificationProfile = applySingleGameProfile(config);
+    const qualificationProfile = usesExtendedEngineAdapter(config)
+      ? applySingleGameProfile(config)
+      : null;
     if (options.command === "capacity-qualify") {
       const maximumConcurrency = integerOption(
         options.max_concurrency,
@@ -4722,7 +5972,9 @@ export async function main(argv = process.argv.slice(2)) {
       return 0;
     }
     qualificationStatus = await preflightQualifiedEngine(config);
-    if (options.command === "run" && config.engine.time_profile_status?.accepted !== true) {
+    if (options.command === "run"
+        && usesExtendedEngineAdapter(config)
+        && config.engine.time_profile_status?.accepted !== true) {
       throw new Error(
         `MCGS timing profile was rejected: ${config.engine.time_profile_status?.reason ?? "unknown reason"}`,
       );
@@ -4730,10 +5982,11 @@ export async function main(argv = process.argv.slice(2)) {
     if (options.command === "qualify") {
       console.log(JSON.stringify({
         status: "qualified",
-        schema: qualificationProfile.schema,
-        model_id: qualificationProfile.model_id,
-        provider: qualificationStatus.provider_effective,
-        cursor_ready_resumes: qualificationStatus.v2_cursor_ready_resumes,
+        schema: qualificationProfile?.schema ?? qualificationStatus.schema,
+        engine_adapter: config.engine.adapter,
+        model_id: qualificationProfile?.model_id ?? null,
+        provider: qualificationStatus.provider_effective ?? null,
+        cursor_ready_resumes: qualificationStatus.v2_cursor_ready_resumes ?? null,
         time_profile: config.engine.time_profile_status,
       }));
       return 0;
@@ -4742,6 +5995,7 @@ export async function main(argv = process.argv.slice(2)) {
       options.capacity_profile ?? config.capacity.capacity_profile,
       config,
       qualificationProfile,
+      qualificationStatus,
     );
   }
   const expectedAccount = options.expected_account;
@@ -4749,10 +6003,15 @@ export async function main(argv = process.argv.slice(2)) {
     throw new Error("--expected-account is required");
   }
   const controller = new AbortController();
+  const signalHandlers = new Map();
   for (const signal of ["SIGINT", "SIGTERM"]) {
-    process.once(signal, () => controller.abort(new Error(`Received ${signal}`)));
+    const handler = () => controller.abort(new Error(`Received ${signal}`));
+    signalHandlers.set(signal, handler);
+    process.once(signal, handler);
   }
-  const unbindShutdownInput = bindShutdownInput(controller);
+  const unbindShutdownInput = options.command === "run"
+    ? bindShutdownInput(controller)
+    : () => {};
   const store = new LichessStore(path.resolve(options.store ?? path.join(runtimeDir, "matches.sqlite")));
   const authority = apiAuthorityKey(config.url, expectedAccount ?? "account-probe");
   const leaseOwner = randomUUID();
@@ -4821,7 +6080,8 @@ export async function main(argv = process.argv.slice(2)) {
       opponent: options.opponent ?? null,
       configured_capacity: config.capacity.total_slots,
       qualified_capacity: config.capacity_profile?.maximum_concurrency ?? 1,
-      provider: qualificationStatus.provider_effective,
+      engine_adapter: config.engine.adapter,
+      provider: qualificationStatus.provider_effective ?? null,
       time_profile: config.engine.time_profile_status,
     });
     await new BotController({
@@ -4834,6 +6094,7 @@ export async function main(argv = process.argv.slice(2)) {
     }).run(options.opponent);
   } finally {
     unbindShutdownInput();
+    for (const [signal, handler] of signalHandlers) process.off(signal, handler);
     if (leaseHeartbeat) clearInterval(leaseHeartbeat);
     store.releaseApiLease(authority, leaseOwner);
     store.close();

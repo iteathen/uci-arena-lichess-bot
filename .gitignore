@@ -8,5 +8,7 @@ logs/
 node_modules/
 dist/
 native/build/
+native/build-repro/
+native/lichess_adapter_launcher.exe
 release-receipts/
 *.log

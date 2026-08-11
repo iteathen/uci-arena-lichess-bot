@@ -1,8 +1,10 @@
 {
-  "schema": "uci_arena_lichess_adapter_v6",
+  "schema": "uci_arena_lichess_adapter_v7",
   "url": "https://lichess.org/",
   "engine": {
+    "adapter": "uci_arena_extended_v1",
     "executable": "<UCI_ARENA_ENGINE_ROOT>/bin/uci_arena_engine.exe",
+    "arguments": [],
     "working_directory": "<UCI_ARENA_ENGINE_ROOT>",
     "single_game_profile": "<UCI_ARENA_ENGINE_ROOT>/profiles/uci_arena_single_game_profile_v1.json",
     "time_profile": "<UCI_ARENA_ENGINE_ROOT>/profiles/uci_time_profile_v3.json",
@@ -18,6 +20,11 @@
       "McgsTemporalWeightProfile": "EarlyCurrent",
       "OwnBook": true
     }
+  },
+  "qualification": {
+    "complete_game_entrypoint": "<UCI_ARENA_EVIDENCE_RUNTIME_ROOT>/arena/run_complete_game_matrix.mjs",
+    "referee": "<UCI_ARENA_EVIDENCE_RUNTIME_ROOT>/bin/uci_arena_complete_game_referee.exe",
+    "stockfish": "<STOCKFISH_ROOT>/bin/stockfish.exe"
   },
   "timing": {
     "opponent_turn_search": true,

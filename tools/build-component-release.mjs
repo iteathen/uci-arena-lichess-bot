@@ -18,6 +18,8 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
 
+import { readAndValidateNativeToolchainReceipt } from "./native-toolchain-receipt.mjs";
+
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const forbiddenParts = new Set([".git", "secrets", "runtime_state", "node_modules", "dist"]);
 
@@ -50,6 +52,20 @@ function safeRelative(value) {
     throw new Error(`unsafe component path: ${value}`);
   }
   return normalized;
+}
+
+export function safeWorkspaceRelative(value) {
+  if (value === ".") return value;
+  return safeRelative(value);
+}
+
+function isSafeWorkspaceRelative(value) {
+  try {
+    safeWorkspaceRelative(value);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function listFiles(directory, relative = "") {
@@ -210,8 +226,53 @@ function installerManifest(componentContract, version, target, staging) {
   }
   const entrypoints = Object.fromEntries(Object.entries(installation.entrypoints ?? {})
     .map(([name, relative]) => [name, safeRelative(relative)]));
-  if (!entrypoints.cli || !entrypoints.adapter || !entrypoints.startup) {
+  if (!entrypoints.cli || !entrypoints.adapter || !entrypoints.startup
+      || !entrypoints.installer_integration) {
     throw new Error("component contract is missing required Installer entrypoints");
+  }
+  const dependencies = stringArray(installation.dependencies, "installation.dependencies");
+  const installerIntegration = structuredClone(installation.installer_integration);
+  const startupControl = installerIntegration?.startup_control;
+  if (installerIntegration?.schema !== "arena_provider_installer_integration_v1"
+      || installerIntegration.schema_version !== 1
+      || installerIntegration.entrypoint !== "installer_integration"
+      || JSON.stringify(installerIntegration.arguments) !== JSON.stringify(["--context"])
+      || installerIntegration.workspace_name !== installation.workspace_name
+      || installerIntegration.configure_when_disabled !== true
+      || installerIntegration.invocation?.kind !== "dependency_runtime"
+      || !dependencies.includes(installerIntegration.invocation.runtime_component_id)
+      || !/^[A-Za-z0-9._-]+$/u.test(
+        installerIntegration.invocation.runtime_entrypoint ?? "",
+      )
+      || !Array.isArray(installerIntegration.dependency_bindings)
+      || !Array.isArray(installerIntegration.locator_bindings)
+      || startupControl?.schema !== "arena_provider_startup_control_v1"
+      || startupControl.schema_version !== 1
+      || startupControl.entrypoint !== "startup"
+      || !Object.hasOwn(entrypoints, startupControl.entrypoint)
+      || JSON.stringify(startupControl.actions?.install) !== JSON.stringify(["startup", "install"])
+      || JSON.stringify(startupControl.actions?.uninstall) !== JSON.stringify(["startup", "uninstall"])
+      || startupControl.workspace_argument?.flag !== "--runtime-dir"
+      || !isSafeWorkspaceRelative(startupControl.workspace_argument?.relative_path)
+      || startupControl.configuration_argument !== "--config"
+      || startupControl.result?.envelope !== "startup"
+      || startupControl.result?.require_configuration_match_on_install !== false
+      || startupControl.result?.require_live_on_install !== false) {
+    throw new Error("component installer-integration contract is invalid");
+  }
+  const acceptedLocatorSources = new Set(["saved_locator", "install_receipt"]);
+  for (const binding of installerIntegration.locator_bindings) {
+    const sources = binding?.accepted_sources;
+    if (typeof binding?.name !== "string"
+        || typeof binding?.kind !== "string"
+        || typeof binding?.required !== "boolean"
+        || !Array.isArray(sources)
+        || sources.length === 0
+        || sources.length > acceptedLocatorSources.size
+        || new Set(sources).size !== sources.length
+        || sources.some((source) => !acceptedLocatorSources.has(source))) {
+      throw new Error("component locator authority-source contract is invalid");
+    }
   }
   const contractManifest = safeRelative(installation.contract_manifest);
   const configurationTemplate = safeRelative(installation.configuration_template);
@@ -236,7 +297,8 @@ function installerManifest(componentContract, version, target, staging) {
     entrypoints,
     contract_manifest: contractManifest,
     capabilities: stringArray(installation.capabilities, "installation.capabilities"),
-    dependencies: stringArray(installation.dependencies, "installation.dependencies"),
+    dependencies,
+    installer_integration: installerIntegration,
     startup: installation.startup,
     data_paths: stringArray(installation.data_paths, "installation.data_paths"),
     workspace_name: installation.workspace_name,
@@ -273,6 +335,25 @@ function build(args) {
       || receipt.source_tree_sha256 !== identity.tree_sha256
       || receipt.passed !== true) {
     throw new Error("test receipt does not authorize this exact component source and target");
+  }
+  const workflowIdentity = args["workflow-identity"] ?? "local-development";
+  const nativeToolchainRequired = definition.native_toolchain_by_target?.[target] !== undefined;
+  let nativeToolchainEvidence;
+  let nativeReceiptPath;
+  if (nativeToolchainRequired) {
+    if (!args["native-toolchain-receipt"]) {
+      throw new Error("native provider components require an exact toolchain receipt");
+    }
+    nativeReceiptPath = path.resolve(args["native-toolchain-receipt"]);
+    nativeToolchainEvidence = readAndValidateNativeToolchainReceipt({
+      filename: nativeReceiptPath,
+      definition,
+      target,
+      sourceCommit: identity.commit,
+      workflowIdentity,
+    });
+  } else if (args["native-toolchain-receipt"]) {
+    throw new Error("non-native provider component received a native toolchain receipt");
   }
   const output = path.resolve(args["output-dir"] ?? path.join(root, "dist"));
   if (output === root || !output.startsWith(`${root}${path.sep}`)) {
@@ -329,6 +410,9 @@ function build(args) {
   mkdirSync(releaseDirectory, { recursive: true });
   copyFileSync(definitionPath, path.join(releaseDirectory, "component-definition.json"));
   copyFileSync(receiptPath, path.join(releaseDirectory, "test-receipt.json"));
+  if (nativeReceiptPath) {
+    copyFileSync(nativeReceiptPath, path.join(releaseDirectory, "native-toolchain-receipt.json"));
+  }
   const lock = JSON.parse(readFileSync(path.join(staging, "package-lock.json"), "utf8"));
   const epoch = Number(args["source-date-epoch"] ?? git(["show", "-s", "--format=%ct", "HEAD"]));
   if (!Number.isSafeInteger(epoch) || epoch <= 0) throw new Error("invalid source-date-epoch");
@@ -344,7 +428,10 @@ function build(args) {
     definition_sha256: sha256File(definitionPath),
     product_component_manifest_sha256: sha256File(componentContractPath),
     test_receipt_sha256: sha256File(receiptPath),
-    workflow_identity: args["workflow-identity"] ?? "local-development",
+    ...(nativeToolchainEvidence
+      ? { native_toolchain_receipt_sha256: nativeToolchainEvidence.sha256 }
+      : {}),
+    workflow_identity: workflowIdentity,
   };
   writeFileSync(path.join(releaseDirectory, "provenance.json"), `${JSON.stringify(provenance, null, 2)}\n`);
   const checksums = Object.fromEntries(listFiles(staging)
@@ -382,11 +469,15 @@ function build(args) {
     clean_tree: identity.clean,
     release_authority: "provider_component_only",
     suite_installer_authority: "iteathen/uci-arena-installer",
-    workflow_identity: args["workflow-identity"] ?? "local-development",
+    workflow_identity: workflowIdentity,
     toolchain_identity: {
       node: process.version,
       platform: process.platform,
       architecture: process.arch,
+      ...(nativeToolchainEvidence ? {
+        native_receipt_sha256: nativeToolchainEvidence.sha256,
+        native_builds: nativeToolchainEvidence.receipt.builds,
+      } : {}),
     },
     dependency_lock_identities: {
       package_lock_sha256: sha256File(path.join(staging, "package-lock.json")),
@@ -407,9 +498,11 @@ function build(args) {
   process.stdout.write(`${JSON.stringify({ artifact, result: resultPath, ...result })}\n`);
 }
 
-try {
-  build(parseArguments(process.argv.slice(2)));
-} catch (error) {
-  process.stderr.write(`component release failed: ${error.message}\n`);
-  process.exitCode = 1;
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  try {
+    build(parseArguments(process.argv.slice(2)));
+  } catch (error) {
+    process.stderr.write(`component release failed: ${error.message}\n`);
+    process.exitCode = 1;
+  }
 }

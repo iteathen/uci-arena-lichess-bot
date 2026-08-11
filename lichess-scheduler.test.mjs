@@ -31,7 +31,7 @@ test("hard audience pools reserve one human slot while bot capacity is occupied"
   assert.equal(pool.acquire("human", { opponent: "public" }), null);
   assert.equal(pool.snapshot().byAudience.bot.preparing, 1);
   assert.equal(pool.snapshot().byAudience.human.preparing, 1);
-  await pool.release(bot);
+  await pool.release(bot, bot.generation);
   assert.ok(pool.acquire("bot", { opponent: "bot-two" }));
 });
 
@@ -65,10 +65,10 @@ test("concurrent releases keep a slot draining until its engine closes", async (
       closes += 1;
       await closeGate;
     },
-  });
-  const firstRelease = pool.release(slot);
+  }, slot.generation);
+  const firstRelease = pool.release(slot, slot.generation);
   assert.equal(slot.state, "draining");
-  assert.equal(await pool.release(slot), false);
+  assert.equal(await pool.release(slot, slot.generation), false);
   assert.equal(slot.state, "draining");
   assert.equal(pool.acquireStarted("bot", { opponent: "next" }), null);
   finishClose();
@@ -78,12 +78,30 @@ test("concurrent releases keep a slot draining until its engine closes", async (
   assert.ok(pool.acquire("bot", { opponent: "next" }));
 });
 
+test("slot transitions require captured generations and stale releases cannot affect reuse", async () => {
+  const pool = new SlotPool(capacity({ humans: 0, bots: 1 }));
+  const first = pool.acquire("bot", { opponent: "first" });
+  const firstGeneration = first.generation;
+  assert.throws(
+    () => pool.attachEngine(first, { close: async () => {} }),
+    /captured generation/,
+  );
+  pool.attachEngine(first, { close: async () => {} }, firstGeneration);
+  await pool.release(first, firstGeneration);
+  const second = pool.acquire("bot", { opponent: "second" });
+  assert.equal(second, first);
+  assert.notEqual(second.generation, firstGeneration);
+  assert.equal(await pool.release(second, firstGeneration), false);
+  assert.equal(second.state, "preparing");
+  await pool.release(second, second.generation);
+});
+
 test("pending lookup is deterministic by challenge id then opponent", () => {
   const pool = new SlotPool(capacity({ humans: 0, bots: 2 }));
   const first = pool.acquire("bot", { opponent: "one", createdAt: 1 });
   const second = pool.acquire("bot", { opponent: "two", createdAt: 2 });
-  pool.pending(first, "challenge-one");
-  pool.pending(second, "challenge-two");
+  pool.pending(first, "challenge-one", first.generation);
+  pool.pending(second, "challenge-two", second.generation);
   assert.equal(pool.findPending({ gameId: "challenge-two" }), second);
   assert.equal(pool.findPending({ gameId: "new-id", opponent: { username: "one" } }), first);
 });

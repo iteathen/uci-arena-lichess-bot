@@ -30,6 +30,8 @@ function options() {
 }
 
 test("startup task is hidden, supervised, and invokes the foreground adapter through a GUI launcher", () => {
+  assert.match(NATIVE_LAUNCHER.replaceAll("\\", "/"), /\/native\/lichess_adapter_launcher\.exe$/);
+  assert.doesNotMatch(NATIVE_LAUNCHER.replaceAll("\\", "/"), /\/build\//);
   const action = startupAction(options());
   assert.equal(action.command, path.resolve(NATIVE_LAUNCHER));
   assert.match(action.arguments, /lichess-adapter\.mjs run/);

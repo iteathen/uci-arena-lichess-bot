@@ -1,11 +1,15 @@
 #!/usr/bin/env node
 
-import { spawn } from "node:child_process";
-import { createInterface } from "node:readline";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { DEFAULT_TEMPLATE, ROOT, loadRuntimeConfig } from "./lichess-adapter.mjs";
+import {
+  DEFAULT_TEMPLATE,
+  ROOT,
+  UciEngine,
+  applySingleGameProfile,
+  loadRuntimeConfig,
+} from "./lichess-adapter.mjs";
 
 function parseArguments(argv) {
   const options = { template: DEFAULT_TEMPLATE, engineRoot: ROOT, depth: 1, timeoutMs: 30000 };
@@ -22,90 +26,32 @@ function parseArguments(argv) {
   return options;
 }
 
-async function readUntil(iterator, predicate, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  const lines = [];
-  while (Date.now() < deadline) {
-    const remaining = deadline - Date.now();
-    let timer;
-    const next = await Promise.race([
-      iterator.next(),
-      new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error("UCI smoke timed out")), remaining);
-      }),
-    ]).finally(() => clearTimeout(timer));
-    if (next.done) throw new Error("UCI engine exited before expected response");
-    lines.push(next.value);
-    if (predicate(next.value)) return lines;
-  }
-  throw new Error("UCI smoke timed out");
-}
-
 export async function smoke(options) {
   const config = loadRuntimeConfig({
     templatePath: path.resolve(options.template),
     engineRoot: options.engineRoot,
   });
-  const executable = config.engine.executable;
-  const child = spawn(executable, [], {
-    cwd: config.engine.working_directory,
-    stdio: ["pipe", "pipe", "pipe"],
-    windowsHide: true,
-  });
-  const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
-  const iterator = lines[Symbol.asyncIterator]();
-  const send = (text) => child.stdin.write(`${text}\n`);
+  const extended = config.engine.adapter !== "standard_uci_v1";
+  if (extended) applySingleGameProfile(config);
+  const engine = new UciEngine(config.engine);
   try {
-    send("uci");
-    const uciLines = await readUntil(iterator, (line) => line === "uciok", options.timeoutMs);
-    const advertised = new Set(
-      uciLines.filter((line) => line.startsWith("option name ") && line.includes(" type "))
-        .map((line) => line.slice("option name ".length).split(" type ", 1)[0]),
-    );
-    const unknown = Object.keys(config.engine.uci_options).filter((name) => !advertised.has(name));
-    if (unknown.length) throw new Error(`Template lists unadvertised UCI options: ${unknown.join(", ")}`);
-    for (const [name, value] of Object.entries(config.engine.uci_options)) {
-      send(`setoption name ${name} value ${String(value)}`);
-    }
-    send("isready");
-    await readUntil(iterator, (line) => line === "readyok", options.timeoutMs);
-    send("runtime_status");
-    const runtimeStatusPrefix = "info string runtime_status_v1 ";
-    const runtimeStatusLines = await readUntil(
-      iterator,
-      (line) => line.startsWith(runtimeStatusPrefix),
-      options.timeoutMs,
-    );
-    const runtimeStatusLine = runtimeStatusLines.at(-1);
-    const runtimeStatus = JSON.parse(
-      runtimeStatusLine.slice(runtimeStatusPrefix.length),
-    );
-    if (Object.hasOwn(config.engine.uci_options, "BookFile")
-        && runtimeStatus.opening_book_active !== true) {
+    await engine.start();
+    if (extended && engine.timeProfileStatus?.accepted !== true) {
       throw new Error(
-        `Configured opening book is not active: ${runtimeStatus.opening_book_message ?? "unknown"}`,
+        `UCI Arena extended smoke rejected its timing profile: ${engine.timeProfileStatus?.reason ?? "unknown reason"}`,
       );
     }
-    if (Object.hasOwn(config.engine.uci_options, "SyzygyPath")
-        && runtimeStatus.syzygy_active !== true) {
-      throw new Error(
-        `Configured Syzygy tablebases are not active: ${runtimeStatus.syzygy_message ?? "unknown"}`,
-      );
-    }
-    send("ucinewgame");
-    send("position startpos");
-    send(`go depth ${options.depth}`);
-    const bestmoveLines = await readUntil(iterator, (line) => line.startsWith("bestmove "), options.timeoutMs);
-    const bestmove = bestmoveLines.at(-1).split(/\s+/)[1];
-    if (!bestmove || bestmove === "0000") throw new Error("Engine returned no usable bestmove");
+    const probe = await engine.fixedDepthProbe(options.depth, options.timeoutMs);
+    const runtimeStatus = engine.qualificationStatus?.live_runtime_status ?? {};
     return {
       schema: "uci_arena_lichess_adapter_smoke_v3",
-      engine: executable,
+      engine: config.engine.executable,
+      engine_adapter: config.engine.adapter,
       working_directory: config.engine.working_directory,
       depth: options.depth,
-      bestmove,
-      advertised_option_count: advertised.size,
-      applied_uci_options: Object.keys(config.engine.uci_options).sort(),
+      bestmove: probe.bestmove,
+      advertised_option_count: engine.advertisedOptions.size,
+      applied_uci_options: Object.keys(engine.appliedUciOptions).sort(),
       opening_book_active: runtimeStatus.opening_book_active === true,
       opening_book_entries: Number(runtimeStatus.opening_book_entries ?? 0),
       syzygy_active: runtimeStatus.syzygy_active === true,
@@ -114,8 +60,7 @@ export async function smoke(options) {
       ),
     };
   } finally {
-    send("quit");
-    child.kill();
+    await engine.close();
   }
 }
 

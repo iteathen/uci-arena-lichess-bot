@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
+  existsSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -10,6 +11,11 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import {
+  sha256Object,
+  TIME_POLICY_VERSION,
+} from "@uci-arena/time-profile-contract";
+
 import { loadSingleGameProfile } from "./lichess-adapter.mjs";
 import { publishSingleGameProfile } from "./publish-single-game-profile.mjs";
 
@@ -17,12 +23,12 @@ function sha256(value) {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
 }
 
-function fixture() {
+function fixture(searchCore = "v2") {
   const root = mkdtempSync(path.join(os.tmpdir(), "uci-single-game-profile-"));
   const engine = path.join(root, "uci_arena_engine.exe");
   const modelRoot = path.join(root, "models", "default");
   const output = path.join(root, "qualification", "profile.json");
-  const diagnosticPath = path.join(root, "diagnostic.json");
+  const timeProfilePath = path.join(root, "time-profile.json");
   const completeGamePath = path.join(root, "complete-game.json");
   mkdirSync(modelRoot, { recursive: true });
   writeFileSync(engine, "exact-engine");
@@ -32,6 +38,7 @@ function fixture() {
   }));
   const engineSha = sha256("exact-engine");
   const identity = {
+    time_policy_version: TIME_POLICY_VERSION,
     engine: { executable_sha256: engineSha },
     model: {
       model_id: "model-a",
@@ -44,9 +51,9 @@ function fixture() {
       onnx_runtime_version: "1.2.3",
     },
     search: {
-      search_core: "v2",
-      threads: 6,
-      root_workers: 6,
+      search_core: searchCore,
+      threads: searchCore === "mcgs" ? 3 : 6,
+      root_workers: searchCore === "mcgs" ? 1 : 6,
       split_depth: 2,
       batch_size_configured: 64,
       batch_size_effective: 64,
@@ -58,32 +65,105 @@ function fixture() {
       nn_speculation: false,
     },
   };
-  writeFileSync(diagnosticPath, JSON.stringify({
-    schema: "uci_time_profile_attempt_v3",
-    phase: "diagnostic",
-    outcome: "accepted_for_calibration",
+  if (searchCore === "mcgs") {
+    identity.search.mcgs = {
+      time_policy: "RelativeClockTemporalV1",
+      search_graph_mb: 64,
+      cpuct_permille: 1500,
+      outstanding_batches: 2,
+      book_prior_blend_permille: 0,
+    };
+  }
+  const timeProfile = {
+    schema: "uci_time_profile_v3",
+    qualified: true,
     identity,
+    identity_sha256: sha256Object(identity),
+    qualification: { repetitions_per_case: 30 },
+    applicability: {
+      move_overhead_ms: {
+        minimum: 250,
+        maximum: 1500,
+        tested_values: [250, 650, 700, 1500],
+      },
+    },
+    predictive_controller: {
+      default_enabled: false,
+      enabled_by_profile: false,
+    },
+    calibration: {
+      provider_batch_reserve_us: 2000,
+      backup_emit_reserve_us: 1000,
+      iteration_forecast_scale_permille: 1000,
+    },
     gates: {
       legal_moves: true,
-      provider_activity_positive: true,
-      provider_safety_passed: true,
+      nonterminal_null_moves: true,
+      controller_disabled: true,
+      provider_timing_captured: true,
+      provider_service_reserve_valid: true,
+      applied_provider_service_reserve_covered: true,
+      applied_backup_emit_reserve_covered: true,
       p99_deadline_overshoot_passed: true,
       maximum_deadline_overshoot_passed: true,
       passed: true,
     },
-  }));
+  };
+  if (searchCore === "mcgs") {
+    for (const gate of [
+      "mcgs_root_coverage_passed",
+      "mcgs_policy_only_fallback_passed",
+      "mcgs_graph_population_passed",
+      "mcgs_async_overlap_passed",
+      "mcgs_single_owner_passed",
+      "mcgs_low_budget_fallback_passed",
+      "mcgs_deterministic_fallback_passed",
+      "mcgs_completion_integrity_passed",
+      "mcgs_temporal_policy_passed",
+      "mcgs_deadline_tail_telemetry_passed",
+    ]) timeProfile.gates[gate] = true;
+  }
+  writeFileSync(timeProfilePath, JSON.stringify(timeProfile));
+  const timeProfileSha = sha256(readFileSync(timeProfilePath));
   writeFileSync(completeGamePath, JSON.stringify({
     schema: "uci_arena_complete_game_matrix_v3",
     completed: true,
-    config: { executable_sha256: { model_engine: engineSha.slice("sha256:".length) } },
+    config: {
+      executable_sha256: { model_engine: engineSha.slice("sha256:".length) },
+      timing_profile: {
+        profile_schema: timeProfile.schema,
+        profile_sha256: timeProfileSha,
+        identity_sha256: timeProfile.identity_sha256,
+      },
+    },
     runtime_contract: {
+      timing_profile: {
+        schema: "uci_arena_complete_game_time_profile_v1",
+        profile_schema: timeProfile.schema,
+        profile_sha256: timeProfileSha,
+        identity_sha256: timeProfile.identity_sha256,
+        accepted: true,
+        applied: true,
+        timing_authority_match: true,
+        provider_service_reserve_us: 2000,
+        backup_emit_reserve_us: 1000,
+        iteration_forecast_scale_permille: 1000,
+        predictive_controller_enabled: false,
+        engine_provenance: { exact: true },
+      },
       expected_parallel_topology: {
-        search_core: "v2",
+        search_core: searchCore,
         provider: "directml",
-        threads: 6,
-        root_workers: 6,
+        threads: searchCore === "mcgs" ? 3 : 6,
+        root_workers: searchCore === "mcgs" ? 1 : 6,
         split_depth: 2,
         batch_size: 64,
+        ...(searchCore === "mcgs" ? {
+          search_graph_mb: 64,
+          mcgs_cpuct_permille: 1500,
+          mcgs_outstanding_batches: 2,
+          mcgs_book_prior_blend_permille: 0,
+        } : {}),
       },
       activation_probe: {
         runtime: {
@@ -94,10 +174,31 @@ function fixture() {
           provider_numeric_fingerprint: "456",
           hardware_driver_fingerprint: "789",
           onnx_runtime_version: "1.2.3",
-          actual_active_workers: 6,
-          v2_cursor_admissions: 4,
-          v2_cursor_async_pending: 2,
-          v2_cursor_ready_resumes: 2,
+          actual_active_workers: searchCore === "mcgs" ? 3 : 6,
+          ...(searchCore === "mcgs" ? {
+            search_graph_mb_configured: 64,
+            mcgs_cpuct_permille_configured: 1500,
+            mcgs_outstanding_batches_configured: 2,
+            mcgs_book_prior_blend_permille_configured: 0,
+            mcgs_time_policy_configured: "RelativeClockTemporalV1",
+            mcgs_graph_nodes: 64,
+            mcgs_graph_edges: 128,
+            mcgs_completed_simulations: 96,
+            mcgs_async_admissions: 32,
+            mcgs_outstanding_peak: 2,
+            mcgs_root_legal_moves: 20,
+            mcgs_root_seeded_moves: 20,
+            mcgs_stale_backups_discarded: 0,
+            mcgs_reservation_leaks: 0,
+            mcgs_provider_admission_denials: 0,
+            mcgs_cache_completions_after_admission_close: 0,
+            mcgs_nonprovider_backups_after_admission_close: 0,
+            mcgs_neural_admission_closed: false,
+          } : {
+            v2_cursor_admissions: 4,
+            v2_cursor_async_pending: 2,
+            v2_cursor_ready_resumes: 2,
+          }),
           provider_batches_delta: 3,
           provider_rows_delta: 8,
           stale_publications_delta: 0,
@@ -119,12 +220,90 @@ function fixture() {
   return {
     engine,
     model_root: modelRoot,
-    diagnostic_evidence: diagnosticPath,
+    time_profile: timeProfilePath,
     complete_game_evidence: completeGamePath,
     output,
     probe_depth: 6,
     probe_timeout_ms: 240_000,
   };
+}
+
+function rebindCompleteGameTimingProfile(options, engineProvenanceExact = true) {
+  const timeProfile = JSON.parse(readFileSync(options.time_profile, "utf8"));
+  const timeProfileSha = sha256(readFileSync(options.time_profile));
+  const completeGame = JSON.parse(readFileSync(options.complete_game_evidence, "utf8"));
+  Object.assign(completeGame.config.timing_profile, {
+    profile_schema: timeProfile.schema,
+    profile_sha256: timeProfileSha,
+    identity_sha256: timeProfile.identity_sha256,
+  });
+  Object.assign(completeGame.runtime_contract.timing_profile, {
+    profile_schema: timeProfile.schema,
+    profile_sha256: timeProfileSha,
+    identity_sha256: timeProfile.identity_sha256,
+    provider_service_reserve_us: timeProfile.calibration.provider_batch_reserve_us,
+    backup_emit_reserve_us: timeProfile.calibration.backup_emit_reserve_us,
+    iteration_forecast_scale_permille:
+      timeProfile.calibration.iteration_forecast_scale_permille,
+    engine_provenance: { exact: engineProvenanceExact },
+  });
+  writeFileSync(options.complete_game_evidence, JSON.stringify(completeGame));
+}
+
+function attachTablebase(options) {
+  const tablebasePath = path.join(path.dirname(options.complete_game_evidence), "syzygy");
+  mkdirSync(tablebasePath);
+  const wdl = Buffer.from("qualified-wdl");
+  const dtz = Buffer.from("qualified-dtz");
+  writeFileSync(path.join(tablebasePath, "KQvK.rtbw"), wdl);
+  writeFileSync(path.join(tablebasePath, "KQvK.rtbz"), dtz);
+  const manifest = {
+    schema: "uci_arena_syzygy_manifest_v1",
+    identity_sha256: `sha256:${"c".repeat(64)}`,
+    cardinality: 3,
+    files: [
+      {
+        name: "KQvK.rtbw",
+        directory: "3-wdl",
+        bytes: wdl.length,
+        sha256: sha256(wdl).slice("sha256:".length),
+      },
+      {
+        name: "KQvK.rtbz",
+        directory: "3-dtz",
+        bytes: dtz.length,
+        sha256: sha256(dtz).slice("sha256:".length),
+      },
+    ],
+  };
+  const manifestPath = path.join(tablebasePath, "syzygy_manifest_v1.json");
+  writeFileSync(manifestPath, JSON.stringify(manifest));
+  const tablebase = {
+    path: tablebasePath,
+    manifest: manifestPath,
+    manifest_identity: manifest.identity_sha256,
+    manifest_file_sha256: sha256(readFileSync(manifestPath)),
+    loaded_cardinality: 3,
+    probe_limit: 3,
+    probe_threads: 2,
+    rule50: true,
+    root_probe: true,
+    internal_probe: true,
+  };
+  const completeGame = JSON.parse(readFileSync(options.complete_game_evidence, "utf8"));
+  completeGame.runtime_contract.expected_parallel_topology.tablebase = tablebase;
+  Object.assign(completeGame.runtime_contract.activation_probe.runtime, {
+    syzygy_active: true,
+    syzygy_loaded_cardinality: 3,
+    syzygy_manifest_identity: manifest.identity_sha256,
+    syzygy_probe_limit: 3,
+    syzygy_probe_threads: 2,
+    syzygy_rule50: true,
+    syzygy_root_probe: true,
+    syzygy_internal_probe: true,
+  });
+  writeFileSync(options.complete_game_evidence, JSON.stringify(completeGame));
+  return tablebase;
 }
 
 test("publishes a self-contained exact local-live-safety profile", () => {
@@ -138,9 +317,16 @@ test("publishes a self-contained exact local-live-safety profile", () => {
   assert.equal(result.qualification_scope, "local_live_safety");
   const loaded = loadSingleGameProfile(options.output);
   assert.equal(loaded.model_id, "model-a");
+  const completeGameArtifact = JSON.parse(
+    readFileSync(options.output, "utf8"),
+  ).evidence.complete_game.artifact;
+  assert.match(
+    completeGameArtifact,
+    /^evidence\/[0-9a-f]{64}-[0-9a-f]{64}\/complete-game\.json$/,
+  );
   assert.equal(
-    JSON.parse(readFileSync(options.output, "utf8")).evidence.complete_game.artifact,
-    "evidence/complete-game.json",
+    existsSync(path.resolve(path.dirname(options.output), completeGameArtifact)),
+    true,
   );
 });
 
@@ -153,4 +339,151 @@ test("does not promote shared-resource evidence to release authority", () => {
     }),
     /resource-isolated/,
   );
+});
+
+test("rejects complete-game evidence that omitted timing-profile application", () => {
+  const options = fixture("mcgs");
+  const completeGame = JSON.parse(readFileSync(options.complete_game_evidence, "utf8"));
+  delete completeGame.runtime_contract.timing_profile;
+  writeFileSync(options.complete_game_evidence, JSON.stringify(completeGame));
+  assert.throws(
+    () => publishSingleGameProfile({
+      ...options,
+      qualification_scope: "local_live_safety",
+    }),
+    /timing-profile application evidence is missing/,
+  );
+});
+
+test("publishes MCGS profile fields from search-core-specific evidence", () => {
+  const options = fixture("mcgs");
+  const result = publishSingleGameProfile({
+    ...options,
+    qualification_scope: "local_live_safety",
+  });
+  assert.equal(result.search_core, "mcgs");
+  assert.equal(result.threads, 3);
+  assert.equal(result.search_graph_mb, 64);
+  assert.equal(result.mcgs_cpuct_permille, 1500);
+  assert.equal(result.mcgs_outstanding_batches, 2);
+  assert.equal(result.mcgs_book_prior_blend_permille, 0);
+  assert.equal(loadSingleGameProfile(options.output).search_core, "mcgs");
+});
+
+test("retains timing authority across provenance-only engine rebuilds", () => {
+  const options = fixture("mcgs");
+  const timeProfile = JSON.parse(readFileSync(options.time_profile, "utf8"));
+  timeProfile.identity.engine.executable_sha256 = `sha256:${"f".repeat(64)}`;
+  timeProfile.identity_sha256 = sha256Object(timeProfile.identity);
+  writeFileSync(options.time_profile, JSON.stringify(timeProfile));
+  rebindCompleteGameTimingProfile(options, false);
+
+  const result = publishSingleGameProfile({
+    ...options,
+    qualification_scope: "local_live_safety",
+  });
+  assert.equal(result.qualified, true);
+  assert.equal(result.engine_build_fingerprint, sha256("exact-engine"));
+});
+
+test("publishes and reloads the exact tablebase contract from complete-game evidence", () => {
+  const options = fixture("mcgs");
+  const tablebase = attachTablebase(options);
+  const result = publishSingleGameProfile({
+    ...options,
+    qualification_scope: "local_live_safety",
+  });
+  assert.deepEqual(result.tablebase, tablebase);
+  assert.deepEqual(loadSingleGameProfile(options.output).tablebase, tablebase);
+});
+
+test("rejects tablebase runtime identity drift without replacing prior authority", () => {
+  const options = fixture("mcgs");
+  attachTablebase(options);
+  mkdirSync(path.dirname(options.output), { recursive: true });
+  writeFileSync(options.output, "prior-authority\n");
+  const completeGame = JSON.parse(readFileSync(options.complete_game_evidence, "utf8"));
+  completeGame.runtime_contract.activation_probe.runtime.syzygy_rule50 = false;
+  writeFileSync(options.complete_game_evidence, JSON.stringify(completeGame));
+  assert.throws(
+    () => publishSingleGameProfile({
+      ...options,
+      qualification_scope: "local_live_safety",
+    }),
+    /Syzygy rule-50 policy mismatch/,
+  );
+  assert.equal(readFileSync(options.output, "utf8"), "prior-authority\n");
+});
+
+test("rejects V2 cursor evidence presented as MCGS authority", () => {
+  const options = fixture("mcgs");
+  const completeGame = JSON.parse(readFileSync(options.complete_game_evidence, "utf8"));
+  delete completeGame.runtime_contract.activation_probe.runtime.mcgs_async_admissions;
+  Object.assign(completeGame.runtime_contract.activation_probe.runtime, {
+    v2_cursor_admissions: 4,
+    v2_cursor_async_pending: 2,
+    v2_cursor_ready_resumes: 2,
+  });
+  writeFileSync(options.complete_game_evidence, JSON.stringify(completeGame));
+  assert.throws(
+    () => publishSingleGameProfile({
+      ...options,
+      qualification_scope: "local_live_safety",
+    }),
+    /MCGS asynchronous admissions/,
+  );
+});
+
+test("rejects an intermediate timing attempt without replacing prior authority", () => {
+  const options = fixture("mcgs");
+  mkdirSync(path.dirname(options.output), { recursive: true });
+  writeFileSync(options.output, "prior-authoritative-profile\n");
+  writeFileSync(options.time_profile, JSON.stringify({
+    schema: "uci_time_profile_attempt_v3",
+    phase: "diagnostic",
+    outcome: "accepted_for_calibration",
+  }));
+  assert.throws(
+    () => publishSingleGameProfile({
+      ...options,
+      qualification_scope: "local_live_safety",
+    }),
+    /profile schema|uci_time_profile_v3/i,
+  );
+  assert.equal(readFileSync(options.output, "utf8"), "prior-authoritative-profile\n");
+  assert.equal(existsSync(path.join(path.dirname(options.output), "evidence")), false);
+});
+
+test("rejects a smoke-sized timing profile without replacing prior authority", () => {
+  const options = fixture("mcgs");
+  mkdirSync(path.dirname(options.output), { recursive: true });
+  writeFileSync(options.output, "prior-authoritative-profile\n");
+  const timeProfile = JSON.parse(readFileSync(options.time_profile, "utf8"));
+  timeProfile.qualification.repetitions_per_case = 2;
+  writeFileSync(options.time_profile, JSON.stringify(timeProfile));
+  assert.throws(
+    () => publishSingleGameProfile({
+      ...options,
+      qualification_scope: "local_live_safety",
+    }),
+    /repetitions per case/,
+  );
+  assert.equal(readFileSync(options.output, "utf8"), "prior-authoritative-profile\n");
+  assert.equal(existsSync(path.join(path.dirname(options.output), "evidence")), false);
+});
+
+test("rejected publication preserves the prior profile and creates no evidence", () => {
+  const options = fixture("mcgs");
+  mkdirSync(path.dirname(options.output), { recursive: true });
+  writeFileSync(options.output, "prior-authoritative-profile\n");
+  assert.throws(
+    () => publishSingleGameProfile({
+      ...options,
+      probe_depth: 1,
+      qualification_scope: "local_live_safety",
+    }),
+    /probe depth/,
+  );
+  assert.equal(readFileSync(options.output, "utf8"), "prior-authoritative-profile\n");
+  assert.equal(existsSync(path.join(path.dirname(options.output), "evidence")), false);
 });

@@ -13,6 +13,7 @@ import {
   engineCommandIdentity,
   loadTimeProfile,
   sha256Object,
+  timingProfilePermissions,
   timeProfileFallbackStatus,
   validateAppliedTimeProfileReserve,
   validateProfileRuntimeSnapshot,
@@ -28,6 +29,45 @@ test("profile validation fails closed before identity use", () => {
   assert.throws(
     () => validateStoredProfile({ schema: PROFILE_SCHEMA, qualified: false }),
     /not qualified/,
+  );
+});
+
+test("legacy v3 permission projection is derived only from the complete gate set", () => {
+  const baseGates = {
+    legal_moves: true,
+    nonterminal_null_moves: true,
+    controller_disabled: true,
+    provider_timing_captured: true,
+    provider_service_reserve_valid: true,
+    applied_provider_service_reserve_covered: true,
+    applied_backup_emit_reserve_covered: true,
+    p99_deadline_overshoot_passed: true,
+    maximum_deadline_overshoot_passed: true,
+    passed: true,
+  };
+  const profile = {
+    schema: PROFILE_SCHEMA,
+    qualified: true,
+    identity: { search: { search_core: "minimax" } },
+    gates: baseGates,
+  };
+  assert.deepEqual(timingProfilePermissions(profile), {
+    provider_safety_qualified: true,
+    forecast_shadow_qualified: true,
+    adaptive_play_qualified: false,
+  });
+  assert.equal(timingProfilePermissions({
+    ...profile,
+    permissions: { provider_safety_qualified: false },
+  }).provider_safety_qualified, false);
+  assert.equal(timingProfilePermissions({
+    ...profile,
+    gates: { ...baseGates, provider_timing_captured: false },
+    permissions: { provider_safety_qualified: true },
+  }).provider_safety_qualified, false);
+  assert.throws(
+    () => timingProfilePermissions({ ...profile, permissions: { provider_safety_qualified: 1 } }),
+    /must be boolean/,
   );
 });
 
@@ -59,6 +99,7 @@ test("consumer contract validates an exact relocated runtime without qualifier s
       extraEngineOptions: {},
     };
     const status = {
+      timing_contract_version: TIME_POLICY_VERSION,
       model_loaded: true,
       model_id: "latticeknight_fixture",
       model_fingerprint: "101",
@@ -128,6 +169,51 @@ test("consumer contract validates an exact relocated runtime without qualifier s
       configuration,
     });
     assert.deepEqual(accepted.uci_options.map(({ value }) => value), [12_000, 2_000, 1_500]);
+    assert.equal(accepted.engine_provenance.exact, true);
+
+    writeFileSync(executable, "engine-contract-fixture-unrelated-rebuild", "utf8");
+    const provenanceDrift = validateProfileRuntimeSnapshot({
+      profile: loaded,
+      status,
+      executable,
+      cwd: directory,
+      uciIdLines,
+      uciOptionLines: [...uciOptionLines, "option name BookStatsFile type string default book.stats"],
+      configuration,
+    });
+    assert.equal(provenanceDrift.timing_authority_match, true);
+    assert.equal(provenanceDrift.engine_provenance.exact, false);
+    assert.equal(provenanceDrift.engine_provenance.executable_match, false);
+    assert.equal(provenanceDrift.engine_provenance.uci_option_contract_match, false);
+
+    const legacyV3Identity = structuredClone(identity);
+    delete legacyV3Identity.search_contract_fingerprint;
+    const legacyV3 = {
+      ...profile,
+      identity: legacyV3Identity,
+      identity_sha256: sha256Object(legacyV3Identity),
+    };
+    assert.equal(validateProfileRuntimeSnapshot({
+      profile: legacyV3,
+      status,
+      executable,
+      cwd: directory,
+      uciIdLines,
+      uciOptionLines,
+      configuration,
+    }).timing_authority_match, true);
+    assert.throws(
+      () => validateProfileRuntimeSnapshot({
+        profile: loaded,
+        status: { ...status, timing_contract_version: "changed-timing-contract" },
+        executable,
+        cwd: directory,
+        uciIdLines,
+        uciOptionLines,
+        configuration,
+      }),
+      /timing_contract_version/,
+    );
     const appliedStatus = {
       ...status,
       time_profile_provider_reserve_us: 12_000,
