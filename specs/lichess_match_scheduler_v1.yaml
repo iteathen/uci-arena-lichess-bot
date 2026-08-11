@@ -25,7 +25,7 @@ authority:
     - "The provider component manifest requires the neutral uci.engine.process capability. UCI Arena Engine is a compatible suite default chosen by product composition, not a hard provider dependency."
     - "The provider selects one explicit engine adapter at composition time. standard_uci_v1 accepts any conforming UCI process; uci_arena_extended_v1 adds UCI Arena runtime, timing, model, and evidence validation without weakening the neutral UCI boundary."
     - "One global event stream owns challenge/game lifecycle; each admitted game owns one independent qualified UCI child and game stream."
-    - "An active game is never aborted or preempted to free a slot."
+    - "An active game is never aborted or preempted merely to free a slot. The sole automatic-abort exception is a standard zero-ply game where this bot is Black and the configured first-move deadline expires while authoritative state still says White has not moved."
     - "Token contents never enter configuration, SQLite, logs, metadata, argv, or child environments."
     - "Every local installation supplies its own operator-owned token file outside the repository and immutable installed component roots. No release or test credential is bundled."
 
@@ -45,6 +45,7 @@ local_api_simulator:
     - POST /api/challenge/{challengeId}/cancel
     - POST /api/challenge/{username}
     - POST /api/bot/game/{gameId}/move/{move}
+    - POST /api/bot/game/{gameId}/abort
   rules:
     - "Automated HTTP adapter integration tests use the simulator instead of a real Lichess credential or public API; narrow unit tests may retain in-memory boundaries."
     - "At least one simulator test runs the complete adapter process, spawns a conforming UCI child, reconstructs an authoritative game stream, and observes the legal move POST at the HTTP boundary."
@@ -89,6 +90,7 @@ configuration:
     challenge_interval_seconds: 5
     reservation_retry_seconds: 30
     challenge_timeout_seconds: 25
+    first_move_timeout_seconds: 60
     max_games_per_opponent_per_day: 2
     timeout_cooldown_minutes: 30
     decline_cooldown_minutes: 360
@@ -193,7 +195,9 @@ slots:
     - "Every asynchronous slot transition and release is authorized by the generation captured when the slot was claimed; a stale callback can never mutate or release a later occupant."
     - "An outbound gameStart that races the challenge-create response adopts the already preparing opponent slot. The late create response may attach its challenge id but cannot move an active slot backward to pending or release its engine."
     - "A disconnected per-game stream reconnects and reconstructs position from authoritative gameFull/gameState moves without releasing its active slot."
-    - "Repeated per-game stream failures retain the active slot and qualified child while retrying with bounded backoff. A retry-count threshold never converts an unfinished remote game into a local terminal session; only authoritative terminal state or explicit whole-provider shutdown ends it."
+    - "Repeated per-game stream failures retain the active slot and qualified child while retrying with bounded backoff. A retry-count threshold never converts an unfinished remote game into a local terminal session; only authoritative terminal state, a successful provider-requested zero-ply abort, or explicit whole-provider shutdown ends it."
+    - "For a standard game where the bot is Black, the first authoritative started state with zero plies arms one first-move deadline. Reconnects do not extend that deadline; process recovery may start one fresh bounded deadline. Any authoritative move, terminal state, or provider shutdown cancels the pending request before dispatch."
+    - "At expiry the provider revalidates zero plies immediately before dispatch and invokes the Bot API abort operation. HTTP 200 is authoritative aborted completion; HTTP 400 is a terminal abort refusal left for stream reconciliation; 429, transport, and 5xx failures use bounded cooldown-aware retry without concurrent abort requests. The provider never invokes this watchdog after one move or while playing White."
 
 owner_control:
   storage: runtime_sqlite_only
@@ -500,6 +504,7 @@ opponent_turn_time_management_2026_07_20:
     - null_bestmove
   validation:
     - "Mock streams cover hits, misses, duplicates, reconnects, clock corrections, takebacks, terminal states, HTTP 400/429, generation changes, and queued-request invalidation with zero early or stale submissions."
+    - "First-move watchdog tests prove that a Black game still at zero plies aborts once after the configured deadline, while a White game, any observed first move, terminal state, shutdown, or queued-request race produces no abort."
     - "Independent legality tests cover illegal engine output, castling, en passant, promotion, pins, long incremental games, and unsupported initial positions."
     - "A completed ponder hit begins POST within 10 ms p95 after authoritative validation, excluding network transit."
     - "Foreground-preemption tests prove bounded stop/drain and no cross-game background interference."
@@ -535,7 +540,7 @@ api_rate_limit_safety_2026_07_21:
     - "One API safety coordinator is shared by authenticated identity probing, finite requests, global-stream handshakes, and per-game-stream handshakes."
     - "Finite exchanges retain the coordinator permit through response-body completion. Established long-lived streams release the handshake permit and remain open during cooldown."
     - "Exactly one global event stream and at most one game stream per game may be pending or established."
-    - "Priority order is move, game-stream reconnect, global-event reconnect, reconciliation/challenge control, challenge creation, then discovery. Priority never bypasses cooldown."
+    - "Priority order is move, game-stream reconnect, global-event reconnect, reconciliation/game/challenge control, challenge creation, then discovery. Priority never bypasses cooldown."
     - "Delayed move and challenge writes revalidate their authoritative generation and useful lifetime immediately before dispatch."
     - "A permanent API error may retain only a bounded sanitized Lichess
       response error/message string for operator diagnosis. Response headers,

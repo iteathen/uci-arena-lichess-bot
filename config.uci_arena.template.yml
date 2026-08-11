@@ -67,6 +67,7 @@
     "challenge_interval_seconds": 5,
     "reservation_retry_seconds": 30,
     "challenge_timeout_seconds": 25,
+    "first_move_timeout_seconds": 60,
     "max_games_per_opponent_per_day": 1,
     "timeout_cooldown_minutes": 30,
     "decline_cooldown_minutes": 360,

@@ -683,7 +683,7 @@ function mockStore() {
   };
 }
 
-function createGameSession(engine, client, config = gameConfig()) {
+function createGameSession(engine, client, config = gameConfig(), overrides = {}) {
   let sessions = [];
   const foregroundCoordinator = new ForegroundSearchCoordinator({
     sessions: () => sessions,
@@ -693,10 +693,12 @@ function createGameSession(engine, client, config = gameConfig()) {
     config,
     account: "arena-bot",
     gameId: "game-1",
-    signal: { aborted: false },
+    signal: overrides.signal ?? { aborted: false },
     slot: { id: "human-1", audience: "human", engine },
-    store: mockStore(),
+    store: overrides.store ?? mockStore(),
     foregroundCoordinator,
+    scheduleTimeout: overrides.scheduleTimeout,
+    cancelTimeout: overrides.cancelTimeout,
   });
   sessions = [session];
   return session;
@@ -2482,6 +2484,159 @@ test("black starts opponent-root work from gameFull and searches only after Whit
   assert.deepEqual(engine.searchCalls[0].moves, ["e2e4"]);
   assert.equal(posts.length, 1);
   assert.match(posts[0], /\/move\/e7e5$/);
+});
+
+test("black aborts one zero-ply game after the first-move deadline", async () => {
+  const posts = [];
+  const finishes = [];
+  let scheduled;
+  const client = {
+    post: async (endpoint, _form, _signal, _priority, beforeDispatch) => {
+      beforeDispatch?.();
+      posts.push(endpoint);
+    },
+  };
+  const engine = new MockGameEngine([]);
+  const config = gameConfig();
+  config.scheduler = { first_move_timeout_seconds: 60 };
+  const session = createGameSession(engine, client, config, {
+    store: { beginGame() {}, finishGame: (game) => finishes.push(game) },
+    scheduleTimeout: (callback, milliseconds) => {
+      scheduled = { callback, milliseconds };
+      return { unref() {} };
+    },
+    cancelTimeout: () => {},
+  });
+  const initial = startedState("");
+  const full = gameFull(initial);
+  full.white = { id: "opponent" };
+  full.black = { id: "arena-bot" };
+  await session.initialize(full, engine);
+  await session.onState(initial, engine);
+
+  assert.equal(scheduled.milliseconds, 60_000);
+  await scheduled.callback();
+  await scheduled.callback();
+  assert.deepEqual(posts, ["api/bot/game/game-1/abort"]);
+  assert.equal(finishes.length, 1);
+  assert.equal(finishes[0].status, "aborted");
+  assert.equal(finishes[0].plies, 0);
+  assert.equal(session.finished, true);
+  assert.equal(engine.stopCalls.at(-1).reason, "first_move_timeout");
+});
+
+test("first authoritative move cancels a queued zero-ply abort", async () => {
+  const posts = [];
+  let scheduled;
+  let abortRequestCancelled = false;
+  let resolveAbortQueued;
+  const abortQueued = new Promise((resolve) => { resolveAbortQueued = resolve; });
+  const client = {
+    post: async (endpoint, _form, signal, _priority, beforeDispatch) => {
+      if (endpoint.endsWith("/abort")) {
+        resolveAbortQueued();
+        return new Promise((_resolve, reject) => {
+          signal.addEventListener("abort", () => {
+            abortRequestCancelled = true;
+            reject(signal.reason);
+          }, { once: true });
+        });
+      }
+      beforeDispatch?.();
+      posts.push(endpoint);
+    },
+  };
+  const engine = new MockGameEngine([{ bestmove: "e7e5", ponder: "g1f3" }]);
+  const config = gameConfig();
+  config.scheduler = { first_move_timeout_seconds: 60 };
+  const session = createGameSession(engine, client, config, {
+    scheduleTimeout: (callback) => {
+      scheduled = callback;
+      return { unref() {} };
+    },
+    cancelTimeout: () => {},
+  });
+  const initial = startedState("");
+  const full = gameFull(initial);
+  full.white = { id: "opponent" };
+  full.black = { id: "arena-bot" };
+  await session.initialize(full, engine);
+  await session.onState(initial, engine);
+  const expiry = scheduled();
+  await abortQueued;
+  await session.onState(startedState("e2e4"), engine);
+  await expiry;
+
+  assert.equal(abortRequestCancelled, true);
+  assert.equal(posts.filter((endpoint) => endpoint.endsWith("/abort")).length, 0);
+  assert.match(posts[0], /\/move\/e7e5$/);
+});
+
+test("first-move watchdog never arms while the bot is White", async () => {
+  let schedules = 0;
+  const session = createGameSession(new MockGameEngine([]), { post: async () => {} }, gameConfig(), {
+    scheduleTimeout: () => {
+      schedules += 1;
+      return { unref() {} };
+    },
+  });
+
+  await session.initialize(gameFull(startedState("")), session.slot.engine);
+
+  assert.equal(session.color, "white");
+  assert.equal(schedules, 0);
+});
+
+test("terminal zero-ply state cancels the first-move watchdog", async () => {
+  const posts = [];
+  let scheduled;
+  let cancellations = 0;
+  const engine = new MockGameEngine([]);
+  const session = createGameSession(engine, { post: async (endpoint) => posts.push(endpoint) }, gameConfig(), {
+    scheduleTimeout: (callback) => {
+      scheduled = callback;
+      return { unref() {} };
+    },
+    cancelTimeout: () => { cancellations += 1; },
+  });
+  const initial = startedState("");
+  const full = gameFull(initial);
+  full.white = { id: "opponent" };
+  full.black = { id: "arena-bot" };
+  await session.initialize(full, engine);
+  await session.onState(initial, engine);
+
+  await session.onState(startedState("", { status: "aborted" }), engine);
+  await scheduled();
+
+  assert.equal(cancellations, 1);
+  assert.equal(posts.filter((endpoint) => endpoint.endsWith("/abort")).length, 0);
+  assert.equal(session.finished, true);
+});
+
+test("provider shutdown prevents a pending zero-ply abort", async () => {
+  const posts = [];
+  let scheduled;
+  const shutdown = new AbortController();
+  const engine = new MockGameEngine([]);
+  const session = createGameSession(engine, { post: async (endpoint) => posts.push(endpoint) }, gameConfig(), {
+    signal: shutdown.signal,
+    scheduleTimeout: (callback) => {
+      scheduled = callback;
+      return { unref() {} };
+    },
+  });
+  const initial = startedState("");
+  const full = gameFull(initial);
+  full.white = { id: "opponent" };
+  full.black = { id: "arena-bot" };
+  await session.initialize(full, engine);
+  await session.onState(initial, engine);
+
+  shutdown.abort();
+  await scheduled();
+
+  assert.equal(posts.filter((endpoint) => endpoint.endsWith("/abort")).length, 0);
 });
 
 test("ponder miss drains stale output, reconstructs the authoritative root, and ignores duplicates", async () => {

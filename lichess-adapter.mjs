@@ -69,6 +69,7 @@ export const LIVE_ACCEPTANCE_CONFIRMATION = "I_ACCEPT_ONE_BOT_GAME";
 export const RATED_PLAY_CONFIRMATION = "I_ACCEPT_RATED_BOT_GAMES";
 export const OUTBOUND_CHALLENGE_CONFIRMATION = "I_ACCEPT_AUTOMATIC_OUTBOUND_CHALLENGES";
 export const MANAGER_OPTIONS_SCHEMA = "uci_arena_lichess_manager_options_v1";
+const FIRST_MOVE_ABORT_RETRY_MS = Object.freeze([15_000, 30_000, 60_000, 120_000, 300_000]);
 
 const PROFILE_OWNED_UCI_OPTIONS = Object.freeze({
   search_core: "SearchCore",
@@ -667,6 +668,7 @@ function validateCapacityConfig(config) {
     ["challenge_interval_seconds", 1, 300],
     ["reservation_retry_seconds", 5, 600],
     ["challenge_timeout_seconds", 10, 300],
+    ["first_move_timeout_seconds", 30, 600],
     ["max_games_per_opponent_per_day", 1, 100],
     ["timeout_cooldown_minutes", 1, 1440],
     ["decline_cooldown_minutes", 1, 10080],
@@ -835,6 +837,7 @@ export function editableManagerOptionsProjection(config) {
       challenge_interval_seconds: config.scheduler.challenge_interval_seconds,
       reservation_retry_seconds: config.scheduler.reservation_retry_seconds,
       challenge_timeout_seconds: config.scheduler.challenge_timeout_seconds,
+      first_move_timeout_seconds: config.scheduler.first_move_timeout_seconds,
     },
     opponent_selection: {
       max_games_per_opponent_per_day: config.scheduler.max_games_per_opponent_per_day,
@@ -926,7 +929,7 @@ export function applyManagerOptionsPatch(rawConfig, patch) {
       "settings.scheduler",
       new Set([
         "enabled", "discovery_interval_seconds", "challenge_interval_seconds",
-        "reservation_retry_seconds", "challenge_timeout_seconds",
+        "reservation_retry_seconds", "challenge_timeout_seconds", "first_move_timeout_seconds",
       ]),
     );
     Object.assign(updated.scheduler, patch.scheduler);
@@ -1097,6 +1100,7 @@ function migrateV2Config(config) {
     challenge_interval_seconds: 5,
     reservation_retry_seconds: 30,
     challenge_timeout_seconds: 25,
+    first_move_timeout_seconds: 60,
     max_games_per_opponent_per_day: 2,
     timeout_cooldown_minutes: 30,
     decline_cooldown_minutes: 360,
@@ -1123,6 +1127,7 @@ function loadConfigDocument({ templatePath = DEFAULT_TEMPLATE, engineRoot = ROOT
     value: Object.freeze(configuredRuntimePathAuthority),
   });
   if (config.schema === "uci_arena_lichess_adapter_v2") migrateV2Config(config);
+  config.scheduler.first_move_timeout_seconds ??= 60;
   config.engine ??= {};
   config.engine.adapter ??= "uci_arena_extended_v1";
   if (!ENGINE_ADAPTERS.has(config.engine.adapter)) {
@@ -1949,6 +1954,7 @@ function apiRequestClass(endpoint, method = "GET") {
   if (normalized.startsWith("api/bot/game/stream/")) return "game_stream";
   if (normalized === "api/stream/event") return "event_stream";
   if (normalized.startsWith("api/account/playing")) return "reconciliation";
+  if (/^api\/bot\/game\/[^/]+\/abort$/.test(normalized)) return "game_control";
   if (normalized === "api/account") return "identity";
   if (normalized.startsWith("api/bot/online") || normalized.startsWith("api/user/")) {
     return "discovery";
@@ -3681,6 +3687,8 @@ export class GameSession {
     foregroundCoordinator,
     onMoveTransportSample = () => {},
     waitForReconnect = delay,
+    scheduleTimeout = setTimeout,
+    cancelTimeout = clearTimeout,
   }) {
     this.client = client;
     this.config = { ...config, timing: { ...DEFAULT_TIMING_CONFIG, ...(config.timing ?? {}) } };
@@ -3706,8 +3714,17 @@ export class GameSession {
     this.opponentSearchDrainMs = 0;
     this.onMoveTransportSample = onMoveTransportSample;
     this.waitForReconnect = waitForReconnect;
+    this.scheduleTimeout = scheduleTimeout;
+    this.cancelTimeout = cancelTimeout;
     this.reconnecting = false;
     this.opponentOperation = Promise.resolve();
+    this.connectionAbortController = null;
+    this.firstMoveWatchdogStarted = false;
+    this.firstMoveTimer = null;
+    this.firstMoveAbortController = null;
+    this.firstMoveAbortInFlight = false;
+    this.firstMoveAbortAttempts = 0;
+    this.finishRecorded = false;
   }
 
   async run() {
@@ -3715,42 +3732,47 @@ export class GameSession {
     if (!engine) throw new Error(`Game ${this.gameId} has no prepared engine`);
     let reconnectDelay = 1_000;
     let consecutiveFailures = 0;
-    while (!this.finished && !this.signal.aborted) {
-      const generationBeforeConnection = this.observedGeneration;
-      try {
-        await this.consumeGameStream(engine);
-        if (!this.finished) throw new Error("Lichess game stream closed before the game finished");
-      } catch (error) {
-        if (this.signal.aborted) break;
-        await this.invalidateOpponentSearch("reconnect");
-        this.reconnecting = true;
-        if (this.observedGeneration > generationBeforeConnection) {
-          consecutiveFailures = 0;
-          reconnectDelay = 1_000;
-        }
-        consecutiveFailures += 1;
-        const retryMs = error instanceof LichessHttpError && error.status === 429
-          ? Math.max(60_000, error.retryAfterMs)
-          : reconnectDelay;
-        log("game_stream_error", {
-          game_id: this.gameId,
-          message: error.message,
-          retry_ms: retryMs,
-          consecutive_failures: consecutiveFailures,
-        });
+    try {
+      while (!this.finished && !this.signal.aborted) {
+        const generationBeforeConnection = this.observedGeneration;
         try {
-          await this.waitForReconnect(retryMs, this.signal);
-        } catch (retryError) {
+          await this.consumeGameStream(engine);
+          if (!this.finished) throw new Error("Lichess game stream closed before the game finished");
+        } catch (error) {
           if (this.signal.aborted) break;
-          throw retryError;
+          await this.invalidateOpponentSearch("reconnect");
+          this.reconnecting = true;
+          if (this.observedGeneration > generationBeforeConnection) {
+            consecutiveFailures = 0;
+            reconnectDelay = 1_000;
+          }
+          consecutiveFailures += 1;
+          const retryMs = error instanceof LichessHttpError && error.status === 429
+            ? Math.max(60_000, error.retryAfterMs)
+            : reconnectDelay;
+          log("game_stream_error", {
+            game_id: this.gameId,
+            message: error.message,
+            retry_ms: retryMs,
+            consecutive_failures: consecutiveFailures,
+          });
+          try {
+            await this.waitForReconnect(retryMs, this.signal);
+          } catch (retryError) {
+            if (this.signal.aborted) break;
+            throw retryError;
+          }
+          reconnectDelay = Math.min(reconnectDelay * 2, 30_000);
         }
-        reconnectDelay = Math.min(reconnectDelay * 2, 30_000);
       }
+    } finally {
+      this.clearFirstMoveWatchdog("session_ended");
     }
   }
 
   async consumeGameStream(engine) {
     const connectionAbort = new AbortController();
+    this.connectionAbortController = connectionAbort;
     const streamSignal = this.signal && typeof this.signal.addEventListener === "function"
       ? AbortSignal.any([this.signal, connectionAbort.signal])
       : connectionAbort.signal;
@@ -3822,10 +3844,16 @@ export class GameSession {
     } catch (error) {
       connectionAbort.abort(error);
       await producer;
+      if (this.connectionAbortController === connectionAbort) {
+        this.connectionAbortController = null;
+      }
       throw error;
     }
     connectionAbort.abort();
     await producer;
+    if (this.connectionAbortController === connectionAbort) {
+      this.connectionAbortController = null;
+    }
     if (producerError && !this.finished && !this.signal.aborted) throw producerError;
   }
 
@@ -3890,6 +3918,140 @@ export class GameSession {
       color: this.color,
       runtime_provenance_sha256: runtimeProvenance.sha256,
     });
+    if (this.color === "black") this.armFirstMoveWatchdog();
+  }
+
+  firstMoveWatchdogEligible() {
+    return Boolean(
+      this.initialized
+      && !this.finished
+      && !this.signal.aborted
+      && this.color === "black"
+      && this.latestObservedState?.status === "started"
+      && this.latestObservedState.moves.length === 0
+    );
+  }
+
+  scheduleFirstMoveAbort(delayMs) {
+    this.firstMoveTimer = this.scheduleTimeout(() => {
+      this.firstMoveTimer = null;
+      return this.abortStalledZeroPlyGame();
+    }, delayMs);
+    this.firstMoveTimer?.unref?.();
+  }
+
+  armFirstMoveWatchdog() {
+    if (this.firstMoveWatchdogStarted || !this.firstMoveWatchdogEligible()) return;
+    this.firstMoveWatchdogStarted = true;
+    this.firstMoveAbortController = new AbortController();
+    const timeoutMs = Number(this.config.scheduler?.first_move_timeout_seconds ?? 60) * 1_000;
+    this.scheduleFirstMoveAbort(timeoutMs);
+    log("first_move_watchdog_armed", {
+      game_id: this.gameId,
+      timeout_ms: timeoutMs,
+    });
+  }
+
+  clearFirstMoveWatchdog(reason) {
+    if (this.firstMoveTimer !== null) {
+      this.cancelTimeout(this.firstMoveTimer);
+      this.firstMoveTimer = null;
+    }
+    if (this.firstMoveAbortController
+        && !this.firstMoveAbortController.signal.aborted) {
+      this.firstMoveAbortController.abort(new Error(`first-move watchdog cleared: ${reason}`));
+    }
+    this.firstMoveAbortController = null;
+  }
+
+  recordGameFinished({ status, result, winner, plies }) {
+    if (this.finishRecorded) return false;
+    this.finishRecorded = true;
+    this.finished = true;
+    this.store.finishGame({
+      id: this.gameId,
+      status,
+      result,
+      winner,
+      plies,
+    });
+    log("game_finished", {
+      game_id: this.gameId,
+      opponent: this.opponent,
+      status,
+      result,
+      winner: winner || null,
+      plies,
+    });
+    return true;
+  }
+
+  async abortStalledZeroPlyGame() {
+    if (this.firstMoveAbortInFlight || !this.firstMoveWatchdogEligible()) return;
+    this.firstMoveAbortInFlight = true;
+    this.firstMoveAbortAttempts += 1;
+    const controller = this.firstMoveAbortController;
+    const requestSignal = this.signal && typeof this.signal.addEventListener === "function"
+      ? AbortSignal.any([this.signal, controller.signal])
+      : controller.signal;
+    try {
+      await this.client.post(
+        `api/bot/game/${encodeURIComponent(this.gameId)}/abort`,
+        undefined,
+        requestSignal,
+        API_REQUEST_PRIORITY.game_control,
+        () => {
+          if (!this.firstMoveWatchdogEligible()) {
+            throw new Error(`First-move abort became stale for ${this.gameId}`);
+          }
+        },
+      );
+      this.finished = true;
+      this.clearFirstMoveWatchdog("abort_succeeded");
+      this.recordGameFinished({ status: "aborted", result: "", winner: "", plies: 0 });
+      try {
+        await this.invalidateOpponentSearch("first_move_timeout");
+      } catch (error) {
+        log("first_move_abort_engine_drain_failed", {
+          game_id: this.gameId,
+          message: error.message,
+        });
+      }
+      log("first_move_timeout_aborted", {
+        game_id: this.gameId,
+        attempts: this.firstMoveAbortAttempts,
+      });
+      this.connectionAbortController?.abort();
+    } catch (error) {
+      if (controller.signal.aborted || this.signal.aborted
+          || !this.firstMoveWatchdogEligible()) return;
+      const httpStatus = error instanceof LichessHttpError ? error.status : null;
+      const retryable = httpStatus === null || httpStatus === 429 || httpStatus >= 500;
+      const retryIndex = this.firstMoveAbortAttempts - 1;
+      if (!retryable || retryIndex >= FIRST_MOVE_ABORT_RETRY_MS.length) {
+        log("first_move_abort_failed", {
+          game_id: this.gameId,
+          status: httpStatus,
+          attempts: this.firstMoveAbortAttempts,
+          retryable,
+          message: error.message,
+        });
+        return;
+      }
+      const retryMs = httpStatus === 429
+        ? Math.max(60_000, Number(error.retryAfterMs ?? 0))
+        : FIRST_MOVE_ABORT_RETRY_MS[retryIndex];
+      log("first_move_abort_retry", {
+        game_id: this.gameId,
+        status: httpStatus,
+        attempts: this.firstMoveAbortAttempts,
+        retry_ms: retryMs,
+        message: error.message,
+      });
+      this.scheduleFirstMoveAbort(retryMs);
+    } finally {
+      this.firstMoveAbortInFlight = false;
+    }
   }
 
   serializeOpponentOperation(operation) {
@@ -3981,6 +4143,9 @@ export class GameSession {
   } = {}) {
     const moves = normalizedMoves(state.moves);
     const status = String(state.status ?? "");
+    if (moves.length > 0 || status !== "started") {
+      this.clearFirstMoveWatchdog(moves.length > 0 ? "first_move_observed" : "terminal_state");
+    }
     const clock = stateClock(state, defaultIncrementMs);
     const previous = this.latestObservedState;
     const transition = this.classifyTransition(
@@ -4168,29 +4333,17 @@ export class GameSession {
       if (this.latestObservedState?.generation !== observation.generation) return;
       const stopped = await this.invalidateOpponentSearch("terminal_state");
       drained ||= stopped.drained;
-      this.finished = true;
       const winner = String(state.winner ?? "");
       const result = winner
         ? winner === this.color ? "win" : "loss"
         : new Set(["draw", "stalemate"]).has(state.status) ? "draw" : "";
-      this.store.finishGame({
-        id: this.gameId,
-        status: state.status,
-        result,
-        winner,
-        plies: moves.length,
-      });
-      log("game_finished", {
-        game_id: this.gameId,
-        opponent: this.opponent,
-        status: state.status,
-        result,
-        winner: winner || null,
-        plies: moves.length,
-      });
+      this.recordGameFinished({ status: state.status, result, winner, plies: moves.length });
       return;
     }
     if (this.latestObservedState?.generation !== observation.generation) return;
+    if (moves.length === 0 && this.color === "black") {
+      this.armFirstMoveWatchdog();
+    }
     if (colorToMove(moves) !== this.color) {
       await this.resumeOpponentSearch();
       return;

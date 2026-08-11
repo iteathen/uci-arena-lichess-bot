@@ -71,6 +71,7 @@ function defaultState() {
     challengeSequence: 0,
     challenges: [],
     moves: [],
+    aborts: [],
   };
 }
 
@@ -189,6 +190,16 @@ export async function startFakeLichessApi({
           form,
         });
         emptyResponse(response);
+        return;
+      }
+
+      const abortMatch = /^\/api\/bot\/game\/([^/]+)\/abort$/.exec(url.pathname);
+      if (request.method === "POST" && abortMatch) {
+        state.aborts.push({
+          gameId: decodeURIComponent(abortMatch[1]),
+          form,
+        });
+        jsonResponse(response, 200, { ok: true });
         return;
       }
 

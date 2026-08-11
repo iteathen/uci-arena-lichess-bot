@@ -314,6 +314,7 @@ export const API_REQUEST_PRIORITY = Object.freeze({
   game_stream: 5,
   event_stream: 10,
   reconciliation: 15,
+  game_control: 20,
   challenge_control: 20,
   identity: 20,
   challenge_create: 30,
