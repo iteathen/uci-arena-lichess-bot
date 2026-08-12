@@ -1642,10 +1642,6 @@ export function applySingleGameProfile(config) {
       throw new Error("Single-game profile Syzygy manifest lacks maximum-cardinality WDL or DTZ files");
     }
   }
-  const engineFingerprint = sha256File(config.engine.executable);
-  if (engineFingerprint !== profile.engine_build_fingerprint) {
-    throw new Error("Single-game profile engine build fingerprint mismatch");
-  }
   const modelRoot = path.resolve(
     config.engine.working_directory,
     config.engine.uci_options.ModelRoot,
@@ -1724,6 +1720,13 @@ export function applySingleGameProfile(config) {
     }
     profile.temporal_curve = null;
     config.engine.temporal_curve_profile_status = null;
+  }
+  // Check executable provenance only after every reusable semantic authority has
+  // been validated. This makes the dedicated error an exact rebuild-evidence
+  // signal instead of masking a model, topology, tablebase, or curve change.
+  const engineFingerprint = sha256File(config.engine.executable);
+  if (engineFingerprint !== profile.engine_build_fingerprint) {
+    throw new Error("Single-game profile engine build fingerprint mismatch");
   }
   config.engine.qualification_profile = profile;
   return profile;
@@ -5504,6 +5507,10 @@ export function providerStatusProjection({
   if (effectiveActive && !streamConnected) blockers.push("event_stream_disconnected");
   if (schedulerFault) blockers.push("scheduler_fault");
   if (startupError) blockers.push("startup_status_unavailable");
+  if (startup?.installed === true &&
+      (startup.enabled === false || startup.enabled === "disabled")) {
+    blockers.push("startup_registration_disabled");
+  }
   return {
     schema: "uci_arena_lichess_status_v3",
     installed: true,
@@ -5553,6 +5560,22 @@ export function providerStatusProjection({
       in_flight_class: runtime?.api_safety?.in_flight_class ?? null,
     },
     blockers: [...new Set(blockers)].slice(0, 64),
+  };
+}
+
+export function startupIsExplicitlyDisabledAndInactive(startup) {
+  const disabled = startup?.enabled === false || startup?.enabled === "disabled";
+  const inactive = startup?.active === false || startup?.active === "inactive";
+  return startup?.installed === true && disabled && inactive;
+}
+
+export function exactEvidenceRequalification(error) {
+  if (error?.message !== "Single-game profile engine build fingerprint mismatch") {
+    return null;
+  }
+  return {
+    requalificationRequired: true,
+    requalificationReason: "exact_engine_evidence_stale",
   };
 }
 
@@ -6188,6 +6211,42 @@ export async function main(argv = process.argv.slice(2)) {
     return 0;
   }
   if (options.command === "startup" && options.action === "complete_replace") {
+    let requalification = null;
+    try {
+      const replacementConfig = loadRuntimeConfig({
+        templatePath: path.resolve(options.config ?? DEFAULT_TEMPLATE),
+        engineRoot: path.resolve(options.engine_root ?? ROOT),
+        environment: {},
+      });
+      if (usesExtendedEngineAdapter(replacementConfig)) {
+        applySingleGameProfile(replacementConfig);
+      }
+    } catch (error) {
+      requalification = exactEvidenceRequalification(error);
+      if (!requalification) throw error;
+    }
+    if (requalification) {
+      const startup = process.platform === "win32"
+        ? await queryWindowsStartup()
+        : process.platform === "linux"
+          ? await queryLinuxStartup()
+          : (() => { throw new Error(`Unsupported startup platform: ${process.platform}`); })();
+      if (!startupIsExplicitlyDisabledAndInactive(startup)) {
+        throw new Error("Lichess startup is not safely disabled for exact evidence requalification");
+      }
+      console.log(JSON.stringify({
+        status: "ready",
+        startup: {
+          ...startup,
+          installed: true,
+          active: false,
+          providerReady: false,
+          replacementReady: false,
+          ...requalification,
+        },
+      }));
+      return 0;
+    }
     const replacement = process.platform === "win32"
       ? await completeWindowsStartupReplacement({
         ready: async () => {
@@ -6268,7 +6327,8 @@ export async function main(argv = process.argv.slice(2)) {
         : process.platform === "linux"
           ? await queryLinuxStartup()
           : { installed: false };
-      if (startup.installed === true) {
+      if (startup.installed === true &&
+          !startupIsExplicitlyDisabledAndInactive(startup)) {
         throw new InstalledQualificationFailure(
           "startup_safety",
           new Error("Disable Lichess Bot startup before requalifying the installed engine"),

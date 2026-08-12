@@ -65,6 +65,16 @@ test("component manifest separates operator engine overrides from managed suite 
     manifest.installation.installer_integration.startup_control.replacement_arguments,
     { previous_root: "--previous-root", replacement_root: "--replacement-root" },
   );
+  assert.equal(
+    manifest.installation.installer_integration.startup_control.result
+      .require_live_on_post_replace,
+    false,
+  );
+  assert.equal(
+    manifest.installation.installer_integration.startup_control.result
+      .allow_deferred_requalification_on_post_replace,
+    true,
+  );
   assert.deepEqual(manifest.installation.external_user_data, ["provider_workspace"]);
 });
 

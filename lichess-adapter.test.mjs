@@ -24,6 +24,7 @@ import {
   applyAdaptiveTemporalCurveProfile,
   applySingleGameProfile,
   bookMoveWasUsed,
+  exactEvidenceRequalification,
   gameRuntimeProvenance,
   loadAdaptiveTemporalCurveProfile,
   loadCapacityProfile,
@@ -39,6 +40,7 @@ import {
   qualificationFailureProjection,
   resolveExternalTokenFile,
   resolveProviderRuntimeDirectory,
+  startupIsExplicitlyDisabledAndInactive,
   managerOptionsProjection,
   main,
   updateManagerOptions,
@@ -72,6 +74,13 @@ test("provider status distinguishes inactive, disconnected, and ready states", (
   assert.equal(missing.active, false);
   assert.equal(missing.ready, false);
   assert.deepEqual(missing.blockers, ["runtime_status_missing", "provider_process_inactive"]);
+
+  const disabled = providerStatusProjection({
+    startup: { installed: true, enabled: false, active: false },
+  });
+  assert.equal(disabled.registered, true);
+  assert.equal(disabled.active, false);
+  assert.equal(disabled.blockers.includes("startup_registration_disabled"), true);
 
   const runtime = {
     schema: "uci_arena_lichess_runtime_v3",
@@ -120,6 +129,80 @@ test("provider status distinguishes inactive, disconnected, and ready states", (
   assert.equal(stale.active, false);
   assert.equal(stale.ready, false);
   assert.deepEqual(stale.blockers, ["runtime_status_stale", "provider_process_inactive"]);
+});
+
+test("post-replacement deferral accepts only exact Engine evidence drift", () => {
+  assert.deepEqual(
+    exactEvidenceRequalification(
+      new Error("Single-game profile engine build fingerprint mismatch"),
+    ),
+    {
+      requalificationRequired: true,
+      requalificationReason: "exact_engine_evidence_stale",
+    },
+  );
+  assert.equal(
+    exactEvidenceRequalification(
+      new Error("Single-game profile model/checkpoint identity mismatch"),
+    ),
+    null,
+  );
+  assert.equal(
+    startupIsExplicitlyDisabledAndInactive({
+      installed: true,
+      enabled: false,
+      active: false,
+    }),
+    true,
+  );
+  assert.equal(
+    startupIsExplicitlyDisabledAndInactive({
+      installed: true,
+      enabled: true,
+      active: false,
+    }),
+    false,
+  );
+  assert.equal(
+    startupIsExplicitlyDisabledAndInactive({
+      installed: true,
+      enabled: "disabled",
+      active: "inactive",
+    }),
+    true,
+  );
+});
+
+test("Engine fingerprint drift cannot mask model or search-authority drift", () => {
+  const fixture = qualifiedFixture();
+  writeFileSync(fixture.config.engine.executable, "replacement-engine");
+  writeFileSync(
+    path.join(fixture.config.engine.working_directory, "model", "checkpoint_manifest.json"),
+    JSON.stringify({ model_id: "different-model", checkpoint_hash: "b".repeat(64) }),
+  );
+  assert.throws(
+    () => applySingleGameProfile(fixture.config),
+    /model\/checkpoint identity mismatch/,
+  );
+
+  writeFileSync(
+    path.join(fixture.config.engine.working_directory, "model", "checkpoint_manifest.json"),
+    JSON.stringify({
+      model_id: fixture.profile.model_id,
+      checkpoint_hash: fixture.profile.checkpoint_hash,
+    }),
+  );
+  fixture.config.engine.uci_options.SearchCore = "v2";
+  assert.throws(
+    () => applySingleGameProfile(fixture.config),
+    /conflicts with profile-owned UCI option SearchCore/,
+  );
+
+  delete fixture.config.engine.uci_options.SearchCore;
+  assert.throws(
+    () => applySingleGameProfile(fixture.config),
+    /engine build fingerprint mismatch/,
+  );
 });
 
 function qualifiedFixture() {

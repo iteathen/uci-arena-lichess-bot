@@ -82,7 +82,7 @@ test("two-phase replacement stops, retargets, and resumes the existing task", as
     { installed: true, active: true, taskStatus: "Running" },
     { installed: true, active: true, taskStatus: "Running" },
     { installed: true, active: false, taskStatus: "Ready" },
-    { installed: true, active: false, taskStatus: "Disabled" },
+    { installed: true, active: false, enabled: false, taskStatus: "Disabled" },
   ];
   try {
     const prepared = await prepareWindowsStartupReplacement({

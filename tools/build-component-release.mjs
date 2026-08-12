@@ -262,7 +262,8 @@ function installerManifest(componentContract, version, target, staging) {
       || startupControl.result?.envelope !== "startup"
       || startupControl.result?.require_configuration_match_on_install !== false
       || startupControl.result?.require_live_on_install !== false
-      || startupControl.result?.require_live_on_post_replace !== true) {
+      || startupControl.result?.require_live_on_post_replace !== false
+      || startupControl.result?.allow_deferred_requalification_on_post_replace !== true) {
     throw new Error("component installer-integration contract is invalid");
   }
   const acceptedLocatorSources = new Set(["saved_locator", "install_receipt"]);
