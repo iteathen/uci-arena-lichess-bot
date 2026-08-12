@@ -481,8 +481,12 @@ function openingBookContract(config, runtimeStatus) {
     }
   }
   for (const [filePath, label] of [[bookFile, "book"]]) {
-    if (!existsSync(filePath) || !statSync(filePath).isFile()) {
+    if (!existsSync(filePath)) {
       throw new Error(`Opening book ${label} file is missing: ${filePath}`);
+    }
+    const metadata = lstatSync(filePath);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) {
+      throw new Error(`Opening book ${label} is not a regular non-link file: ${filePath}`);
     }
   }
   if (Boolean(statsFile) !== Boolean(policyFile)) {
@@ -515,8 +519,12 @@ function openingBookContract(config, runtimeStatus) {
     };
   }
   for (const [filePath, label] of [[statsFile, "stats"], [policyFile, "policy"]]) {
-    if (!existsSync(filePath) || !statSync(filePath).isFile()) {
+    if (!existsSync(filePath)) {
       throw new Error(`Opening book ${label} file is missing: ${filePath}`);
+    }
+    const metadata = lstatSync(filePath);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) {
+      throw new Error(`Opening book ${label} is not a regular non-link file: ${filePath}`);
     }
   }
   const descriptor = openSync(statsFile, "r");
@@ -538,14 +546,109 @@ function openingBookContract(config, runtimeStatus) {
   if (!Number.isSafeInteger(rows) || rows !== bookRows) {
     throw new Error("Opening book stats row count does not match Polyglot framing");
   }
+  const identity = BigInt(`0x${header[1]}`).toString(10);
+  const manifestFile = path.join(path.dirname(bookFile), "snapshot.manifest.json");
+  if (existsSync(manifestFile)) {
+    const manifestMetadata = lstatSync(manifestFile);
+    if (!manifestMetadata.isFile() || manifestMetadata.isSymbolicLink()
+        || manifestMetadata.size <= 0 || manifestMetadata.size > 1_048_576) {
+      throw new Error("Opening book snapshot manifest is not a bounded regular file");
+    }
+    let manifest;
+    let manifestBytes;
+    try {
+      manifestBytes = readFileSync(manifestFile);
+      manifest = JSON.parse(manifestBytes.toString("utf8"));
+    } catch {
+      throw new Error("Opening book snapshot manifest is invalid JSON");
+    }
+    const requiredArtifacts = [
+      "strong_rare_v1.bin",
+      "strong_rare_v1.stats",
+      "strong_rare_v1.policy",
+    ];
+    if (manifest?.schema !== "uci_arena_book_snapshot_v2"
+        || !/^(?:integration|qualified)-[0-9a-f]{20}$/u.test(manifest?.snapshot_id ?? "")
+        || manifest?.record_count !== rows
+        || !manifest.artifacts || typeof manifest.artifacts !== "object"
+        || Array.isArray(manifest.artifacts)
+        || requiredArtifacts.some((name) => !/^[0-9a-f]{64}$/u.test(
+          manifest.artifacts[name] ?? "",
+        ))) {
+      throw new Error("Opening book snapshot manifest contract is invalid");
+    }
+    if (path.basename(bookFile) !== requiredArtifacts[0]
+        || path.basename(statsFile) !== requiredArtifacts[1]
+        || path.basename(policyFile) !== requiredArtifacts[2]
+        || path.dirname(statsFile) !== path.dirname(bookFile)
+        || path.dirname(policyFile) !== path.dirname(bookFile)) {
+      throw new Error("Opening book configured artifacts do not match the snapshot manifest");
+    }
+    for (const [artifactPath, artifactName] of [
+      [bookFile, requiredArtifacts[0]],
+      [statsFile, requiredArtifacts[1]],
+      [policyFile, requiredArtifacts[2]],
+    ]) {
+      const observed = sha256File(artifactPath).slice("sha256:".length);
+      if (observed !== manifest.artifacts[artifactName]) {
+        throw new Error(`Opening book snapshot artifact digest mismatch: ${artifactName}`);
+      }
+    }
+    const manifestSha256 = createHash("sha256").update(manifestBytes).digest("hex");
+    return {
+      book_file: bookFile,
+      stats_file: statsFile,
+      policy_file: policyFile,
+      manifest_file: manifestFile,
+      statistics_available: true,
+      identity,
+      rows,
+      snapshot_identity: `sha256:${manifestSha256}`,
+      snapshot_generation: manifest.snapshot_id,
+      manifest_sha256: manifestSha256,
+      policy_sha256: manifest.artifacts[requiredArtifacts[2]],
+      validation: "manifest_verified",
+    };
+  }
   return {
     book_file: bookFile,
     stats_file: statsFile,
     policy_file: policyFile,
     statistics_available: true,
-    identity: BigInt(`0x${header[1]}`).toString(10),
+    identity,
     rows,
+    snapshot_identity: `fnv1a64:${header[1].toLocaleLowerCase()}`,
+    snapshot_generation: "",
+    manifest_sha256: "",
+    policy_sha256: "",
+    validation: "legacy_file_set",
   };
+}
+
+function retainedManifestSnapshot(previous, current) {
+  if (previous?.opening_book_adapter_validation !== "file_set_revalidated"
+      && previous?.opening_book_adapter_validation !== "retained_prior_valid_snapshot") {
+    return false;
+  }
+  if (previous.opening_book_validation !== "manifest_verified"
+      || current?.opening_book_validation !== "manifest_verified") {
+    return false;
+  }
+  return [
+    "opening_book_enabled",
+    "opening_book_active",
+    "opening_book_statistics_available",
+    "opening_book_entries",
+    "opening_book_identity",
+    "opening_book_snapshot_identity",
+    "opening_book_snapshot_generation",
+    "opening_book_manifest_sha256",
+    "opening_book_policy_sha256",
+    "opening_book_validation",
+    "opening_book_file",
+    "opening_book_stats_file",
+    "opening_book_policy_file",
+  ].every((field) => current[field] === previous[field]);
 }
 
 function validateEngineArguments(value) {
@@ -2292,6 +2395,12 @@ function parseInfo(line) {
     "time_book_credit_after_ms",
     "time_searched_decisions_completed",
     "time_completion_applied",
+    "book_probe_hit",
+    "book_move_used",
+    "book_exit",
+    "book_phase_latched",
+    "book_candidate_count",
+    "book_candidate_games",
   ]) {
     const match = line.match(new RegExp(`(?:^| )${key} (\\d+)`));
     if (match) telemetry[key] = Number(match[1]);
@@ -2306,11 +2415,24 @@ function parseInfo(line) {
     const match = line.match(new RegExp(`(?:^| )${key} (\\d+)`));
     if (match) telemetry[key] = Number(match[1]);
   }
+  for (const key of ["book_evaluation_cp"]) {
+    const match = line.match(new RegExp(`(?:^| )${key} (-?\\d+)`));
+    if (match) telemetry[key] = Number(match[1]);
+  }
+  for (const key of ["book_selected_lcb", "book_best_lcb", "book_exit_probability"]) {
+    const match = line.match(new RegExp(`(?:^| )${key} (-?(?:\\d+(?:\\.\\d*)?|\\.\\d+))`));
+    if (match) telemetry[key] = Number(match[1]);
+  }
   for (const key of [
     "book_probe_result",
     "book_miss_reason",
     "book_evaluation_source",
     "book_snapshot_identity",
+    "book_completion_kind",
+    "book_snapshot_generation",
+    "book_snapshot_manifest_sha256",
+    "book_snapshot_validation",
+    "book_evaluation_model_fingerprint",
     "mcgs_search_intent",
     "mcgs_book_hint_result",
     "mcgs_book_hint_identity",
@@ -2764,6 +2886,27 @@ export class UciEngine {
     this.send("ucinewgame");
     await this.exchange("isready", (line) => line === "readyok", 30_000);
     this.runtimeGeneration += 1;
+    if (this.qualificationStatus?.live_runtime_status) {
+      const previousRuntimeStatus = this.qualificationStatus.live_runtime_status;
+      const liveRuntimeStatus = await this.runtimeStatus();
+      const configuredOwnBook = Object.hasOwn(this.config.uci_options, "OwnBook")
+        ? this.config.uci_options.OwnBook
+        : true;
+      let openingBookAdapterValidation = "file_set_revalidated";
+      try {
+        this.validateOpeningBookRuntime(liveRuntimeStatus, configuredOwnBook);
+      } catch (error) {
+        if (!retainedManifestSnapshot(previousRuntimeStatus, liveRuntimeStatus)) throw error;
+        openingBookAdapterValidation = "retained_prior_valid_snapshot";
+      }
+      this.qualificationStatus = {
+        ...this.qualificationStatus,
+        live_runtime_status: {
+          ...liveRuntimeStatus,
+          opening_book_adapter_validation: openingBookAdapterValidation,
+        },
+      };
+    }
   }
 
   async runtimeStatus() {
@@ -2974,39 +3117,62 @@ export class UciEngine {
       await this.exchange("isready", (line) => line === "readyok", 30_000);
       if (this.qualificationStatus) {
         const liveRuntimeStatus = await this.runtimeStatus();
-        const bookExpected = String(restoredOwnBook).trim().toLocaleLowerCase() === "true";
-        if (liveRuntimeStatus.opening_book_enabled !== bookExpected) {
-          throw new Error("Restored OwnBook setting does not match runtime status");
-        }
-        if (bookExpected && liveRuntimeStatus.opening_book_active !== true) {
-          throw new Error(`Opening book failed to activate: ${liveRuntimeStatus.opening_book_message}`);
-        }
-        if (bookExpected) {
-          const expectedBook = openingBookContract(this.config, liveRuntimeStatus);
-          if (liveRuntimeStatus.opening_book_identity !== expectedBook.identity) {
-            throw new Error(
-              `Opening book content identity mismatch: `
-              + `${liveRuntimeStatus.opening_book_identity}!=${expectedBook.identity}`,
-            );
-          }
-          if (liveRuntimeStatus.opening_book_entries !== expectedBook.rows) {
-            throw new Error(
-              `Opening book entry count mismatch: `
-              + `${liveRuntimeStatus.opening_book_entries}!=${expectedBook.rows}`,
-            );
-          }
-          if (liveRuntimeStatus.opening_book_statistics_available
-              !== expectedBook.statistics_available) {
-            throw new Error("Opening book statistics capability mismatch");
-          }
-        }
+        this.validateOpeningBookRuntime(liveRuntimeStatus, restoredOwnBook);
         this.qualificationStatus = {
           ...this.qualificationStatus,
-          live_runtime_status: liveRuntimeStatus,
+          live_runtime_status: {
+            ...liveRuntimeStatus,
+            opening_book_adapter_validation: "file_set_revalidated",
+          },
         };
       }
     }
     return this.qualificationStatus;
+  }
+
+  validateOpeningBookRuntime(liveRuntimeStatus, ownBook) {
+    const bookExpected = String(ownBook).trim().toLocaleLowerCase() === "true";
+    if (liveRuntimeStatus.opening_book_enabled !== bookExpected) {
+      throw new Error("Restored OwnBook setting does not match runtime status");
+    }
+    if (!bookExpected) return null;
+    if (liveRuntimeStatus.opening_book_active !== true) {
+      throw new Error(`Opening book failed to activate: ${liveRuntimeStatus.opening_book_message}`);
+    }
+    const expectedBook = openingBookContract(this.config, liveRuntimeStatus);
+    if (liveRuntimeStatus.opening_book_identity !== expectedBook.identity) {
+      throw new Error(
+        `Opening book content identity mismatch: `
+        + `${liveRuntimeStatus.opening_book_identity}!=${expectedBook.identity}`,
+      );
+    }
+    if (liveRuntimeStatus.opening_book_entries !== expectedBook.rows) {
+      throw new Error(
+        `Opening book entry count mismatch: `
+        + `${liveRuntimeStatus.opening_book_entries}!=${expectedBook.rows}`,
+      );
+    }
+    if (liveRuntimeStatus.opening_book_statistics_available
+        !== expectedBook.statistics_available) {
+      throw new Error("Opening book statistics capability mismatch");
+    }
+    if (expectedBook.validation === "manifest_verified") {
+      for (const [field, expected] of [
+        ["opening_book_snapshot_identity", expectedBook.snapshot_identity],
+        ["opening_book_snapshot_generation", expectedBook.snapshot_generation],
+        ["opening_book_manifest_sha256", expectedBook.manifest_sha256],
+        ["opening_book_policy_sha256", expectedBook.policy_sha256],
+        ["opening_book_validation", expectedBook.validation],
+      ]) {
+        if (liveRuntimeStatus[field] !== expected) {
+          throw new Error(
+            `Opening book activated snapshot mismatch for ${field}: `
+            + `${liveRuntimeStatus[field] ?? "missing"}!=${expected}`,
+          );
+        }
+      }
+    }
+    return expectedBook;
   }
 
   setOption(name, value) {
@@ -3527,6 +3693,12 @@ export function gameRuntimeProvenance(config, engine) {
         liveRuntime.opening_book_statistics_available ?? null,
       observed_entries: liveRuntime.opening_book_entries ?? null,
       observed_identity: liveRuntime.opening_book_identity ?? "",
+      observed_snapshot_identity: liveRuntime.opening_book_snapshot_identity ?? "",
+      observed_snapshot_generation: liveRuntime.opening_book_snapshot_generation ?? "",
+      observed_manifest_sha256: liveRuntime.opening_book_manifest_sha256 ?? "",
+      observed_policy_sha256: liveRuntime.opening_book_policy_sha256 ?? "",
+      observed_validation: liveRuntime.opening_book_validation ?? "",
+      observed_adapter_validation: liveRuntime.opening_book_adapter_validation ?? "",
       mcgs_prior_blend_permille:
         Number(config.engine.uci_options?.McgsBookPriorBlendPermille ?? 0),
       observed_message: liveRuntime.opening_book_message ?? "",
@@ -3673,6 +3845,10 @@ export class ForegroundSearchCoordinator {
       },
     };
   }
+}
+
+export function bookMoveWasUsed(telemetry) {
+  return telemetry?.book_move_used === 1;
 }
 
 export class GameSession {
@@ -4548,8 +4724,8 @@ export class GameSession {
         root_legality_sync_ms: observation.legalitySynchronization?.elapsedMs ?? null,
         root_legality_applied_plies: observation.legalitySynchronization?.appliedPlies ?? null,
         root_legality_rebuilt: observation.legalitySynchronization?.rebuilt ?? null,
-        book_hit: result.telemetry?.book_probe_result === "hit",
         ...result.telemetry,
+        book_hit: bookMoveWasUsed(result.telemetry),
       });
       this.opponentSearchDrainMs = 0;
     } catch (error) {

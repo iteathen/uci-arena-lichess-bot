@@ -23,6 +23,7 @@ import {
   challengeDeclineReason,
   applyAdaptiveTemporalCurveProfile,
   applySingleGameProfile,
+  bookMoveWasUsed,
   gameRuntimeProvenance,
   loadAdaptiveTemporalCurveProfile,
   loadCapacityProfile,
@@ -400,6 +401,32 @@ function installQualifiedBookFixture(engineConfig) {
     opening_book_file: bookFile,
     opening_book_stats_file: statsFile,
     opening_book_policy_file: policyFile,
+  };
+}
+
+function installManifestBookFixture(engineConfig) {
+  const bookStatus = installQualifiedBookFixture(engineConfig);
+  const manifestPath = path.join(path.dirname(bookStatus.opening_book_file), "snapshot.manifest.json");
+  const artifacts = Object.fromEntries([
+    ["strong_rare_v1.bin", bookStatus.opening_book_file],
+    ["strong_rare_v1.stats", bookStatus.opening_book_stats_file],
+    ["strong_rare_v1.policy", bookStatus.opening_book_policy_file],
+  ].map(([name, filePath]) => [name, sha256(readFileSync(filePath)).slice("sha256:".length)]));
+  const manifest = {
+    schema: "uci_arena_book_snapshot_v2",
+    snapshot_id: "integration-0123456789abcdefabcd",
+    record_count: 1259,
+    artifacts,
+  };
+  writeFileSync(manifestPath, JSON.stringify(manifest));
+  const manifestSha256 = sha256(readFileSync(manifestPath)).slice("sha256:".length);
+  return {
+    ...bookStatus,
+    opening_book_snapshot_identity: `sha256:${manifestSha256}`,
+    opening_book_snapshot_generation: manifest.snapshot_id,
+    opening_book_manifest_sha256: manifestSha256,
+    opening_book_policy_sha256: artifacts["strong_rare_v1.policy"],
+    opening_book_validation: "manifest_verified",
   };
 }
 
@@ -1795,6 +1822,121 @@ test("runtime qualification rejects a loaded opening book with the wrong content
   );
 });
 
+test("runtime qualification independently binds an activated Book Forge manifest", async () => {
+  const { config, profile } = qualifiedFixture();
+  const engineConfig = { ...config.engine, qualification_profile: profile };
+  const bookStatus = installManifestBookFixture(engineConfig);
+  const engine = new UciEngine(engineConfig);
+  engine.advertisedOptions.add("OwnBook");
+  engine.send = () => {};
+  engine.newGame = async () => {};
+  engine.exchange = async (command) => command.startsWith("go depth ") ? "bestmove e2e4" : "readyok";
+  engine.runtimeStatus = async () => ({ ...qualifiedRuntimeStatus(profile), ...bookStatus });
+
+  await engine.qualifyRuntime();
+  assert.equal(
+    engine.qualificationStatus.live_runtime_status.opening_book_snapshot_generation,
+    "integration-0123456789abcdefabcd",
+  );
+  assert.equal(
+    engine.qualificationStatus.live_runtime_status.opening_book_validation,
+    "manifest_verified",
+  );
+});
+
+test("runtime qualification rejects a stale activated Book Forge generation", async () => {
+  const { config, profile } = qualifiedFixture();
+  const engineConfig = { ...config.engine, qualification_profile: profile };
+  const bookStatus = installManifestBookFixture(engineConfig);
+  const engine = new UciEngine(engineConfig);
+  engine.advertisedOptions.add("OwnBook");
+  engine.send = () => {};
+  engine.newGame = async () => {};
+  engine.exchange = async (command) => command.startsWith("go depth ") ? "bestmove e2e4" : "readyok";
+  engine.runtimeStatus = async () => ({
+    ...qualifiedRuntimeStatus(profile),
+    ...bookStatus,
+    opening_book_snapshot_generation: "integration-ffffffffffffffffffff",
+  });
+
+  await assert.rejects(
+    () => engine.qualifyRuntime(),
+    /activated snapshot mismatch for opening_book_snapshot_generation/,
+  );
+});
+
+test("ucinewgame refreshes and revalidates the active Book Forge generation", async () => {
+  const { config, profile } = qualifiedFixture();
+  const engineConfig = { ...config.engine, qualification_profile: profile };
+  const bookStatus = installManifestBookFixture(engineConfig);
+  const engine = new UciEngine(engineConfig);
+  engine.qualificationStatus = {
+    live_runtime_status: {
+      ...qualifiedRuntimeStatus(profile),
+      ...bookStatus,
+      opening_book_snapshot_generation: "integration-ffffffffffffffffffff",
+      opening_book_adapter_validation: "file_set_revalidated",
+    },
+  };
+  engine.stopAndDrain = async () => {};
+  engine.send = () => {};
+  engine.exchange = async () => "readyok";
+  engine.runtimeStatus = async () => ({ ...qualifiedRuntimeStatus(profile), ...bookStatus });
+
+  await engine.newGame();
+  assert.equal(
+    engine.qualificationStatus.live_runtime_status.opening_book_snapshot_generation,
+    "integration-0123456789abcdefabcd",
+  );
+  assert.equal(engine.runtimeGeneration, 1);
+});
+
+test("ucinewgame retains a previously validated generation after an invalid replacement", async () => {
+  const { config, profile } = qualifiedFixture();
+  const engineConfig = { ...config.engine, qualification_profile: profile };
+  const bookStatus = installManifestBookFixture(engineConfig);
+  const previouslyValidated = {
+    ...qualifiedRuntimeStatus(profile),
+    ...bookStatus,
+    opening_book_adapter_validation: "file_set_revalidated",
+  };
+  writeFileSync(bookStatus.opening_book_policy_file, "invalid-replacement=true\n");
+  const engine = new UciEngine(engineConfig);
+  engine.qualificationStatus = { live_runtime_status: previouslyValidated };
+  engine.stopAndDrain = async () => {};
+  engine.send = () => {};
+  engine.exchange = async () => "readyok";
+  engine.runtimeStatus = async () => ({ ...previouslyValidated });
+
+  await engine.newGame();
+  assert.equal(
+    engine.qualificationStatus.live_runtime_status.opening_book_snapshot_generation,
+    "integration-0123456789abcdefabcd",
+  );
+  assert.equal(
+    engine.qualificationStatus.live_runtime_status.opening_book_adapter_validation,
+    "retained_prior_valid_snapshot",
+  );
+});
+
+test("runtime qualification rejects Book Forge artifact tampering", async () => {
+  const { config, profile } = qualifiedFixture();
+  const engineConfig = { ...config.engine, qualification_profile: profile };
+  const bookStatus = installManifestBookFixture(engineConfig);
+  writeFileSync(bookStatus.opening_book_policy_file, "tampered=true\n");
+  const engine = new UciEngine(engineConfig);
+  engine.advertisedOptions.add("OwnBook");
+  engine.send = () => {};
+  engine.newGame = async () => {};
+  engine.exchange = async (command) => command.startsWith("go depth ") ? "bestmove e2e4" : "readyok";
+  engine.runtimeStatus = async () => ({ ...qualifiedRuntimeStatus(profile), ...bookStatus });
+
+  await assert.rejects(
+    () => engine.qualifyRuntime(),
+    /snapshot artifact digest mismatch: strong_rare_v1.policy/,
+  );
+});
+
 test("game provenance captures exact model, effective timing options, and observed book state", () => {
   const { config, profile } = qualifiedFixture();
   config.engine.qualification_profile = { ...profile, profile_path: config.engine.single_game_profile };
@@ -1827,6 +1969,12 @@ test("game provenance captures exact model, effective timing options, and observ
     qualificationStatus: {
       live_runtime_status: {
         ...qualifiedRuntimeStatus(profile),
+        opening_book_snapshot_identity: `sha256:${"c".repeat(64)}`,
+        opening_book_snapshot_generation: "integration-0123456789abcdefabcd",
+        opening_book_manifest_sha256: "c".repeat(64),
+        opening_book_policy_sha256: "d".repeat(64),
+        opening_book_validation: "manifest_verified",
+        opening_book_adapter_validation: "file_set_revalidated",
         syzygy_active: true,
         syzygy_loaded_cardinality: 6,
         syzygy_identity: "123456789",
@@ -1875,6 +2023,13 @@ test("game provenance captures exact model, effective timing options, and observ
   assert.equal(first.provenance.book.observed_active, true);
   assert.equal(first.provenance.book.observed_entries, 1259);
   assert.equal(first.provenance.book.observed_identity, "123456789");
+  assert.equal(
+    first.provenance.book.observed_snapshot_generation,
+    "integration-0123456789abcdefabcd",
+  );
+  assert.equal(first.provenance.book.observed_manifest_sha256, "c".repeat(64));
+  assert.equal(first.provenance.book.observed_validation, "manifest_verified");
+  assert.equal(first.provenance.book.observed_adapter_validation, "file_set_revalidated");
   assert.equal(first.provenance.book.mcgs_prior_blend_permille, 250);
   assert.equal(first.provenance.tablebase.configured_probe_limit, 6);
   assert.equal(first.provenance.tablebase.observed_active, true);
@@ -2045,14 +2200,28 @@ test("UCI search telemetry retains identity across later info string lines", () 
 
 test("UCI book telemetry is structured without losing later search identity", () => {
   const engine = new UciEngine({ uci_options: {} });
-  engine.onLine("info string book_probe_result hit book_miss_reason none book_lookup_us 9 book_evaluation_source neutral_fallback book_evaluation_us 0 book_decision_us 11 book_emit_us 1 book_snapshot_identity 12345 book_record_count 363");
+  engine.onLine("info string book_decision_v1 book_probe_result hit book_probe_hit 1 book_move_used 0 book_exit 1 book_phase_latched 1 book_completion_kind search_handoff book_miss_reason none book_lookup_us 9 book_evaluation_source completed_evaluation book_evaluation_cp -23 book_evaluation_us 4 book_decision_us 11 book_emit_us 0 book_candidate_count 4 book_candidate_games 81 book_selected_lcb 0.42 book_best_lcb 0.57 book_exit_probability 0.73 book_snapshot_identity sha256:12345 book_snapshot_generation integration-0123456789abcdefabcd book_snapshot_manifest_sha256 abc123 book_snapshot_validation manifest_verified book_record_count 363 book_evaluation_model_fingerprint 18446744073709551615");
   engine.onLine("info depth 0 nodes 0 model_provider directml model_fingerprint 9876 model_id model_v1 string opening_book");
   assert.equal(engine.latestInfo.book_probe_result, "hit");
+  assert.equal(engine.latestInfo.book_probe_hit, 1);
+  assert.equal(engine.latestInfo.book_move_used, 0);
+  assert.equal(engine.latestInfo.book_exit, 1);
+  assert.equal(engine.latestInfo.book_completion_kind, "search_handoff");
   assert.equal(engine.latestInfo.book_miss_reason, "none");
   assert.equal(engine.latestInfo.book_lookup_us, 9);
+  assert.equal(engine.latestInfo.book_evaluation_cp, -23);
   assert.equal(engine.latestInfo.book_decision_us, 11);
-  assert.equal(engine.latestInfo.book_snapshot_identity, "12345");
+  assert.equal(engine.latestInfo.book_candidate_count, 4);
+  assert.equal(engine.latestInfo.book_selected_lcb, 0.42);
+  assert.equal(engine.latestInfo.book_exit_probability, 0.73);
+  assert.equal(engine.latestInfo.book_snapshot_identity, "sha256:12345");
+  assert.equal(
+    engine.latestInfo.book_evaluation_model_fingerprint,
+    "18446744073709551615",
+  );
   assert.equal(engine.latestInfo.book_record_count, 363);
+  assert.equal(bookMoveWasUsed(engine.latestInfo), false);
+  assert.equal(bookMoveWasUsed({ book_probe_hit: 1, book_move_used: 1 }), true);
   assert.equal(engine.latestInfo.model_provider, "directml");
   engine.onLine("info depth 3 mcgs_search_intent opponent_root mcgs_book_hint_result hit mcgs_book_hint_active 1 mcgs_book_hint_identity 18446744073709551615 mcgs_book_hint_candidates 2 mcgs_book_prior_blend_permille 250 mcgs_book_top_move e7e5 mcgs_book_top_frequency_ppm 700000 mcgs_book_top_neural_prior_ppm 100000 mcgs_book_top_effective_prior_ppm 250000 mcgs_root_completed_edges_at_start 4 mcgs_root_visited_edges_at_start 5");
   assert.equal(engine.latestInfo.mcgs_search_intent, "opponent_root");

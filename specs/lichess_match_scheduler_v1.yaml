@@ -155,7 +155,9 @@ engine_adapters:
   uci_arena_extended_v1:
     required_protocol:
       - "The existing exact single-game, model, provider, MCGS, timing, capacity, opening-book, and tablebase gates remain authoritative."
-      - "Opening-book publication remains independent of single-game search qualification so Book Forge may publish a newer conforming uci_arena_book_snapshot_v2 snapshot without regenerating timing evidence. When the same-basename .stats and .policy pair is present, the adapter derives the configured book binary's expected FNV-1a identity from its bounded stats header and requires the engine's successful enhanced validation to report that exact loaded identity after restoring OwnBook. With both sidecars absent, the Engine-owned base Polyglot capability remains usable and runtime identity is bound from the live Engine report without inventing Book Forge statistics or hint authority."
+      - "Opening-book publication remains independent of single-game search qualification so Book Forge may publish a newer conforming uci_arena_book_snapshot_v2 snapshot without regenerating timing evidence. When snapshot.manifest.json exists beside the canonical .bin/.stats/.policy set, the adapter independently validates the bounded manifest schema, generation, record count, exact artifact names and SHA-256 digests, then requires the Engine's activated snapshot identity, generation, manifest digest, policy digest, validation mode, entry count, and exact paths to match after restoring OwnBook and again after each ucinewgame before recording game provenance. A replacement that fails any check cannot displace the last qualified Engine process or enter completed-game evidence."
+      - "If the on-disk live channel is replaced or becomes invalid after a manifest generation was independently validated, ucinewgame may continue only when every Engine-reported active snapshot and path field exactly matches that previously validated generation. Game provenance marks this retained_prior_valid_snapshot state; initial qualification and any changed or previously unvalidated identity still fail closed."
+      - "A same-basename .stats and .policy pair without snapshot.manifest.json remains a rolling-compatible legacy file set: the adapter derives the configured book binary's expected FNV-1a identity from its bounded stats header and requires that exact loaded identity. With both sidecars absent, the Engine-owned base Polyglot capability remains usable and runtime identity is bound from the live Engine report without inventing Book Forge statistics, manifest authority, or hint authority."
       - "Installer composition for uci_arena_extended_v1 requires one regular non-link book binary. A same-basename .stats and .policy pair is optional but atomic: both valid regular non-link paths are supplied together or neither is supplied. A partial pair fails configuration, while an absent pair explicitly clears sidecar options instead of falling through to unrelated engine defaults."
       - "When a single-game profile binds Syzygy, runtime qualification requires exact active cardinality, manifest identity, probe limit and worker topology, rule-50 policy, and root/internal activation; retained files without a current matching profile and live runtime report have no installation or play authority."
       - "Profile-owned Syzygy path conflicts are decided from normalized absolute platform path identity, not raw separator, case, dot-segment, or trailing-separator spelling. A genuinely different tablebase or manifest still fails closed and content identity remains independently validated."
@@ -498,12 +500,34 @@ opponent_turn_time_management_2026_07_20:
     - state_received_to_dispatch_ms
     - post_dispatch_to_ack_ms
     - book_probe_result
+    - book_probe_hit
+    - book_move_used
+    - book_exit
+    - book_phase_latched
+    - book_completion_kind
     - book_miss_reason
     - book_lookup_us
+    - book_evaluation_source
+    - book_evaluation_cp
+    - book_evaluation_us
     - book_decision_us
+    - book_emit_us
+    - book_candidate_count
+    - book_candidate_games
+    - book_selected_lcb
+    - book_best_lcb
+    - book_exit_probability
     - book_snapshot_identity
+    - book_snapshot_generation
+    - book_snapshot_manifest_sha256
+    - book_snapshot_validation
     - book_record_count
+    - book_evaluation_model_fingerprint
     - null_bestmove
+  opening_book_evidence:
+    - "A probe hit is lookup evidence, not proof that the book supplied the played move. book_hit is true only when typed book_move_used equals one; a hit that crosses the dynamic exit threshold remains a search_handoff with book_exit true and book_hit false."
+    - "Typed decision evidence preserves the completed compatible evaluation or neutral fallback, candidate context, LCBs, exit probability, activated snapshot generation and manifest identity, and measured lookup/decision/emission latency without reinterpreting later MCGS telemetry."
+    - "Per-game provenance distinguishes a file_set_revalidated generation from a retained_prior_valid_snapshot whose invalid replacement was rejected without changing the Engine's active generation."
   validation:
     - "Mock streams cover hits, misses, duplicates, reconnects, clock corrections, takebacks, terminal states, HTTP 400/429, generation changes, and queued-request invalidation with zero early or stale submissions."
     - "First-move watchdog tests prove that a Black game still at zero plies aborts once after the configured deadline, while a White game, any observed first move, terminal state, shutdown, or queued-request race produces no abort."
