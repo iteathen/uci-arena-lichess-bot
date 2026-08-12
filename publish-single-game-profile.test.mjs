@@ -202,8 +202,13 @@ function fixture(searchCore = "v2") {
           provider_batches_delta: 3,
           provider_rows_delta: 8,
           stale_publications_delta: 0,
-          bestmove_active_tickets: 0,
+          stale_publications: 0,
+          bestmove_active_tickets: 4,
           bestmove_active_async_leases: 0,
+          post_bestmove_drain_ms: 15.25,
+          post_bestmove_status_samples: 2,
+          active_tickets: 0,
+          active_async_leases: 0,
         },
       },
     },
@@ -327,6 +332,39 @@ test("publishes a self-contained exact local-live-safety profile", () => {
   assert.equal(
     existsSync(path.resolve(path.dirname(options.output), completeGameArtifact)),
     true,
+  );
+});
+
+test("accepts bestmove-boundary work only after a clean bounded drain", () => {
+  const accepted = fixture("mcgs");
+  const result = publishSingleGameProfile({
+    ...accepted,
+    qualification_scope: "local_live_safety",
+  });
+  assert.equal(result.qualified, true);
+
+  const leaked = fixture("mcgs");
+  const leakedEvidence = JSON.parse(readFileSync(leaked.complete_game_evidence, "utf8"));
+  leakedEvidence.runtime_contract.activation_probe.runtime.active_tickets = 1;
+  writeFileSync(leaked.complete_game_evidence, JSON.stringify(leakedEvidence));
+  assert.throws(
+    () => publishSingleGameProfile({
+      ...leaked,
+      qualification_scope: "local_live_safety",
+    }),
+    /did not drain cleanly/,
+  );
+
+  const unbounded = fixture("mcgs");
+  const unboundedEvidence = JSON.parse(readFileSync(unbounded.complete_game_evidence, "utf8"));
+  unboundedEvidence.runtime_contract.activation_probe.runtime.post_bestmove_drain_ms = 2_001;
+  writeFileSync(unbounded.complete_game_evidence, JSON.stringify(unboundedEvidence));
+  assert.throws(
+    () => publishSingleGameProfile({
+      ...unbounded,
+      qualification_scope: "local_live_safety",
+    }),
+    /drain was not bounded/,
   );
 });
 
