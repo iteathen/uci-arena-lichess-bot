@@ -214,7 +214,7 @@ export async function prepareLinuxStartupReplacement({
   const updated = retargetSystemdUnit(
     await readFile(unitPath, "utf8"), previousRoot, replacementRoot,
   );
-  await systemctl(["stop", SYSTEMD_UNIT_NAME]);
+  await systemctl(["disable", "--now", SYSTEMD_UNIT_NAME]);
   if (await systemctlState("is-active") === "active") {
     throw new Error(`${SYSTEMD_UNIT_NAME} did not stop for replacement`);
   }
@@ -222,8 +222,12 @@ export async function prepareLinuxStartupReplacement({
   await writeFile(temporaryUnitPath, updated, { encoding: "utf8", mode: 0o600 });
   await rename(temporaryUnitPath, unitPath);
   await systemctl(["daemon-reload"]);
+  const state = await queryLinuxStartup();
+  if (state.enabled !== "disabled" || state.active !== "inactive") {
+    throw new Error(`${SYSTEMD_UNIT_NAME} did not enter replacement-ready state`);
+  }
   return {
-    ...(await queryLinuxStartup()),
+    ...state,
     installed: true,
     active: false,
     replacementReady: true,

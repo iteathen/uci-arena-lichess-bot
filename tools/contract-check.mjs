@@ -71,7 +71,8 @@ if (startupControl?.schema !== "arena_provider_startup_control_v2"
       !== JSON.stringify(["startup", "complete_replace"])
     || startupControl.replacement_arguments?.previous_root !== "--previous-root"
     || startupControl.replacement_arguments?.replacement_root !== "--replacement-root"
-    || startupControl.result?.require_live_on_post_replace !== true) {
+    || startupControl.result?.require_live_on_post_replace !== false
+    || startupControl.result?.allow_deferred_requalification_on_post_replace !== true) {
   errors.push("Installer startup-control v2 projection is incomplete");
 }
 if (service.startup?.credential_gated !== true

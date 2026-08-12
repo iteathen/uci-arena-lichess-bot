@@ -116,10 +116,17 @@ async function queryStartupTask(execute = execFileAsync) {
       maxBuffer: 1024 * 1024,
     });
     const status = /Status:\s*([^\r\n]+)/i.exec(stdout)?.[1]?.trim() ?? "unknown";
+    const scheduledState = /Scheduled Task State:\s*([^\r\n]+)/i
+      .exec(stdout)?.[1]?.trim() ?? "unknown";
     const lastResult = /Last Result:\s*([^\r\n]+)/i.exec(stdout)?.[1]?.trim() ?? "unknown";
     return {
       installed: true,
       active: /^running$/iu.test(status),
+      enabled: /^enabled$/iu.test(scheduledState)
+        ? true
+        : /^disabled$/iu.test(scheduledState)
+          ? false
+          : null,
       taskName: STARTUP_TASK_NAME,
       taskStatus: status,
       lastResult,
@@ -303,7 +310,7 @@ export async function prepareWindowsStartupReplacement({
     await rm(temporaryXml, { force: true });
   }
   const state = await query();
-  if (!state.installed || state.active) {
+  if (!state.installed || state.active || state.enabled !== false) {
     throw new Error("Lichess startup task did not enter replacement-ready state");
   }
   return { ...state, installed: true, active: false, replacementReady: true };
