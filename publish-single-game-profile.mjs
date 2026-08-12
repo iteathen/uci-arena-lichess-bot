@@ -336,9 +336,24 @@ function validateCompleteGame(
       [runtime.v2_cursor_ready_resumes, "cursor ready resumes"],
     ]) requireValue(Number(value) > 0, `Complete-game ${label} is not positive`);
   }
+  for (const [value, label] of [
+    [runtime.bestmove_active_tickets, "bestmove active tickets"],
+    [runtime.bestmove_active_async_leases, "bestmove active asynchronous leases"],
+  ]) {
+    requireValue(Number.isSafeInteger(value) && value >= 0,
+      `Complete-game ${label} telemetry is invalid`);
+  }
+  requireValue(Number.isFinite(runtime.post_bestmove_drain_ms)
+    && runtime.post_bestmove_drain_ms >= 0
+    && runtime.post_bestmove_drain_ms <= 2_000,
+  "Complete-game post-bestmove drain was not bounded");
+  requireValue(Number.isSafeInteger(runtime.post_bestmove_status_samples)
+    && runtime.post_bestmove_status_samples >= 1,
+  "Complete-game post-bestmove drain sampling is invalid");
   requireValue(runtime.stale_publications_delta === 0
-    && runtime.bestmove_active_tickets === 0
-    && runtime.bestmove_active_async_leases === 0,
+    && runtime.stale_publications === 0
+    && runtime.active_tickets === 0
+    && runtime.active_async_leases === 0,
   "Complete-game activation did not drain cleanly");
   return validateCompleteGameTablebase(topology.tablebase, runtime);
 }
