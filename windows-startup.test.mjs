@@ -11,7 +11,10 @@ import {
   STARTUP_TASK_NAME,
   buildTaskXml,
   completeWindowsStartupReplacement,
+  parseWindowsArguments,
   prepareWindowsStartupReplacement,
+  quoteWindowsArgument,
+  reconcileWindowsTaskXml,
   retargetWindowsTaskXml,
   stopAndDeleteWindowsTask,
   startupAction,
@@ -203,6 +206,39 @@ test("startup replacement accepts the Task Scheduler default when task enablemen
   assert.match(updated, new RegExp(replacementRoot.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "iu"));
   assert.doesNotMatch(updated, /<Settings>[\s\S]*?<Enabled>false<\/Enabled>/u);
   assert.match(updated, /<LogonTrigger><Enabled>true<\/Enabled>/u);
+});
+
+test("post-requalification reconciliation replaces stale runtime bindings and preserves credentials", () => {
+  const stale = {
+    ...options(),
+    profile: "runtime_state/model/stale-single.json",
+    capacityProfile: "runtime_state/model/stale-capacity.json",
+    modelRoot: "engine/runtime/models/stale/engine",
+  };
+  const current = {
+    ...options(),
+    profile: "runtime_state/model/current-single.json",
+    capacityProfile: "runtime_state/model/current-capacity.json",
+    modelRoot: "engine/runtime/models/current/engine",
+  };
+  delete current.tokenFile;
+  delete current.expectedAccount;
+  const tokenFile = path.resolve(stale.tokenFile);
+  const reconciled = reconcileWindowsTaskXml(buildTaskXml(stale, "S-1-5-21-1"), current);
+  assert.doesNotMatch(reconciled, /stale-(single|capacity)|models\\stale/iu);
+  assert.match(reconciled, /current-single\.json/iu);
+  assert.match(reconciled, /current-capacity\.json/iu);
+  assert.match(reconciled, /models\\current\\engine/iu);
+  assert.match(
+    reconciled,
+    new RegExp(tokenFile.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "iu"),
+  );
+  assert.match(reconciled, /--expected-account account/iu);
+});
+
+test("Windows startup argument parser is the inverse of canonical quoting", () => {
+  const values = ["plain", "path with spaces\\", 'embedded"quote', ""];
+  assert.deepEqual(parseWindowsArguments(values.map(quoteWindowsArgument).join(" ")), values);
 });
 
 test("startup teardown waits for launcher exit before deleting the task", async () => {

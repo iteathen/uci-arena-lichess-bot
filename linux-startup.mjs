@@ -29,6 +29,85 @@ export function systemdEscapeArgument(value) {
     .replaceAll("%", "%%")}"`;
 }
 
+export function parseSystemdArguments(commandLine) {
+  const result = [];
+  let index = 0;
+  while (index < commandLine.length) {
+    while (/\s/u.test(commandLine[index] ?? "")) index += 1;
+    if (index >= commandLine.length) break;
+    if (commandLine[index] !== '"') {
+      throw new Error("Existing Lichess systemd action is not canonically quoted");
+    }
+    index += 1;
+    let value = "";
+    let closed = false;
+    while (index < commandLine.length) {
+      const character = commandLine[index];
+      if (character === '"') {
+        index += 1;
+        closed = true;
+        break;
+      }
+      if (character === "\\") {
+        const escaped = commandLine[index + 1];
+        if (escaped !== "\\" && escaped !== '"') {
+          throw new Error("Existing Lichess systemd action has an unsupported escape");
+        }
+        value += escaped;
+        index += 2;
+        continue;
+      }
+      if ((character === "$" || character === "%")
+          && commandLine[index + 1] === character) {
+        value += character;
+        index += 2;
+        continue;
+      }
+      value += character;
+      index += 1;
+    }
+    if (!closed || (index < commandLine.length && !/\s/u.test(commandLine[index]))) {
+      throw new Error("Existing Lichess systemd action has invalid quoting");
+    }
+    result.push(value);
+  }
+  return result;
+}
+
+function existingCredentialProjection(values) {
+  if (values.length < 11 || values[2] !== "run"
+      || path.resolve(values[1]) !== path.resolve(ADAPTER)
+      || !path.isAbsolute(values[0])) {
+    throw new Error("Existing Lichess systemd action is not the owned adapter command");
+  }
+  const permitted = new Set([
+    "--config", "--token-file", "--expected-account", "--runtime-dir", "--profile",
+    "--time-profile", "--temporal-curve-profile", "--capacity-profile", "--model-root",
+  ]);
+  const bindings = new Map();
+  for (let index = 3; index < values.length; index += 2) {
+    const flag = values[index];
+    const value = values[index + 1];
+    if (!permitted.has(flag) || value === undefined || bindings.has(flag)) {
+      throw new Error("Existing Lichess systemd action has an unsupported argument shape");
+    }
+    bindings.set(flag, value);
+  }
+  for (const flag of ["--config", "--token-file", "--expected-account", "--runtime-dir"]) {
+    if (!bindings.get(flag)) throw new Error(`Existing Lichess systemd action omits ${flag}`);
+  }
+  const tokenFile = path.resolve(bindings.get("--token-file"));
+  const relativeToken = path.relative(ROOT, tokenFile);
+  if (relativeToken === "" || (!relativeToken.startsWith("..") && !path.isAbsolute(relativeToken))) {
+    throw new Error("Existing Lichess startup token path is inside the component root");
+  }
+  const expectedAccount = bindings.get("--expected-account");
+  if (expectedAccount.length > 64 || /[\0\r\n]/u.test(expectedAccount)) {
+    throw new Error("Existing Lichess startup account identity is invalid");
+  }
+  return { tokenFile, expectedAccount };
+}
+
 export function startupUnitPath({
   environment = process.env,
   homeDirectory = os.homedir(),
@@ -91,6 +170,23 @@ PrivateTmp=true
 [Install]
 WantedBy=default.target
 `;
+}
+
+export function reconcileSystemdUnit(unit, options) {
+  const workingMatches = [...unit.matchAll(/^WorkingDirectory=(.*)$/gmu)];
+  const execMatches = [...unit.matchAll(/^ExecStart=(.*)$/gmu)];
+  if (workingMatches.length !== 1 || execMatches.length !== 1
+      || parseSystemdArguments(workingMatches[0][1]).length !== 1
+      || path.resolve(parseSystemdArguments(workingMatches[0][1])[0]) !== path.resolve(ROOT)) {
+    throw new Error("Existing Lichess systemd unit is not owned by this component root");
+  }
+  const existing = parseSystemdArguments(execMatches[0][1]);
+  const credentials = existingCredentialProjection(existing);
+  const action = startupAction({ ...options, ...credentials });
+  const command = [action.command, ...action.arguments].map(systemdEscapeArgument).join(" ");
+  return unit
+    .replace(workingMatches[0][0], `WorkingDirectory=${systemdEscapeArgument(action.workingDirectory)}`)
+    .replace(execMatches[0][0], `ExecStart=${command}`);
 }
 
 async function systemctl(argumentsList) {
@@ -232,6 +328,28 @@ export async function prepareLinuxStartupReplacement({
     active: false,
     replacementReady: true,
   };
+}
+
+export async function reconcileLinuxStartupReplacement({ startupOptions } = {}) {
+  requireLinux();
+  if (!startupOptions?.runtimeDir) {
+    throw new Error("startup replacement reconciliation requires current runtime bindings");
+  }
+  const before = await queryLinuxStartup();
+  if (!before.installed || before.enabled !== "disabled" || before.active !== "inactive") {
+    throw new Error(`${SYSTEMD_UNIT_NAME} is not disabled and inactive for reconciliation`);
+  }
+  const unitPath = startupUnitPath();
+  const updated = reconcileSystemdUnit(await readFile(unitPath, "utf8"), startupOptions);
+  const temporaryUnitPath = `${unitPath}.reconcile-${process.pid}`;
+  await writeFile(temporaryUnitPath, updated, { encoding: "utf8", mode: 0o600 });
+  await rename(temporaryUnitPath, unitPath);
+  await systemctl(["daemon-reload"]);
+  const state = await queryLinuxStartup();
+  if (state.enabled !== "disabled" || state.active !== "inactive") {
+    throw new Error(`${SYSTEMD_UNIT_NAME} did not remain replacement-ready after reconciliation`);
+  }
+  return { ...state, installed: true, active: false, replacementReady: true };
 }
 
 export async function completeLinuxStartupReplacement() {
