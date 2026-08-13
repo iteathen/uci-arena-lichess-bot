@@ -5,6 +5,8 @@ import test from "node:test";
 import {
   SYSTEMD_UNIT_NAME,
   buildSystemdUnit,
+  parseSystemdArguments,
+  reconcileSystemdUnit,
   retargetSystemdUnit,
   startupAction,
   startupUnitPath,
@@ -69,4 +71,38 @@ test("systemd path honors XDG_CONFIG_HOME and argument escaping is literal", () 
   );
   assert.equal(systemdEscapeArgument('a b"$%\\c'), '"a b\\"$$%%\\\\c"');
   assert.throws(() => systemdEscapeArgument("bad\nvalue"), /control characters/);
+});
+
+test("post-requalification systemd reconciliation replaces stale bindings and preserves credentials", () => {
+  const stale = {
+    ...options(),
+    profile: "runtime_state/model/stale-single.json",
+    capacityProfile: "runtime_state/model/stale-capacity.json",
+    modelRoot: "engine/runtime/models/stale/engine",
+  };
+  const current = {
+    ...options(),
+    profile: "runtime_state/model/current-single.json",
+    capacityProfile: "runtime_state/model/current-capacity.json",
+    modelRoot: "engine/runtime/models/current/engine",
+  };
+  delete current.tokenFile;
+  delete current.expectedAccount;
+  const reconciled = reconcileSystemdUnit(buildSystemdUnit(stale), current);
+  for (const stalePath of [stale.profile, stale.capacityProfile, stale.modelRoot]) {
+    assert.equal(reconciled.includes(systemdEscapeArgument(path.resolve(stalePath))), false);
+  }
+  for (const currentPath of [current.profile, current.capacityProfile, current.modelRoot]) {
+    assert.equal(reconciled.includes(systemdEscapeArgument(path.resolve(currentPath))), true);
+  }
+  assert.equal(
+    reconciled.includes(systemdEscapeArgument(path.resolve(stale.tokenFile))),
+    true,
+  );
+  assert.match(reconciled, /--expected-account/);
+});
+
+test("systemd startup argument parser is the inverse of canonical escaping", () => {
+  const values = ["plain", "path with spaces\\", 'embedded"quote', "money$percent%"];
+  assert.deepEqual(parseSystemdArguments(values.map(systemdEscapeArgument).join(" ")), values);
 });

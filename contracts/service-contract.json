@@ -2,7 +2,7 @@
   "schema": "uci_arena_service_contract_v1",
   "service": {
     "component_id": "lichess.adapter",
-    "component_version": "1.0.18",
+    "component_version": "1.0.19",
     "product_id": "uci_arena.lichess_bot",
     "contract_version": "1.0",
     "transport": "cli_json",

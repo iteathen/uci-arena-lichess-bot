@@ -22,6 +22,88 @@ function xmlEscape(value) {
     .replaceAll('"', "&quot;").replaceAll("'", "&apos;");
 }
 
+function xmlUnescape(value) {
+  return String(value).replace(/&(quot|apos|lt|gt|amp);/gu, (_, entity) => ({
+    quot: '"', apos: "'", lt: "<", gt: ">", amp: "&",
+  })[entity]);
+}
+
+export function parseWindowsArguments(commandLine) {
+  const result = [];
+  let index = 0;
+  while (index < commandLine.length) {
+    while (/\s/u.test(commandLine[index] ?? "")) index += 1;
+    if (index >= commandLine.length) break;
+    let value = "";
+    let quoted = false;
+    while (index < commandLine.length) {
+      let backslashes = 0;
+      while (commandLine[index] === "\\") {
+        backslashes += 1;
+        index += 1;
+      }
+      if (commandLine[index] === '"') {
+        value += "\\".repeat(Math.floor(backslashes / 2));
+        if (backslashes % 2 === 1) value += '"';
+        else quoted = !quoted;
+        index += 1;
+        continue;
+      }
+      value += "\\".repeat(backslashes);
+      if (index >= commandLine.length || (!quoted && /\s/u.test(commandLine[index]))) break;
+      value += commandLine[index];
+      index += 1;
+    }
+    if (quoted) throw new Error("Existing Lichess startup arguments have an unterminated quote");
+    result.push(value);
+    while (/\s/u.test(commandLine[index] ?? "")) index += 1;
+  }
+  return result;
+}
+
+function existingCredentialProjection(argumentsText, adapterPath) {
+  const values = parseWindowsArguments(argumentsText);
+  if (values.length < 11 || values[2] !== "run"
+      || path.resolve(values[1]) !== path.resolve(adapterPath)
+      || !path.isAbsolute(values[0])) {
+    throw new Error("Existing Lichess startup action is not the owned adapter command");
+  }
+  const permitted = new Set([
+    "--config", "--token-file", "--expected-account", "--runtime-dir", "--profile",
+    "--time-profile", "--temporal-curve-profile", "--capacity-profile", "--model-root",
+  ]);
+  const bindings = new Map();
+  for (let index = 3; index < values.length; index += 2) {
+    const flag = values[index];
+    const value = values[index + 1];
+    if (!permitted.has(flag) || value === undefined || bindings.has(flag)) {
+      throw new Error("Existing Lichess startup action has an unsupported argument shape");
+    }
+    bindings.set(flag, value);
+  }
+  for (const flag of ["--config", "--token-file", "--expected-account", "--runtime-dir"]) {
+    if (!bindings.get(flag)) {
+      throw new Error(`Existing Lichess startup action omits ${flag}`);
+    }
+  }
+  const tokenFile = path.resolve(bindings.get("--token-file"));
+  const relativeToken = path.relative(ROOT, tokenFile);
+  if (relativeToken === "" || (!relativeToken.startsWith("..") && !path.isAbsolute(relativeToken))) {
+    throw new Error("Existing Lichess startup token path is inside the component root");
+  }
+  const expectedAccount = bindings.get("--expected-account");
+  if (expectedAccount.length > 64 || /[\0\r\n]/u.test(expectedAccount)) {
+    throw new Error("Existing Lichess startup account identity is invalid");
+  }
+  return { tokenFile, expectedAccount };
+}
+
+function exactXmlElement(block, name) {
+  const matches = [...block.matchAll(new RegExp(`<${name}>([\\s\\S]*?)<\\/${name}>`, "giu"))];
+  if (matches.length !== 1) throw new Error(`Existing Lichess startup task has invalid ${name}`);
+  return xmlUnescape(matches[0][1]);
+}
+
 export function quoteWindowsArgument(value) {
   const text = String(value);
   if (!text.length) return '""';
@@ -91,6 +173,32 @@ export function buildTaskXml(options, userSid) {
   </Actions>
 </Task>
 `;
+}
+
+export function reconcileWindowsTaskXml(taskXml, options) {
+  const execMatches = [...taskXml.matchAll(/<Exec>[\s\S]*?<\/Exec>/giu)];
+  if (execMatches.length !== 1) {
+    throw new Error("Existing Lichess startup task must contain one owned Exec action");
+  }
+  const existingExec = execMatches[0][0];
+  const existingCommand = exactXmlElement(existingExec, "Command");
+  const existingWorkingDirectory = exactXmlElement(existingExec, "WorkingDirectory");
+  const expectedLauncher = path.resolve(options.nativeLauncher ?? NATIVE_LAUNCHER);
+  if (path.resolve(existingCommand) !== expectedLauncher
+      || path.resolve(existingWorkingDirectory) !== path.resolve(ROOT)) {
+    throw new Error("Existing Lichess startup task action is not owned by this component root");
+  }
+  const credentials = existingCredentialProjection(
+    exactXmlElement(existingExec, "Arguments"),
+    ADAPTER,
+  );
+  const action = startupAction({
+    ...options,
+    ...credentials,
+    nativeLauncher: expectedLauncher,
+  });
+  const replacementExec = `<Exec><Command>${xmlEscape(action.command)}</Command><Arguments>${xmlEscape(action.arguments)}</Arguments><WorkingDirectory>${xmlEscape(action.workingDirectory)}</WorkingDirectory></Exec>`;
+  return taskXml.replace(existingExec, replacementExec);
 }
 
 async function currentUserSid() {
@@ -312,6 +420,51 @@ export async function prepareWindowsStartupReplacement({
   const state = await query();
   if (!state.installed || state.active || state.enabled !== false) {
     throw new Error("Lichess startup task did not enter replacement-ready state");
+  }
+  return { ...state, installed: true, active: false, replacementReady: true };
+}
+
+export async function reconcileWindowsStartupReplacement({
+  startupOptions,
+  execute = execFileAsync,
+  query = () => queryStartupTask(execute),
+} = {}) {
+  requireWindows();
+  if (!startupOptions?.runtimeDir) {
+    throw new Error("startup replacement reconciliation requires current runtime bindings");
+  }
+  const before = await query();
+  if (!before.installed || before.active || before.enabled !== false) {
+    throw new Error("Lichess startup task is not disabled and inactive for reconciliation");
+  }
+  const { stdout } = await execute(
+    "schtasks.exe", ["/Query", "/TN", STARTUP_TASK_NAME, "/XML"],
+    { windowsHide: true, timeout: 10_000, maxBuffer: 1024 * 1024 },
+  );
+  const updatedXml = reconcileWindowsTaskXml(stdout, startupOptions);
+  const runtimeDir = path.resolve(startupOptions.runtimeDir);
+  await mkdir(runtimeDir, { recursive: true });
+  const temporaryXml = path.join(runtimeDir, `startup-reconcile-${process.pid}.xml`);
+  await writeFile(
+    temporaryXml,
+    Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(updatedXml, "utf16le")]),
+  );
+  try {
+    await execute("schtasks.exe", ["/Delete", "/TN", STARTUP_TASK_NAME, "/F"], {
+      windowsHide: true, timeout: 10_000, maxBuffer: 1024 * 1024,
+    });
+    await execute("schtasks.exe", ["/Create", "/TN", STARTUP_TASK_NAME, "/XML", temporaryXml, "/F"], {
+      windowsHide: true, timeout: 20_000, maxBuffer: 1024 * 1024,
+    });
+    await execute("schtasks.exe", ["/Change", "/TN", STARTUP_TASK_NAME, "/DISABLE"], {
+      windowsHide: true, timeout: 10_000, maxBuffer: 1024 * 1024,
+    });
+  } finally {
+    await rm(temporaryXml, { force: true });
+  }
+  const state = await query();
+  if (!state.installed || state.active || state.enabled !== false) {
+    throw new Error("Lichess startup task did not remain replacement-ready after reconciliation");
   }
   return { ...state, installed: true, active: false, replacementReady: true };
 }

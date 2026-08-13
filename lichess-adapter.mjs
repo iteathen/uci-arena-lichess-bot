@@ -37,6 +37,7 @@ import {
   installWindowsStartup,
   prepareWindowsStartupReplacement,
   queryWindowsStartup,
+  reconcileWindowsStartupReplacement,
   uninstallWindowsStartup,
 } from "./windows-startup.mjs";
 import {
@@ -44,6 +45,7 @@ import {
   installLinuxStartup,
   prepareLinuxStartupReplacement,
   queryLinuxStartup,
+  reconcileLinuxStartupReplacement,
   uninstallLinuxStartup,
 } from "./linux-startup.mjs";
 import {
@@ -6078,6 +6080,18 @@ async function preflightDeploymentBundle(config) {
   return { qualificationProfile, qualificationStatus };
 }
 
+function startupRuntimeOptions(config, configPath, runtimeDir) {
+  return {
+    config: path.resolve(configPath),
+    runtimeDir: path.resolve(runtimeDir),
+    profile: config.engine.single_game_profile,
+    timeProfile: config.engine.time_profile,
+    temporalCurve: config.engine.temporal_curve_profile,
+    capacityProfile: config.capacity.capacity_profile,
+    modelRoot: config.engine.uci_options.ModelRoot,
+  };
+}
+
 function integerOption(value, label, fallback) {
   const parsed = value === undefined ? fallback : Number(value);
   if (!Number.isSafeInteger(parsed)) throw new Error(`${label} must be an integer`);
@@ -6212,15 +6226,22 @@ export async function main(argv = process.argv.slice(2)) {
   }
   if (options.command === "startup" && options.action === "complete_replace") {
     let requalification = null;
+    let replacementConfig = null;
+    const replacementConfigPath = path.resolve(options.config ?? DEFAULT_TEMPLATE);
     try {
-      const replacementConfig = loadRuntimeConfig({
-        templatePath: path.resolve(options.config ?? DEFAULT_TEMPLATE),
+      replacementConfig = loadRuntimeConfig({
+        templatePath: replacementConfigPath,
         engineRoot: path.resolve(options.engine_root ?? ROOT),
         environment: {},
       });
-      if (usesExtendedEngineAdapter(replacementConfig)) {
-        applySingleGameProfile(replacementConfig);
-      }
+      const { qualificationProfile, qualificationStatus } =
+        await preflightDeploymentBundle(replacementConfig);
+      loadCapacityProfile(
+        replacementConfig.capacity.capacity_profile,
+        replacementConfig,
+        qualificationProfile,
+        qualificationStatus,
+      );
     } catch (error) {
       requalification = exactEvidenceRequalification(error);
       if (!requalification) throw error;
@@ -6246,6 +6267,18 @@ export async function main(argv = process.argv.slice(2)) {
         },
       }));
       return 0;
+    }
+    const startupOptions = startupRuntimeOptions(
+      replacementConfig,
+      replacementConfigPath,
+      runtimeDir,
+    );
+    if (process.platform === "win32") {
+      await reconcileWindowsStartupReplacement({ startupOptions });
+    } else if (process.platform === "linux") {
+      await reconcileLinuxStartupReplacement({ startupOptions });
+    } else {
+      throw new Error(`Unsupported startup platform: ${process.platform}`);
     }
     const replacement = process.platform === "win32"
       ? await completeWindowsStartupReplacement({
