@@ -1,10 +1,16 @@
 import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { rm } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { setTimeout as wait } from "node:timers/promises";
+import {
+  classifyExactPathSync,
+  createExactTemporaryFileSync,
+  ensureExactDirectorySync,
+  publishExactJsonSync,
+  removeExactPublishedFileSync,
+} from "./exact-file.mjs";
 
 const execFileAsync = promisify(execFile);
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -12,6 +18,30 @@ const ROOT = HERE;
 const ADAPTER = path.join(HERE, "lichess-adapter.mjs");
 export const STARTUP_TASK_NAME = "UCI Arena Lichess Adapter";
 export const NATIVE_LAUNCHER = path.join(HERE, "native", "lichess_adapter_launcher.exe");
+const STARTUP_FILE_LIMIT = 1024 * 1024;
+
+function exactRegularFileExistsSync(filename, label) {
+  const admission = classifyExactPathSync(filename, { label });
+  if (admission.kind === "missing") return false;
+  if (admission.kind !== "file") throw new Error(`${label} is not a regular non-link file`);
+  return true;
+}
+
+function stageTaskXml(runtimeDirectory, prefix, xml) {
+  const runtime = ensureExactDirectorySync(runtimeDirectory, "Lichess runtime directory");
+  return createExactTemporaryFileSync(
+    runtime,
+    prefix,
+    Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(xml, "utf16le")]),
+    { maximumBytes: STARTUP_FILE_LIMIT, label: "Lichess startup task XML" },
+  );
+}
+
+function removeStagedTaskXml(staged) {
+  removeExactPublishedFileSync(staged.filename, staged.identity, {
+    label: "Lichess startup task XML",
+  });
+}
 
 function requireWindows() {
   if (process.platform !== "win32") throw new Error("Lichess startup supervision is supported only on Windows");
@@ -422,25 +452,19 @@ export async function prepareWindowsStartupReplacement({
     controlLauncher: NATIVE_LAUNCHER,
     ownedLauncher: path.join(path.resolve(previousRoot), "native", "lichess_adapter_launcher.exe"),
   });
-  const resolvedRuntime = path.resolve(runtimeDir);
-  await mkdir(resolvedRuntime, { recursive: true });
-  const temporaryXml = path.join(resolvedRuntime, `startup-replacement-${process.pid}.xml`);
-  await writeFile(
-    temporaryXml,
-    Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(updatedXml, "utf16le")]),
-  );
+  const stagedXml = stageTaskXml(path.resolve(runtimeDir), "startup-replacement", updatedXml);
   try {
     await execute("schtasks.exe", ["/Delete", "/TN", STARTUP_TASK_NAME, "/F"], {
       windowsHide: true, timeout: 10_000, maxBuffer: 1024 * 1024,
     });
-    await execute("schtasks.exe", ["/Create", "/TN", STARTUP_TASK_NAME, "/XML", temporaryXml, "/F"], {
+    await execute("schtasks.exe", ["/Create", "/TN", STARTUP_TASK_NAME, "/XML", stagedXml.filename, "/F"], {
       windowsHide: true, timeout: 20_000, maxBuffer: 1024 * 1024,
     });
     await execute("schtasks.exe", ["/Change", "/TN", STARTUP_TASK_NAME, "/DISABLE"], {
       windowsHide: true, timeout: 10_000, maxBuffer: 1024 * 1024,
     });
   } finally {
-    await rm(temporaryXml, { force: true });
+    removeStagedTaskXml(stagedXml);
   }
   const state = await query();
   if (!state.installed || state.active || state.enabled !== false) {
@@ -467,25 +491,23 @@ export async function reconcileWindowsStartupReplacement({
     { windowsHide: true, timeout: 10_000, maxBuffer: 1024 * 1024 },
   );
   const updatedXml = reconcileWindowsTaskXml(stdout, startupOptions);
-  const runtimeDir = path.resolve(startupOptions.runtimeDir);
-  await mkdir(runtimeDir, { recursive: true });
-  const temporaryXml = path.join(runtimeDir, `startup-reconcile-${process.pid}.xml`);
-  await writeFile(
-    temporaryXml,
-    Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(updatedXml, "utf16le")]),
+  const stagedXml = stageTaskXml(
+    path.resolve(startupOptions.runtimeDir),
+    "startup-reconcile",
+    updatedXml,
   );
   try {
     await execute("schtasks.exe", ["/Delete", "/TN", STARTUP_TASK_NAME, "/F"], {
       windowsHide: true, timeout: 10_000, maxBuffer: 1024 * 1024,
     });
-    await execute("schtasks.exe", ["/Create", "/TN", STARTUP_TASK_NAME, "/XML", temporaryXml, "/F"], {
+    await execute("schtasks.exe", ["/Create", "/TN", STARTUP_TASK_NAME, "/XML", stagedXml.filename, "/F"], {
       windowsHide: true, timeout: 20_000, maxBuffer: 1024 * 1024,
     });
     await execute("schtasks.exe", ["/Change", "/TN", STARTUP_TASK_NAME, "/DISABLE"], {
       windowsHide: true, timeout: 10_000, maxBuffer: 1024 * 1024,
     });
   } finally {
-    await rm(temporaryXml, { force: true });
+    removeStagedTaskXml(stagedXml);
   }
   const state = await query();
   if (!state.installed || state.active || state.enabled !== false) {
@@ -580,15 +602,16 @@ export async function installWindowsStartup(options) {
   requireWindows();
   if (!options.expectedAccount) throw new Error("startup install requires --expected-account");
   const launcher = path.resolve(options.nativeLauncher ?? NATIVE_LAUNCHER);
-  if (!existsSync(launcher)) throw new Error(`Lichess windowless launcher is unavailable: ${launcher}`);
+  if (!exactRegularFileExistsSync(launcher, "Lichess windowless launcher")) {
+    throw new Error("Lichess windowless launcher is unavailable");
+  }
   const runtimeDir = path.resolve(options.runtimeDir);
-  await mkdir(runtimeDir, { recursive: true });
+  ensureExactDirectorySync(runtimeDir, "Lichess runtime directory");
   const userSid = await currentUserSid();
   const taskXml = buildTaskXml({ ...options, nativeLauncher: launcher }, userSid);
-  const temporaryXml = path.join(runtimeDir, `startup-task-${process.pid}.xml`);
-  await writeFile(temporaryXml, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(taskXml, "utf16le")]));
+  const stagedXml = stageTaskXml(runtimeDir, "startup-task", taskXml);
   try {
-    await execFileAsync("schtasks.exe", ["/Create", "/TN", STARTUP_TASK_NAME, "/XML", temporaryXml, "/F"], {
+    await execFileAsync("schtasks.exe", ["/Create", "/TN", STARTUP_TASK_NAME, "/XML", stagedXml.filename, "/F"], {
       windowsHide: true,
       timeout: 20_000,
       maxBuffer: 1024 * 1024,
@@ -596,7 +619,7 @@ export async function installWindowsStartup(options) {
   } catch (error) {
     throw new Error(`Could not install Lichess startup task: ${error.stderr?.trim() || error.stdout?.trim() || error.message}`);
   } finally {
-    await rm(temporaryXml, { force: true });
+    removeStagedTaskXml(stagedXml);
   }
   const evidence = {
     schema: "uci_arena_lichess_startup_v1",
@@ -605,7 +628,10 @@ export async function installWindowsStartup(options) {
     windowless: true,
     runtimeDir,
   };
-  await writeFile(path.join(runtimeDir, "startup-task.json"), `${JSON.stringify(evidence, null, 2)}\n`, "utf8");
+  publishExactJsonSync(path.join(runtimeDir, "startup-task.json"), evidence, {
+    maximumBytes: STARTUP_FILE_LIMIT,
+    label: "Lichess startup task evidence",
+  });
   await execFileAsync("schtasks.exe", ["/Run", "/TN", STARTUP_TASK_NAME], {
     windowsHide: true,
     timeout: 10_000,

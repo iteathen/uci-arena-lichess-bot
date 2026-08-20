@@ -1,15 +1,5 @@
 #!/usr/bin/env node
 
-import { createHash } from "node:crypto";
-import {
-  copyFileSync,
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  renameSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -18,25 +8,47 @@ import {
   PROFILE_SCHEMA,
   validateStoredProfile,
 } from "@uci-arena/time-profile-contract";
+import {
+  activateExactDirectorySync,
+  admitExactDirectorySync,
+  classifyExactPathSync,
+  createExactTemporaryDirectorySync,
+  ensureExactDirectorySync,
+  hashExactFileSync,
+  publishExactFileSync,
+  publishExactJsonSync,
+  readExactJsonSync,
+  removeExactDirectorySync,
+  removeExactPublishedFileSync,
+} from "./exact-file.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const LOCAL_SCOPE = "local_live_safety";
 const RELEASE_SCOPE = "release";
 
-function sha256Buffer(value) {
-  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+const PROFILE_FILE_LIMIT = 16 * 1024 * 1024;
+const LARGE_ASSET_LIMIT = 16 * 1024 * 1024 * 1024;
+
+function exactRegularFileExistsSync(filename, label) {
+  const admission = classifyExactPathSync(filename, { label });
+  if (admission.kind === "missing") return false;
+  if (admission.kind !== "file") throw new Error(`${label} is not a regular non-link file`);
+  return true;
 }
 
-function sha256File(filePath) {
-  return sha256Buffer(readFileSync(filePath));
+function exactDirectoryExistsSync(filename, label) {
+  const admission = classifyExactPathSync(filename, { label });
+  if (admission.kind === "missing") return false;
+  if (admission.kind !== "directory") throw new Error(`${label} is not a safe directory`);
+  return true;
+}
+
+function sha256File(filePath, label = "Profile artifact", maximumBytes = PROFILE_FILE_LIMIT) {
+  return hashExactFileSync(filePath, { maximumBytes, label }).sha256;
 }
 
 function readJson(filePath, label) {
-  try {
-    return JSON.parse(readFileSync(filePath, "utf8"));
-  } catch (error) {
-    throw new Error(`${label} is not valid JSON: ${error.message}`);
-  }
+  return readExactJsonSync(filePath, { maximumBytes: PROFILE_FILE_LIMIT, label }).value;
 }
 
 function requireValue(condition, message) {
@@ -177,17 +189,24 @@ function validateCompleteGameTablebase(tablebase, runtime) {
   if (tablebase === null || tablebase === undefined) return null;
   requireValue(tablebase && typeof tablebase === "object",
     "Complete-game tablebase contract is not an object");
-  requireValue(path.isAbsolute(tablebase.path) && existsSync(tablebase.path),
+  requireValue(path.isAbsolute(tablebase.path)
+    && exactDirectoryExistsSync(tablebase.path, "Complete-game Syzygy directory"),
     "Complete-game Syzygy path is not an available absolute path");
-  requireValue(path.isAbsolute(tablebase.manifest) && existsSync(tablebase.manifest),
+  requireValue(path.isAbsolute(tablebase.manifest)
+    && exactRegularFileExistsSync(tablebase.manifest, "Complete-game Syzygy manifest"),
     "Complete-game Syzygy manifest is not an available absolute path");
+  admitExactDirectorySync(tablebase.path, { label: "Complete-game Syzygy directory" });
   requireValue(/^sha256:[0-9a-f]{64}$/.test(tablebase.manifest_identity ?? ""),
     "Complete-game Syzygy manifest identity is invalid");
   requireValue(/^sha256:[0-9a-f]{64}$/.test(tablebase.manifest_file_sha256 ?? ""),
     "Complete-game Syzygy manifest file SHA-256 is invalid");
-  same(sha256File(tablebase.manifest), tablebase.manifest_file_sha256,
+  const manifestAdmission = readExactJsonSync(tablebase.manifest, {
+    maximumBytes: PROFILE_FILE_LIMIT,
+    label: "Complete-game Syzygy manifest",
+  });
+  same(manifestAdmission.sha256, tablebase.manifest_file_sha256,
     "Complete-game Syzygy manifest file");
-  const manifest = readJson(tablebase.manifest, "Complete-game Syzygy manifest");
+  const manifest = manifestAdmission.value;
   requireValue(manifest.schema === "uci_arena_syzygy_manifest_v1"
     && manifest.identity_sha256 === tablebase.manifest_identity
     && manifest.cardinality === tablebase.loaded_cardinality
@@ -365,16 +384,24 @@ export function publishSingleGameProfile(options) {
   const completeGamePath = path.resolve(options.complete_game_evidence);
   const output = path.resolve(options.output);
   const scope = options.qualification_scope ?? LOCAL_SCOPE;
-  const executableSha = sha256File(engine);
+  const executableSha = sha256File(engine, "Qualified engine executable", LARGE_ASSET_LIMIT);
   const checkpoint = readJson(path.join(modelRoot, "checkpoint_manifest.json"),
     "Checkpoint manifest");
   requireValue(/^[0-9a-f]{64}$/.test(checkpoint.checkpoint_hash ?? ""),
     "Checkpoint manifest has no lowercase SHA-256 checkpoint_hash");
-  const timeProfile = validateStoredProfile(readJson(timeProfilePath, "Timing profile"));
+  const admittedTimeProfile = readExactJsonSync(timeProfilePath, {
+    maximumBytes: PROFILE_FILE_LIMIT,
+    label: "Timing profile",
+  });
+  const timeProfile = validateStoredProfile(admittedTimeProfile.value);
   const identity = validateTimingProfile(timeProfile, checkpoint);
-  const timeProfileSha = sha256File(timeProfilePath);
+  const timeProfileSha = admittedTimeProfile.sha256;
+  const admittedCompleteGame = readExactJsonSync(completeGamePath, {
+    maximumBytes: PROFILE_FILE_LIMIT,
+    label: "Complete-game evidence",
+  });
   const tablebase = validateCompleteGame(
-    readJson(completeGamePath, "Complete-game evidence"),
+    admittedCompleteGame.value,
     identity,
     executableSha,
     scope,
@@ -382,7 +409,7 @@ export function publishSingleGameProfile(options) {
     timeProfileSha,
   );
 
-  const completeGameSha = sha256File(completeGamePath);
+  const completeGameSha = admittedCompleteGame.sha256;
   const evidenceRoot = path.join(path.dirname(output), "evidence");
   const evidenceDirectory = path.join(
     evidenceRoot,
@@ -445,43 +472,95 @@ export function publishSingleGameProfile(options) {
   if (tablebase) profile.tablebase = tablebase;
   requireValue(profile.qualification_probe.depth >= profile.split_depth,
     "Qualification probe depth must be at least split depth");
-  mkdirSync(path.dirname(output), { recursive: true });
-  mkdirSync(evidenceRoot, { recursive: true });
-  let createdEvidence = false;
-  if (existsSync(evidenceDirectory)) {
-    requireValue(existsSync(timeProfileTarget) && sha256File(timeProfileTarget) === timeProfileSha,
+  ensureExactDirectorySync(path.dirname(output), "Single-game profile directory");
+  ensureExactDirectorySync(evidenceRoot, "Single-game evidence directory");
+  let createdEvidence = null;
+  if (exactDirectoryExistsSync(evidenceDirectory, "Immutable single-game evidence")) {
+    requireValue(exactRegularFileExistsSync(timeProfileTarget, "Immutable timing-profile evidence")
+      && sha256File(timeProfileTarget, "Immutable timing-profile evidence") === timeProfileSha,
       "Existing immutable timing-profile evidence does not match its digest path");
-    requireValue(existsSync(completeGameTarget)
-      && sha256File(completeGameTarget) === completeGameSha,
+    requireValue(exactRegularFileExistsSync(completeGameTarget, "Immutable complete-game evidence")
+      && sha256File(completeGameTarget, "Immutable complete-game evidence") === completeGameSha,
     "Existing immutable complete-game evidence does not match its digest path");
   } else {
-    const temporaryEvidence = `${evidenceDirectory}.tmp-${process.pid}`;
-    rmSync(temporaryEvidence, { recursive: true, force: true });
+    const temporary = createExactTemporaryDirectorySync(
+      evidenceRoot,
+      path.basename(evidenceDirectory),
+      { label: "Single-game evidence staging directory" },
+    );
+    let stagedTimeProfile = null;
+    let stagedCompleteGame = null;
     try {
-      mkdirSync(temporaryEvidence);
-      copyFileSync(timeProfilePath, path.join(temporaryEvidence, "time-profile.json"));
-      copyFileSync(completeGamePath, path.join(temporaryEvidence, "complete-game.json"));
+      const stagedTimePath = path.join(temporary.directory, "time-profile.json");
+      const stagedCompletePath = path.join(temporary.directory, "complete-game.json");
+      stagedTimeProfile = publishExactFileSync(stagedTimePath, admittedTimeProfile.bytes, {
+        maximumBytes: PROFILE_FILE_LIMIT,
+        label: "Staged timing-profile evidence",
+      });
+      stagedCompleteGame = publishExactFileSync(stagedCompletePath, admittedCompleteGame.bytes, {
+        maximumBytes: PROFILE_FILE_LIMIT,
+        label: "Staged complete-game evidence",
+      });
       requireValue(
-        sha256File(path.join(temporaryEvidence, "time-profile.json")) === timeProfileSha,
+        sha256File(stagedTimePath, "Staged timing-profile evidence") === timeProfileSha,
         "Staged timing-profile evidence digest mismatch",
       );
       requireValue(
-        sha256File(path.join(temporaryEvidence, "complete-game.json")) === completeGameSha,
+        sha256File(stagedCompletePath, "Staged complete-game evidence") === completeGameSha,
         "Staged complete-game evidence digest mismatch",
       );
-      renameSync(temporaryEvidence, evidenceDirectory);
-      createdEvidence = true;
-    } finally {
-      rmSync(temporaryEvidence, { recursive: true, force: true });
+      createdEvidence = activateExactDirectorySync(
+        temporary.directory,
+        evidenceDirectory,
+        temporary.identity,
+        { label: "Immutable single-game evidence" },
+      );
+    } catch (error) {
+      if (stagedCompleteGame) {
+        removeExactPublishedFileSync(
+          path.join(temporary.directory, "complete-game.json"),
+          stagedCompleteGame.identity,
+          { label: "Staged complete-game evidence" },
+        );
+      }
+      if (stagedTimeProfile) {
+        removeExactPublishedFileSync(
+          path.join(temporary.directory, "time-profile.json"),
+          stagedTimeProfile.identity,
+          { label: "Staged timing-profile evidence" },
+        );
+      }
+      removeExactDirectorySync(temporary.directory, temporary.identity, {
+        label: "Single-game evidence staging directory",
+      });
+      throw error;
     }
   }
-  const temporary = `${output}.tmp-${process.pid}`;
   try {
-    writeFileSync(temporary, `${JSON.stringify(profile, null, 2)}\n`, "utf8");
-    renameSync(temporary, output);
+    publishExactJsonSync(output, profile, {
+      maximumBytes: PROFILE_FILE_LIMIT,
+      label: "Single-game profile",
+    });
   } catch (error) {
-    rmSync(temporary, { force: true });
-    if (createdEvidence) rmSync(evidenceDirectory, { recursive: true, force: true });
+    if (createdEvidence) {
+      const activeTime = hashExactFileSync(timeProfileTarget, {
+        maximumBytes: PROFILE_FILE_LIMIT,
+        label: "Immutable timing-profile evidence",
+      });
+      const activeComplete = hashExactFileSync(completeGameTarget, {
+        maximumBytes: PROFILE_FILE_LIMIT,
+        label: "Immutable complete-game evidence",
+      });
+      removeExactPublishedFileSync(completeGameTarget, activeComplete.identity, {
+        label: "Immutable complete-game evidence",
+      });
+      removeExactPublishedFileSync(timeProfileTarget, activeTime.identity, {
+        label: "Immutable timing-profile evidence",
+      });
+      removeExactDirectorySync(evidenceDirectory, createdEvidence.identity, {
+        label: "Immutable single-game evidence",
+      });
+    }
     throw error;
   }
   return { ...profile, profile_path: output };

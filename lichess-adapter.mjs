@@ -3,19 +3,7 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
-  appendFileSync,
-  closeSync,
-  existsSync,
-  lstatSync,
-  openSync,
-  mkdirSync,
-  readFileSync,
-  readSync,
-  renameSync,
   rmSync,
-  statSync,
-  unlinkSync,
-  writeFileSync,
 } from "node:fs";
 import { createInterface } from "node:readline";
 import { performance } from "node:perf_hooks";
@@ -54,7 +42,6 @@ import {
   AuthoritativeChessState,
 } from "./chess-legality.mjs";
 import {
-  loadTimeProfile,
   timeProfileFallbackStatus,
   validateStoredProfile,
   validateAppliedTimeProfileReserve,
@@ -66,6 +53,18 @@ import {
   probeProcessInstance,
   processInstanceIsCurrent,
 } from "./process-instance-identity.mjs";
+import {
+  admitExactDirectorySync,
+  appendExactFileSync,
+  classifyExactPathSync,
+  ensureExactDirectorySync,
+  exactFileMetadataSync,
+  hashExactFileSync,
+  publishExactJsonSync,
+  readExactJsonSync,
+  readExactTextSync,
+  rotateExactFileSync,
+} from "./exact-file.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT = HERE;
@@ -79,6 +78,44 @@ export const RATED_PLAY_CONFIRMATION = "I_ACCEPT_RATED_BOT_GAMES";
 export const OUTBOUND_CHALLENGE_CONFIRMATION = "I_ACCEPT_AUTOMATIC_OUTBOUND_CHALLENGES";
 export const MANAGER_OPTIONS_SCHEMA = "uci_arena_lichess_manager_options_v1";
 const FIRST_MOVE_ABORT_RETRY_MS = Object.freeze([15_000, 30_000, 60_000, 120_000, 300_000]);
+const EXACT_FILE_LIMITS = Object.freeze({
+  credential: 4_096,
+  configuration: 1_048_576,
+  runtimeStatus: 1_048_576,
+  startupDefinition: 1_048_576,
+  transportProfile: 4_194_304,
+  profile: 16_777_216,
+  argumentFile: 67_108_864,
+  largeAsset: 17_179_869_184,
+});
+
+function readBoundedJson(filename, maximumBytes, label) {
+  return readExactJsonSync(filename, { maximumBytes, label }).value;
+}
+
+function exactRegularFileExistsSync(filename, label) {
+  const admission = classifyExactPathSync(filename, { label });
+  if (admission.kind === "missing") return false;
+  if (admission.kind !== "file") throw new Error(`${label} is not a regular non-link file`);
+  return true;
+}
+
+function exactDirectoryExistsSync(filename, label) {
+  const admission = classifyExactPathSync(filename, { label });
+  if (admission.kind === "missing") return false;
+  if (admission.kind !== "directory") throw new Error(`${label} is not a safe directory`);
+  return true;
+}
+
+function loadExactTimeProfile(filename, cwd = process.cwd()) {
+  const resolved = path.isAbsolute(filename) ? path.resolve(filename) : path.resolve(cwd, filename);
+  const profile = validateStoredProfile(readBoundedJson(
+    resolved,
+    EXACT_FILE_LIMITS.profile,
+    "Timing profile",
+  ));
+  return { ...profile, profile_path: resolved };
+}
 
 const PROFILE_OWNED_UCI_OPTIONS = Object.freeze({
   search_core: "SearchCore",
@@ -255,11 +292,15 @@ function transportReserveFromP99(p99) {
 }
 
 export function loadTransportProfile(profilePath, now = Date.now()) {
-  if (!profilePath || !existsSync(profilePath)) {
+  if (!profilePath || !exactRegularFileExistsSync(profilePath, "Lichess transport profile")) {
     return { status: "missing", qualified: false, reason: "transport profile is unavailable" };
   }
   try {
-    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+    const profile = readBoundedJson(
+      profilePath,
+      EXACT_FILE_LIMITS.transportProfile,
+      "Lichess transport profile",
+    );
     if (![TRANSPORT_PROFILE_SCHEMA, LEGACY_TRANSPORT_PROFILE_SCHEMA].includes(profile.schema)) {
       throw new Error("unsupported schema");
     }
@@ -308,9 +349,13 @@ export class TransportProfileTracker {
     this.pendingSamples = new Map();
     this.effectiveReserveMs = bootstrapReserveMs;
     this.legacyReadOnly = false;
-    if (profilePath && existsSync(profilePath)) {
+    if (profilePath && exactRegularFileExistsSync(profilePath, "Lichess transport profile")) {
       try {
-        const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+        const profile = readBoundedJson(
+          profilePath,
+          EXACT_FILE_LIMITS.transportProfile,
+          "Lichess transport profile",
+        );
         if (profile.schema === TRANSPORT_PROFILE_SCHEMA && Array.isArray(profile.samples)) {
           const valid = profile.samples.every((sample) =>
             Number.isFinite(sample?.bestmove_to_ack_ms)
@@ -393,10 +438,11 @@ export class TransportProfileTracker {
       effective_reserve_ms: qualified ? reserve : this.bootstrapReserveMs,
       samples: this.samples,
     };
-    mkdirSync(path.dirname(this.profilePath), { recursive: true });
-    const temporary = `${this.profilePath}.tmp-${process.pid}`;
-    writeFileSync(temporary, `${JSON.stringify(profile, null, 2)}\n`, "utf8");
-    renameSync(temporary, this.profilePath);
+  ensureExactDirectorySync(path.dirname(this.profilePath), "Lichess transport profile directory");
+    publishExactJsonSync(this.profilePath, profile, {
+      maximumBytes: EXACT_FILE_LIMITS.transportProfile,
+      label: "Lichess transport profile",
+    });
     this.telemetry({
       event: "transport_profile_status",
       qualified,
@@ -438,8 +484,15 @@ export function assertSupportedNode() {
   }
 }
 
-function sha256File(filePath) {
-  return `sha256:${createHash("sha256").update(readFileSync(filePath)).digest("hex")}`;
+function sha256File(
+  filePath,
+  maximumBytes = EXACT_FILE_LIMITS.largeAsset,
+  label = "Lichess authority file",
+) {
+  return hashExactFileSync(filePath, {
+    maximumBytes,
+    label,
+  }).sha256;
 }
 
 function sha256Json(value) {
@@ -489,15 +542,10 @@ function openingBookContract(config, runtimeStatus) {
       }
     }
   }
-  for (const [filePath, label] of [[bookFile, "book"]]) {
-    if (!existsSync(filePath)) {
-      throw new Error(`Opening book ${label} file is missing: ${filePath}`);
-    }
-    const metadata = lstatSync(filePath);
-    if (!metadata.isFile() || metadata.isSymbolicLink()) {
-      throw new Error(`Opening book ${label} is not a regular non-link file: ${filePath}`);
-    }
-  }
+  const bookAdmission = hashExactFileSync(bookFile, {
+    maximumBytes: EXACT_FILE_LIMITS.largeAsset,
+    label: "Opening book binary",
+  });
   if (Boolean(statsFile) !== Boolean(policyFile)) {
     throw new Error("Opening book has a partial stats/policy sidecar pair");
   }
@@ -508,11 +556,10 @@ function openingBookContract(config, runtimeStatus) {
   if (runtimeStatus.opening_book_statistics_available !== statisticsAvailable) {
     throw new Error("Opening book runtime statistics capability mismatch");
   }
-  const bookMetadata = statSync(bookFile);
-  if (bookMetadata.size <= 0 || bookMetadata.size % 16 !== 0) {
+  if (bookAdmission.byteLength <= 0 || bookAdmission.byteLength % 16 !== 0) {
     throw new Error("Opening book Polyglot framing is invalid");
   }
-  const bookRows = bookMetadata.size / 16;
+  const bookRows = bookAdmission.byteLength / 16;
   if (!statisticsAvailable) {
     const identity = String(runtimeStatus.opening_book_identity ?? "");
     if (!/^\d+$/u.test(identity) || !Number.isSafeInteger(bookRows)) {
@@ -527,26 +574,19 @@ function openingBookContract(config, runtimeStatus) {
       rows: bookRows,
     };
   }
-  for (const [filePath, label] of [[statsFile, "stats"], [policyFile, "policy"]]) {
-    if (!existsSync(filePath)) {
-      throw new Error(`Opening book ${label} file is missing: ${filePath}`);
-    }
-    const metadata = lstatSync(filePath);
-    if (!metadata.isFile() || metadata.isSymbolicLink()) {
-      throw new Error(`Opening book ${label} is not a regular non-link file: ${filePath}`);
-    }
-  }
-  const descriptor = openSync(statsFile, "r");
-  let firstLine;
-  try {
-    const buffer = Buffer.allocUnsafe(4_096);
-    const bytes = readSync(descriptor, buffer, 0, buffer.length, 0);
-    const newline = buffer.subarray(0, bytes).indexOf(0x0a);
-    if (newline < 0) throw new Error("Opening book stats header exceeds 4095 bytes");
-    firstLine = buffer.subarray(0, newline).toString("utf8").replace(/\r$/u, "");
-  } finally {
-    closeSync(descriptor);
-  }
+  const statsAdmission = hashExactFileSync(statsFile, {
+    maximumBytes: EXACT_FILE_LIMITS.largeAsset,
+    label: "Opening book statistics",
+    capturePrefixBytes: 4_096,
+  });
+  const policyAdmission = hashExactFileSync(policyFile, {
+    maximumBytes: EXACT_FILE_LIMITS.largeAsset,
+    label: "Opening book policy",
+  });
+  const newline = statsAdmission.prefix.indexOf(0x0a);
+  if (newline < 0) throw new Error("Opening book stats header exceeds 4095 bytes");
+  const firstLine = statsAdmission.prefix.subarray(0, newline)
+    .toString("utf8").replace(/\r$/u, "");
   const header = firstLine.match(
     /^# uci_arena_book_stats_v1 book_fnv1a64=([0-9a-fA-F]{16}) rows=([1-9][0-9]*)$/u,
   );
@@ -557,20 +597,13 @@ function openingBookContract(config, runtimeStatus) {
   }
   const identity = BigInt(`0x${header[1]}`).toString(10);
   const manifestFile = path.join(path.dirname(bookFile), "snapshot.manifest.json");
-  if (existsSync(manifestFile)) {
-    const manifestMetadata = lstatSync(manifestFile);
-    if (!manifestMetadata.isFile() || manifestMetadata.isSymbolicLink()
-        || manifestMetadata.size <= 0 || manifestMetadata.size > 1_048_576) {
-      throw new Error("Opening book snapshot manifest is not a bounded regular file");
-    }
-    let manifest;
-    let manifestBytes;
-    try {
-      manifestBytes = readFileSync(manifestFile);
-      manifest = JSON.parse(manifestBytes.toString("utf8"));
-    } catch {
-      throw new Error("Opening book snapshot manifest is invalid JSON");
-    }
+  if (exactRegularFileExistsSync(manifestFile, "Opening book snapshot manifest")) {
+    const manifestAdmission = readExactJsonSync(manifestFile, {
+      maximumBytes: EXACT_FILE_LIMITS.runtimeStatus,
+      label: "Opening book snapshot manifest",
+    });
+    const manifest = manifestAdmission.value;
+    const manifestBytes = manifestAdmission.bytes;
     const requiredArtifacts = [
       "strong_rare_v1.bin",
       "strong_rare_v1.stats",
@@ -593,14 +626,20 @@ function openingBookContract(config, runtimeStatus) {
         || path.dirname(policyFile) !== path.dirname(bookFile)) {
       throw new Error("Opening book configured artifacts do not match the snapshot manifest");
     }
-    for (const [artifactPath, artifactName] of [
-      [bookFile, requiredArtifacts[0]],
-      [statsFile, requiredArtifacts[1]],
-      [policyFile, requiredArtifacts[2]],
+    for (const [admission, artifactPath, artifactName] of [
+      [bookAdmission, bookFile, requiredArtifacts[0]],
+      [statsAdmission, statsFile, requiredArtifacts[1]],
+      [policyAdmission, policyFile, requiredArtifacts[2]],
     ]) {
-      const observed = sha256File(artifactPath).slice("sha256:".length);
+      const observed = hashExactFileSync(artifactPath, {
+        maximumBytes: EXACT_FILE_LIMITS.largeAsset,
+        label: `Opening book snapshot ${artifactName}`,
+      }).sha256.slice("sha256:".length);
       if (observed !== manifest.artifacts[artifactName]) {
         throw new Error(`Opening book snapshot artifact digest mismatch: ${artifactName}`);
+      }
+      if (observed !== admission.sha256.slice("sha256:".length)) {
+        throw new Error(`Opening book snapshot artifact changed during admission: ${artifactName}`);
       }
     }
     const manifestSha256 = createHash("sha256").update(manifestBytes).digest("hex");
@@ -704,15 +743,28 @@ function engineLaunchIdentity(config) {
     const candidate = path.isAbsolute(argument)
       ? argument
       : path.resolve(config.working_directory, argument);
-    return existsSync(candidate) && statSync(candidate).isFile()
-      ? { argument, sha256: sha256File(candidate) }
-      : { argument, sha256: null };
+    const candidateKind = classifyExactPathSync(candidate, { label: "Engine argument path" });
+    if (candidateKind.kind !== "file") return { argument, sha256: null };
+    return {
+      argument,
+      sha256: hashExactFileSync(candidate, {
+        maximumBytes: EXACT_FILE_LIMITS.argumentFile,
+        label: "Engine argument file",
+      }).sha256,
+    };
   });
   return {
-    executable_sha256: sha256File(config.executable),
+    executable_sha256: hashExactFileSync(config.executable, {
+      maximumBytes: EXACT_FILE_LIMITS.largeAsset,
+      label: "UCI executable",
+    }).sha256,
     arguments: argumentsList,
     argument_files: argumentFiles,
   };
+}
+
+function sameEngineLaunchIdentity(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 function requireString(value, label, pattern) {
@@ -887,7 +939,11 @@ function capacityEvidenceSummary(config) {
       const resolved = path.isAbsolute(configured)
         ? configured
         : path.resolve(config.engine.working_directory, configured);
-      const profile = JSON.parse(readFileSync(resolved, "utf8"));
+      const profile = readBoundedJson(
+        resolved,
+        EXACT_FILE_LIMITS.profile,
+        "Standard UCI capacity profile",
+      );
       return {
         status: "runtime_revalidation_required",
         qualified: false,
@@ -905,7 +961,7 @@ function capacityEvidenceSummary(config) {
   try {
     const singleGameProfile = applySingleGameProfile(config);
     if (singleGameProfile.search_core === "mcgs") {
-      const timingProfile = loadTimeProfile(
+      const timingProfile = loadExactTimeProfile(
         config.engine.time_profile,
         config.engine.working_directory,
       );
@@ -1079,7 +1135,11 @@ export function updateManagerOptions({
     throw new Error("config update requires an explicit --config path");
   }
   const target = path.resolve(templatePath);
-  const originalRaw = JSON.parse(readFileSync(target, "utf8"));
+  const originalAdmission = readExactJsonSync(target, {
+    maximumBytes: EXACT_FILE_LIMITS.configuration,
+    label: "Lichess configuration",
+  });
+  const originalRaw = originalAdmission.value;
   const before = loadManagerConfig({ templatePath: target, engineRoot });
   const patch = typeof settings === "string" ? JSON.parse(settings) : settings;
   const updatedRaw = applyManagerOptionsPatch(originalRaw, patch);
@@ -1101,30 +1161,29 @@ export function updateManagerOptions({
     throw new Error(`Enabling automatic outbound challenges requires ${OUTBOUND_CHALLENGE_CONFIRMATION}`);
   }
 
-  const temporary = path.join(
-    path.dirname(target),
-    `.${path.basename(target)}.tmp-${process.pid}-${randomUUID()}`,
-  );
-  try {
-    writeFileSync(temporary, `${JSON.stringify(updatedRaw, null, 2)}\n`, "utf8");
-    const after = loadManagerConfig({ templatePath: temporary, engineRoot });
-    if (capacityShapeChanged(before, after) && !after.capacity.legacy_shared) {
-      const evidence = capacityEvidenceSummary(after);
-      if (!evidence.qualified) {
-        throw new Error("Capacity changes require a present qualified capacity profile");
-      }
-      if (after.capacity.total_slots > evidence.maximum_concurrency) {
-        throw new Error(
-          `Configured Lichess capacity ${after.capacity.total_slots} exceeds qualified maximum ${evidence.maximum_concurrency}`,
-        );
-      }
-    }
-    renameSync(temporary, target);
-    return managerOptionsProjection(after);
-  } catch (error) {
-    if (existsSync(temporary)) unlinkSync(temporary);
-    throw error;
-  }
+  let after;
+  publishExactJsonSync(target, updatedRaw, {
+    maximumBytes: EXACT_FILE_LIMITS.configuration,
+    label: "Lichess configuration",
+    expectedTargetIdentity: originalAdmission.identity,
+    hooks: {
+      beforeActivation({ temporary }) {
+        after = loadManagerConfig({ templatePath: temporary, engineRoot });
+        if (capacityShapeChanged(before, after) && !after.capacity.legacy_shared) {
+          const evidence = capacityEvidenceSummary(after);
+          if (!evidence.qualified) {
+            throw new Error("Capacity changes require a present qualified capacity profile");
+          }
+          if (after.capacity.total_slots > evidence.maximum_concurrency) {
+            throw new Error(
+              `Configured Lichess capacity ${after.capacity.total_slots} exceeds qualified maximum ${evidence.maximum_concurrency}`,
+            );
+          }
+        }
+      },
+    },
+  });
+  return managerOptionsProjection(after);
 }
 
 function normalizeTimingConfig(config) {
@@ -1223,7 +1282,11 @@ function migrateV2Config(config) {
 }
 
 function loadConfigDocument({ templatePath = DEFAULT_TEMPLATE, engineRoot = ROOT } = {}) {
-  const parsed = JSON.parse(readFileSync(templatePath, "utf8"));
+  const parsed = readBoundedJson(
+    templatePath,
+    EXACT_FILE_LIMITS.configuration,
+    "Lichess configuration",
+  );
   if (parsed.schema !== CURRENT_CONFIG_SCHEMA && !LEGACY_CONFIG_SCHEMAS.has(parsed.schema)) {
     throw new Error(`Unsupported Lichess adapter config schema: ${parsed.schema ?? "missing"}`);
   }
@@ -1393,7 +1456,11 @@ export function loadRuntimeConfig({
 
 export function loadSingleGameProfile(profilePath) {
   const resolvedPath = path.resolve(profilePath);
-  const profile = JSON.parse(readFileSync(resolvedPath, "utf8"));
+  const profile = readBoundedJson(
+    resolvedPath,
+    EXACT_FILE_LIMITS.profile,
+    "Lichess single-game profile",
+  );
   if (profile.schema !== "uci_arena_single_game_profile_v1") {
     throw new Error(`Unsupported single-game profile schema: ${profile.schema ?? "missing"}`);
   }
@@ -1456,11 +1523,13 @@ export function loadSingleGameProfile(profilePath) {
         path.resolve(ROOT, evidence.artifact),
         path.resolve(path.dirname(resolvedPath), evidence.artifact),
       ];
-    const artifactPath = artifactCandidates.find((candidate) => existsSync(candidate));
+    const artifactPath = artifactCandidates.find((candidate) =>
+      exactRegularFileExistsSync(candidate, `Single-game profile evidence ${name}`));
     if (!artifactPath) {
       throw new Error(`Single-game profile evidence ${name} artifact is missing`);
     }
-    if (sha256File(artifactPath) !== evidence.artifact_sha256) {
+    if (sha256File(artifactPath, EXACT_FILE_LIMITS.profile, "Single-game evidence")
+        !== evidence.artifact_sha256) {
       throw new Error(`Single-game profile evidence ${name} hash mismatch`);
     }
   }
@@ -1469,7 +1538,11 @@ export function loadSingleGameProfile(profilePath) {
 
 export function loadAdaptiveTemporalCurveProfile(profilePath) {
   const resolvedPath = path.resolve(profilePath);
-  const artifact = JSON.parse(readFileSync(resolvedPath, "utf8"));
+  const artifact = readBoundedJson(
+    resolvedPath,
+    EXACT_FILE_LIMITS.profile,
+    "Lichess adaptive temporal-curve profile",
+  );
   if (artifact.schema !== ADAPTIVE_CURVE_SCHEMA) {
     throw new Error(
       `Unsupported adaptive temporal-curve schema: ${artifact.schema ?? "missing"}`,
@@ -1548,7 +1621,7 @@ export function loadAdaptiveTemporalCurveProfile(profilePath) {
   return {
     ...artifact,
     profile_path: resolvedPath,
-    artifact_sha256: sha256File(resolvedPath),
+    artifact_sha256: sha256File(resolvedPath, EXACT_FILE_LIMITS.profile, "Single-game profile"),
     applied_uci_options: options,
   };
 }
@@ -1606,13 +1679,17 @@ export function applySingleGameProfile(config) {
     const manifestPath = path.isAbsolute(profile.tablebase.manifest)
       ? profile.tablebase.manifest
       : path.resolve(config.engine.working_directory, profile.tablebase.manifest);
-    if (!existsSync(manifestPath)) {
+    if (!exactRegularFileExistsSync(manifestPath, "Syzygy manifest")) {
       throw new Error("Single-game profile Syzygy manifest is missing");
     }
-    if (sha256File(manifestPath) !== profile.tablebase.manifest_file_sha256) {
+    const manifestAdmission = readExactJsonSync(manifestPath, {
+      maximumBytes: EXACT_FILE_LIMITS.profile,
+      label: "Syzygy manifest",
+    });
+    if (manifestAdmission.sha256 !== profile.tablebase.manifest_file_sha256) {
       throw new Error("Single-game profile Syzygy manifest file hash mismatch");
     }
-    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    const manifest = manifestAdmission.value;
     if (manifest.identity_sha256 !== profile.tablebase.manifest_identity) {
       throw new Error("Single-game profile Syzygy manifest content identity mismatch");
     }
@@ -1641,10 +1718,20 @@ export function applySingleGameProfile(config) {
       hasMaximumDtz ||= entry.directory === `${profile.tablebase.loaded_cardinality}-dtz`
         && entry.name.endsWith(".rtbz");
       const tableFile = path.join(tablebasePath, entry.name);
-      const tableMetadata = existsSync(tableFile) ? statSync(tableFile) : null;
-      if (tableMetadata === null || !tableMetadata.isFile()
-          || tableMetadata.size !== entry.bytes) {
+      let tableAdmission;
+      try {
+        tableAdmission = exactFileMetadataSync(tableFile, {
+          maximumBytes: EXACT_FILE_LIMITS.largeAsset,
+          label: "Syzygy tablebase asset",
+        });
+      } catch {
         throw new Error(`Single-game profile Syzygy table file is missing or partial: ${entry.name}`);
+      }
+      if (tableAdmission.byteLength !== entry.bytes) {
+        throw new Error(`Single-game profile Syzygy table file is missing or partial: ${entry.name}`);
+      }
+      if (tableAdmission.sha256 !== `sha256:${entry.sha256}`) {
+        throw new Error(`Single-game profile Syzygy table file identity mismatch: ${entry.name}`);
       }
     }
     if (!hasMaximumWdl || !hasMaximumDtz) {
@@ -1656,10 +1743,14 @@ export function applySingleGameProfile(config) {
     config.engine.uci_options.ModelRoot,
   );
   const checkpointManifestPath = path.join(modelRoot, "checkpoint_manifest.json");
-  if (!existsSync(checkpointManifestPath)) {
+  if (!exactRegularFileExistsSync(checkpointManifestPath, "Model checkpoint manifest")) {
     throw new Error("Single-game profile model checkpoint manifest is missing");
   }
-  const checkpointManifest = JSON.parse(readFileSync(checkpointManifestPath, "utf8"));
+  const checkpointManifest = readBoundedJson(
+    checkpointManifestPath,
+    EXACT_FILE_LIMITS.profile,
+    "Model checkpoint manifest",
+  );
   if (checkpointManifest.model_id !== profile.model_id
       || checkpointManifest.checkpoint_hash !== profile.checkpoint_hash) {
     throw new Error("Single-game profile model/checkpoint identity mismatch");
@@ -1761,7 +1852,11 @@ export function loadCapacityProfile(
       throw new Error("Standard UCI concurrency above one requires a capacity profile");
     }
     const resolvedStandardPath = path.resolve(profilePath);
-    const standard = JSON.parse(readFileSync(resolvedStandardPath, "utf8"));
+    const standard = readBoundedJson(
+      resolvedStandardPath,
+      EXACT_FILE_LIMITS.profile,
+      "Standard UCI capacity profile",
+    );
     if (standard.schema !== "uci_arena_lichess_standard_uci_capacity_profile_v1"
         || standard.qualified !== true) {
       throw new Error("Standard UCI capacity profile is not qualified");
@@ -1792,7 +1887,11 @@ export function loadCapacityProfile(
     return { ...standard, profile_path: resolvedStandardPath };
   }
   const resolvedPath = path.resolve(profilePath);
-  const capacity = JSON.parse(readFileSync(resolvedPath, "utf8"));
+  const capacity = readBoundedJson(
+    resolvedPath,
+    EXACT_FILE_LIMITS.profile,
+    "Lichess capacity profile",
+  );
   if (!new Set([
     "uci_arena_lichess_capacity_profile_v1",
     "uci_arena_lichess_capacity_profile_v2",
@@ -1809,7 +1908,11 @@ export function loadCapacityProfile(
   }
   const bindings = {
     engine_build_fingerprint: sha256File(config.engine.executable),
-    single_game_profile_sha256: sha256File(singleGameProfile.profile_path),
+    single_game_profile_sha256: sha256File(
+      singleGameProfile.profile_path,
+      EXACT_FILE_LIMITS.profile,
+      "Single-game profile",
+    ),
     model_fingerprint: singleGameProfile.model_fingerprint,
     provider_numeric_fingerprint: singleGameProfile.provider_numeric_fingerprint,
     hardware_driver_fingerprint: singleGameProfile.hardware_driver_fingerprint,
@@ -1827,11 +1930,15 @@ export function loadCapacityProfile(
     const timeProfilePath = config.engine.time_profile_status?.profile_path
       ?? config.engine.time_profile;
     if (config.engine.time_profile_status?.accepted !== true || !timeProfilePath
-        || !existsSync(path.resolve(timeProfilePath))) {
+        || !exactRegularFileExistsSync(path.resolve(timeProfilePath), "Timing profile")) {
       throw new Error("Lichess capacity profile v2 requires an accepted timing profile");
     }
     const timingBindings = {
-      time_profile_sha256: sha256File(path.resolve(timeProfilePath)),
+      time_profile_sha256: sha256File(
+        path.resolve(timeProfilePath),
+        EXACT_FILE_LIMITS.profile,
+        "Timing profile",
+      ),
       time_profile_identity_sha256: config.engine.time_profile_status.identity_sha256,
       search_core: singleGameProfile.search_core,
     };
@@ -1856,7 +1963,7 @@ export function publishCapacityProfile(
   statuses,
 ) {
   const target = path.resolve(targetPath);
-  mkdirSync(path.dirname(target), { recursive: true });
+  ensureExactDirectorySync(path.dirname(target), "Lichess capacity profile directory");
   if (config.engine.adapter === "standard_uci_v1") {
     const identity = statuses[0];
     if (!identity || statuses.some((status) => status?.qualified !== true
@@ -1882,9 +1989,10 @@ export function publishCapacityProfile(
         bestmove: status.bestmove,
       })),
     };
-    const temporary = `${target}.tmp-${process.pid}`;
-    writeFileSync(temporary, `${JSON.stringify(profile, null, 2)}\n`, "utf8");
-    renameSync(temporary, target);
+    publishExactJsonSync(target, profile, {
+      maximumBytes: EXACT_FILE_LIMITS.profile,
+      label: "Standard UCI capacity profile",
+    });
     return { ...profile, profile_path: target };
   }
   if (config.engine.time_profile_status?.accepted !== true) {
@@ -1897,11 +2005,19 @@ export function publishCapacityProfile(
     published_at: new Date().toISOString(),
     maximum_concurrency: maximumConcurrency,
     engine_build_fingerprint: sha256File(config.engine.executable),
-    single_game_profile_sha256: sha256File(singleGameProfile.profile_path),
+    single_game_profile_sha256: sha256File(
+      singleGameProfile.profile_path,
+      EXACT_FILE_LIMITS.profile,
+      "Single-game profile",
+    ),
     model_fingerprint: singleGameProfile.model_fingerprint,
     provider_numeric_fingerprint: singleGameProfile.provider_numeric_fingerprint,
     hardware_driver_fingerprint: singleGameProfile.hardware_driver_fingerprint,
-    time_profile_sha256: sha256File(path.resolve(timeProfilePath)),
+    time_profile_sha256: sha256File(
+      path.resolve(timeProfilePath),
+      EXACT_FILE_LIMITS.profile,
+      "Timing profile",
+    ),
     time_profile_identity_sha256: config.engine.time_profile_status.identity_sha256,
     search_core: singleGameProfile.search_core,
     provider: singleGameProfile.provider,
@@ -1922,9 +2038,10 @@ export function publishCapacityProfile(
       mcgs_outstanding_peak: status.mcgs_outstanding_peak,
     })),
   };
-  const temporary = `${target}.tmp-${process.pid}`;
-  writeFileSync(temporary, `${JSON.stringify(profile, null, 2)}\n`, "utf8");
-  renameSync(temporary, target);
+  publishExactJsonSync(target, profile, {
+    maximumBytes: EXACT_FILE_LIMITS.profile,
+    label: "Lichess capacity profile",
+  });
   return { ...profile, profile_path: target };
 }
 
@@ -1982,13 +2099,22 @@ function delay(milliseconds, signal) {
 }
 
 function readTokenForRuntime(tokenFile) {
-  const tokenStat = statSync(tokenFile);
-  if (!tokenStat.isFile() || tokenStat.size <= 0 || tokenStat.size > MAX_TOKEN_FILE_BYTES) {
-    throw new Error(`Lichess token file must be a nonempty regular file no larger than ${MAX_TOKEN_FILE_BYTES} bytes`);
+  let admitted;
+  try {
+    admitted = readExactTextSync(tokenFile, {
+      maximumBytes: EXACT_FILE_LIMITS.credential,
+      label: "Lichess credential",
+      sensitive: true,
+    });
+  } catch {
+    throw new Error(
+      `Lichess token file must be a nonempty regular file no larger than ${MAX_TOKEN_FILE_BYTES} bytes`,
+    );
   }
-  const token = readFileSync(tokenFile, "utf8").trim();
+  const token = admitted.text.trim();
+  admitted.bytes.fill(0);
   if (!token || /\s/u.test(token)) {
-    throw new Error("Lichess token file must contain exactly one non-whitespace token");
+    throw new Error("Lichess credential must contain exactly one non-whitespace token");
   }
   return token;
 }
@@ -2095,12 +2221,16 @@ function streamKey(endpoint) {
 export class LichessClient {
   constructor({
     token,
+    tokenProvider,
     baseUrl = "https://lichess.org/",
     fetchImpl = globalThis.fetch,
     requestQueue,
     safetyCoordinator,
   }) {
-    this.token = token;
+    if (typeof tokenProvider !== "function" && typeof token !== "string") {
+      throw new Error("Lichess client requires a request-scoped credential provider");
+    }
+    this.tokenProvider = tokenProvider ?? (() => token);
     this.baseUrl = baseUrl;
     this.fetchImpl = fetchImpl;
     this.requestQueue = safetyCoordinator ?? requestQueue ?? new ApiSafetyCoordinator();
@@ -2114,9 +2244,13 @@ export class LichessClient {
     signal,
     requestClass = apiRequestClass(endpoint, method),
   } = {}) {
+    const token = this.tokenProvider();
+    if (typeof token !== "string" || !token || /\s/u.test(token)) {
+      throw new Error("Lichess request credential is invalid");
+    }
     const headers = {
       Accept: stream ? "application/x-ndjson" : "application/json",
-      Authorization: `Bearer ${this.token}`,
+      Authorization: `Bearer ${token}`,
       "User-Agent": "UCI-Arena-Lichess-Adapter/1",
     };
     let body;
@@ -2266,7 +2400,7 @@ export async function probeAccount({
   signal,
 }) {
   const apiClient = client ?? new LichessClient({
-    token: readTokenForRuntime(tokenFile),
+    tokenProvider: () => readTokenForRuntime(tokenFile),
     baseUrl: url,
     fetchImpl,
   });
@@ -2743,14 +2877,24 @@ export class UciEngine {
   }
 
   async start() {
-    if (!existsSync(this.config.executable)) {
-      throw new Error(`UCI executable not found: ${this.config.executable}`);
-    }
+    const admittedLaunchIdentity = engineLaunchIdentity(this.config);
     this.child = spawn(this.config.executable, this.config.arguments ?? [], {
       cwd: this.config.working_directory,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
+    let postSpawnLaunchIdentity;
+    try {
+      postSpawnLaunchIdentity = engineLaunchIdentity(this.config);
+    } catch (error) {
+      this.child.kill();
+      throw error;
+    }
+    if (!sameEngineLaunchIdentity(admittedLaunchIdentity, postSpawnLaunchIdentity)) {
+      this.child.kill();
+      throw new Error("UCI executable or argument identity changed during process creation");
+    }
+    this.launchIdentity = postSpawnLaunchIdentity;
     this.lines = createInterface({ input: this.child.stdout, crlfDelay: Infinity });
     this.lines.on("line", (line) => this.onLine(line));
     this.child.stderr.on("data", (chunk) => {
@@ -2773,6 +2917,11 @@ export class UciEngine {
         "the selected standard UCI engine owns its time management",
       );
       this.qualificationStatus = await this.qualifyStandardRuntime();
+    }
+    const qualifiedLaunchIdentity = engineLaunchIdentity(this.config);
+    if (!sameEngineLaunchIdentity(this.launchIdentity, qualifiedLaunchIdentity)) {
+      this.child.kill();
+      throw new Error("UCI executable or argument identity changed before qualification authority");
     }
     if (this.qualificationStatus) this.qualificationStatus.time_profile = this.timeProfileStatus;
   }
@@ -3016,7 +3165,7 @@ export class UciEngine {
     const resolvedPath = path.isAbsolute(configuredPath)
       ? configuredPath
       : path.resolve(this.config.working_directory, configuredPath);
-    if (!existsSync(resolvedPath)) {
+    if (!exactRegularFileExistsSync(resolvedPath, "Timing profile")) {
       this.timeProfileStatus = timeProfileFallbackStatus(
         "missing",
         `timing profile is unavailable: ${resolvedPath}`,
@@ -3029,7 +3178,7 @@ export class UciEngine {
     let profile;
     let reserveWasSet = false;
     try {
-      profile = loadTimeProfile(resolvedPath, this.config.working_directory);
+      profile = loadExactTimeProfile(resolvedPath, this.config.working_directory);
       const configuration = this.timeProfileConfiguration(0);
       const accepted = validateProfileRuntimeSnapshot({
         profile,
@@ -3222,8 +3371,8 @@ export class UciEngine {
       schema: "uci_arena_standard_uci_qualification_v1",
       qualified: true,
       engine_adapter: "standard_uci_v1",
-      engine_build_fingerprint: sha256File(this.config.executable),
-      engine_launch_identity_sha256: sha256Json(engineLaunchIdentity(this.config)),
+      engine_build_fingerprint: this.launchIdentity.executable_sha256,
+      engine_launch_identity_sha256: sha256Json(this.launchIdentity),
       uci_identity_sha256: sha256Json(uciIdentity),
       applied_options_sha256: sha256Json(appliedOptions),
       uci_id_lines: uciIdentity.id_lines,
@@ -3542,18 +3691,30 @@ let runtimeLogFile = null;
 let runtimeLogBytes = 0;
 
 function rotateRuntimeLog() {
-  if (!runtimeLogFile || !existsSync(runtimeLogFile)) return;
+  if (!runtimeLogFile || !exactRegularFileExistsSync(runtimeLogFile, "Lichess runtime log")) return;
   const previous = `${runtimeLogFile}.1`;
-  if (existsSync(previous)) unlinkSync(previous);
-  renameSync(runtimeLogFile, previous);
+  rotateExactFileSync(runtimeLogFile, previous, {
+    maximumFileBytes: MAX_RUNTIME_LOG_BYTES,
+    label: "Lichess runtime log",
+  });
   runtimeLogBytes = 0;
 }
 
 function configureRuntimeLog(runtimeDir) {
-  mkdirSync(runtimeDir, { recursive: true });
+  ensureExactDirectorySync(runtimeDir, "Lichess runtime log directory");
   runtimeLogFile = path.join(runtimeDir, "adapter.ndjson");
-  runtimeLogBytes = existsSync(runtimeLogFile) ? statSync(runtimeLogFile).size : 0;
-  if (runtimeLogBytes >= MAX_RUNTIME_LOG_BYTES) rotateRuntimeLog();
+  try {
+    runtimeLogBytes = exactRegularFileExistsSync(runtimeLogFile, "Lichess runtime log")
+      ? exactFileMetadataSync(runtimeLogFile, {
+        maximumBytes: MAX_RUNTIME_LOG_BYTES,
+        label: "Lichess runtime log",
+      }).byteLength
+      : 0;
+    if (runtimeLogBytes >= MAX_RUNTIME_LOG_BYTES) rotateRuntimeLog();
+  } catch {
+    runtimeLogFile = null;
+    runtimeLogBytes = 0;
+  }
 }
 
 function log(event, details = {}) {
@@ -3574,7 +3735,10 @@ function log(event, details = {}) {
       const record = `${line}\n`;
       const recordBytes = Buffer.byteLength(record, "utf8");
       if (runtimeLogBytes + recordBytes > MAX_RUNTIME_LOG_BYTES) rotateRuntimeLog();
-      appendFileSync(runtimeLogFile, record, "utf8");
+      appendExactFileSync(runtimeLogFile, record, {
+        maximumFileBytes: MAX_RUNTIME_LOG_BYTES,
+        label: "Lichess runtime log",
+      });
       runtimeLogBytes += recordBytes;
     } catch {
       // Runtime logging must not interrupt move submission or game handling.
@@ -3600,7 +3764,7 @@ function optionalFileFingerprint(filePath, workingDirectory) {
   const resolved = path.isAbsolute(configured)
     ? configured
     : path.resolve(workingDirectory ?? ROOT, configured);
-  return existsSync(resolved) ? sha256File(resolved) : "";
+  return exactRegularFileExistsSync(resolved, "Optional provenance file") ? sha256File(resolved) : "";
 }
 
 export function gameRuntimeProvenance(config, engine) {
@@ -5464,27 +5628,36 @@ export class BotController {
 }
 
 function writeRuntimeMetadata(runtimeDir, metadata) {
-  mkdirSync(runtimeDir, { recursive: true });
+  ensureExactDirectorySync(runtimeDir, "Lichess runtime directory");
   const target = path.join(runtimeDir, "runtime.json");
-  const temporary = `${target}.tmp`;
-  writeFileSync(temporary, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
-  renameSync(temporary, target);
+  publishExactJsonSync(target, metadata, {
+    maximumBytes: EXACT_FILE_LIMITS.runtimeStatus,
+    label: "Lichess runtime status",
+  });
 }
 
 function boundedRuntimeMetadata(runtimeDir) {
   const target = path.join(path.resolve(runtimeDir), "runtime.json");
-  if (!existsSync(target)) return { runtime: null, error: "runtime_status_missing" };
+  if (!exactRegularFileExistsSync(target, "Lichess runtime status")) {
+    return { runtime: null, error: "runtime_status_missing" };
+  }
   try {
-    if (statSync(target).size > 1024 * 1024) {
-      return { runtime: null, error: "runtime_status_oversized" };
-    }
-    const runtime = JSON.parse(readFileSync(target, "utf8"));
+    const runtime = readBoundedJson(
+      target,
+      EXACT_FILE_LIMITS.runtimeStatus,
+      "Lichess runtime status",
+    );
     if (runtime?.schema !== "uci_arena_lichess_runtime_v3") {
       return { runtime: null, error: "runtime_status_incompatible" };
     }
     return { runtime, error: null };
-  } catch {
-    return { runtime: null, error: "runtime_status_invalid" };
+  } catch (error) {
+    return {
+      runtime: null,
+      error: error?.code === "EXACT_FILE_TOO_LARGE"
+        ? "runtime_status_oversized"
+        : "runtime_status_invalid",
+    };
   }
 }
 
@@ -5678,10 +5851,10 @@ function qualificationRegularFile(value, label) {
   requireString(value, label);
   const resolved = path.resolve(value);
   if (!path.isAbsolute(value)) throw new Error(`${label} must be an absolute path`);
-  const metadata = lstatSync(resolved);
-  if (!metadata.isFile() || metadata.isSymbolicLink()) {
-    throw new Error(`${label} must be a regular non-link file`);
-  }
+  exactFileMetadataSync(resolved, {
+    maximumBytes: EXACT_FILE_LIMITS.largeAsset,
+    label,
+  });
   return resolved;
 }
 
@@ -5689,23 +5862,18 @@ function qualificationDirectory(value, label) {
   requireString(value, label);
   const resolved = path.resolve(value);
   if (!path.isAbsolute(value)) throw new Error(`${label} must be an absolute path`);
-  const metadata = lstatSync(resolved);
-  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
-    throw new Error(`${label} must be a non-link directory`);
-  }
+  admitExactDirectorySync(resolved, { label });
   return resolved;
 }
 
 function readQualificationJson(filename, label, maximumBytes = 16 * 1024 * 1024) {
   const resolved = qualificationRegularFile(filename, label);
-  const metadata = statSync(resolved);
-  if (metadata.size < 2 || metadata.size > maximumBytes) {
-    throw new Error(`${label} is not a bounded JSON file`);
-  }
   try {
-    return JSON.parse(readFileSync(resolved, "utf8"));
+    const admitted = readExactJsonSync(resolved, { maximumBytes, label });
+    if (admitted.byteLength < 2) throw new Error("empty JSON");
+    return admitted.value;
   } catch (error) {
-    throw new Error(`${label} is not valid JSON: ${error.message}`);
+    throw new Error(`${label} is not valid bounded JSON`);
   }
 }
 
@@ -5936,7 +6104,7 @@ export async function runInstalledQualificationWorkflow({
 } = {}) {
   const resolvedConfig = qualificationRegularFile(configPath, "qualification config");
   const resolvedRuntime = path.resolve(runtimeDir);
-  mkdirSync(resolvedRuntime, { recursive: true });
+  ensureExactDirectorySync(resolvedRuntime, "Lichess qualification runtime directory");
   const baseConfig = loadRuntimeConfig({
     templatePath: resolvedConfig,
     engineRoot: path.dirname(resolvedConfig),
@@ -5946,7 +6114,11 @@ export async function runInstalledQualificationWorkflow({
   const concurrency = maximumConcurrency ?? baseConfig.capacity.total_slots;
   requireInteger(concurrency, "qualification maximum concurrency", 1, 64);
   const engineSha = sha256File(baseConfig.engine.executable);
-  const timingSha = sha256File(baseConfig.engine.time_profile);
+  const timingSha = sha256File(
+    baseConfig.engine.time_profile,
+    EXACT_FILE_LIMITS.profile,
+    "Timing profile",
+  );
   const qualificationDependencies = baseConfig.qualification;
   if (!qualificationDependencies || typeof qualificationDependencies !== "object") {
     throw new Error("Installed Lichess qualification dependencies are unavailable");
@@ -5967,17 +6139,25 @@ export async function runInstalledQualificationWorkflow({
       "qualification.stockfish",
     )),
     syzygy_manifest_sha256: baseConfig.engine.uci_options.SyzygyPath
-      ? sha256File(qualificationRegularFile(
-        baseConfig.engine.uci_options.SyzygyManifest
-          ?? path.join(baseConfig.engine.uci_options.SyzygyPath, "syzygy_manifest_v1.json"),
-        "SyzygyManifest",
-      ))
+      ? sha256File(
+        qualificationRegularFile(
+          baseConfig.engine.uci_options.SyzygyManifest
+            ?? path.join(baseConfig.engine.uci_options.SyzygyPath, "syzygy_manifest_v1.json"),
+          "SyzygyManifest",
+        ),
+        EXACT_FILE_LIMITS.profile,
+        "Syzygy manifest",
+      )
       : null,
     temporal_curve_sha256: baseConfig.engine.temporal_curve_profile
-      ? sha256File(qualificationRegularFile(
-        baseConfig.engine.temporal_curve_profile,
-        "engine.temporal_curve_profile",
-      ))
+      ? sha256File(
+        qualificationRegularFile(
+          baseConfig.engine.temporal_curve_profile,
+          "engine.temporal_curve_profile",
+        ),
+        EXACT_FILE_LIMITS.profile,
+        "Temporal-curve profile",
+      )
       : null,
   };
   const runKey = createHash("sha256").update(JSON.stringify({
@@ -5992,14 +6172,22 @@ export async function runInstalledQualificationWorkflow({
   const singleGamePath = path.join(outputDirectory, "uci_arena_single_game_profile_v1.json");
   const capacityPath = path.join(outputDirectory, "uci_arena_lichess_capacity_profile_v2.json");
   const markerPath = path.join(outputDirectory, "qualification-result.json");
-  if (existsSync(markerPath)) {
+  if (exactRegularFileExistsSync(markerPath, "Installed qualification result")) {
     const marker = readQualificationJson(markerPath, "qualification result");
     if (marker.schema !== "uci_arena_lichess_qualification_result_v1"
         || marker.engine_sha256 !== engineSha
         || marker.timing_sha256 !== timingSha
         || marker.maximum_concurrency !== concurrency
-        || marker.single_game_profile_sha256 !== sha256File(singleGamePath)
-        || marker.capacity_profile_sha256 !== sha256File(capacityPath)) {
+        || marker.single_game_profile_sha256 !== sha256File(
+          singleGamePath,
+          EXACT_FILE_LIMITS.profile,
+          "Single-game profile",
+        )
+        || marker.capacity_profile_sha256 !== sha256File(
+          capacityPath,
+          EXACT_FILE_LIMITS.profile,
+          "Capacity profile",
+        )) {
       throw new Error("Existing installed qualification result is inconsistent");
     }
     return {
@@ -6010,8 +6198,11 @@ export async function runInstalledQualificationWorkflow({
       reused: true,
     };
   }
-  if (existsSync(outputDirectory)) rmSync(outputDirectory, { recursive: true, force: true });
-  mkdirSync(outputDirectory, { recursive: true });
+  if (exactDirectoryExistsSync(outputDirectory, "Installed qualification output directory")) {
+    admitExactDirectorySync(outputDirectory, { label: "Installed qualification output directory" });
+    rmSync(outputDirectory, { recursive: true, force: true });
+  }
+  ensureExactDirectorySync(outputDirectory, "Installed qualification output directory");
   let stage = "complete_game";
   try {
     const command = installedQualificationCommand(baseConfig, completeGamePath);
@@ -6056,16 +6247,25 @@ export async function runInstalledQualificationWorkflow({
       timing_sha256: timingSha,
       timing_identity_sha256: command.timingProfile.identity_sha256,
       maximum_concurrency: concurrency,
-      single_game_profile_sha256: sha256File(singleGamePath),
-      capacity_profile_sha256: sha256File(capacityPath),
+      single_game_profile_sha256: sha256File(
+        singleGamePath,
+        EXACT_FILE_LIMITS.profile,
+        "Single-game profile",
+      ),
+      capacity_profile_sha256: sha256File(
+        capacityPath,
+        EXACT_FILE_LIMITS.profile,
+        "Capacity profile",
+      ),
       search_core: singleGameProfile.search_core,
       model_id: singleGameProfile.model_id,
       provider: singleGameProfile.provider,
       completed_at: new Date().toISOString(),
     };
-    const temporaryMarker = `${markerPath}.tmp-${process.pid}`;
-    writeFileSync(temporaryMarker, `${JSON.stringify(marker, null, 2)}\n`, "utf8");
-    renameSync(temporaryMarker, markerPath);
+    publishExactJsonSync(markerPath, marker, {
+      maximumBytes: EXACT_FILE_LIMITS.profile,
+      label: "Installed qualification result",
+    });
     return {
       ...marker,
       status: "qualified",
@@ -6074,7 +6274,10 @@ export async function runInstalledQualificationWorkflow({
       reused: false,
     };
   } catch (error) {
-    rmSync(outputDirectory, { recursive: true, force: true });
+    if (exactDirectoryExistsSync(outputDirectory, "Installed qualification output directory")) {
+      admitExactDirectorySync(outputDirectory, { label: "Installed qualification output directory" });
+      rmSync(outputDirectory, { recursive: true, force: true });
+    }
     throw new InstalledQualificationFailure(stage, error);
   }
 }
@@ -6557,7 +6760,7 @@ export async function main(argv = process.argv.slice(2)) {
       }, 10_000);
     }
     const client = new LichessClient({
-      token: readTokenForRuntime(tokenFile),
+      tokenProvider: () => readTokenForRuntime(tokenFile),
       baseUrl: config.url,
       safetyCoordinator,
     });

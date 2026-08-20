@@ -1,13 +1,6 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
-import {
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  statSync,
-  writeFileSync,
-} from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -16,10 +9,26 @@ import {
   LIVE_ACCEPTANCE_CONFIRMATION,
 } from "./lichess-adapter.mjs";
 import { normalizedUsername } from "./lichess-store.mjs";
+import {
+  classifyExactPathSync,
+  ensureExactDirectorySync,
+  publishExactJsonSync,
+  readExactFileSync,
+  readExactJsonSync,
+} from "./exact-file.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = HERE;
 const ADAPTER = path.join(HERE, "lichess-adapter.mjs");
+const ACCEPTANCE_FILE_LIMIT = 1024 * 1024;
+const RUNTIME_LOG_LIMIT = 16 * 1024 * 1024;
+
+function exactRegularFileExistsSync(filename, label) {
+  const admission = classifyExactPathSync(filename, { label });
+  if (admission.kind === "missing") return false;
+  if (admission.kind !== "file") throw new Error(`${label} is not a regular non-link file`);
+  return true;
+}
 
 export const MAX_LIVE_ACCEPTANCE_ATTEMPTS = 3;
 export const MAX_LIVE_ACCEPTANCE_MINUTES = 20;
@@ -269,7 +278,12 @@ export async function runSpawnedAttempt({
   now = Date.now,
 }) {
   const logPath = path.join(runtimeDir, "adapter.ndjson");
-  let logOffset = existsSync(logPath) ? statSync(logPath).size : 0;
+  let logOffset = exactRegularFileExistsSync(logPath, "Lichess runtime log")
+    ? readExactFileSync(logPath, {
+      maximumBytes: RUNTIME_LOG_LIMIT,
+      label: "Lichess runtime log",
+    }).byteLength
+    : 0;
   let partial = "";
   let state = {
     challengeCreated: false,
@@ -291,8 +305,11 @@ export async function runSpawnedAttempt({
   });
   try {
     while (now() < deadline) {
-      if (existsSync(logPath)) {
-        const bytes = readFileSync(logPath);
+      if (exactRegularFileExistsSync(logPath, "Lichess runtime log")) {
+        const bytes = readExactFileSync(logPath, {
+          maximumBytes: RUNTIME_LOG_LIMIT,
+          label: "Lichess runtime log",
+        }).bytes;
         if (bytes.length < logOffset) {
           logOffset = 0;
           partial = "";
@@ -389,14 +406,20 @@ export async function main(argv = process.argv.slice(2)) {
   const runtimeDir = path.resolve(
     options.runtime_dir ?? path.join(ROOT, "runtime_state", "lichess", "live-acceptance"),
   );
-  mkdirSync(runtimeDir, { recursive: true });
+  ensureExactDirectorySync(runtimeDir, "Lichess live-acceptance runtime directory");
   const sourceConfigPath = path.resolve(
     options.config ?? path.join(HERE, "config.uci_arena.template.yml"),
   );
   const configPath = path.join(runtimeDir, "acceptance.config.json");
-  const sourceConfig = JSON.parse(readFileSync(sourceConfigPath, "utf8"));
+  const sourceConfig = readExactJsonSync(sourceConfigPath, {
+    maximumBytes: ACCEPTANCE_FILE_LIMIT,
+    label: "Lichess live-acceptance source configuration",
+  }).value;
   const acceptanceConfig = buildAcceptanceConfig(sourceConfig);
-  writeFileSync(configPath, `${JSON.stringify(acceptanceConfig, null, 2)}\n`, "utf8");
+  publishExactJsonSync(configPath, acceptanceConfig, {
+    maximumBytes: ACCEPTANCE_FILE_LIMIT,
+    label: "Lichess live-acceptance configuration",
+  });
   const resultPath = path.join(runtimeDir, "acceptance-result.json");
   try {
     const result = await executeAcceptancePlan({
@@ -408,7 +431,10 @@ export async function main(argv = process.argv.slice(2)) {
         deadline,
       }),
     });
-    writeFileSync(resultPath, `${JSON.stringify(result, null, 2)}\n`, "utf8");
+    publishExactJsonSync(resultPath, result, {
+      maximumBytes: ACCEPTANCE_FILE_LIMIT,
+      label: "Lichess live-acceptance result",
+    });
     process.stdout.write(`${JSON.stringify(result)}\n`);
     return 0;
   } catch (error) {
@@ -420,7 +446,10 @@ export async function main(argv = process.argv.slice(2)) {
       opponent: options.opponent,
       reason: error.message,
     };
-    writeFileSync(resultPath, `${JSON.stringify(failure, null, 2)}\n`, "utf8");
+    publishExactJsonSync(resultPath, failure, {
+      maximumBytes: ACCEPTANCE_FILE_LIMIT,
+      label: "Lichess live-acceptance failure",
+    });
     throw error;
   }
 }

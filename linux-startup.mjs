@@ -1,10 +1,16 @@
 import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+import {
+  classifyExactPathSync,
+  ensureExactDirectorySync,
+  publishExactFileSync,
+  publishExactJsonSync,
+  readExactTextSync,
+} from "./exact-file.mjs";
 
 const execFileAsync = promisify(execFile);
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -12,6 +18,14 @@ const ROOT = HERE;
 const ADAPTER = path.join(HERE, "lichess-adapter.mjs");
 
 export const SYSTEMD_UNIT_NAME = "uci-arena-lichess.service";
+const STARTUP_FILE_LIMIT = 1024 * 1024;
+
+function exactRegularFileExistsSync(filename, label) {
+  const admission = classifyExactPathSync(filename, { label });
+  if (admission.kind === "missing") return false;
+  if (admission.kind !== "file") throw new Error(`${label} is not a regular non-link file`);
+  return true;
+}
 
 function requireLinux() {
   if (process.platform !== "linux") {
@@ -214,7 +228,7 @@ async function systemctlState(action) {
 export async function queryLinuxStartup(options = {}) {
   requireLinux();
   const unitPath = startupUnitPath(options);
-  if (!existsSync(unitPath)) {
+  if (!exactRegularFileExistsSync(unitPath, "Lichess systemd unit")) {
     return { installed: false, unitName: SYSTEMD_UNIT_NAME, unitPath };
   }
   const [enabled, active] = await Promise.all([
@@ -254,16 +268,16 @@ export async function recoverLinuxStartup({
 export async function installLinuxStartup(options) {
   requireLinux();
   if (!options.expectedAccount) throw new Error("startup install requires --expected-account");
-  if (!existsSync(ADAPTER)) throw new Error(`Lichess adapter is unavailable: ${ADAPTER}`);
+  if (!exactRegularFileExistsSync(ADAPTER, "Lichess adapter")) {
+    throw new Error("Lichess adapter is unavailable");
+  }
   const unitPath = startupUnitPath();
-  const temporaryUnitPath = `${unitPath}.tmp-${process.pid}`;
-  await mkdir(path.dirname(unitPath), { recursive: true });
-  await mkdir(path.resolve(options.runtimeDir), { recursive: true });
-  await writeFile(temporaryUnitPath, buildSystemdUnit(options), {
-    encoding: "utf8",
-    mode: 0o600,
+  ensureExactDirectorySync(path.dirname(unitPath), "Systemd user unit directory");
+  ensureExactDirectorySync(path.resolve(options.runtimeDir), "Lichess runtime directory");
+  publishExactFileSync(unitPath, buildSystemdUnit(options), {
+    maximumBytes: STARTUP_FILE_LIMIT,
+    label: "Lichess systemd unit",
   });
-  await rename(temporaryUnitPath, unitPath);
   try {
     await systemctl(["daemon-reload"]);
     await systemctl(["enable", "--now", SYSTEMD_UNIT_NAME]);
@@ -279,10 +293,10 @@ export async function installLinuxStartup(options) {
     scope: "user",
     runtimeDir: path.resolve(options.runtimeDir),
   };
-  await writeFile(
+  publishExactJsonSync(
     path.join(path.resolve(options.runtimeDir), "startup-systemd.json"),
-    `${JSON.stringify(evidence, null, 2)}\n`,
-    "utf8",
+    evidence,
+    { maximumBytes: STARTUP_FILE_LIMIT, label: "Lichess systemd startup evidence" },
   );
   return queryLinuxStartup();
 }
@@ -327,17 +341,27 @@ export async function prepareLinuxStartupReplacement({
     throw new Error("startup replacement requires previous and replacement roots");
   }
   const unitPath = startupUnitPath();
-  if (!existsSync(unitPath)) throw new Error(`${SYSTEMD_UNIT_NAME} is unavailable for replacement`);
+  if (!exactRegularFileExistsSync(unitPath, "Lichess systemd unit")) {
+    throw new Error(`${SYSTEMD_UNIT_NAME} is unavailable for replacement`);
+  }
+  const admittedUnit = readExactTextSync(unitPath, {
+    maximumBytes: STARTUP_FILE_LIMIT,
+    label: "Lichess systemd unit",
+  });
   const updated = retargetSystemdUnit(
-    await readFile(unitPath, "utf8"), previousRoot, replacementRoot,
+    admittedUnit.text,
+    previousRoot,
+    replacementRoot,
   );
   await systemctl(["disable", "--now", SYSTEMD_UNIT_NAME]);
   if (await systemctlState("is-active") === "active") {
     throw new Error(`${SYSTEMD_UNIT_NAME} did not stop for replacement`);
   }
-  const temporaryUnitPath = `${unitPath}.replacement-${process.pid}`;
-  await writeFile(temporaryUnitPath, updated, { encoding: "utf8", mode: 0o600 });
-  await rename(temporaryUnitPath, unitPath);
+  publishExactFileSync(unitPath, updated, {
+    maximumBytes: STARTUP_FILE_LIMIT,
+    label: "Lichess replacement systemd unit",
+    expectedTargetIdentity: admittedUnit.identity,
+  });
   await systemctl(["daemon-reload"]);
   const state = await queryLinuxStartup();
   if (state.enabled !== "disabled" || state.active !== "inactive") {
@@ -361,10 +385,16 @@ export async function reconcileLinuxStartupReplacement({ startupOptions } = {}) 
     throw new Error(`${SYSTEMD_UNIT_NAME} is not disabled and inactive for reconciliation`);
   }
   const unitPath = startupUnitPath();
-  const updated = reconcileSystemdUnit(await readFile(unitPath, "utf8"), startupOptions);
-  const temporaryUnitPath = `${unitPath}.reconcile-${process.pid}`;
-  await writeFile(temporaryUnitPath, updated, { encoding: "utf8", mode: 0o600 });
-  await rename(temporaryUnitPath, unitPath);
+  const admittedUnit = readExactTextSync(unitPath, {
+    maximumBytes: STARTUP_FILE_LIMIT,
+    label: "Lichess systemd unit",
+  });
+  const updated = reconcileSystemdUnit(admittedUnit.text, startupOptions);
+  publishExactFileSync(unitPath, updated, {
+    maximumBytes: STARTUP_FILE_LIMIT,
+    label: "Reconciled Lichess systemd unit",
+    expectedTargetIdentity: admittedUnit.identity,
+  });
   await systemctl(["daemon-reload"]);
   const state = await queryLinuxStartup();
   if (state.enabled !== "disabled" || state.active !== "inactive") {
