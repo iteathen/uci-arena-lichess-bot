@@ -250,6 +250,31 @@ export async function queryWindowsStartup() {
   return queryStartupTask();
 }
 
+export async function recoverWindowsStartup({
+  execute = execFileAsync,
+  query = () => queryStartupTask(execute),
+  platform = process.platform,
+} = {}) {
+  if (platform !== "win32") {
+    throw new Error("Lichess startup supervision is supported only on Windows");
+  }
+  const registered = await query();
+  if (!registered.installed) throw new Error(`Lichess startup task is not registered: ${STARTUP_TASK_NAME}`);
+  if (registered.enabled !== true) throw new Error("Lichess startup task is disabled or its state is unknown");
+  if (!registered.active) {
+    await execute("schtasks.exe", ["/Run", "/TN", STARTUP_TASK_NAME], {
+      windowsHide: true,
+      timeout: 10_000,
+      maxBuffer: 1024 * 1024,
+    });
+  }
+  return {
+    ...(await query()),
+    recoveryRequested: true,
+    registrationMutated: false,
+  };
+}
+
 async function stopWindowsTask({
   execute = execFileAsync,
   query = () => queryStartupTask(execute),

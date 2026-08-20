@@ -77,6 +77,11 @@
       "mutates": true,
       "credential": "external_file_path_only"
     },
+    "startup_recover": {
+      "arguments": ["startup", "recover"],
+      "mutates": true,
+      "credential": "forbidden"
+    },
     "startup_uninstall": {
       "arguments": ["startup", "uninstall"],
       "mutates": true,

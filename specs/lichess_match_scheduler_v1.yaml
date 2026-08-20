@@ -191,7 +191,7 @@ slots:
     - "Human and bot pools are hard partitions for challenge admission unless allow_borrowing is explicitly true. An already-started game recovered from Lichess may use any otherwise empty qualified slot after its native audience pool is exhausted; recovery never preempts an active game."
     - "Owner reservations claim the next human slot; while claimed, non-owner human challenges receive later."
     - "Public humans may use unreserved human slots; BOT-title challengers use only bot slots."
-    - "On restart, reconcile /api/account/playing before creating or accepting new work."
+    - "On restart, establish the provider heartbeat/supervision loop before reconciling /api/account/playing. Scheduling and challenge admission remain disabled until reconciliation succeeds; transient API or network failure enters the same bounded reconnect/backoff lifecycle and never terminates the provider before supervision exists."
     - "After a global event-stream disconnect, reconnect with bounded exponential backoff and reconcile /api/account/playing before resuming scheduling so a gameStart event lost during the gap is recovered."
     - "Game admission is serialized by game id. Concurrent event-stream and reconciliation observations coalesce into one start, one child, one stream, and one slot generation."
     - "Every asynchronous slot transition and release is authorized by the generation captured when the slot was claimed; a stale callback can never mutate or release a later occupant."
@@ -228,11 +228,11 @@ opponent_scheduler:
 storage:
   engine: node_sqlite
   journal_mode: WAL
-  schema_version: 3
+  schema_version: 4
   tables: [schema_meta, owners, reservations, scheduler_control, opponents, challenge_attempts, games, api_safety_state, api_client_leases]
   invariants:
     - "Opening an existing schema-v3 store idempotently materializes every required table. A superseded api_rate_limit singleton is imported as a conservative legacy-global safety row so a branch or adapter upgrade cannot erase or shorten an unexpired 429 cooldown."
-    - "The API-client lease excludes every different live or unverifiable local owner until its TTL expires. A replacement process may take over a still-fresh lease early only when an injected OS liveness probe proves the exact recorded owner PID is absent; PID liveness uncertainty fails closed."
+    - "The API-client lease persists the exact process-instance identity captured at acquisition. A replacement may take over a still-fresh lease only when an OS probe proves that exact instance is absent or the pid now names a different process; an exact live or unverifiable owner remains exclusive until normal expiry."
     - "Game id and challenge id ingestion are idempotent."
     - "Every game immutably binds opponent, color, time control, result, engine build, model id/fingerprint/checkpoint/adapter, provider/numeric/runtime/hardware identity, complete search and batching options, timing-profile identity and permissions, semantic timing-authority match, qualified-versus-current engine provenance comparison, and configured plus observed opening-book state."
     - "When AdaptiveCurveV1 is active, every game additionally binds the validated temporal-curve artifact revision, file sha256, evidence-manifest sha256, formula identity, and complete applied coefficient UCI options."
@@ -388,7 +388,7 @@ telemetry:
     - api_queue_depth_and_in_flight_request_class
     - api_429_counts_and_client_lease_health
   status_authority:
-    - "A live PID is insufficient authority for active or ready. Runtime evidence older than the bounded heartbeat window is stale even if that PID has been reused by another process."
+    - "A live PID is insufficient authority for active or ready. Runtime evidence must bind the exact current process instance, and evidence older than the bounded heartbeat window is stale even if that PID has been reused by another process."
     - "Status distinguishes missing, invalid, stale, inactive, disconnected, scheduler-faulted, and ready states without reading a credential."
 
 transport_bounds:
@@ -407,6 +407,9 @@ validation:
   - "Substitution tests run a minimal standard UCI fixture with no UCI Arena options or runtime_status and prove qualification, legal move submission, provenance, and one-slot admission."
   - "Race tests prove duplicate gameStart/reconciliation and outbound create-response reordering cannot create two children, two streams, a leaked slot, or a stale-generation release."
   - "Reconnect tests exceed the former retry threshold without ending the active session or releasing its authority."
+  - "Startup reconciliation tests prove a transient API failure leaves the provider supervised, publishes a typed pending blocker, retries with bounded backoff, and reaches challenge-ready state after recovery."
+  - "Startup recovery tests prove the Manager operation invokes only the existing registered task or unit and cannot mutate registration."
+  - "Lease tests prove an exact live owner is retained, a reused live pid is reclaimed, and unverifiable identity fails closed."
   - "Transport tests reject oversized JSON, NDJSON records, and finite collections before unbounded buffering."
   - "Packaged Windows startup tests resolve the launcher at native/lichess_adapter_launcher.exe rather than a source-build directory."
   - "Windows lifecycle tests prove restart-disable precedes exact owned-tree termination, Task Scheduler stopped-state proof precedes Delete, deletion reaches absent state, and timeout or access failure cannot report uninstall success."
@@ -754,6 +757,7 @@ manager_account_and_options_contract_2026_07_31:
       - scheduler_resume
       - startup_status
       - startup_install
+      - startup_recover
       - startup_uninstall
       - provider_status
       - qualification_run
@@ -763,6 +767,7 @@ manager_account_and_options_contract_2026_07_31:
       - "Manager invokes only the fixed provider command and action set with separately validated scalar arguments; browser input never becomes an executable, script, shell fragment, store path, or runtime path."
       - "Responses are bounded typed JSON and omit credentials, engine child details, raw config, filesystem discovery, and database internals."
       - "Account controls do not require or read the bot token and cannot interrupt an active game."
+      - "startup_recover is credential-free and starts only the existing provider-owned per-user registration. It rejects absent or disabled registration and never creates, replaces, enables, disables, or deletes registration."
   installed_qualification:
     operation: qualification_run
     rules:

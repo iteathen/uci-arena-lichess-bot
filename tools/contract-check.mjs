@@ -93,7 +93,7 @@ const requiredOperations = new Set([
   "account_probe", "config_get", "config_update", "owner_add", "owner_list",
   "owner_remove", "provider_status", "reservation_cancel", "reservation_create",
   "reservation_status", "scheduler_pause", "scheduler_resume", "scheduler_status",
-  "startup_install", "startup_status", "startup_uninstall",
+  "startup_install", "startup_recover", "startup_status", "startup_uninstall",
 ]);
 if (operations.schema !== "uci_arena_lichess_manager_api_v1"
     || [...requiredOperations].some((name) => !operations.operations?.[name])) {

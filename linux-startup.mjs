@@ -230,6 +230,27 @@ export async function queryLinuxStartup(options = {}) {
   };
 }
 
+export async function recoverLinuxStartup({
+  query = queryLinuxStartup,
+  systemctlImpl = systemctl,
+  platform = process.platform,
+} = {}) {
+  if (platform !== "linux") {
+    throw new Error("Lichess systemd user supervision is supported only on Linux");
+  }
+  const registered = await query();
+  if (!registered.installed) throw new Error(`${SYSTEMD_UNIT_NAME} is not registered`);
+  if (registered.enabled !== "enabled") {
+    throw new Error(`${SYSTEMD_UNIT_NAME} is disabled or its state is unknown`);
+  }
+  if (registered.active !== "active") await systemctlImpl(["start", SYSTEMD_UNIT_NAME]);
+  return {
+    ...(await query()),
+    recoveryRequested: true,
+    registrationMutated: false,
+  };
+}
+
 export async function installLinuxStartup(options) {
   requireLinux();
   if (!options.expectedAccount) throw new Error("startup install requires --expected-account");

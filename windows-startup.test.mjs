@@ -14,6 +14,7 @@ import {
   parseWindowsArguments,
   prepareWindowsStartupReplacement,
   quoteWindowsArgument,
+  recoverWindowsStartup,
   reconcileWindowsTaskXml,
   retargetWindowsTaskXml,
   stopAndDeleteWindowsTask,
@@ -36,6 +37,31 @@ function options() {
     nativeLauncher: NATIVE_LAUNCHER,
   };
 }
+
+test("Windows startup recovery starts only the existing enabled task", async () => {
+  const calls = [];
+  let active = false;
+  const recovered = await recoverWindowsStartup({
+    platform: "win32",
+    query: async () => ({ installed: true, enabled: true, active }),
+    execute: async (executable, argumentsList) => {
+      calls.push({ executable, argumentsList });
+      active = true;
+    },
+  });
+  assert.deepEqual(calls, [{
+    executable: "schtasks.exe",
+    argumentsList: ["/Run", "/TN", STARTUP_TASK_NAME],
+  }]);
+  assert.equal(recovered.active, true);
+  assert.equal(recovered.registrationMutated, false);
+  await assert.rejects(recoverWindowsStartup({
+    platform: "win32",
+    query: async () => ({ installed: true, enabled: false, active: false }),
+    execute: async () => calls.push("unexpected"),
+  }), /disabled/);
+  assert.equal(calls.length, 1);
+});
 
 test("startup task is hidden, supervised, and invokes the foreground adapter through a GUI launcher", () => {
   assert.match(NATIVE_LAUNCHER.replaceAll("\\", "/"), /\/native\/lichess_adapter_launcher\.exe$/);

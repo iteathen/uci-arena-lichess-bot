@@ -2,6 +2,10 @@ import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import {
+  sameProcessInstance,
+  validProcessIdentity,
+} from "./process-instance-identity.mjs";
 
 function normalizedUsername(value) {
   const username = String(value ?? "").trim().toLocaleLowerCase();
@@ -146,6 +150,7 @@ export class LichessStore {
         authority_key TEXT PRIMARY KEY,
         owner_id TEXT NOT NULL,
         pid INTEGER NOT NULL,
+        process_identity_json TEXT NOT NULL DEFAULT '',
         heartbeat_at INTEGER NOT NULL,
         expires_at INTEGER NOT NULL
       );
@@ -191,6 +196,7 @@ export class LichessStore {
             authority_key TEXT PRIMARY KEY,
             owner_id TEXT NOT NULL,
             pid INTEGER NOT NULL,
+            process_identity_json TEXT NOT NULL DEFAULT '',
             heartbeat_at INTEGER NOT NULL,
             expires_at INTEGER NOT NULL
           );
@@ -231,7 +237,25 @@ export class LichessStore {
       }
       version = 3;
     }
-    if (version !== 3) throw new Error(`Unsupported Lichess store schema version: ${version}`);
+    if (version === 3) {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        const columns = new Set(this.db.prepare("PRAGMA table_info(api_client_leases)").all()
+          .map((column) => column.name));
+        if (!columns.has("process_identity_json")) {
+          this.db.exec(
+            "ALTER TABLE api_client_leases ADD COLUMN process_identity_json TEXT NOT NULL DEFAULT ''",
+          );
+        }
+        this.db.exec("UPDATE schema_meta SET version=4");
+        this.db.exec("COMMIT");
+      } catch (error) {
+        this.db.exec("ROLLBACK");
+        throw error;
+      }
+      version = 4;
+    }
+    if (version !== 4) throw new Error(`Unsupported Lichess store schema version: ${version}`);
   }
 
   close() {
@@ -398,29 +422,44 @@ export class LichessStore {
     pid,
     now = Date.now(),
     ttlMs = 60_000,
-    ownerProcessAlive = null,
+    ownerProcessProbe = null,
+    processIdentity = null,
   ) {
     const normalized = authorityKey(key);
     const owner = String(ownerId ?? "").trim();
     if (!owner) throw new Error("Lichess API lease owner id is required");
-    if (ownerProcessAlive !== null && typeof ownerProcessAlive !== "function") {
-      throw new Error("Lichess API lease owner liveness probe is invalid");
+    if (ownerProcessProbe !== null && typeof ownerProcessProbe !== "function") {
+      throw new Error("Lichess API lease owner process probe is invalid");
+    }
+    if (!validProcessIdentity(processIdentity, Number(pid))) {
+      throw new Error("Lichess API lease process identity is invalid");
     }
     const expiresAt = now + integer(ttlMs, 60_000);
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const active = this.db.prepare(`
-        SELECT owner_id, pid, heartbeat_at, expires_at
+        SELECT owner_id, pid, process_identity_json, heartbeat_at, expires_at
         FROM api_client_leases WHERE authority_key=?
       `).get(normalized);
       const activePid = Number(active?.pid);
-      const ownerProvenDead = active
-        && active.owner_id !== owner
-        && Number.isSafeInteger(activePid)
-        && activePid > 0
-        && ownerProcessAlive?.(activePid) === false;
+      let ownerProvenReplaced = false;
+      if (active && active.owner_id !== owner && Number.isSafeInteger(activePid)
+          && activePid > 0 && ownerProcessProbe) {
+        let observed = { state: "unverifiable" };
+        try {
+          observed = ownerProcessProbe(activePid) ?? observed;
+        } catch {}
+        let recordedIdentity = null;
+        try {
+          const parsed = JSON.parse(active.process_identity_json);
+          if (validProcessIdentity(parsed, activePid)) recordedIdentity = parsed;
+        } catch {}
+        ownerProvenReplaced = observed.state === "absent"
+          || (recordedIdentity && observed.state === "present"
+            && !sameProcessInstance(recordedIdentity, observed.identity));
+      }
       if (active && active.owner_id !== owner && Number(active.expires_at) > now
-          && !ownerProvenDead) {
+          && !ownerProvenReplaced) {
         const error = new Error(
           `Lichess API authority ${normalized} is already leased by process ${active.pid}`,
         );
@@ -429,11 +468,13 @@ export class LichessStore {
         throw error;
       }
       this.db.prepare(`
-        INSERT INTO api_client_leases(authority_key, owner_id, pid, heartbeat_at, expires_at)
-        VALUES(?, ?, ?, ?, ?)
+        INSERT INTO api_client_leases(authority_key, owner_id, pid, process_identity_json,
+          heartbeat_at, expires_at)
+        VALUES(?, ?, ?, ?, ?, ?)
         ON CONFLICT(authority_key) DO UPDATE SET owner_id=excluded.owner_id,
-          pid=excluded.pid, heartbeat_at=excluded.heartbeat_at, expires_at=excluded.expires_at
-      `).run(normalized, owner, integer(pid), now, expiresAt);
+          pid=excluded.pid, process_identity_json=excluded.process_identity_json,
+          heartbeat_at=excluded.heartbeat_at, expires_at=excluded.expires_at
+      `).run(normalized, owner, integer(pid), JSON.stringify(processIdentity), now, expiresAt);
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -442,12 +483,29 @@ export class LichessStore {
     return this.apiLease(normalized);
   }
 
-  heartbeatApiLease(key, ownerId, pid, now = Date.now(), ttlMs = 60_000) {
+  heartbeatApiLease(
+    key,
+    ownerId,
+    pid,
+    now = Date.now(),
+    ttlMs = 60_000,
+    processIdentity = null,
+  ) {
     const normalized = authorityKey(key);
+    if (!validProcessIdentity(processIdentity, Number(pid))) {
+      throw new Error("Lichess API lease process identity is invalid");
+    }
     const result = this.db.prepare(`
-      UPDATE api_client_leases SET pid=?, heartbeat_at=?, expires_at=?
-      WHERE authority_key=? AND owner_id=?
-    `).run(integer(pid), now, now + integer(ttlMs, 60_000), normalized, String(ownerId));
+      UPDATE api_client_leases SET heartbeat_at=?, expires_at=?
+      WHERE authority_key=? AND owner_id=? AND pid=? AND process_identity_json=?
+    `).run(
+      now,
+      now + integer(ttlMs, 60_000),
+      normalized,
+      String(ownerId),
+      integer(pid),
+      JSON.stringify(processIdentity),
+    );
     if (result.changes !== 1) {
       const error = new Error(`Lichess API lease ownership was lost for ${normalized}`);
       error.code = "LICHESS_API_LEASE_LOST";
@@ -463,7 +521,7 @@ export class LichessStore {
 
   apiLease(key) {
     return this.db.prepare(`
-      SELECT authority_key, owner_id, pid, heartbeat_at, expires_at
+      SELECT authority_key, owner_id, pid, process_identity_json, heartbeat_at, expires_at
       FROM api_client_leases WHERE authority_key=?
     `).get(authorityKey(key)) ?? null;
   }
@@ -744,7 +802,7 @@ export class LichessStore {
 
   status(now = Date.now()) {
     return {
-      schemaVersion: 3,
+      schemaVersion: 4,
       control: this.control(now),
       owners: this.listOwners(),
       opponents: this.db.prepare("SELECT COUNT(*) AS count FROM opponents").get().count,
