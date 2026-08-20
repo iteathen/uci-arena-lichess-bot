@@ -1,10 +1,12 @@
 #!/usr/bin/env node
-import { createHash } from "node:crypto";
-import { copyFileSync, existsSync, readFileSync } from "node:fs";
+import { copyFileSync, existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { LichessStore } from "./lichess-store.mjs";
+import { readExactJsonSync } from "./exact-file.mjs";
+
+const BACKFILL_MANIFEST_LIMIT = 16 * 1024 * 1024;
 
 function parseArguments(argv) {
   const args = {};
@@ -21,10 +23,6 @@ function parseArguments(argv) {
     index += 1;
   }
   return args;
-}
-
-function sha256(content) {
-  return `sha256:${createHash("sha256").update(content).digest("hex")}`;
 }
 
 function backupPath(database) {
@@ -60,8 +58,11 @@ export function runBackfill({ database, manifest, apply = false, backup } = {}) 
   if (!manifest) throw new Error("--manifest is required");
   const databasePath = path.resolve(database);
   const manifestPath = path.resolve(manifest);
-  const manifestContent = readFileSync(manifestPath);
-  const evidence = JSON.parse(manifestContent);
+  const manifestAdmission = readExactJsonSync(manifestPath, {
+    maximumBytes: BACKFILL_MANIFEST_LIMIT,
+    label: "Provenance backfill manifest",
+  });
+  const evidence = manifestAdmission.value;
   if (evidence.schema !== "uci_arena_game_provenance_backfill_v1") {
     throw new Error(`Unsupported provenance backfill manifest schema: ${evidence.schema}`);
   }
@@ -86,7 +87,7 @@ export function runBackfill({ database, manifest, apply = false, backup } = {}) 
       mode: apply ? "applied" : "dry_run",
       database: databasePath,
       manifest: manifestPath,
-      manifest_sha256: sha256(manifestContent),
+      manifest_sha256: manifestAdmission.sha256,
       backup: resolvedBackup,
       matched: reports.reduce((sum, report) => sum + report.matched, 0),
       updated: reports.reduce((sum, report) => sum + report.updated, 0),

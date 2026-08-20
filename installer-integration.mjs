@@ -1,4 +1,4 @@
-import { lstatSync, readFileSync, readdirSync } from 'node:fs';
+import { readdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -7,9 +7,15 @@ import {
   editableManagerOptionsProjection,
   loadManagerConfig,
 } from './lichess-adapter.mjs';
+import {
+  admitExactDirectorySync,
+  admitExactFileSync,
+  readExactJsonSync,
+} from './exact-file.mjs';
 
 const MAXIMUM_CONTEXT_BYTES = 1024 * 1024;
 const MAXIMUM_EXISTING_CONFIGURATION_BYTES = 1024 * 1024;
+const MAXIMUM_BOOK_BYTES = 16 * 1024 * 1024 * 1024;
 const DEFAULT_TEMPLATE = fileURLToPath(new URL('./config.uci_arena.template.yml', import.meta.url));
 
 function requireObject(value, label) {
@@ -33,17 +39,23 @@ function optionalAbsolutePath(value, label) {
 function openingBookOptions(locator) {
   if (locator === undefined) return {};
   const selected = requireAbsolutePath(locator, 'locators.opening_book');
-  const metadata = lstatSync(selected);
-  if (metadata.isSymbolicLink()) throw new Error('opening-book locator may not be a link');
   let book = selected;
-  if (metadata.isDirectory()) {
+  let selectedDirectory = null;
+  try {
+    selectedDirectory = admitExactDirectorySync(selected, { label: 'Opening-book directory' });
+  } catch (error) {
+    if (error?.code !== 'EXACT_FILE_ANCESTOR_INVALID') throw error;
+  }
+  if (selectedDirectory) {
     const canonical = path.join(selected, 'strong_rare_v1.bin');
     try {
-      const canonicalMetadata = lstatSync(canonical);
-      if (canonicalMetadata.isFile() && !canonicalMetadata.isSymbolicLink()) book = canonical;
-      else throw new Error('canonical opening book is not a regular file');
+      admitExactFileSync(canonical, {
+        maximumBytes: MAXIMUM_BOOK_BYTES,
+        label: 'Canonical opening book',
+      });
+      book = canonical;
     } catch (error) {
-      if (error.code !== 'ENOENT') throw error;
+      if (error.code !== 'EXACT_FILE_MISSING') throw error;
       const candidates = readdirSync(selected, { withFileTypes: true })
         .filter((entry) => entry.isFile() && !entry.isSymbolicLink()
           && ['.bin', '.book'].includes(path.extname(entry.name).toLowerCase()))
@@ -54,9 +66,12 @@ function openingBookOptions(locator) {
       }
       [book] = candidates;
     }
-  } else if (!metadata.isFile()) {
-    throw new Error('opening-book locator must be a regular file or directory');
+    const directoryAfter = admitExactDirectorySync(selected, { label: 'Opening-book directory' });
+    if (JSON.stringify(directoryAfter.identity) !== JSON.stringify(selectedDirectory.identity)) {
+      throw new Error('opening-book directory changed during selection');
+    }
   }
+  admitExactFileSync(book, { maximumBytes: MAXIMUM_BOOK_BYTES, label: 'Opening book' });
   const options = {
     OwnBook: true,
     BookFile: book,
@@ -67,13 +82,13 @@ function openingBookOptions(locator) {
   for (const [suffix, option] of [['.stats', 'BookStatsFile'], ['.policy', 'BookPolicyFile']]) {
     const sidecar = path.join(path.dirname(book), `${path.basename(book, path.extname(book))}${suffix}`);
     try {
-      const sidecarMetadata = lstatSync(sidecar);
-      if (!sidecarMetadata.isFile() || sidecarMetadata.isSymbolicLink()) {
-        throw new Error(`opening-book ${suffix} sidecar is not a regular file`);
-      }
+      admitExactFileSync(sidecar, {
+        maximumBytes: MAXIMUM_BOOK_BYTES,
+        label: `Opening-book ${suffix} sidecar`,
+      });
       sidecars.push({ option, sidecar });
     } catch (error) {
-      if (error.code === 'ENOENT') continue;
+      if (error.code === 'EXACT_FILE_MISSING') continue;
       throw error;
     }
   }
@@ -92,16 +107,14 @@ function disabled(configuration) {
 
 function preserveManagerOptions(configuration, workspace, engineRoot) {
   const existingPath = path.join(workspace, 'manager-config.json');
-  let metadata;
   try {
-    metadata = lstatSync(existingPath);
+    admitExactFileSync(existingPath, {
+      maximumBytes: MAXIMUM_EXISTING_CONFIGURATION_BYTES,
+      label: 'Existing managed configuration',
+    });
   } catch (error) {
-    if (error.code === 'ENOENT') return configuration;
+    if (error.code === 'EXACT_FILE_MISSING') return configuration;
     throw error;
-  }
-  if (!metadata.isFile() || metadata.isSymbolicLink()
-      || metadata.size < 2 || metadata.size > MAXIMUM_EXISTING_CONFIGURATION_BYTES) {
-    throw new Error('existing managed configuration is not a bounded regular file');
   }
   const current = loadManagerConfig({ templatePath: existingPath, engineRoot });
   return applyManagerOptionsPatch(configuration, editableManagerOptionsProjection(current));
@@ -117,7 +130,10 @@ export function renderInstallerConfiguration(context) {
   const workspace = requireAbsolutePath(context.workspace, 'workspace');
   const bindings = requireObject(context.bindings ?? {}, 'bindings');
   const locators = requireObject(context.locators ?? {}, 'locators');
-  let configuration = JSON.parse(readFileSync(DEFAULT_TEMPLATE, 'utf8'));
+  let configuration = readExactJsonSync(DEFAULT_TEMPLATE, {
+    maximumBytes: MAXIMUM_EXISTING_CONFIGURATION_BYTES,
+    label: 'Default Lichess configuration template',
+  }).value;
   const importedEngine = optionalAbsolutePath(locators.uci_engine, 'locators.uci_engine');
   const defaultEngine = optionalAbsolutePath(bindings.default_engine, 'bindings.default_engine');
   const engine = importedEngine ?? defaultEngine;
@@ -210,12 +226,10 @@ export function renderInstallerConfiguration(context) {
 
 function readContext(filename) {
   const absolute = requireAbsolutePath(filename, 'context file');
-  const metadata = lstatSync(absolute);
-  if (!metadata.isFile() || metadata.isSymbolicLink()
-      || metadata.size < 2 || metadata.size > MAXIMUM_CONTEXT_BYTES) {
-    throw new Error('installer context file is not a bounded regular file');
-  }
-  return JSON.parse(readFileSync(absolute, 'utf8'));
+  return readExactJsonSync(absolute, {
+    maximumBytes: MAXIMUM_CONTEXT_BYTES,
+    label: 'Installer context file',
+  }).value;
 }
 
 function main(argv) {

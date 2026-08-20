@@ -105,6 +105,35 @@ configuration:
     human_slot_borrowing: false
     public_humans: true
 
+exact_file_authority:
+  owner: lichess_provider_exact_file_component
+  role: provider_local_filesystem_adapter
+  limits:
+    path_utf8_bytes: 32768
+    credential_bytes: 4096
+    configuration_bytes: 1048576
+    runtime_status_bytes: 1048576
+    startup_definition_bytes: 1048576
+    transport_profile_bytes: 4194304
+    profile_manifest_and_evidence_bytes: 16777216
+    engine_argument_file_bytes: 67108864
+    executable_book_and_tablebase_asset_bytes: 17179869184
+  rules:
+    - "One provider-local exact-file component owns bounded regular-file admission, streaming SHA-256, exact byte reads, append authority, and atomic file publication. Domain parsing and policy remain with their existing provider owners."
+    - "Every admitted path and existing ancestor is bounded and must be a real directory or regular final file rather than a symlink, junction, reparse substitution, device, socket, FIFO, or other special object."
+    - "Reads and hashes bind pre-open path identity, opened descriptor identity and size, post-use descriptor identity, and post-use path identity. No-follow open is mandatory where the platform exposes it; unsupported platform capability remains explicit and the identity comparison still fails closed on observed substitution."
+    - "Credential reads consume at most 4096 bytes with one-byte overflow detection, accept one non-whitespace value, are performed only for one transport request, and never cache, hash, persist, log, return, or include credential bytes or paths in diagnostics."
+    - "Configuration, profile, manifest, evidence, runtime-status, startup-definition, argument-file, executable, book, and tablebase reads use the named finite limits above before allocation or streaming work proportional to arbitrary input. Large assets are hashed incrementally."
+    - "A UCI child is admitted from one exact executable and bounded exact argument-file identity set. The provider revalidates those identities immediately before process creation and before qualification authority; any observed change terminates the new child and blocks its evidence."
+    - "Publications use one random private exclusive temporary file in the proven destination directory, exact bounded writes, file synchronization when authoritative, atomic same-directory activation, parent synchronization where supported, target revalidation, and identity-safe cleanup that preserves the primary failure. Predictable pid-only temporary names are forbidden."
+    - "Runtime logs use exact non-link append ownership and bounded rotation. Existing link/reparse targets or path substitution disable only log diagnostics and never interrupt an active game."
+  failure:
+    - "Missing, oversized, wrong-type, replaced, mutated, truncated, grown, unreadable, unclosable, or unpublishable authority files fail closed with bounded provider-owned diagnostics. Credential diagnostics never disclose the credential path."
+    - "No check-then-read fallback, whole-binary materialization, implicit alternate file, or prior-path hash may become runtime or evidence authority."
+  validation:
+    - "Synthetic fixtures cover final-path and ancestor links, post-admission swap, same-size mutation, growth, truncation, one-byte overflow, directories and supported special files, read/write/close/sync/activation/cleanup failures, hostile target creation, and exact Windows/Linux identity behavior."
+    - "Integrated tests prove malformed credential, configuration, profile, executable, argument, manifest, runtime-status, log, and startup paths fail before use while valid installed and package-local inputs retain their behavior."
+
 capacity_profile:
   schemas: [uci_arena_lichess_capacity_profile_v1, uci_arena_lichess_capacity_profile_v2, uci_arena_lichess_standard_uci_capacity_profile_v1]
   required_bindings:

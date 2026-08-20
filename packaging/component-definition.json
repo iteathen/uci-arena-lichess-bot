@@ -16,6 +16,7 @@
     {"source": "chess-legality.mjs", "target": "chess-legality.mjs"},
     {"source": "config.uci_arena.template.yml", "target": "config.uci_arena.template.yml"},
     {"source": "contracts", "target": "contracts"},
+    {"source": "exact-file.mjs", "target": "exact-file.mjs"},
     {"source": "lichess-adapter.mjs", "target": "lichess-adapter.mjs"},
     {"source": "lichess-scheduler.mjs", "target": "lichess-scheduler.mjs"},
     {"source": "lichess-store.mjs", "target": "lichess-store.mjs"},
