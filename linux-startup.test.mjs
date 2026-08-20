@@ -6,6 +6,7 @@ import {
   SYSTEMD_UNIT_NAME,
   buildSystemdUnit,
   parseSystemdArguments,
+  recoverLinuxStartup,
   reconcileSystemdUnit,
   retargetSystemdUnit,
   startupAction,
@@ -26,6 +27,28 @@ function options() {
     modelRoot: "engine/runtime/models/model/engine",
   };
 }
+
+test("Linux startup recovery starts only the existing enabled user unit", async () => {
+  const calls = [];
+  let active = "inactive";
+  const recovered = await recoverLinuxStartup({
+    platform: "linux",
+    query: async () => ({ installed: true, enabled: "enabled", active }),
+    systemctlImpl: async (argumentsList) => {
+      calls.push(argumentsList);
+      active = "active";
+    },
+  });
+  assert.deepEqual(calls, [["start", SYSTEMD_UNIT_NAME]]);
+  assert.equal(recovered.active, "active");
+  assert.equal(recovered.registrationMutated, false);
+  await assert.rejects(recoverLinuxStartup({
+    platform: "linux",
+    query: async () => ({ installed: true, enabled: "disabled", active: "inactive" }),
+    systemctlImpl: async () => calls.push("unexpected"),
+  }), /disabled/);
+  assert.equal(calls.length, 1);
+});
 
 test("Linux startup action runs the foreground adapter with path-only credential input", () => {
   const action = startupAction(options());

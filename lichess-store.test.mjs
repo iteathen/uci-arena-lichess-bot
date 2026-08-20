@@ -12,12 +12,23 @@ function storeFixture() {
   return new LichessStore(path.join(directory, "matches.sqlite"));
 }
 
-test("store migrates to schema three and uses WAL", () => {
+function processIdentity(pid, startToken = String(pid)) {
+  return {
+    schema: "uci_arena_process_instance_identity_v1",
+    platform: "win32",
+    pid,
+    start_token: startToken,
+    executable_path: "C:\\UCI Arena\\node.exe",
+    boot_id: "",
+  };
+}
+
+test("store migrates to schema four and uses WAL", () => {
   const store = storeFixture();
   try {
-    assert.equal(store.status().schemaVersion, 3);
+    assert.equal(store.status().schemaVersion, 4);
     assert.equal(store.db.prepare("PRAGMA journal_mode").get().journal_mode, "wal");
-    assert.equal(store.db.prepare("SELECT version FROM schema_meta").get().version, 3);
+    assert.equal(store.db.prepare("SELECT version FROM schema_meta").get().version, 4);
   } finally {
     store.close();
   }
@@ -40,7 +51,7 @@ test("schema-one stores migrate without losing existing control state", () => {
   legacy.close();
   const store = new LichessStore(file);
   try {
-    assert.equal(store.status().schemaVersion, 3);
+    assert.equal(store.status().schemaVersion, 4);
     assert.equal(store.control().paused, true);
     assert.deepEqual(store.apiSafetyState("https://lichess.org|arena-bot"), {
       cooldownUntil: 0,
@@ -93,9 +104,17 @@ test("schema-three stores repair API safety tables without shortening legacy coo
       last429At: 50_000,
       lastRetryAfterMs: 60_000,
     });
-    assert.equal(store.acquireApiLease(key, "repair-owner", 101, 50_000, 60_000).owner_id, "repair-owner");
+    assert.equal(store.acquireApiLease(
+      key,
+      "repair-owner",
+      101,
+      50_000,
+      60_000,
+      null,
+      processIdentity(101),
+    ).owner_id, "repair-owner");
     assert.equal(store.releaseApiLease(key, "repair-owner"), true);
-    assert.equal(store.status().schemaVersion, 3);
+    assert.equal(store.status().schemaVersion, 4);
   } finally {
     store.close();
   }
@@ -147,14 +166,20 @@ test("API client lease excludes a second process and permits stale takeover", ()
   const second = new LichessStore(file);
   const key = "https://lichess.org|arena-bot";
   try {
-    first.acquireApiLease(key, "owner-one", 101, 1_000, 60_000);
+    const firstIdentity = processIdentity(101);
+    const secondIdentity = processIdentity(202);
+    first.acquireApiLease(key, "owner-one", 101, 1_000, 60_000, null, firstIdentity);
     assert.throws(
-      () => second.acquireApiLease(key, "owner-two", 202, 2_000, 60_000),
+      () => second.acquireApiLease(
+        key, "owner-two", 202, 2_000, 60_000, null, secondIdentity,
+      ),
       (error) => error.code === "LICHESS_API_LEASE_HELD",
     );
-    first.heartbeatApiLease(key, "owner-one", 101, 10_000, 60_000);
+    first.heartbeatApiLease(key, "owner-one", 101, 10_000, 60_000, firstIdentity);
     assert.equal(first.apiLease(key).expires_at, 70_000);
-    second.acquireApiLease(key, "owner-two", 202, 70_001, 60_000);
+    second.acquireApiLease(
+      key, "owner-two", 202, 70_001, 60_000, null, secondIdentity,
+    );
     assert.equal(second.apiLease(key).owner_id, "owner-two");
     assert.equal(first.releaseApiLease(key, "owner-one"), false);
     assert.equal(second.releaseApiLease(key, "owner-two"), true);
@@ -164,20 +189,39 @@ test("API client lease excludes a second process and permits stale takeover", ()
   }
 });
 
-test("API client lease permits fresh takeover only when the recorded owner PID is proven dead", () => {
+test("API client lease permits fresh takeover only when the exact owner is absent or replaced", () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-lichess-dead-lease-"));
   const file = path.join(directory, "matches.sqlite");
   const first = new LichessStore(file);
   const second = new LichessStore(file);
   const key = "https://lichess.org|arena-bot";
   try {
-    first.acquireApiLease(key, "owner-one", 101, 1_000, 60_000);
+    const firstIdentity = processIdentity(101, "100");
+    const reusedIdentity = processIdentity(101, "200");
+    const secondIdentity = processIdentity(202, "300");
+    first.acquireApiLease(key, "owner-one", 101, 1_000, 60_000, null, firstIdentity);
     assert.throws(
-      () => second.acquireApiLease(key, "owner-two", 202, 2_000, 60_000, () => true),
+      () => second.acquireApiLease(
+        key,
+        "owner-two",
+        202,
+        2_000,
+        60_000,
+        () => ({ state: "present", identity: firstIdentity }),
+        secondIdentity,
+      ),
       (error) => error.code === "LICHESS_API_LEASE_HELD",
     );
     assert.throws(
-      () => second.acquireApiLease(key, "owner-two", 202, 2_000, 60_000, () => undefined),
+      () => second.acquireApiLease(
+        key,
+        "owner-two",
+        202,
+        2_000,
+        60_000,
+        () => ({ state: "unverifiable" }),
+        secondIdentity,
+      ),
       (error) => error.code === "LICHESS_API_LEASE_HELD",
     );
 
@@ -187,12 +231,26 @@ test("API client lease permits fresh takeover only when the recorded owner PID i
       202,
       2_000,
       60_000,
-      (pid) => pid === 101 ? false : true,
+      () => ({ state: "present", identity: reusedIdentity }),
+      secondIdentity,
     );
 
     assert.equal(replacement.owner_id, "owner-two");
     assert.equal(replacement.pid, 202);
     assert.equal(first.releaseApiLease(key, "owner-one"), false);
+
+    second.releaseApiLease(key, "owner-two");
+    first.acquireApiLease(key, "owner-three", 101, 3_000, 60_000, null, firstIdentity);
+    const absent = second.acquireApiLease(
+      key,
+      "owner-four",
+      202,
+      4_000,
+      60_000,
+      () => ({ state: "absent" }),
+      secondIdentity,
+    );
+    assert.equal(absent.owner_id, "owner-four");
   } finally {
     first.close();
     second.close();

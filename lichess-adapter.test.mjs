@@ -110,6 +110,21 @@ test("provider status distinguishes inactive, disconnected, and ready states", (
   assert.equal(disconnected.games.active, 1);
   assert.equal(disconnected.games.cancelling, 1);
 
+  const recovering = providerStatusProjection({
+    runtime: {
+      ...runtime,
+      scheduler: { ...runtime.scheduler, reconciliation_pending: true },
+    },
+    active: true,
+    startup: { installed: true },
+    now: Date.parse(runtime.updated_at),
+  });
+  assert.equal(recovering.ready, false);
+  assert.deepEqual(recovering.blockers, [
+    "event_stream_disconnected",
+    "startup_reconciliation_pending",
+  ]);
+
   const ready = providerStatusProjection({
     runtime: { ...runtime, stream_connected: true },
     active: true,
@@ -3948,6 +3963,65 @@ test("restart recovery prefers canonical opponent id over a title-prefixed displ
     assert.equal(recoveredSlot.audience, "bot");
     await Promise.allSettled(controller.activeGames.values());
   } finally {
+    await controller.slots.drainAll();
+    store.close();
+  }
+});
+
+test("initial reconciliation failure remains supervised and retries before stream admission", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-startup-recovery-"));
+  const store = new LichessStore(path.join(directory, "matches.sqlite"));
+  const lifetime = new AbortController();
+  let recoveryCalls = 0;
+  let pendingObserved = false;
+  let connectedAfterRecovery = false;
+  const client = {
+    requestQueue: { snapshot: () => ({ depth: 0 }) },
+    safetySnapshot: () => ({
+      state: "ready",
+      cooldown_until: 0,
+      cooldown_remaining_ms: 0,
+      strike_count: 0,
+    }),
+    json: async () => {
+      recoveryCalls += 1;
+      if (recoveryCalls === 1) throw new Error("temporary startup API failure");
+      return { nowPlaying: [] };
+    },
+    openStream: async () => ({
+      async *[Symbol.asyncIterator]() {
+        connectedAfterRecovery = true;
+        lifetime.abort(new Error("startup recovery test complete"));
+      },
+    }),
+  };
+  const config = gameConfig();
+  config.scheduler = { ...config.scheduler, enabled: false };
+  config.capacity = {
+    total_slots: 1,
+    startup_parallelism: 1,
+    human: { slots: 0, allow_borrowing: false, accept_public: false },
+    bot: { slots: 1, target_active: 0 },
+  };
+  const controller = new BotController({
+    client,
+    config,
+    account: "self",
+    runtimeDir: directory,
+    signal: lifetime.signal,
+    store,
+    reconnectDelay: async () => {
+      const runtime = JSON.parse(readFileSync(path.join(directory, "runtime.json"), "utf8"));
+      pendingObserved = runtime.scheduler.reconciliation_pending === true;
+    },
+  });
+  try {
+    await controller.run();
+    assert.equal(recoveryCalls, 2);
+    assert.equal(pendingObserved, true);
+    assert.equal(connectedAfterRecovery, true);
+  } finally {
+    lifetime.abort();
     await controller.slots.drainAll();
     store.close();
   }

@@ -37,6 +37,7 @@ import {
   installWindowsStartup,
   prepareWindowsStartupReplacement,
   queryWindowsStartup,
+  recoverWindowsStartup,
   reconcileWindowsStartupReplacement,
   uninstallWindowsStartup,
 } from "./windows-startup.mjs";
@@ -45,6 +46,7 @@ import {
   installLinuxStartup,
   prepareLinuxStartupReplacement,
   queryLinuxStartup,
+  recoverLinuxStartup,
   reconcileLinuxStartupReplacement,
   uninstallLinuxStartup,
 } from "./linux-startup.mjs";
@@ -59,6 +61,11 @@ import {
   validateProfileRuntimeSnapshot,
 } from "@uci-arena/time-profile-contract";
 import { publishSingleGameProfile } from "./publish-single-game-profile.mjs";
+import {
+  currentProcessIdentity,
+  probeProcessInstance,
+  processInstanceIsCurrent,
+} from "./process-instance-identity.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT = HERE;
@@ -4772,7 +4779,17 @@ export class GameSession {
 }
 
 export class BotController {
-  constructor({ client, config, account, runtimeDir, signal, store, random = Math.random, now = Date.now }) {
+  constructor({
+    client,
+    config,
+    account,
+    runtimeDir,
+    signal,
+    store,
+    random = Math.random,
+    now = Date.now,
+    reconnectDelay = delay,
+  }) {
     this.client = client;
     this.config = { ...config, timing: { ...DEFAULT_TIMING_CONFIG, ...(config.timing ?? {}) } };
     this.config.engine = { ...config.engine, timing: this.config.timing };
@@ -4782,6 +4799,7 @@ export class BotController {
     this.store = store;
     this.random = random;
     this.now = now;
+    this.reconnectDelay = reconnectDelay;
     this.slots = new SlotPool(config.capacity);
     this.engineStarts = new AsyncSemaphore(config.capacity.startup_parallelism);
     this.activeGames = new Map();
@@ -4812,7 +4830,7 @@ export class BotController {
 
   async run(opponent) {
     this.manualOpponent = opponent ? normalizedUsername(opponent) : null;
-    await this.recoverPlayingGames();
+    this.needsReconciliation = true;
     const schedulerTask = this.schedulerLoop();
     const statusHeartbeat = setInterval(() => {
       void this.writeStatus().catch((error) => {
@@ -4821,8 +4839,10 @@ export class BotController {
     }, 5_000);
     let reconnectDelay = 1_000;
     try {
+      await this.writeStatus();
       while (!this.signal.aborted) {
         try {
+          if (this.needsReconciliation) await this.recoverPlayingGames();
           const events = await this.client.openStream("api/stream/event", this.signal);
           const connectedAt = Date.now();
           this.streamConnected = true;
@@ -4845,7 +4865,7 @@ export class BotController {
           log("event_stream_error", { message: error.message, retry_ms: retryMs });
           await this.writeStatus();
           try {
-            await delay(retryMs, this.signal);
+            await this.reconnectDelay(retryMs, this.signal);
           } catch (retryError) {
             if (this.signal.aborted) break;
             throw retryError;
@@ -5386,6 +5406,7 @@ export class BotController {
       schema: "uci_arena_lichess_runtime_v3",
       adapter_id: "lichess_node_adapter_v2",
       pid: process.pid,
+      process_instance: currentProcessIdentity(),
       account: this.account,
       stream_connected: this.streamConnected,
       configured_capacity: this.config.capacity.total_slots,
@@ -5467,21 +5488,11 @@ function boundedRuntimeMetadata(runtimeDir) {
   }
 }
 
-function processIsAlive(pid) {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error?.code === "EPERM";
-  }
-}
-
 export function providerStatusProjection({
   runtime = null,
   runtimeError = runtime ? null : "runtime_status_missing",
   startup = { installed: false },
-  active = runtime ? processIsAlive(runtime.pid) : false,
+  active = runtime ? processInstanceIsCurrent(runtime.process_instance) : false,
   startupError = null,
   now = Date.now(),
   runtimeMaximumAgeMs = RUNTIME_STATUS_MAXIMUM_AGE_MS,
@@ -5503,10 +5514,12 @@ export function providerStatusProjection({
   );
   const streamConnected = effectiveActive && runtime?.stream_connected === true;
   const schedulerFault = runtime?.scheduler?.fault ?? null;
+  const reconciliationPending = runtime?.scheduler?.reconciliation_pending === true;
   const blockers = [];
   if (effectiveRuntimeError) blockers.push(effectiveRuntimeError);
   if (!effectiveActive) blockers.push("provider_process_inactive");
   if (effectiveActive && !streamConnected) blockers.push("event_stream_disconnected");
+  if (reconciliationPending) blockers.push("startup_reconciliation_pending");
   if (schedulerFault) blockers.push("scheduler_fault");
   if (startupError) blockers.push("startup_status_unavailable");
   if (startup?.installed === true &&
@@ -5518,7 +5531,7 @@ export function providerStatusProjection({
     installed: true,
     registered: startup?.installed === true,
     active: effectiveActive,
-    ready: effectiveActive && streamConnected && !schedulerFault,
+    ready: effectiveActive && streamConnected && !schedulerFault && !reconciliationPending,
     stream_connected: streamConnected,
     runtime_updated_at: typeof runtime?.updated_at === "string" ? runtime.updated_at : null,
     account: runtime?.account
@@ -6195,6 +6208,15 @@ export async function main(argv = process.argv.slice(2)) {
     console.log(JSON.stringify({ status: "ready", startup }));
     return 0;
   }
+  if (options.command === "startup" && options.action === "recover") {
+    const startup = process.platform === "win32"
+      ? await recoverWindowsStartup()
+      : process.platform === "linux"
+        ? await recoverLinuxStartup()
+        : (() => { throw new Error(`Unsupported startup platform: ${process.platform}`); })();
+    console.log(JSON.stringify({ status: "ready", startup }));
+    return 0;
+  }
   if (options.command === "startup"
       && options.action === "uninstall") {
     const startup = process.platform === "win32"
@@ -6491,6 +6513,7 @@ export async function main(argv = process.argv.slice(2)) {
   const store = new LichessStore(path.resolve(options.store ?? path.join(runtimeDir, "matches.sqlite")));
   const authority = apiAuthorityKey(config.url, expectedAccount ?? "account-probe");
   const leaseOwner = randomUUID();
+  const processIdentity = currentProcessIdentity();
   let leaseHeartbeat = null;
   try {
     store.acquireApiLease(
@@ -6499,7 +6522,8 @@ export async function main(argv = process.argv.slice(2)) {
       process.pid,
       Date.now(),
       60_000,
-      processIsAlive,
+      probeProcessInstance,
+      processIdentity,
     );
     const safetyCoordinator = new ApiSafetyCoordinator({
       initialState: store.apiSafetyState(authority),
@@ -6519,7 +6543,14 @@ export async function main(argv = process.argv.slice(2)) {
     if (options.command === "run") {
       leaseHeartbeat = setInterval(() => {
         try {
-          store.heartbeatApiLease(authority, leaseOwner, process.pid);
+          store.heartbeatApiLease(
+            authority,
+            leaseOwner,
+            process.pid,
+            Date.now(),
+            60_000,
+            processIdentity,
+          );
         } catch (error) {
           controller.abort(error);
         }
