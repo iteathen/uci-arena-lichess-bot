@@ -1,6 +1,6 @@
 # Shared Agent Operating Standard
 
-Version: `2026-08-09.v2`
+Version: `2026-08-20.v3`
 
 This is the reusable operating core for AI coding agents. Project-local `AGENTS.md` files add product identity, authority order, commands, and non-negotiable constraints. A project may strengthen this standard but should not casually fork its language or duplicate it elsewhere.
 
@@ -81,6 +81,19 @@ At a component boundary:
 Inside a valid boundary, prefer simple idiomatic code, SOLID/CUPID responsibilities, concrete private helpers, and direct hot-path implementation. Do not add abstraction without real variation, ownership, testing, lifecycle, or clarity value.
 
 Foundational ranges, precision, schemas, IDs, persistence formats, and boundaries must fit the real domain rather than accidental limits from the first example. Future-proof foundations; do not invent speculative features.
+
+### Non-negotiable LEGO isolation, naming, and transient topology
+
+These are architecture gates, not style preferences. They apply to names and local logic as strongly as to imports and dependency injection.
+
+- **Complete module isolation:** every LEGO brick is self-contained. Internal logic, types, state, and names describe only the brick's own domain and contract. Never reference an external module/repository/product/provider name, foreign object type, or neighbor-specific context merely because that neighbor is connected today. External identity belongs in composition or in the adapter that intrinsically owns that integration.
+- **Agnostic interface naming:** inputs, outputs, ports, events, properties, commands, queries, DTOs, callbacks, and public types describe local data, intent, or action. They never encode the identity of the current upstream source or downstream target. A domain identity is valid inside the component that actually owns that domain; it is a leak when copied into another generic brick.
+- **Transient topology:** architect every external connection as temporary. Replacing, removing, isolating, or rewiring a neighbor must not require changes to the component's internal logic or vocabulary. The composition root owns relationships, selection, and lifecycle wiring; bricks do not discover neighbors or branch on product/repository/provider identity.
+- **Rewiring test:** before accepting a boundary, mentally replace the current neighbor with another conforming implementation or remove it entirely. If internal names become false, foreign types surface, or local logic needs topology-specific branches, the boundary leaks and must be redesigned.
+- **No abstraction theater:** do not create a port, interface, event bus, registry, or generic wrapper merely to appear modular. A port exists only for a real ownership, substitution, lifecycle, failure, or testing boundary. Direct private calls inside one brick are preferred when there is no genuine boundary.
+- **One owner remains one owner:** neutral naming must never blur semantic authority. Do not replace explicit ownership with `common`, `shared`, `generic`, `manager`, or callback-based dumping grounds.
+
+A violation of these rules is an architecture defect and a stop condition before implementation or acceptance, not a naming nit to defer for cleanup.
 
 ## 5. Execute in coherent steps and inspect reality
 
