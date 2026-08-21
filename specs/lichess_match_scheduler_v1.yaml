@@ -56,8 +56,8 @@ local_api_simulator:
     - "The simulator is test tooling only and cannot be selected by tracked production configuration or packaged as a runtime fallback."
 
 configuration:
-  schema: uci_arena_lichess_adapter_v7
-  backward_compatibility: "v2/v3/v4/v5/v6 retain their declared migrations; new configuration is emitted as v7. Legacy documents without engine.adapter retain uci_arena_extended_v1 behavior."
+  schema: uci_arena_lichess_adapter_v8
+  backward_compatibility: "v2/v3/v4/v5/v6 retain their declared migrations; v7 documents migrate challenge_interval_seconds to the v8 safety floor; new configuration is emitted as v8. Legacy documents without engine.adapter retain uci_arena_extended_v1 behavior."
   path_independence:
     - "Provider source paths resolve from the provider component root. Persistent runtime paths resolve first from an explicit runtime-directory argument, then from the parent of an explicitly supplied provider configuration, and otherwise use the component-root development fallback. An installed configuration must therefore keep mutable runtime state in its preserved provider workspace, never the immutable component root, process current working directory, or a former engine-repository location."
     - "Engine executable, engine working directory, model, timing, capacity, and qualification paths enter explicitly from installed component discovery or invocation options."
@@ -87,7 +87,7 @@ configuration:
   scheduler_defaults:
     enabled: true
     discovery_interval_seconds: 60
-    challenge_interval_seconds: 5
+    challenge_interval_seconds: 300
     reservation_retry_seconds: 30
     challenge_timeout_seconds: 25
     first_move_timeout_seconds: 60
@@ -251,16 +251,16 @@ opponent_scheduler:
   randomization: weighted_random
   rules:
     - "Never challenge self, an offline/stale candidate, a cooled-down opponent, or an opponent at its daily game cap."
-    - "Create outbound challenges one request at a time, at least challenge_interval_seconds apart, until target_active is reserved by pending plus active bot slots."
+    - "Create outbound challenges one request at a time, at least challenge_interval_seconds apart, until target_active is reserved by pending plus active bot slots. Version 8 requires a minimum configured spacing of 300 seconds; older configurations migrate upward instead of retaining an unsafe faster effective value."
     - "Game move submission has highest request priority, but no request class bypasses an active HTTP 429 cooldown."
 
 storage:
   engine: node_sqlite
   journal_mode: WAL
-  schema_version: 4
+  schema_version: 5
   tables: [schema_meta, owners, reservations, scheduler_control, opponents, challenge_attempts, games, api_safety_state, api_client_leases]
   invariants:
-    - "Opening an existing schema-v3 store idempotently materializes every required table. A superseded api_rate_limit singleton is imported as a conservative legacy-global safety row so a branch or adapter upgrade cannot erase or shorten an unexpired 429 cooldown."
+    - "Opening an existing schema-v3 or schema-v4 store idempotently materializes every required table. A superseded api_rate_limit singleton is imported as a conservative legacy-global safety row so a branch or adapter upgrade cannot erase or shorten an unexpired 429 cooldown. Schema-v5 adds durable challenge-create circuit fields without weakening imported global cooldown authority."
     - "The API-client lease persists the exact process-instance identity captured at acquisition. A replacement may take over a still-fresh lease only when an OS probe proves that exact instance is absent or the pid now names a different process; an exact live or unverifiable owner remains exclusive until normal expiry."
     - "Game id and challenge id ingestion are idempotent."
     - "Every game immutably binds opponent, color, time control, result, engine build, model id/fingerprint/checkpoint/adapter, provider/numeric/runtime/hardware identity, complete search and batching options, timing-profile identity and permissions, semantic timing-authority match, qualified-versus-current engine provenance comparison, and configured plus observed opening-book state."
@@ -416,9 +416,13 @@ telemetry:
     - api_cooldown_deadline_and_backoff_level
     - api_queue_depth_and_in_flight_request_class
     - api_429_counts_and_client_lease_health
+    - challenge_create_quarantine_deadline_strikes_and_half_open_state
+    - startup_phase_and_event_stream_lifecycle
   status_authority:
     - "A live PID is insufficient authority for active or ready. Runtime evidence must bind the exact current process instance, and evidence older than the bounded heartbeat window is stale even if that PID has been reused by another process."
-    - "Status distinguishes missing, invalid, stale, inactive, disconnected, scheduler-faulted, and ready states without reading a credential."
+    - "Status distinguishes missing, invalid, stale, inactive, stream-transport-disconnected, startup-waiting-for-global-cooldown, challenge-create-quarantined, scheduler-faulted, and ready states without reading a credential."
+    - "The run process publishes a fresh process-bound starting heartbeat immediately after acquiring the API-client lease and before account probing or reconciliation can wait. Restored cooldown and challenge quarantine are emitted once to the bounded runtime log and projected in typed status."
+    - "Status projects whether exactly one fresh local API-client lease belongs to the current provider process without returning its owner id, process identity, authority key, credential, or command line. A local lease cannot prove that no independently configured client exists on another host, so no cross-host exclusivity claim is made."
 
 transport_bounds:
   rules:
@@ -616,6 +620,17 @@ api_rate_limit_safety_2026_07_21:
       - "All new moves, finite requests, and stream reconnect handshakes wait. Existing streams remain open for authoritative observations."
       - "Move, challenge-create, accept, decline, and cancel writes are never blindly replayed; their owning state machine reconciles before issuing another write."
       - "Automatic recovery is allowed only after the effective cooldown. No configuration or local command may shorten it."
+      - "A challenge-create 429 applies the mandatory global minimum and any valid Retry-After to every request class, but advances the separate challenge-create circuit instead of the generic consecutive global schedule. Other request classes retain the generic consecutive schedule."
+  challenge_creation_circuit:
+    request_class: challenge_create
+    consecutive_schedule_ms: [60000, 120000, 300000, 900000, 3600000, 21600000]
+    maximum_quarantine_ms: 21600000
+    rules:
+      - "Challenge-create strike, deadline, last-429, and half-open state are persisted synchronously with the global cooldown before the 429 is propagated. Persistence never shortens an existing challenge deadline."
+      - "While the challenge circuit is open, challenge-create work is rejected locally before engine preparation or API queue admission. Identity, reconciliation, game control, move submission, discovery, and stream handshakes resume after the mandatory global cooldown."
+      - "The maximum strike opens one fixed six-hour quiet window. No hourly or otherwise earlier automatic challenge probe is queued, so an internal retry cannot perpetually refresh the quiet-period clock."
+      - "After the fixed deadline, exactly one challenge-create request may enter half-open state. A successful challenge-create response closes and resets the circuit; another 429 reopens it at the maximum six-hour quarantine. Non-429 outcomes end the half-open attempt without claiming limiter recovery and retain the prior strike level for the next normally paced attempt."
+      - "Restored, entered, extended, half-open, recovered, and globally cleared transitions emit bounded credential-free events and fresh status."
   single_client_lease:
     key: api_origin_plus_expected_account
     heartbeat_ms: 10000
@@ -628,6 +643,7 @@ api_rate_limit_safety_2026_07_21:
     - "Concurrency tests prove one finite exchange or handshake at a time while established event and game streams coexist."
     - "Restart and migration tests prove schema-v2 cooldown durability, lease exclusion, heartbeat, expiry, and owner-safe release."
     - "No live validation deliberately induces a Lichess 429."
+    - "Challenge-circuit fake-clock tests prove the global minute, durable escalating quarantine, no queued challenge during quarantine, one half-open request after six hours, success reset, and continued identity/stream admission after the global deadline."
 
 mixed_mcgs_capacity_canary_2026_07_20:
   status: active

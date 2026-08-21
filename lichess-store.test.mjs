@@ -23,12 +23,20 @@ function processIdentity(pid, startToken = String(pid)) {
   };
 }
 
-test("store migrates to schema four and uses WAL", () => {
+const EMPTY_CHALLENGE_SAFETY = Object.freeze({
+  challengeBlockedUntil: 0,
+  challengeStrikeCount: 0,
+  challengeLast429At: 0,
+  challengeRecoveredAt: 0,
+  challengeHalfOpen: false,
+});
+
+test("store migrates to schema five and uses WAL", () => {
   const store = storeFixture();
   try {
-    assert.equal(store.status().schemaVersion, 4);
+    assert.equal(store.status().schemaVersion, 5);
     assert.equal(store.db.prepare("PRAGMA journal_mode").get().journal_mode, "wal");
-    assert.equal(store.db.prepare("SELECT version FROM schema_meta").get().version, 4);
+    assert.equal(store.db.prepare("SELECT version FROM schema_meta").get().version, 5);
   } finally {
     store.close();
   }
@@ -51,13 +59,14 @@ test("schema-one stores migrate without losing existing control state", () => {
   legacy.close();
   const store = new LichessStore(file);
   try {
-    assert.equal(store.status().schemaVersion, 4);
+    assert.equal(store.status().schemaVersion, 5);
     assert.equal(store.control().paused, true);
     assert.deepEqual(store.apiSafetyState("https://lichess.org|arena-bot"), {
       cooldownUntil: 0,
       strikeCount: 0,
       last429At: 0,
       lastRetryAfterMs: 0,
+      ...EMPTY_CHALLENGE_SAFETY,
     });
   } finally {
     store.close();
@@ -91,18 +100,21 @@ test("schema-three stores repair API safety tables without shortening legacy coo
       strikeCount: 3,
       last429At: 40_000,
       lastRetryAfterMs: 0,
+      ...EMPTY_CHALLENGE_SAFETY,
     });
     store.saveApiSafetyState(key, {
       cooldownUntil: 90_000,
       strikeCount: 1,
       last429At: 50_000,
       lastRetryAfterMs: 60_000,
+      ...EMPTY_CHALLENGE_SAFETY,
     }, 50_000);
     assert.deepEqual(store.apiSafetyState(key), {
       cooldownUntil: 100_000,
       strikeCount: 1,
       last429At: 50_000,
       lastRetryAfterMs: 60_000,
+      ...EMPTY_CHALLENGE_SAFETY,
     });
     assert.equal(store.acquireApiLease(
       key,
@@ -114,7 +126,7 @@ test("schema-three stores repair API safety tables without shortening legacy coo
       processIdentity(101),
     ).owner_id, "repair-owner");
     assert.equal(store.releaseApiLease(key, "repair-owner"), true);
-    assert.equal(store.status().schemaVersion, 4);
+    assert.equal(store.status().schemaVersion, 5);
   } finally {
     store.close();
   }
@@ -135,12 +147,14 @@ test("API cooldown state is durable and never shortened", () => {
       strikeCount: 2,
       last429At: 50_000,
       lastRetryAfterMs: 1_000,
+      ...EMPTY_CHALLENGE_SAFETY,
     }, 50_000);
     assert.deepEqual(store.apiSafetyState(key), {
       cooldownUntil: 100_000,
       strikeCount: 2,
       last429At: 50_000,
       lastRetryAfterMs: 1_000,
+      ...EMPTY_CHALLENGE_SAFETY,
     });
     store.saveApiSafetyState(key, {
       cooldownUntil: 80_000,
@@ -153,6 +167,63 @@ test("API cooldown state is durable and never shortened", () => {
       strikeCount: 2,
       last429At: 50_000,
       lastRetryAfterMs: 1_000,
+      ...EMPTY_CHALLENGE_SAFETY,
+    });
+  } finally {
+    store.close();
+  }
+});
+
+test("challenge quarantine is durable and only a newer recovery clears it", () => {
+  const store = storeFixture();
+  const key = "https://lichess.org|arena-bot";
+  try {
+    store.saveApiSafetyState(key, {
+      cooldownUntil: 100_000,
+      strikeCount: 0,
+      last429At: 0,
+      lastRetryAfterMs: 0,
+      challengeBlockedUntil: 500_000,
+      challengeStrikeCount: 6,
+      challengeLast429At: 100_000,
+      challengeRecoveredAt: 0,
+      challengeHalfOpen: false,
+    }, 100_000);
+    store.saveApiSafetyState(key, {
+      cooldownUntil: 90_000,
+      strikeCount: 0,
+      last429At: 0,
+      lastRetryAfterMs: 0,
+      challengeBlockedUntil: 200_000,
+      challengeStrikeCount: 1,
+      challengeLast429At: 90_000,
+      challengeRecoveredAt: 0,
+      challengeHalfOpen: false,
+    }, 110_000);
+    assert.equal(store.apiSafetyState(key).challengeBlockedUntil, 500_000);
+    assert.equal(store.apiSafetyState(key).challengeStrikeCount, 6);
+
+    store.saveApiSafetyState(key, {
+      cooldownUntil: 100_000,
+      strikeCount: 0,
+      last429At: 0,
+      lastRetryAfterMs: 0,
+      challengeBlockedUntil: 0,
+      challengeStrikeCount: 0,
+      challengeLast429At: 0,
+      challengeRecoveredAt: 600_000,
+      challengeHalfOpen: false,
+    }, 600_000);
+    assert.deepEqual(store.apiSafetyState(key), {
+      cooldownUntil: 100_000,
+      strikeCount: 0,
+      last429At: 0,
+      lastRetryAfterMs: 0,
+      challengeBlockedUntil: 0,
+      challengeStrikeCount: 0,
+      challengeLast429At: 0,
+      challengeRecoveredAt: 600_000,
+      challengeHalfOpen: false,
     });
   } finally {
     store.close();

@@ -147,7 +147,7 @@ test("acceptance activation is explicit and hard-capped", () => {
 
 test("acceptance config permits only the explicit casual outbound target", () => {
   const config = buildAcceptanceConfig({
-    schema: "uci_arena_lichess_adapter_v7",
+    schema: "uci_arena_lichess_adapter_v8",
     scheduler: { enabled: true },
     capacity: {
       human: { slots: 1, accept_public: true },

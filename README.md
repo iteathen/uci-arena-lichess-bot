@@ -90,7 +90,7 @@ timing contracts, startup definitions, and Manager controls.
 ## Configuration
 
 `config.uci_arena.template.yml` is JSON syntax with the current
-`uci_arena_lichess_adapter_v7` schema. The `.yml` name is retained for installed
+`uci_arena_lichess_adapter_v8` schema. The `.yml` name is retained for installed
 compatibility.
 
 `<UCI_ARENA_ENGINE_ROOT>` is an explicit installed component binding. It is not
@@ -160,10 +160,13 @@ node .\lichess-adapter.mjs status `
 ```
 
 It returns `uci_arena_lichess_status_v3` with explicit values for installed,
-registered, active, ready, stream connectivity, capacity, active/pending games,
-scheduler state, API cooldown, and blockers. A stale or missing `runtime.json`
-never claims that the provider is active. Status never returns raw config,
-credential data, logs, SQLite rows, or engine command lines.
+registered, active, ready, stream lifecycle, capacity, active/pending games,
+scheduler state, global API cooldown, outbound-challenge quarantine, local API
+lease health, and blockers. A supervised process waiting for a persisted API
+cooldown is reported as `waiting_for_api_cooldown`, not as an unexplained stream
+disconnect. A stale or missing `runtime.json` never claims that the provider is
+active. Status never returns raw config, credential data, logs, SQLite rows,
+lease owner ids, process identities, or engine command lines.
 
 ## Qualification and execution
 
@@ -315,6 +318,11 @@ The provider owns a WAL-mode SQLite store. It persists owners, reservations,
 scheduler controls, opponents, challenge attempts, games, API safety state, and
 single-client leases. Restart reconciles active games before admitting new work.
 Rate-limit cooldowns survive restart and cannot be shortened by local config.
+Every 429 stops all new Lichess requests for at least one minute. Repeated
+challenge-create 429s additionally open a durable challenge-only circuit up to
+six hours, so event and game streams can recover after the global cooldown
+without an hourly challenge probe refreshing the limiter. Version-7 configs
+migrate challenge spacing below 300 seconds to that version-8 safety floor.
 Runtime NDJSON logging retains a bounded current log and one rotated predecessor
 inside the persistent provider workspace.
 

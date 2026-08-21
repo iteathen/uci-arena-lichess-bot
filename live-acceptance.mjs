@@ -103,8 +103,8 @@ export function validateAcceptanceOptions(options) {
 
 export function buildAcceptanceConfig(sourceConfig) {
   const config = structuredClone(sourceConfig);
-  if (config.schema !== "uci_arena_lichess_adapter_v7") {
-    throw new Error("Live acceptance requires a v7 Lichess adapter configuration");
+  if (config.schema !== "uci_arena_lichess_adapter_v8") {
+    throw new Error("Live acceptance requires a v8 Lichess adapter configuration");
   }
   if (!config.capacity?.bot || config.capacity.bot.slots < 1) {
     throw new Error("Live acceptance requires at least one configured bot slot");

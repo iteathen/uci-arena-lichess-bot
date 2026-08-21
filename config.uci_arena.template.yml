@@ -1,5 +1,5 @@
 {
-  "schema": "uci_arena_lichess_adapter_v7",
+  "schema": "uci_arena_lichess_adapter_v8",
   "url": "https://lichess.org/",
   "engine": {
     "adapter": "uci_arena_extended_v1",
@@ -64,7 +64,7 @@
   "scheduler": {
     "enabled": true,
     "discovery_interval_seconds": 60,
-    "challenge_interval_seconds": 5,
+    "challenge_interval_seconds": 300,
     "reservation_retry_seconds": 30,
     "challenge_timeout_seconds": 25,
     "first_move_timeout_seconds": 60,

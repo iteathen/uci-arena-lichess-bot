@@ -114,7 +114,7 @@
       "properties": {
         "enabled": {"type": "boolean"},
         "discovery_interval_seconds": {"type": "integer", "minimum": 15, "maximum": 3600},
-        "challenge_interval_seconds": {"type": "integer", "minimum": 1, "maximum": 300},
+        "challenge_interval_seconds": {"type": "integer", "minimum": 300, "maximum": 3600},
         "reservation_retry_seconds": {"type": "integer", "minimum": 5, "maximum": 600},
         "challenge_timeout_seconds": {"type": "integer", "minimum": 10, "maximum": 300},
         "first_move_timeout_seconds": {"type": "integer", "minimum": 30, "maximum": 600}
