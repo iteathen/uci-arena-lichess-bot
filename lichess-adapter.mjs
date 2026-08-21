@@ -5940,6 +5940,31 @@ export function providerStatusProjection({
   };
 }
 
+export function replacementStartupReadiness(status) {
+  const providerReady = status?.ready === true;
+  const allowedCooldownBlockers = new Set([
+    "event_stream_waiting_for_api_cooldown",
+    "api_global_cooldown",
+    "outbound_challenge_quarantined",
+  ]);
+  const blockers = Array.isArray(status?.blockers) ? status.blockers : [];
+  const apiCooldownDeferred = !providerReady
+    && status?.active === true
+    && status?.stream_state === "waiting_for_api_cooldown"
+    && status?.scheduler?.fault === null
+    && status?.rate_limit?.state === "cooldown"
+    && Number.isSafeInteger(status?.rate_limit?.cooldown_remaining_ms)
+    && status.rate_limit.cooldown_remaining_ms > 0
+    && status?.rate_limit?.client_lease?.state === "authoritative"
+    && blockers.length > 0
+    && blockers.every((blocker) => allowedCooldownBlockers.has(blocker));
+  return {
+    stable: providerReady || apiCooldownDeferred,
+    providerReady,
+    apiCooldownDeferred,
+  };
+}
+
 export function startupIsExplicitlyDisabledAndInactive(startup) {
   const disabled = startup?.enabled === false || startup?.enabled === "disabled";
   const inactive = startup?.active === false || startup?.active === "inactive";
@@ -6694,21 +6719,36 @@ export async function main(argv = process.argv.slice(2)) {
     } else {
       throw new Error(`Unsupported startup platform: ${process.platform}`);
     }
+    let replacementReadiness = {
+      stable: false,
+      providerReady: false,
+      apiCooldownDeferred: false,
+    };
     const replacement = process.platform === "win32"
       ? await completeWindowsStartupReplacement({
         ready: async () => {
           const { runtime, error: runtimeError } = boundedRuntimeMetadata(runtimeDir);
-          return providerStatusProjection({
+          replacementReadiness = replacementStartupReadiness(providerStatusProjection({
             runtime,
             runtimeError,
             startup: { installed: true, active: true },
-          }).ready;
+          }));
+          return replacementReadiness.stable;
         },
       })
       : process.platform === "linux"
         ? await completeLinuxStartupReplacement()
         : (() => { throw new Error(`Unsupported startup platform: ${process.platform}`); })();
-    console.log(JSON.stringify({ status: "ready", startup: replacement }));
+    console.log(JSON.stringify({
+      status: "ready",
+      startup: process.platform === "win32"
+        ? {
+          ...replacement,
+          providerReady: replacementReadiness.providerReady,
+          apiCooldownDeferred: replacementReadiness.apiCooldownDeferred,
+        }
+        : replacement,
+    }));
     return 0;
   }
   const configPath = path.resolve(options.config ?? DEFAULT_TEMPLATE);

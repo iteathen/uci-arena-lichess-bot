@@ -37,6 +37,7 @@ import {
   parseRuntimeStatus,
   probeAccount,
   providerStatusProjection,
+  replacementStartupReadiness,
   qualificationFailureProjection,
   resolveExternalTokenFile,
   resolveProviderRuntimeDirectory,
@@ -222,6 +223,46 @@ test("post-replacement deferral accepts only exact Engine evidence drift", () =>
     }),
     true,
   );
+});
+
+test("post-replacement readiness preserves a durable global API cooldown", () => {
+  const coolingDown = {
+    active: true,
+    ready: false,
+    stream_state: "waiting_for_api_cooldown",
+    scheduler: { fault: null },
+    rate_limit: {
+      state: "cooldown",
+      cooldown_remaining_ms: 3_600_000,
+      client_lease: { state: "authoritative" },
+    },
+    blockers: [
+      "event_stream_waiting_for_api_cooldown",
+      "api_global_cooldown",
+      "outbound_challenge_quarantined",
+    ],
+  };
+  assert.deepEqual(replacementStartupReadiness(coolingDown), {
+    stable: true,
+    providerReady: false,
+    apiCooldownDeferred: true,
+  });
+  assert.equal(replacementStartupReadiness({
+    ...coolingDown,
+    blockers: [...coolingDown.blockers, "startup_reconciliation_pending"],
+  }).stable, false);
+  assert.equal(replacementStartupReadiness({
+    ...coolingDown,
+    rate_limit: {
+      ...coolingDown.rate_limit,
+      client_lease: { state: "conflict" },
+    },
+  }).stable, false);
+  assert.deepEqual(replacementStartupReadiness({ ready: true }), {
+    stable: true,
+    providerReady: true,
+    apiCooldownDeferred: false,
+  });
 });
 
 test("Engine fingerprint drift cannot mask model or search-authority drift", () => {
