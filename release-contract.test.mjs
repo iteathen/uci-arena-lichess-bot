@@ -21,6 +21,7 @@ test("component definition packages runtime contracts without test or source-tre
   assert.equal(sources.includes("vendor/time-profile-contract/package.json"), true);
   assert.equal(sources.includes("vendor/time-profile-contract/src"), true);
   assert.equal(sources.includes("lichess-adapter.mjs"), true);
+  assert.equal(sources.includes("process-instance-identity.mjs"), true);
   assert.equal(sources.some((source) => source.includes("fake-api")
     || source.includes("test-fixtures")
     || source.includes("/test")), false);
