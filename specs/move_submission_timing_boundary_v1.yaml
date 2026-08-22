@@ -1,0 +1,109 @@
+meta:
+  spec_id: move_submission_timing_boundary_v1
+  version: 1
+  status: active
+  owner: lichess_transport
+  purpose: >
+    Define the Lichess provider boundary between chess-thinking time owned by the
+    attached UCI engine and transport/API timing owned by this provider.
+
+ownership:
+  attached_uci_engine:
+    owns:
+      - chess_move_time_allocation
+      - current_game_clock_composition_for_search_derived_moves
+      - timing_policy_applicability
+      - move_selection
+      - timing_policy_execution_when_supported
+    rules:
+      - "For a standard UCI engine, the provider supplies authoritative clock fields and accepts the engine's normal UCI timing behavior without inventing provider-side chess strategy."
+      - "For the extended adapter, Engine-owned timing contracts may expose richer timing-policy/applicability authority, but that does not transfer chess-time ownership to the provider."
+  lichess_provider:
+    owns:
+      - authoritative_stream_clock_projection
+      - local_state_processing_measurement
+      - move_submission_queueing
+      - transport_reserve_measurement
+      - request_priority
+      - rate_limit_and_cooldown_policy
+      - pre_dispatch_authority_revalidation
+      - move_post_and_acknowledgement
+    does_not_own:
+      - timing_step_curve_or_minimum_useful_block_semantics
+      - allocation_strategy
+      - search_attention_depth_topology_or_work_policy
+      - book_or_tablebase_move_resolution_semantics
+
+clock_handoff:
+  rule: >
+    The provider sends the authoritative current game clocks and increments using
+    the selected UCI adapter contract. Its measured local/transport reserve may be
+    supplied through the engine's declared overhead/safety input. This preserves
+    transport pressure without making the provider the chess-time allocator.
+  constraints:
+    - "Do not precompute a chess-thinking duration in the provider and then force the engine to match it."
+    - "Do not reinterpret a qualified timing-policy artifact, useful-block threshold, or allocation strategy inside the provider."
+    - "Do not hide transport reserve inside a generic chess-value modifier; retain its transport meaning and measurement provenance."
+    - "Transport reserve may constrain safely available time but cannot command search behavior."
+
+post_bestmove_rule:
+  invariant: >
+    After the provider receives a legal authoritative bestmove for the current
+    game state, it adds no artificial chess-thinking delay. It submits as soon as
+    provider-owned state validation, serialized move priority, rate-limit/cooldown
+    policy, and transport safety permit.
+  forbidden:
+    - sleep_until_a_chess_timing_curve_deadline_after_bestmove
+    - duplicate_engine_time_management
+    - add_human_like_delay_without_a_separate_explicit_product_policy
+  note: >
+    API cooldown, queue serialization, authoritative-state revalidation, and
+    transport safety are real provider constraints and are not artificial chess
+    delay.
+
+extended_timing_validation:
+  rule: >
+    Extended UCI Arena validation must distinguish search-derived timing from an
+    explicit timing-not-applicable move. It must not require normal search-timing
+    telemetry on every legal move when the Engine truthfully reports that a
+    configured non-search authority already resolved the current move.
+  search_derived:
+    requires:
+      - engine_timing_policy_identity_when_declared
+      - bounded_timing_completion_authority
+      - current_clock_related_telemetry_required_by_the_versioned_engine_contract
+  timing_not_applicable:
+    requires:
+      - explicit_engine_owned_applicability_or_completion_authority
+      - current_position_or_generation_binding
+      - legal_bestmove
+    rules:
+      - "The provider does not infer this state merely from seeing book or tablebase capability."
+      - "Book hints, priors, tablebase safety constraints, or other advisory evidence do not let the provider bypass timing validation by guesswork."
+      - "The Engine remains authority for whether the move was actually resolved without additional search time."
+  compatibility: >
+    Existing timing-profile/temporal-curve schemas keep their historical meaning.
+    A new timing-policy/applicability contract requires explicit versioned adapter
+    support rather than silently changing old validation semantics.
+
+transport_evidence:
+  rules:
+    - "Transport evidence remains adapter-owned and measures provider-local/API latency, not chess search value."
+    - "Current transport-profile qualification and bootstrap reserve remain valid safety machinery."
+    - "Transport evidence may change the reserve supplied to future games only through its declared completed-game evidence lifecycle."
+    - "Transport samples must not be fed back as minimum useful search blocks or allocation-strategy evidence without an explicit external evidence contract that preserves their distinct meaning."
+
+search_boundary:
+  rules:
+    - "The provider never changes engine search attention, depth, graph topology, batching, queues, or work scheduling because of Lichess clock pressure."
+    - "Clock pressure reaches the Engine through UCI clock/overhead inputs; the Engine's timing owner decides when a search-derived move is due."
+    - "The provider remains able to operate a conforming standard UCI engine that exposes no UCI Arena timing artifacts."
+
+validation:
+  - "A conforming standard UCI child receives exact authoritative clocks and no provider-side chess-time duration."
+  - "An extended search-derived move continues to require the versioned Engine timing authority expected by that adapter version."
+  - "An extended explicit timing-not-applicable move can be accepted without fabricating normal timing telemetry when the versioned Engine contract permits it."
+  - "The provider never infers timing-not-applicable from book/tablebase availability alone."
+  - "After legal bestmove receipt, no provider timer intentionally delays submission for chess-thinking purposes."
+  - "Transport queue, cooldown, state-revalidation, and acknowledgement timing remain independently observable."
+  - "Changing transport reserve cannot change Engine search-attention policy through any provider control path."
