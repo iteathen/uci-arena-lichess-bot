@@ -1,11 +1,21 @@
 meta:
   spec_id: move_submission_timing_boundary_v1
-  version: 1
+  version: 2
   status: active
   owner: lichess_transport
   purpose: >
     Define the Lichess provider boundary between chess-thinking time owned by the
     attached UCI engine and transport/API timing owned by this provider.
+
+authority_relationship:
+  broader_runtime_spec: specs/lichess_match_scheduler_v1.yaml
+  rule: >
+    This specification is the more-specific authority for move-time ownership,
+    clock handoff, transport reserve, post-bestmove delay, and extended timing
+    validation. If broader scheduler wording can be read as giving the provider
+    chess-time allocation or timing-strategy authority, this specification
+    controls. The scheduler remains authoritative for Lichess transport,
+    challenge/game lifecycle, API safety, and provider persistence.
 
 ownership:
   attached_uci_engine:
