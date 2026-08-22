@@ -4,8 +4,10 @@ import test from "node:test";
 import {
   API_RATE_LIMIT_BACKOFF_MS,
   API_RATE_LIMIT_STRIKE_RESET_MS,
+  CHALLENGE_RATE_LIMIT_BACKOFF_MS,
   ApiSafetyCoordinator,
   AsyncSemaphore,
+  ChallengeRequestQuarantinedError,
   PriorityRequestQueue,
   SlotPool,
   candidateWeight,
@@ -192,6 +194,59 @@ test("rate-limit cooldown escalates and resets after six quiet hours", async () 
   now += API_RATE_LIMIT_STRIKE_RESET_MS;
   assert.equal(await queue.registerRateLimit(null), API_RATE_LIMIT_BACKOFF_MS[0]);
   assert.equal(queue.snapshot().strike_count, 1);
+});
+
+test("challenge 429s use a class quarantine without extending the global cooldown", async () => {
+  let now = 10_000;
+  const persisted = [];
+  const queue = new ApiSafetyCoordinator({
+    now: () => now,
+    setTimer: () => 1,
+    clearTimer: () => {},
+    persistSafetyState: async (state) => persisted.push({ ...state }),
+  });
+
+  for (let index = 0; index < CHALLENGE_RATE_LIMIT_BACKOFF_MS.length; index += 1) {
+    const expected = CHALLENGE_RATE_LIMIT_BACKOFF_MS[index];
+    assert.equal(await queue.registerRateLimit(null, "challenge_create"), 60_000);
+    assert.equal(queue.challengeRemainingMs(), expected);
+    assert.equal(queue.snapshot().challenge_strike_count, index + 1);
+    now = queue.challengeBlockedUntil;
+  }
+
+  assert.equal(queue.snapshot().state, "challenge_half_open");
+  const halfOpen = queue.enqueue(() => "recovered", { requestClass: "challenge_create" });
+  assert.equal(await halfOpen, "recovered");
+  assert.equal(queue.snapshot().state, "ready");
+  assert.equal(queue.snapshot().challenge_strike_count, 0);
+  assert.ok(persisted.some((state) => state.challengeHalfOpen));
+  assert.ok(persisted.some((state) => state.challengeRecoveredAt === now));
+});
+
+test("challenge quarantine rejects writes locally while identity resumes after one minute", async () => {
+  let now = 1_000;
+  const queue = new ApiSafetyCoordinator({
+    now: () => now,
+    setTimer: () => 1,
+    clearTimer: () => {},
+  });
+  await queue.registerRateLimit(null, "challenge_create");
+  now = queue.cooldownUntil;
+  await queue.registerRateLimit(null, "challenge_create");
+  now = queue.cooldownUntil;
+
+  await assert.rejects(
+    queue.enqueue(() => assert.fail("quarantined challenge dispatched"), {
+      requestClass: "challenge_create",
+    }),
+    (error) => error instanceof ChallengeRequestQuarantinedError
+      && error.code === "LICHESS_CHALLENGE_QUARANTINED",
+  );
+  assert.equal(
+    await queue.enqueue(() => "identity-ready", { requestClass: "identity" }),
+    "identity-ready",
+  );
+  assert.equal(queue.snapshot().challenge_remaining_ms, 60_000);
 });
 
 test("Retry-After accepts delta seconds and HTTP dates without weakening the minimum", () => {

@@ -10,6 +10,7 @@
     "active",
     "ready",
     "stream_connected",
+    "stream_state",
     "runtime_updated_at",
     "account",
     "capacity",
@@ -25,6 +26,16 @@
     "active": {"type": "boolean"},
     "ready": {"type": "boolean"},
     "stream_connected": {"type": "boolean"},
+    "stream_state": {
+      "enum": [
+        "starting",
+        "reconciling",
+        "connecting",
+        "waiting_for_api_cooldown",
+        "connected",
+        "disconnected"
+      ]
+    },
     "runtime_updated_at": {
       "oneOf": [
         {"type": "string", "format": "date-time", "maxLength": 64},
@@ -93,18 +104,33 @@
     },
     "rate_limit": {
       "type": "object",
-      "required": ["state", "cooldown_until", "cooldown_remaining_ms", "strike_count", "queue_depth", "in_flight_class"],
+      "required": ["state", "cooldown_until", "cooldown_remaining_ms", "strike_count", "challenge_state", "challenge_blocked_until", "challenge_remaining_ms", "challenge_strike_count", "queue_depth", "in_flight_class", "client_lease"],
       "properties": {
-        "state": {"enum": ["unknown", "ready", "cooldown"]},
+        "state": {"enum": ["unknown", "ready", "cooldown", "challenge_quarantined", "challenge_half_open"]},
         "cooldown_until": {"$ref": "#/$defs/nullable_nonnegative_integer"},
         "cooldown_remaining_ms": {"$ref": "#/$defs/nullable_nonnegative_integer"},
         "strike_count": {"$ref": "#/$defs/nullable_nonnegative_integer"},
+        "challenge_state": {"enum": ["unknown", "ready", "quarantined", "half_open_ready", "half_open"]},
+        "challenge_blocked_until": {"$ref": "#/$defs/nullable_nonnegative_integer"},
+        "challenge_remaining_ms": {"$ref": "#/$defs/nullable_nonnegative_integer"},
+        "challenge_strike_count": {"$ref": "#/$defs/nullable_nonnegative_integer"},
         "queue_depth": {"$ref": "#/$defs/nullable_nonnegative_integer"},
         "in_flight_class": {
           "oneOf": [
             {"type": "string", "minLength": 1, "maxLength": 64},
             {"type": "null"}
           ]
+        },
+        "client_lease": {
+          "type": "object",
+          "required": ["state", "active_clients", "heartbeat_at", "expires_at"],
+          "properties": {
+            "state": {"enum": ["unknown", "authoritative", "missing", "conflict"]},
+            "active_clients": {"$ref": "#/$defs/nullable_nonnegative_integer"},
+            "heartbeat_at": {"$ref": "#/$defs/nullable_nonnegative_integer"},
+            "expires_at": {"$ref": "#/$defs/nullable_nonnegative_integer"}
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false

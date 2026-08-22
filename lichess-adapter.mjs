@@ -218,13 +218,15 @@ const REQUIRED_PROFILE_EVIDENCE = Object.freeze([
   "topology",
   "complete_game",
 ]);
-const CURRENT_CONFIG_SCHEMA = "uci_arena_lichess_adapter_v7";
+const CURRENT_CONFIG_SCHEMA = "uci_arena_lichess_adapter_v8";
+const MINIMUM_CHALLENGE_INTERVAL_SECONDS = 300;
 const LEGACY_CONFIG_SCHEMAS = new Set([
   "uci_arena_lichess_adapter_v2",
   "uci_arena_lichess_adapter_v3",
   "uci_arena_lichess_adapter_v4",
   "uci_arena_lichess_adapter_v5",
   "uci_arena_lichess_adapter_v6",
+  "uci_arena_lichess_adapter_v7",
 ]);
 const ENGINE_ADAPTERS = new Set(["standard_uci_v1", "uci_arena_extended_v1"]);
 
@@ -829,7 +831,7 @@ function validateCapacityConfig(config) {
   }
   for (const [name, minimum, maximum] of [
     ["discovery_interval_seconds", 15, 3600],
-    ["challenge_interval_seconds", 1, 300],
+    ["challenge_interval_seconds", MINIMUM_CHALLENGE_INTERVAL_SECONDS, 3600],
     ["reservation_retry_seconds", 5, 600],
     ["challenge_timeout_seconds", 10, 300],
     ["first_move_timeout_seconds", 30, 600],
@@ -1143,6 +1145,13 @@ export function updateManagerOptions({
   const before = loadManagerConfig({ templatePath: target, engineRoot });
   const patch = typeof settings === "string" ? JSON.parse(settings) : settings;
   const updatedRaw = applyManagerOptionsPatch(originalRaw, patch);
+  if (originalRaw.schema !== CURRENT_CONFIG_SCHEMA) {
+    updatedRaw.scheduler.challenge_interval_seconds = Math.max(
+      MINIMUM_CHALLENGE_INTERVAL_SECONDS,
+      Number(updatedRaw.scheduler.challenge_interval_seconds) || 0,
+    );
+  }
+  updatedRaw.schema = CURRENT_CONFIG_SCHEMA;
   const inboundRatedWasEnabled = before.challenges.modes.includes("rated");
   const inboundRatedWillBeEnabled = updatedRaw.challenges.modes.includes("rated");
   const ratedPlayWillBeNewlyEnabled = (updatedRaw.outbound_challenge.rated === true
@@ -1268,7 +1277,7 @@ function migrateV2Config(config) {
   config.scheduler = {
     enabled: false,
     discovery_interval_seconds: 60,
-    challenge_interval_seconds: 5,
+    challenge_interval_seconds: MINIMUM_CHALLENGE_INTERVAL_SECONDS,
     reservation_retry_seconds: 30,
     challenge_timeout_seconds: 25,
     first_move_timeout_seconds: 60,
@@ -1298,20 +1307,28 @@ function loadConfigDocument({ templatePath = DEFAULT_TEMPLATE, engineRoot = ROOT
     temporalCurveProfile: path.isAbsolute(parsed.engine?.temporal_curve_profile ?? ""),
   };
   const config = replaceEngineRootPlaceholder(parsed, path.resolve(engineRoot));
+  const legacyConfiguration = config.schema !== CURRENT_CONFIG_SCHEMA;
   Object.defineProperty(config, CONFIGURED_RUNTIME_PATH_AUTHORITY, {
     value: Object.freeze(configuredRuntimePathAuthority),
   });
   if (config.schema === "uci_arena_lichess_adapter_v2") migrateV2Config(config);
+  if (legacyConfiguration) {
+    config.scheduler.challenge_interval_seconds = Math.max(
+      MINIMUM_CHALLENGE_INTERVAL_SECONDS,
+      Number(config.scheduler.challenge_interval_seconds) || 0,
+    );
+  }
   config.scheduler.first_move_timeout_seconds ??= 60;
   config.engine ??= {};
   config.engine.adapter ??= "uci_arena_extended_v1";
   if (!ENGINE_ADAPTERS.has(config.engine.adapter)) {
     throw new Error(`Unsupported Lichess engine adapter: ${config.engine.adapter}`);
   }
-  if (config.schema !== CURRENT_CONFIG_SCHEMA) {
+  if (legacyConfiguration) {
     config.timing ??= {};
     config.timing.initial_transport_reserve_ms ??= 250;
   }
+  config.schema = CURRENT_CONFIG_SCHEMA;
   return config;
 }
 
@@ -2388,6 +2405,10 @@ export class LichessClient {
 
   isCoolingDown() {
     return this.requestQueue.isCoolingDown();
+  }
+
+  isRequestClassBlocked(requestClass) {
+    return this.requestQueue.isRequestClassBlocked?.(requestClass) === true;
   }
 }
 
@@ -4953,6 +4974,7 @@ export class BotController {
     random = Math.random,
     now = Date.now,
     reconnectDelay = delay,
+    apiLeaseStatus = null,
   }) {
     this.client = client;
     this.config = { ...config, timing: { ...DEFAULT_TIMING_CONFIG, ...(config.timing ?? {}) } };
@@ -4964,6 +4986,14 @@ export class BotController {
     this.random = random;
     this.now = now;
     this.reconnectDelay = reconnectDelay;
+    this.apiLeaseStatus = typeof apiLeaseStatus === "function"
+      ? apiLeaseStatus
+      : () => ({
+        state: "unknown",
+        active_clients: this.store.activeApiLeases().length,
+        heartbeat_at: null,
+        expires_at: null,
+      });
     this.slots = new SlotPool(config.capacity);
     this.engineStarts = new AsyncSemaphore(config.capacity.startup_parallelism);
     this.activeGames = new Map();
@@ -4979,6 +5009,7 @@ export class BotController {
     this.lastReconciliationAt = 0;
     this.needsReconciliation = false;
     this.streamConnected = false;
+    this.streamLifecycle = "starting";
     this.tickRunning = false;
     this.schedulerFault = null;
     const transportProfilePath = this.config.timing.transport_profile_path
@@ -5006,16 +5037,26 @@ export class BotController {
       await this.writeStatus();
       while (!this.signal.aborted) {
         try {
-          if (this.needsReconciliation) await this.recoverPlayingGames();
+          if (this.needsReconciliation) {
+            this.streamLifecycle = "reconciling";
+            await this.writeStatus();
+            await this.recoverPlayingGames();
+          }
+          this.streamLifecycle = this.client.isCoolingDown?.()
+            ? "waiting_for_api_cooldown"
+            : "connecting";
+          await this.writeStatus();
           const events = await this.client.openStream("api/stream/event", this.signal);
           const connectedAt = Date.now();
           this.streamConnected = true;
+          this.streamLifecycle = "connected";
           await this.writeStatus();
           for await (const event of events) {
             reconnectDelay = 1_000;
             await this.onEvent(event);
           }
           this.streamConnected = false;
+          this.streamLifecycle = "disconnected";
           this.needsReconciliation = true;
           if (Date.now() - connectedAt >= 30_000) reconnectDelay = 1_000;
           if (!this.signal.aborted) throw new Error("Lichess event stream closed");
@@ -5023,6 +5064,9 @@ export class BotController {
           this.streamConnected = false;
           this.needsReconciliation = true;
           if (this.signal.aborted) break;
+          this.streamLifecycle = this.client.isCoolingDown?.()
+            ? "waiting_for_api_cooldown"
+            : "disconnected";
           const retryMs = error instanceof LichessHttpError && error.status === 429
             ? Math.max(60_000, error.retryAfterMs)
             : reconnectDelay;
@@ -5309,7 +5353,8 @@ export class BotController {
 
   async createChallenge(opponent, audience) {
     const normalized = normalizedUsername(opponent);
-    if (normalized === this.account || this.slots.hasOpponent(normalized)) return false;
+    if (normalized === this.account || this.slots.hasOpponent(normalized)
+        || this.client.isRequestClassBlocked?.("challenge_create")) return false;
     const slot = this.slots.acquire(audience, { opponent: normalized, direction: "outbound" });
     if (!slot) return false;
     const slotGeneration = slot.generation;
@@ -5397,14 +5442,17 @@ export class BotController {
       if (this.schedulerFault) return;
       const control = this.store.control(now);
       if (control.paused) return;
-      if (this.manualOpponent) {
+      const challengeCreationBlocked = this.client.isRequestClassBlocked?.("challenge_create")
+        === true;
+      if (this.manualOpponent && !challengeCreationBlocked) {
         const opponent = this.manualOpponent;
         this.manualOpponent = null;
         const audience = this.store.isOwner(opponent) ? "human" : "bot";
         await this.createChallenge(opponent, audience);
       }
       const reservation = control.reservation;
-      if (reservation && !this.slots.hasOpponent(reservation.opponent, "human")
+      if (!challengeCreationBlocked && reservation
+          && !this.slots.hasOpponent(reservation.opponent, "human")
           && this.slots.available("human") > 0
           && now - this.lastOwnerChallengeAt >= this.config.scheduler.reservation_retry_seconds * 1_000) {
         await this.createChallenge(reservation.opponent, "human");
@@ -5413,6 +5461,7 @@ export class BotController {
       if (now - this.lastDiscoveryAt >= this.config.scheduler.discovery_interval_seconds * 1_000) {
         await this.discoverBots(now);
       }
+      if (challengeCreationBlocked) return;
       if (now - this.lastBotChallengeAt < this.config.scheduler.challenge_interval_seconds * 1_000) return;
       while (this.slots.occupied("bot") < this.config.capacity.bot.target_active
           && this.slots.available("bot") > 0) {
@@ -5566,6 +5615,11 @@ export class BotController {
   }
 
   async writeStatus() {
+    const streamLifecycle = this.streamConnected
+      ? "connected"
+      : this.client.isCoolingDown?.()
+        ? "waiting_for_api_cooldown"
+        : this.streamLifecycle;
     writeRuntimeMetadata(this.runtimeDir, {
       schema: "uci_arena_lichess_runtime_v3",
       adapter_id: "lichess_node_adapter_v2",
@@ -5573,6 +5627,7 @@ export class BotController {
       process_instance: currentProcessIdentity(),
       account: this.account,
       stream_connected: this.streamConnected,
+      stream_lifecycle: streamLifecycle,
       configured_capacity: this.config.capacity.total_slots,
       qualified_capacity: this.config.capacity_profile?.maximum_concurrency ?? 1,
       slots: this.slots.snapshot(),
@@ -5590,7 +5645,7 @@ export class BotController {
       },
       api_safety: {
         ...this.client.safetySnapshot(),
-        active_client_leases: this.store.activeApiLeases().length,
+        client_lease: this.apiLeaseStatus(),
       },
       timing: {
         opponent_turn_search: this.config.timing.opponent_turn_search,
@@ -5633,6 +5688,68 @@ function writeRuntimeMetadata(runtimeDir, metadata) {
   publishExactJsonSync(target, metadata, {
     maximumBytes: EXACT_FILE_LIMITS.runtimeStatus,
     label: "Lichess runtime status",
+  });
+}
+
+function localApiLeaseStatus(store, authority, leaseOwner, processIdentity, now = Date.now()) {
+  const lease = store.apiLease(authority);
+  const active = lease && Number(lease.expires_at) > now;
+  const authoritative = active
+    && lease.owner_id === leaseOwner
+    && Number(lease.pid) === process.pid
+    && lease.process_identity_json === JSON.stringify(processIdentity);
+  return {
+    state: authoritative ? "authoritative" : active ? "conflict" : "missing",
+    active_clients: active ? 1 : 0,
+    heartbeat_at: active && Number.isSafeInteger(Number(lease.heartbeat_at))
+      ? Number(lease.heartbeat_at)
+      : null,
+    expires_at: active && Number.isSafeInteger(Number(lease.expires_at))
+      ? Number(lease.expires_at)
+      : null,
+  };
+}
+
+function writeStartingRuntimeStatus({
+  runtimeDir,
+  config,
+  store,
+  safetyCoordinator,
+  apiLeaseStatus,
+}) {
+  const control = store.control();
+  writeRuntimeMetadata(runtimeDir, {
+    schema: "uci_arena_lichess_runtime_v3",
+    adapter_id: "lichess_node_adapter_v2",
+    pid: process.pid,
+    process_instance: currentProcessIdentity(),
+    account: null,
+    stream_connected: false,
+    stream_lifecycle: safetyCoordinator.isCoolingDown()
+      ? "waiting_for_api_cooldown"
+      : "starting",
+    configured_capacity: config.capacity.total_slots,
+    qualified_capacity: config.capacity_profile?.maximum_concurrency ?? 1,
+    slots: [],
+    scheduler: {
+      enabled: config.scheduler.enabled,
+      target_active_bots: config.capacity.bot.target_active,
+      last_discovery_at: null,
+      last_bot_challenge_at: null,
+      last_owner_challenge_at: null,
+      last_reconciliation_at: null,
+      reconciliation_pending: true,
+      fault: null,
+      request_queue: safetyCoordinator.snapshot(),
+      ...control,
+    },
+    api_safety: {
+      ...safetyCoordinator.snapshot(),
+      active_streams: [],
+      client_lease: apiLeaseStatus(),
+    },
+    engine_adapter: config.engine.adapter,
+    updated_at: new Date().toISOString(),
   });
 }
 
@@ -5686,13 +5803,69 @@ export function providerStatusProjection({
     ]),
   );
   const streamConnected = effectiveActive && runtime?.stream_connected === true;
-  const schedulerFault = runtime?.scheduler?.fault ?? null;
-  const reconciliationPending = runtime?.scheduler?.reconciliation_pending === true;
+  const allowedStreamStates = new Set([
+    "starting",
+    "reconciling",
+    "connecting",
+    "waiting_for_api_cooldown",
+    "connected",
+    "disconnected",
+  ]);
+  const observedStreamLifecycle = runtime?.stream_lifecycle;
+  const streamLifecycle = streamConnected
+    ? "connected"
+    : effectiveActive && allowedStreamStates.has(observedStreamLifecycle)
+      ? observedStreamLifecycle
+      : "disconnected";
+  const apiSafety = effectiveActive ? runtime?.api_safety ?? {} : {};
+  const allowedRateLimitStates = new Set([
+    "ready",
+    "cooldown",
+    "challenge_quarantined",
+    "challenge_half_open",
+  ]);
+  const allowedChallengeStates = new Set([
+    "ready",
+    "quarantined",
+    "half_open_ready",
+    "half_open",
+  ]);
+  const allowedLeaseStates = new Set(["authoritative", "missing", "conflict"]);
+  const nullableStatusInteger = (value) => Number.isSafeInteger(value) && value >= 0
+    ? value
+    : null;
+  const globalCooldown = apiSafety.state === "cooldown"
+    && Number(apiSafety.cooldown_remaining_ms) > 0;
+  const challengeQuarantined = apiSafety.challenge_state === "quarantined"
+    && Number(apiSafety.challenge_remaining_ms) > 0;
+  const apiLeaseState = allowedLeaseStates.has(apiSafety.client_lease?.state)
+    ? apiSafety.client_lease.state
+    : "unknown";
+  const schedulerFault = effectiveActive ? runtime?.scheduler?.fault ?? null : null;
+  const reconciliationPending = effectiveActive
+    && runtime?.scheduler?.reconciliation_pending === true;
   const blockers = [];
   if (effectiveRuntimeError) blockers.push(effectiveRuntimeError);
   if (!effectiveActive) blockers.push("provider_process_inactive");
-  if (effectiveActive && !streamConnected) blockers.push("event_stream_disconnected");
+  if (effectiveActive && !streamConnected) {
+    if (streamLifecycle === "waiting_for_api_cooldown") {
+      blockers.push("event_stream_waiting_for_api_cooldown");
+    } else if (streamLifecycle === "starting") {
+      blockers.push("provider_starting");
+    } else if (streamLifecycle === "connecting") {
+      blockers.push("event_stream_connecting");
+    } else if (streamLifecycle !== "reconciling") {
+      blockers.push("event_stream_disconnected");
+    }
+  }
   if (reconciliationPending) blockers.push("startup_reconciliation_pending");
+  if (effectiveActive && globalCooldown) blockers.push("api_global_cooldown");
+  if (effectiveActive && challengeQuarantined) {
+    blockers.push("outbound_challenge_quarantined");
+  }
+  if (effectiveActive && apiLeaseState !== "authoritative") {
+    blockers.push("api_client_lease_unhealthy");
+  }
   if (schedulerFault) blockers.push("scheduler_fault");
   if (startupError) blockers.push("startup_status_unavailable");
   if (startup?.installed === true &&
@@ -5704,8 +5877,10 @@ export function providerStatusProjection({
     installed: true,
     registered: startup?.installed === true,
     active: effectiveActive,
-    ready: effectiveActive && streamConnected && !schedulerFault && !reconciliationPending,
+    ready: effectiveActive && streamConnected && !schedulerFault && !reconciliationPending
+      && apiLeaseState === "authoritative",
     stream_connected: streamConnected,
+    stream_state: streamLifecycle,
     runtime_updated_at: typeof runtime?.updated_at === "string" ? runtime.updated_at : null,
     account: runtime?.account
       ? { username: String(runtime.account), bot: true }
@@ -5740,14 +5915,53 @@ export function providerStatusProjection({
         : null,
     },
     rate_limit: {
-      state: runtime?.api_safety?.state ?? "unknown",
-      cooldown_until: runtime?.api_safety?.cooldown_until ?? null,
-      cooldown_remaining_ms: runtime?.api_safety?.cooldown_remaining_ms ?? null,
-      strike_count: runtime?.api_safety?.strike_count ?? null,
-      queue_depth: runtime?.api_safety?.queue_depth ?? null,
-      in_flight_class: runtime?.api_safety?.in_flight_class ?? null,
+      state: allowedRateLimitStates.has(apiSafety.state) ? apiSafety.state : "unknown",
+      cooldown_until: nullableStatusInteger(apiSafety.cooldown_until),
+      cooldown_remaining_ms: nullableStatusInteger(apiSafety.cooldown_remaining_ms),
+      strike_count: nullableStatusInteger(apiSafety.strike_count),
+      challenge_state: allowedChallengeStates.has(apiSafety.challenge_state)
+        ? apiSafety.challenge_state
+        : "unknown",
+      challenge_blocked_until: nullableStatusInteger(apiSafety.challenge_blocked_until),
+      challenge_remaining_ms: nullableStatusInteger(apiSafety.challenge_remaining_ms),
+      challenge_strike_count: nullableStatusInteger(apiSafety.challenge_strike_count),
+      queue_depth: nullableStatusInteger(apiSafety.queue_depth),
+      in_flight_class: typeof apiSafety.in_flight_class === "string"
+        ? apiSafety.in_flight_class.slice(0, 64)
+        : null,
+      client_lease: {
+        state: apiLeaseState,
+        active_clients: nullableStatusInteger(apiSafety.client_lease?.active_clients),
+        heartbeat_at: nullableStatusInteger(apiSafety.client_lease?.heartbeat_at),
+        expires_at: nullableStatusInteger(apiSafety.client_lease?.expires_at),
+      },
     },
     blockers: [...new Set(blockers)].slice(0, 64),
+  };
+}
+
+export function replacementStartupReadiness(status) {
+  const providerReady = status?.ready === true;
+  const allowedCooldownBlockers = new Set([
+    "event_stream_waiting_for_api_cooldown",
+    "api_global_cooldown",
+    "outbound_challenge_quarantined",
+  ]);
+  const blockers = Array.isArray(status?.blockers) ? status.blockers : [];
+  const apiCooldownDeferred = !providerReady
+    && status?.active === true
+    && status?.stream_state === "waiting_for_api_cooldown"
+    && status?.scheduler?.fault === null
+    && status?.rate_limit?.state === "cooldown"
+    && Number.isSafeInteger(status?.rate_limit?.cooldown_remaining_ms)
+    && status.rate_limit.cooldown_remaining_ms > 0
+    && status?.rate_limit?.client_lease?.state === "authoritative"
+    && blockers.length > 0
+    && blockers.every((blocker) => allowedCooldownBlockers.has(blocker));
+  return {
+    stable: providerReady || apiCooldownDeferred,
+    providerReady,
+    apiCooldownDeferred,
   };
 }
 
@@ -6505,21 +6719,36 @@ export async function main(argv = process.argv.slice(2)) {
     } else {
       throw new Error(`Unsupported startup platform: ${process.platform}`);
     }
+    let replacementReadiness = {
+      stable: false,
+      providerReady: false,
+      apiCooldownDeferred: false,
+    };
     const replacement = process.platform === "win32"
       ? await completeWindowsStartupReplacement({
         ready: async () => {
           const { runtime, error: runtimeError } = boundedRuntimeMetadata(runtimeDir);
-          return providerStatusProjection({
+          replacementReadiness = replacementStartupReadiness(providerStatusProjection({
             runtime,
             runtimeError,
             startup: { installed: true, active: true },
-          }).ready;
+          }));
+          return replacementReadiness.stable;
         },
       })
       : process.platform === "linux"
         ? await completeLinuxStartupReplacement()
         : (() => { throw new Error(`Unsupported startup platform: ${process.platform}`); })();
-    console.log(JSON.stringify({ status: "ready", startup: replacement }));
+    console.log(JSON.stringify({
+      status: "ready",
+      startup: process.platform === "win32"
+        ? {
+          ...replacement,
+          providerReady: replacementReadiness.providerReady,
+          apiCooldownDeferred: replacementReadiness.apiCooldownDeferred,
+        }
+        : replacement,
+    }));
     return 0;
   }
   const configPath = path.resolve(options.config ?? DEFAULT_TEMPLATE);
@@ -6718,6 +6947,7 @@ export async function main(argv = process.argv.slice(2)) {
   const leaseOwner = randomUUID();
   const processIdentity = currentProcessIdentity();
   let leaseHeartbeat = null;
+  let startupStatusHeartbeat = null;
   try {
     store.acquireApiLease(
       authority,
@@ -6736,14 +6966,39 @@ export async function main(argv = process.argv.slice(2)) {
         cooldown_until: state.cooldownUntil || null,
         strike_count: state.strikeCount,
         last_retry_after_ms: state.lastRetryAfterMs,
+        challenge_blocked_until: state.challengeBlockedUntil || null,
+        challenge_strike_count: state.challengeStrikeCount,
+        challenge_half_open: state.challengeHalfOpen,
       }),
     });
+    await safetyCoordinator.restorePersistedState();
+    const apiLeaseStatus = () => localApiLeaseStatus(
+      store,
+      authority,
+      leaseOwner,
+      processIdentity,
+    );
     if (options.command === "probe" && safetyCoordinator.isCoolingDown()) {
       throw new Error(
         `Lichess API cooldown is active until ${new Date(safetyCoordinator.cooldownUntil).toISOString()}`,
       );
     }
     if (options.command === "run") {
+      const publishStartingStatus = () => writeStartingRuntimeStatus({
+        runtimeDir,
+        config,
+        store,
+        safetyCoordinator,
+        apiLeaseStatus,
+      });
+      publishStartingStatus();
+      startupStatusHeartbeat = setInterval(() => {
+        try {
+          publishStartingStatus();
+        } catch (error) {
+          log("runtime_status_write_error", { message: error.message });
+        }
+      }, 5_000);
       leaseHeartbeat = setInterval(() => {
         try {
           store.heartbeatApiLease(
@@ -6801,18 +7056,26 @@ export async function main(argv = process.argv.slice(2)) {
       provider: qualificationStatus.provider_effective ?? null,
       time_profile: config.engine.time_profile_status,
     });
-    await new BotController({
+    const botController = new BotController({
       client,
       config,
       account: profile.username,
       runtimeDir,
       signal: controller.signal,
       store,
-    }).run(options.opponent);
+      apiLeaseStatus,
+    });
+    await botController.writeStatus();
+    if (startupStatusHeartbeat) {
+      clearInterval(startupStatusHeartbeat);
+      startupStatusHeartbeat = null;
+    }
+    await botController.run(options.opponent);
   } finally {
     unbindShutdownInput();
     for (const [signal, handler] of signalHandlers) process.off(signal, handler);
     if (leaseHeartbeat) clearInterval(leaseHeartbeat);
+    if (startupStatusHeartbeat) clearInterval(startupStatusHeartbeat);
     store.releaseApiLease(authority, leaseOwner);
     store.close();
   }

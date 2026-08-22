@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -118,6 +119,98 @@ test("provider probe reaches the account API without a configured engine", async
     ]);
   } finally {
     console.log = originalLog;
+    await rm(root, { recursive: true, force: true });
+    await token.close();
+    await api.close();
+  }
+});
+
+test("supervised startup publishes restored cooldown before its account probe waits", async () => {
+  const api = await startFakeLichessApi({ fixtureToken: FIXTURE_TOKEN });
+  const token = await temporaryToken();
+  const root = await mkdtemp(path.join(os.tmpdir(), "uci-arena-startup-cooldown-"));
+  const configPath = path.join(root, "config.json");
+  const runtimeDir = path.join(root, "runtime");
+  const runtimePath = path.join(runtimeDir, "runtime.json");
+  const storePath = path.join(root, "matches.sqlite");
+  const config = JSON.parse(await readFile(DEFAULT_TEMPLATE, "utf8"));
+  config.url = api.origin;
+  config.engine = {
+    adapter: "standard_uci_v1",
+    executable: process.execPath,
+    arguments: [path.join(HERE, "test-fixtures", "fake-standard-uci-engine.mjs")],
+    working_directory: HERE,
+    search_timeout_grace_ms: 1_000,
+    shutdown_grace_ms: 1_000,
+    uci_options: {},
+  };
+  config.timing.opponent_turn_search = false;
+  config.capacity = {
+    total_slots: 1,
+    capacity_profile: null,
+    startup_parallelism: 1,
+    human: { slots: 0, allow_borrowing: false, accept_public: false },
+    bot: { slots: 1, target_active: 0 },
+  };
+  config.scheduler.enabled = false;
+  await writeFile(configPath, JSON.stringify(config), "utf8");
+
+  const authority = `${new URL(api.origin).origin.toLocaleLowerCase()}|fixturearenabot`;
+  const observedAt = Date.now();
+  const seed = new LichessStore(storePath);
+  seed.saveApiSafetyState(authority, {
+    cooldownUntil: observedAt + 60_000,
+    strikeCount: 0,
+    last429At: 0,
+    lastRetryAfterMs: 0,
+    challengeBlockedUntil: observedAt + 21_600_000,
+    challengeStrikeCount: 6,
+    challengeLast429At: observedAt,
+    challengeRecoveredAt: 0,
+    challengeHalfOpen: false,
+  }, observedAt);
+  seed.close();
+
+  const child = spawn(process.execPath, [
+    path.join(HERE, "lichess-adapter.mjs"),
+    "run",
+    "--config", configPath,
+    "--token-file", token.tokenFile,
+    "--expected-account", "fixturearenabot",
+    "--runtime-dir", runtimeDir,
+    "--store", storePath,
+  ], {
+    cwd: root,
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  let output = "";
+  child.stdout.on("data", (chunk) => { output = `${output}${chunk}`.slice(-16_384); });
+  child.stderr.on("data", (chunk) => { output = `${output}${chunk}`.slice(-16_384); });
+  const exited = once(child, "exit");
+  try {
+    await waitFor(() => existsSync(runtimePath), {
+      message: `startup runtime status was not published; output=${output}`,
+    });
+    const runtime = JSON.parse(readFileSync(runtimePath, "utf8"));
+    assert.equal(runtime.pid, child.pid);
+    assert.equal(runtime.stream_lifecycle, "waiting_for_api_cooldown");
+    assert.equal(runtime.api_safety.state, "cooldown");
+    assert.equal(runtime.api_safety.challenge_state, "quarantined");
+    assert.equal(runtime.api_safety.client_lease.state, "authoritative");
+    assert.deepEqual(api.requests, []);
+
+    child.stdin.end("shutdown\n");
+    const [code, signal] = await exited;
+    assert.equal(signal, null, output);
+    assert.equal(code, 1, output);
+    const rows = readFileSync(path.join(runtimeDir, "adapter.ndjson"), "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    assert.ok(rows.some((row) => row.event === "api_rate_limit_restored"));
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
     await rm(root, { recursive: true, force: true });
     await token.close();
     await api.close();

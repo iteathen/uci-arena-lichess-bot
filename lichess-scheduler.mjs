@@ -330,6 +330,14 @@ export const API_RATE_LIMIT_BACKOFF_MS = Object.freeze([
   3_600_000,
 ]);
 export const API_RATE_LIMIT_STRIKE_RESET_MS = 6 * 60 * 60 * 1_000;
+export const CHALLENGE_RATE_LIMIT_BACKOFF_MS = Object.freeze([
+  60_000,
+  120_000,
+  300_000,
+  900_000,
+  3_600_000,
+  API_RATE_LIMIT_STRIKE_RESET_MS,
+]);
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 export function retryAfterMilliseconds(value, now = Date.now()) {
@@ -346,6 +354,17 @@ export function retryAfterMilliseconds(value, now = Date.now()) {
 
 function abortReason(signal) {
   return signal?.reason instanceof Error ? signal.reason : new Error("Lichess request was cancelled");
+}
+
+export class ChallengeRequestQuarantinedError extends Error {
+  constructor(blockedUntil, now = Date.now()) {
+    super(`Lichess outbound challenge creation is quarantined until ${new Date(blockedUntil).toISOString()}`);
+    this.name = "ChallengeRequestQuarantinedError";
+    this.code = "LICHESS_CHALLENGE_QUARANTINED";
+    this.requestClass = "challenge_create";
+    this.blockedUntil = blockedUntil;
+    this.retryAfterMs = Math.max(0, blockedUntil - now);
+  }
 }
 
 export class ApiSafetyCoordinator {
@@ -372,6 +391,29 @@ export class ApiSafetyCoordinator {
     this.lastRetryAfterMs = Number(
       initialState.lastRetryAfterMs ?? initialState.last_retry_after_ms,
     ) || 0;
+    this.challengeBlockedUntil = Number(
+      initialState.challengeBlockedUntil ?? initialState.challenge_blocked_until,
+    ) || 0;
+    this.challengeStrikeCount = Number(
+      initialState.challengeStrikeCount ?? initialState.challenge_strike_count,
+    ) || 0;
+    this.challengeLast429At = Number(
+      initialState.challengeLast429At ?? initialState.challenge_last_429_at,
+    ) || 0;
+    this.challengeRecoveredAt = Number(
+      initialState.challengeRecoveredAt ?? initialState.challenge_recovered_at,
+    ) || 0;
+    this.challengeHalfOpen = Boolean(
+      initialState.challengeHalfOpen ?? initialState.challenge_half_open,
+    );
+    this.restoredAmbiguousChallengeAttempt = this.challengeHalfOpen;
+    if (this.restoredAmbiguousChallengeAttempt) {
+      this.challengeBlockedUntil = Math.max(
+        this.challengeBlockedUntil,
+        this.now() + CHALLENGE_RATE_LIMIT_BACKOFF_MS.at(-1),
+      );
+      this.challengeHalfOpen = false;
+    }
     this.timer = null;
     this.timerDeadline = 0;
     this.counters = {
@@ -393,6 +435,10 @@ export class ApiSafetyCoordinator {
         reject(abortReason(signal));
         return;
       }
+      if (this.isRequestClassBlocked(requestClass)) {
+        reject(new ChallengeRequestQuarantinedError(this.challengeBlockedUntil, this.now()));
+        return;
+      }
       const entry = {
         task,
         priority,
@@ -409,6 +455,7 @@ export class ApiSafetyCoordinator {
           if (index < 0) return;
           this.queue.splice(index, 1);
           reject(abortReason(signal));
+          this.rescheduleCooldownTimer();
           this.pump();
         };
         signal.addEventListener("abort", entry.abortListener, { once: true });
@@ -424,21 +471,58 @@ export class ApiSafetyCoordinator {
     const retryAfterMs = typeof retryAfter === "number"
       ? Math.max(0, Math.ceil(retryAfter))
       : retryAfterMilliseconds(retryAfter, now);
-    const recent = this.last429At > 0 && now - this.last429At < API_RATE_LIMIT_STRIKE_RESET_MS;
-    this.strikeCount = recent
-      ? Math.min(API_RATE_LIMIT_BACKOFF_MS.length, this.strikeCount + 1)
-      : 1;
-    const scheduled = API_RATE_LIMIT_BACKOFF_MS[this.strikeCount - 1];
-    const delayMs = Math.max(scheduled, retryAfterMs);
-    this.last429At = now;
+    let scheduled;
+    let challengeEvent = null;
+    if (requestClass === "challenge_create") {
+      const previousStrikeCount = this.challengeStrikeCount;
+      this.challengeStrikeCount = this.challengeHalfOpen
+        ? CHALLENGE_RATE_LIMIT_BACKOFF_MS.length
+        : Math.min(CHALLENGE_RATE_LIMIT_BACKOFF_MS.length, previousStrikeCount + 1);
+      scheduled = CHALLENGE_RATE_LIMIT_BACKOFF_MS[this.challengeStrikeCount - 1];
+      this.challengeBlockedUntil = Math.max(
+        this.challengeBlockedUntil,
+        now + Math.max(scheduled, retryAfterMs),
+      );
+      this.challengeLast429At = now;
+      this.challengeHalfOpen = false;
+      challengeEvent = previousStrikeCount > 0
+        ? "api_challenge_quarantine_extended"
+        : "api_challenge_quarantine_entered";
+    } else {
+      const recent = this.last429At > 0
+        && now - this.last429At < API_RATE_LIMIT_STRIKE_RESET_MS;
+      this.strikeCount = recent
+        ? Math.min(API_RATE_LIMIT_BACKOFF_MS.length, this.strikeCount + 1)
+        : 1;
+      scheduled = API_RATE_LIMIT_BACKOFF_MS[this.strikeCount - 1];
+      this.last429At = now;
+    }
+    const globalScheduled = requestClass === "challenge_create"
+      ? API_RATE_LIMIT_BACKOFF_MS[0]
+      : scheduled;
+    const delayMs = Math.max(globalScheduled, retryAfterMs);
     this.lastRetryAfterMs = retryAfterMs;
     this.cooldownUntil = Math.max(this.cooldownUntil, now + delayMs);
     this.counters.rateLimited += 1;
     this.rescheduleCooldownTimer();
     const state = this.safetyState();
     if (this.persistSafetyState) await this.persistSafetyState(state);
+    if (challengeEvent) {
+      this.rejectBlockedChallengeEntries();
+      this.onStateChange?.({ event: challengeEvent, requestClass, ...state });
+    }
     this.onStateChange?.({ event: "api_rate_limit_entered", requestClass, ...state });
     return Math.max(0, this.cooldownUntil - now);
+  }
+
+  async restorePersistedState() {
+    if (this.restoredAmbiguousChallengeAttempt && this.persistSafetyState) {
+      await this.persistSafetyState(this.safetyState());
+    }
+    this.restoredAmbiguousChallengeAttempt = false;
+    if (this.isCoolingDown() || this.challengeStrikeCount > 0) {
+      this.onStateChange?.({ event: "api_rate_limit_restored", ...this.safetyState() });
+    }
   }
 
   safetyState() {
@@ -447,6 +531,11 @@ export class ApiSafetyCoordinator {
       strikeCount: this.effectiveStrikeCount(),
       last429At: this.last429At,
       lastRetryAfterMs: this.lastRetryAfterMs,
+      challengeBlockedUntil: this.challengeBlockedUntil,
+      challengeStrikeCount: this.challengeStrikeCount,
+      challengeLast429At: this.challengeLast429At,
+      challengeRecoveredAt: this.challengeRecoveredAt,
+      challengeHalfOpen: this.challengeHalfOpen,
     };
   }
 
@@ -463,18 +552,47 @@ export class ApiSafetyCoordinator {
     return this.cooldownRemainingMs() > 0;
   }
 
+  challengeRemainingMs() {
+    return Math.max(0, this.challengeBlockedUntil - this.now());
+  }
+
+  challengeState() {
+    if (this.challengeHalfOpen) return "half_open";
+    if (this.challengeRemainingMs() > 0) return "quarantined";
+    if (this.challengeStrikeCount >= CHALLENGE_RATE_LIMIT_BACKOFF_MS.length) {
+      return "half_open_ready";
+    }
+    return "ready";
+  }
+
+  isRequestClassBlocked(requestClass) {
+    return requestClass === "challenge_create"
+      && (this.challengeRemainingMs() > 0 || this.challengeHalfOpen);
+  }
+
   snapshot() {
     const queueDepthByClass = {};
     for (const entry of this.queue) {
       queueDepthByClass[entry.requestClass] = (queueDepthByClass[entry.requestClass] ?? 0) + 1;
     }
     return {
-      state: this.isCoolingDown() ? "cooldown" : "ready",
+      state: this.isCoolingDown()
+        ? "cooldown"
+        : this.challengeRemainingMs() > 0
+          ? "challenge_quarantined"
+          : this.challengeStrikeCount >= CHALLENGE_RATE_LIMIT_BACKOFF_MS.length
+            ? "challenge_half_open"
+            : "ready",
       cooldown_until: this.cooldownUntil || null,
       cooldown_remaining_ms: this.cooldownRemainingMs(),
       strike_count: this.effectiveStrikeCount(),
-      last_429_at: this.last429At || null,
+      last_429_at: Math.max(this.last429At, this.challengeLast429At) || null,
       last_retry_after_ms: this.lastRetryAfterMs,
+      challenge_state: this.challengeState(),
+      challenge_blocked_until: this.challengeBlockedUntil || null,
+      challenge_remaining_ms: this.challengeRemainingMs(),
+      challenge_strike_count: this.challengeStrikeCount,
+      challenge_last_429_at: this.challengeLast429At || null,
       in_flight_class: this.inFlightClass,
       queue_depth: this.queue.length,
       queue_depth_by_class: queueDepthByClass,
@@ -510,12 +628,66 @@ export class ApiSafetyCoordinator {
     }, Math.min(remaining, MAX_TIMER_DELAY_MS));
   }
 
+  rejectBlockedChallengeEntries() {
+    if (this.challengeRemainingMs() <= 0 && !this.challengeHalfOpen) return;
+    const retained = [];
+    for (const entry of this.queue) {
+      if (entry.requestClass !== "challenge_create") {
+        retained.push(entry);
+        continue;
+      }
+      if (entry.abortListener) entry.signal.removeEventListener("abort", entry.abortListener);
+      entry.reject(new ChallengeRequestQuarantinedError(this.challengeBlockedUntil, this.now()));
+    }
+    this.queue = retained;
+    this.rescheduleCooldownTimer();
+  }
+
+  async beginRequest(requestClass) {
+    if (requestClass !== "challenge_create"
+        || this.challengeStrikeCount < CHALLENGE_RATE_LIMIT_BACKOFF_MS.length) return;
+    if (this.isRequestClassBlocked(requestClass)) {
+      throw new ChallengeRequestQuarantinedError(this.challengeBlockedUntil, this.now());
+    }
+    this.challengeHalfOpen = true;
+    if (this.persistSafetyState) await this.persistSafetyState(this.safetyState());
+    this.onStateChange?.({
+      event: "api_challenge_quarantine_half_open",
+      requestClass,
+      ...this.safetyState(),
+    });
+  }
+
+  async finishRequest(requestClass, succeeded) {
+    if (requestClass !== "challenge_create" || this.challengeStrikeCount <= 0) return;
+    if (succeeded) {
+      this.challengeRecoveredAt = this.now();
+      this.challengeBlockedUntil = 0;
+      this.challengeStrikeCount = 0;
+      this.challengeLast429At = 0;
+      this.challengeHalfOpen = false;
+      if (this.persistSafetyState) await this.persistSafetyState(this.safetyState());
+      this.onStateChange?.({
+        event: "api_challenge_quarantine_recovered",
+        requestClass,
+        ...this.safetyState(),
+      });
+      return;
+    }
+    if (this.challengeHalfOpen) {
+      this.challengeHalfOpen = false;
+      if (this.persistSafetyState) await this.persistSafetyState(this.safetyState());
+    }
+  }
+
   pump() {
     if (this.running || !this.queue.length) return;
     if (this.isCoolingDown()) {
       this.rescheduleCooldownTimer();
       return;
     }
+    this.rejectBlockedChallengeEntries();
+    if (!this.queue.length) return;
     const next = this.queue.shift();
     if (next.abortListener) next.signal.removeEventListener("abort", next.abortListener);
     if (next.signal?.aborted) {
@@ -526,7 +698,17 @@ export class ApiSafetyCoordinator {
     this.running = true;
     this.inFlightClass = next.requestClass;
     this.counters.dispatched += 1;
-    Promise.resolve().then(next.task).then((value) => {
+    Promise.resolve().then(async () => {
+      await this.beginRequest(next.requestClass);
+      try {
+        const value = await next.task();
+        await this.finishRequest(next.requestClass, true);
+        return value;
+      } catch (error) {
+        await this.finishRequest(next.requestClass, false);
+        throw error;
+      }
+    }).then((value) => {
       this.counters.succeeded += 1;
       next.resolve(value);
     }, (error) => {

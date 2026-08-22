@@ -37,6 +37,7 @@ import {
   parseRuntimeStatus,
   probeAccount,
   providerStatusProjection,
+  replacementStartupReadiness,
   qualificationFailureProjection,
   resolveExternalTokenFile,
   resolveProviderRuntimeDirectory,
@@ -87,6 +88,7 @@ test("provider status distinguishes inactive, disconnected, and ready states", (
     pid: 42,
     account: "arena-bot",
     stream_connected: false,
+    stream_lifecycle: "disconnected",
     configured_capacity: 2,
     qualified_capacity: 2,
     slots: [
@@ -94,7 +96,18 @@ test("provider status distinguishes inactive, disconnected, and ready states", (
       { state: "cancelling", audience: "bot" },
     ],
     scheduler: { enabled: true, paused: false, target_active_bots: 1, fault: null },
-    api_safety: { state: "ready", queue_depth: 0 },
+    api_safety: {
+      state: "ready",
+      queue_depth: 0,
+      challenge_state: "ready",
+      challenge_remaining_ms: 0,
+      client_lease: {
+        state: "authoritative",
+        active_clients: 1,
+        heartbeat_at: Date.parse("2026-08-01T00:00:00.000Z"),
+        expires_at: Date.parse("2026-08-01T00:01:00.000Z"),
+      },
+    },
     updated_at: "2026-08-01T00:00:00.000Z",
   };
   const disconnected = providerStatusProjection({
@@ -113,6 +126,7 @@ test("provider status distinguishes inactive, disconnected, and ready states", (
   const recovering = providerStatusProjection({
     runtime: {
       ...runtime,
+      stream_lifecycle: "reconciling",
       scheduler: { ...runtime.scheduler, reconciliation_pending: true },
     },
     active: true,
@@ -120,13 +134,36 @@ test("provider status distinguishes inactive, disconnected, and ready states", (
     now: Date.parse(runtime.updated_at),
   });
   assert.equal(recovering.ready, false);
-  assert.deepEqual(recovering.blockers, [
-    "event_stream_disconnected",
+  assert.deepEqual(recovering.blockers, ["startup_reconciliation_pending"]);
+
+  const coolingDown = providerStatusProjection({
+    runtime: {
+      ...runtime,
+      stream_lifecycle: "waiting_for_api_cooldown",
+      scheduler: { ...runtime.scheduler, reconciliation_pending: true },
+      api_safety: {
+        ...runtime.api_safety,
+        state: "cooldown",
+        cooldown_remaining_ms: 60_000,
+        challenge_state: "quarantined",
+        challenge_remaining_ms: 21_600_000,
+      },
+    },
+    active: true,
+    startup: { installed: true },
+    now: Date.parse(runtime.updated_at),
+  });
+  assert.equal(coolingDown.active, true);
+  assert.equal(coolingDown.stream_state, "waiting_for_api_cooldown");
+  assert.deepEqual(coolingDown.blockers, [
+    "event_stream_waiting_for_api_cooldown",
     "startup_reconciliation_pending",
+    "api_global_cooldown",
+    "outbound_challenge_quarantined",
   ]);
 
   const ready = providerStatusProjection({
-    runtime: { ...runtime, stream_connected: true },
+    runtime: { ...runtime, stream_connected: true, stream_lifecycle: "connected" },
     active: true,
     startup: { installed: true },
     now: Date.parse(runtime.updated_at),
@@ -136,7 +173,7 @@ test("provider status distinguishes inactive, disconnected, and ready states", (
   assert.deepEqual(Object.keys(ready.account), ["username", "bot"]);
 
   const stale = providerStatusProjection({
-    runtime: { ...runtime, stream_connected: true },
+    runtime: { ...runtime, stream_connected: true, stream_lifecycle: "connected" },
     active: true,
     startup: { installed: true },
     now: Date.parse(runtime.updated_at) + 15_001,
@@ -186,6 +223,46 @@ test("post-replacement deferral accepts only exact Engine evidence drift", () =>
     }),
     true,
   );
+});
+
+test("post-replacement readiness preserves a durable global API cooldown", () => {
+  const coolingDown = {
+    active: true,
+    ready: false,
+    stream_state: "waiting_for_api_cooldown",
+    scheduler: { fault: null },
+    rate_limit: {
+      state: "cooldown",
+      cooldown_remaining_ms: 3_600_000,
+      client_lease: { state: "authoritative" },
+    },
+    blockers: [
+      "event_stream_waiting_for_api_cooldown",
+      "api_global_cooldown",
+      "outbound_challenge_quarantined",
+    ],
+  };
+  assert.deepEqual(replacementStartupReadiness(coolingDown), {
+    stable: true,
+    providerReady: false,
+    apiCooldownDeferred: true,
+  });
+  assert.equal(replacementStartupReadiness({
+    ...coolingDown,
+    blockers: [...coolingDown.blockers, "startup_reconciliation_pending"],
+  }).stable, false);
+  assert.equal(replacementStartupReadiness({
+    ...coolingDown,
+    rate_limit: {
+      ...coolingDown.rate_limit,
+      client_lease: { state: "conflict" },
+    },
+  }).stable, false);
+  assert.deepEqual(replacementStartupReadiness({ ready: true }), {
+    stable: true,
+    providerReady: true,
+    apiCooldownDeferred: false,
+  });
 });
 
 test("Engine fingerprint drift cannot mask model or search-authority drift", () => {
@@ -843,7 +920,7 @@ test("runtime config is credential-free and resolves repository paths", () => {
   const serialized = JSON.stringify(config).toLowerCase();
   assert.equal(serialized.includes("test-token"), false);
   assert.equal(serialized.includes("oauth_token"), false);
-  assert.equal(config.schema, "uci_arena_lichess_adapter_v7");
+  assert.equal(config.schema, "uci_arena_lichess_adapter_v8");
   assert.equal(config.timing.opponent_turn_search, true);
   assert.equal(config.timing.foreground_preempts_ponder, true);
   assert.equal(config.timing.initial_transport_reserve_ms, 650);
@@ -1391,9 +1468,23 @@ test("v2 config migrates to one shared slot with automatic scheduling disabled",
   assert.equal(config.capacity.total_slots, 1);
   assert.equal(config.capacity.legacy_shared, true);
   assert.equal(config.scheduler.enabled, false);
-  assert.equal(config.schema, "uci_arena_lichess_adapter_v7");
+  assert.equal(config.schema, "uci_arena_lichess_adapter_v8");
+  assert.equal(config.scheduler.challenge_interval_seconds, 300);
   assert.equal(config.timing.opponent_turn_search, true);
   assert.equal(config.timing.initial_transport_reserve_ms, 250);
+});
+
+test("v7 config migrates unsafe challenge pacing to the v8 safety floor", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-v7-config-"));
+  const template = JSON.parse(readFileSync(DEFAULT_TEMPLATE, "utf8"));
+  template.schema = "uci_arena_lichess_adapter_v7";
+  template.scheduler.challenge_interval_seconds = 5;
+  const configPath = path.join(directory, "v7.json");
+  writeFileSync(configPath, JSON.stringify(template));
+
+  const config = loadManagerConfig({ templatePath: configPath });
+  assert.equal(config.schema, "uci_arena_lichess_adapter_v8");
+  assert.equal(config.scheduler.challenge_interval_seconds, 300);
 });
 
 test("v3 accepts a configurable sixteen-slot layout and rejects invalid sums", () => {

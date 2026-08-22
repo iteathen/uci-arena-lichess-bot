@@ -144,6 +144,11 @@ export class LichessStore {
         strike_count INTEGER NOT NULL DEFAULT 0,
         last_429_at INTEGER NOT NULL DEFAULT 0,
         last_retry_after_ms INTEGER NOT NULL DEFAULT 0,
+        challenge_blocked_until INTEGER NOT NULL DEFAULT 0,
+        challenge_strike_count INTEGER NOT NULL DEFAULT 0,
+        challenge_last_429_at INTEGER NOT NULL DEFAULT 0,
+        challenge_recovered_at INTEGER NOT NULL DEFAULT 0,
+        challenge_half_open INTEGER NOT NULL DEFAULT 0,
         updated_at INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS api_client_leases(
@@ -190,6 +195,11 @@ export class LichessStore {
             strike_count INTEGER NOT NULL DEFAULT 0,
             last_429_at INTEGER NOT NULL DEFAULT 0,
             last_retry_after_ms INTEGER NOT NULL DEFAULT 0,
+            challenge_blocked_until INTEGER NOT NULL DEFAULT 0,
+            challenge_strike_count INTEGER NOT NULL DEFAULT 0,
+            challenge_last_429_at INTEGER NOT NULL DEFAULT 0,
+            challenge_recovered_at INTEGER NOT NULL DEFAULT 0,
+            challenge_half_open INTEGER NOT NULL DEFAULT 0,
             updated_at INTEGER NOT NULL
           );
           CREATE TABLE IF NOT EXISTS api_client_leases(
@@ -255,7 +265,31 @@ export class LichessStore {
       }
       version = 4;
     }
-    if (version !== 4) throw new Error(`Unsupported Lichess store schema version: ${version}`);
+    if (version === 4) {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        const columns = new Set(this.db.prepare("PRAGMA table_info(api_safety_state)").all()
+          .map((column) => column.name));
+        for (const [name, definition] of [
+          ["challenge_blocked_until", "INTEGER NOT NULL DEFAULT 0"],
+          ["challenge_strike_count", "INTEGER NOT NULL DEFAULT 0"],
+          ["challenge_last_429_at", "INTEGER NOT NULL DEFAULT 0"],
+          ["challenge_recovered_at", "INTEGER NOT NULL DEFAULT 0"],
+          ["challenge_half_open", "INTEGER NOT NULL DEFAULT 0"],
+        ]) {
+          if (!columns.has(name)) {
+            this.db.exec(`ALTER TABLE api_safety_state ADD COLUMN ${name} ${definition}`);
+          }
+        }
+        this.db.exec("UPDATE schema_meta SET version=5");
+        this.db.exec("COMMIT");
+      } catch (error) {
+        this.db.exec("ROLLBACK");
+        throw error;
+      }
+      version = 5;
+    }
+    if (version !== 5) throw new Error(`Unsupported Lichess store schema version: ${version}`);
   }
 
   close() {
@@ -351,7 +385,8 @@ export class LichessStore {
     const normalized = authorityKey(key);
     const rows = this.db.prepare(`
       SELECT authority_key, cooldown_until, strike_count, last_429_at,
-        last_retry_after_ms
+        last_retry_after_ms, challenge_blocked_until, challenge_strike_count,
+        challenge_last_429_at, challenge_recovered_at, challenge_half_open
       FROM api_safety_state WHERE authority_key=? OR authority_key='*'
     `).all(normalized);
     const latest = rows.reduce((selected, row) => {
@@ -361,16 +396,43 @@ export class LichessStore {
       }
       return selected;
     }, null);
+    const challengeLatest = rows.reduce((selected, row) => {
+      const eventAt = Math.max(
+        Number(row.challenge_last_429_at),
+        Number(row.challenge_recovered_at),
+      );
+      const selectedAt = selected
+        ? Math.max(
+          Number(selected.challenge_last_429_at),
+          Number(selected.challenge_recovered_at),
+        )
+        : -1;
+      if (!selected || eventAt > selectedAt) return row;
+      if (eventAt === selectedAt && row.authority_key === normalized) return row;
+      return selected;
+    }, null);
     return latest ? {
       cooldownUntil: Math.max(...rows.map((row) => Number(row.cooldown_until))),
       strikeCount: Number(latest.strike_count),
       last429At: Number(latest.last_429_at),
       lastRetryAfterMs: Number(latest.last_retry_after_ms),
+      challengeBlockedUntil: Math.max(
+        ...rows.map((row) => Number(row.challenge_blocked_until)),
+      ),
+      challengeStrikeCount: Number(challengeLatest.challenge_strike_count),
+      challengeLast429At: Number(challengeLatest.challenge_last_429_at),
+      challengeRecoveredAt: Number(challengeLatest.challenge_recovered_at),
+      challengeHalfOpen: Boolean(challengeLatest.challenge_half_open),
     } : {
       cooldownUntil: 0,
       strikeCount: 0,
       last429At: 0,
       lastRetryAfterMs: 0,
+      challengeBlockedUntil: 0,
+      challengeStrikeCount: 0,
+      challengeLast429At: 0,
+      challengeRecoveredAt: 0,
+      challengeHalfOpen: false,
     };
   }
 
@@ -378,8 +440,10 @@ export class LichessStore {
     const normalized = authorityKey(key);
     this.db.prepare(`
       INSERT INTO api_safety_state(authority_key, cooldown_until, strike_count,
-        last_429_at, last_retry_after_ms, updated_at)
-      VALUES(?, ?, ?, ?, ?, ?)
+        last_429_at, last_retry_after_ms, challenge_blocked_until,
+        challenge_strike_count, challenge_last_429_at, challenge_recovered_at,
+        challenge_half_open, updated_at)
+      VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(authority_key) DO UPDATE SET
         cooldown_until=MAX(api_safety_state.cooldown_until, excluded.cooldown_until),
         strike_count=CASE
@@ -396,6 +460,54 @@ export class LichessStore {
             THEN MAX(api_safety_state.last_retry_after_ms, excluded.last_retry_after_ms)
           ELSE api_safety_state.last_retry_after_ms
         END,
+        challenge_blocked_until=CASE
+          WHEN MAX(excluded.challenge_last_429_at, excluded.challenge_recovered_at)
+              > MAX(api_safety_state.challenge_last_429_at,
+                api_safety_state.challenge_recovered_at)
+            OR (MAX(excluded.challenge_last_429_at, excluded.challenge_recovered_at)
+                = MAX(api_safety_state.challenge_last_429_at,
+                  api_safety_state.challenge_recovered_at)
+              AND excluded.updated_at>=api_safety_state.updated_at)
+            THEN excluded.challenge_blocked_until
+          ELSE api_safety_state.challenge_blocked_until
+        END,
+        challenge_strike_count=CASE
+          WHEN MAX(excluded.challenge_last_429_at, excluded.challenge_recovered_at)
+              > MAX(api_safety_state.challenge_last_429_at,
+                api_safety_state.challenge_recovered_at)
+            OR (MAX(excluded.challenge_last_429_at, excluded.challenge_recovered_at)
+                = MAX(api_safety_state.challenge_last_429_at,
+                  api_safety_state.challenge_recovered_at)
+              AND excluded.updated_at>=api_safety_state.updated_at)
+            THEN excluded.challenge_strike_count
+          ELSE api_safety_state.challenge_strike_count
+        END,
+        challenge_last_429_at=CASE
+          WHEN MAX(excluded.challenge_last_429_at, excluded.challenge_recovered_at)
+              > MAX(api_safety_state.challenge_last_429_at,
+                api_safety_state.challenge_recovered_at)
+            OR (MAX(excluded.challenge_last_429_at, excluded.challenge_recovered_at)
+                = MAX(api_safety_state.challenge_last_429_at,
+                  api_safety_state.challenge_recovered_at)
+              AND excluded.updated_at>=api_safety_state.updated_at)
+            THEN excluded.challenge_last_429_at
+          ELSE api_safety_state.challenge_last_429_at
+        END,
+        challenge_recovered_at=MAX(
+          api_safety_state.challenge_recovered_at,
+          excluded.challenge_recovered_at
+        ),
+        challenge_half_open=CASE
+          WHEN MAX(excluded.challenge_last_429_at, excluded.challenge_recovered_at)
+              > MAX(api_safety_state.challenge_last_429_at,
+                api_safety_state.challenge_recovered_at)
+            OR (MAX(excluded.challenge_last_429_at, excluded.challenge_recovered_at)
+                = MAX(api_safety_state.challenge_last_429_at,
+                  api_safety_state.challenge_recovered_at)
+              AND excluded.updated_at>=api_safety_state.updated_at)
+            THEN excluded.challenge_half_open
+          ELSE api_safety_state.challenge_half_open
+        END,
         updated_at=MAX(api_safety_state.updated_at, excluded.updated_at)
     `).run(
       normalized,
@@ -403,6 +515,11 @@ export class LichessStore {
       integer(state.strikeCount),
       integer(state.last429At),
       integer(state.lastRetryAfterMs),
+      integer(state.challengeBlockedUntil),
+      integer(state.challengeStrikeCount),
+      integer(state.challengeLast429At),
+      integer(state.challengeRecoveredAt),
+      state.challengeHalfOpen ? 1 : 0,
       now,
     );
     return this.apiSafetyState(normalized);
@@ -411,7 +528,9 @@ export class LichessStore {
   listApiSafetyState() {
     return this.db.prepare(`
       SELECT authority_key, cooldown_until, strike_count, last_429_at,
-        last_retry_after_ms, updated_at
+        last_retry_after_ms, challenge_blocked_until, challenge_strike_count,
+        challenge_last_429_at, challenge_recovered_at, challenge_half_open,
+        updated_at
       FROM api_safety_state ORDER BY authority_key
     `).all();
   }
@@ -802,7 +921,7 @@ export class LichessStore {
 
   status(now = Date.now()) {
     return {
-      schemaVersion: 4,
+      schemaVersion: 5,
       control: this.control(now),
       owners: this.listOwners(),
       opponents: this.db.prepare("SELECT COUNT(*) AS count FROM opponents").get().count,
