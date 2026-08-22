@@ -1,6 +1,6 @@
 meta:
   spec_id: uci_arena_lichess_bot_foundation_v1
-  version: 1
+  version: 2
   status: active
   owner: governance
 
@@ -9,10 +9,16 @@ north_star: >
   safely operates any conforming UCI engine without acquiring engine, Manager,
   or Installer internals.
 
+required_companion_specs:
+  - specs/move_submission_timing_boundary_v1.yaml
+
 hard_rules:
   - The provider never imports Engine, Manager, Book Forge, Evidence Service, or Installer source.
   - One admitted game owns one isolated qualified UCI child.
   - Canonical streamed game state and independent legality validation gate every move submission.
-  - Provider configuration, scheduling, reservations, rate limiting, recovery, and persistence remain provider-owned.
+  - Provider configuration, scheduling, reservations, rate limiting, recovery, transport timing, and persistence remain provider-owned.
+  - Chess-thinking time remains the attached UCI engine's authority; the provider supplies authoritative clock facts and its measured transport reserve but does not invent or reinterpret timing-block/allocation strategy.
+  - After a legal authoritative bestmove is received, the provider adds no chess-thinking delay and submits as soon as state, queue, rate-limit, and transport policy permit.
+  - Extended adapters must distinguish versioned search-timing authority from an explicit Engine-owned timing-not-applicable outcome rather than assuming every move requires normal timing telemetry.
   - Credentials are external operator-owned files whose contents are never exposed to agents, tests, logs, artifacts, Manager, or Installer.
   - Component releases carry exact digests, SBOMs, test receipts, and signed provenance.
