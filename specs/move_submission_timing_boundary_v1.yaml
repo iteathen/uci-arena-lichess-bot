@@ -1,21 +1,23 @@
 meta:
   spec_id: move_submission_timing_boundary_v1
-  version: 2
+  version: 3
   status: active
   owner: lichess_transport
   purpose: >
     Define the Lichess provider boundary between chess-thinking time owned by the
-    attached UCI engine and transport/API timing owned by this provider.
+    attached UCI engine and transport/API timing owned by this provider, including
+    conditional API pacing that waits only when current provider policy actually
+    requires it.
 
 authority_relationship:
   broader_runtime_spec: specs/lichess_match_scheduler_v1.yaml
   rule: >
     This specification is the more-specific authority for move-time ownership,
-    clock handoff, transport reserve, post-bestmove delay, and extended timing
-    validation. If broader scheduler wording can be read as giving the provider
-    chess-time allocation or timing-strategy authority, this specification
-    controls. The scheduler remains authoritative for Lichess transport,
-    challenge/game lifecycle, API safety, and provider persistence.
+    clock handoff, transport reserve, post-bestmove delay, API pacing, and extended
+    timing validation. If broader scheduler wording can be read as giving the
+    provider chess-time allocation or timing-strategy authority, this
+    specification controls. The scheduler remains authoritative for Lichess
+    transport, challenge/game lifecycle, API safety, and provider persistence.
 
 ownership:
   attached_uci_engine:
@@ -56,12 +58,65 @@ clock_handoff:
     - "Do not hide transport reserve inside a generic chess-value modifier; retain its transport meaning and measurement provenance."
     - "Transport reserve may constrain safely available time but cannot command search behavior."
 
+transport_reserve_is_not_delay:
+  invariant: >
+    The learned/bootstrap transport reserve represents clock that the Engine should
+    avoid spending on chess search so that legality validation, request-queue
+    latency, dispatch, and acknowledgement can complete safely. It is a safety
+    reserve supplied before bestmove, not a minimum wall-clock delay imposed after
+    bestmove.
+  forbidden:
+    - sleep_for_transport_reserve_after_bestmove
+    - add_transport_reserve_to_engine_selected_thinking_time
+    - interpret_move_overhead_as_minimum_move_duration
+
+api_pacing_contract:
+  current_public_lichess_rules:
+    verified: '2026-08-22'
+    source: lichess_public_api_tips
+    rules:
+      - one_request_at_a_time
+      - after_http_429_wait_at_least_one_full_minute_before_resuming_api_usage
+    note: >
+      Current public Lichess guidance does not declare a normal fixed minimum
+      interval that must be added to every successful move submission. Rate limits
+      are varied and may change, so runtime response evidence remains authoritative
+      when a stronger cooldown is observed.
+  normal_success_path: >
+    If no active cooldown/quarantine/deadline or serialized predecessor request
+    blocks the move, dispatch as soon as current-state authority has been
+    revalidated. Do not invent a minimum per-move sleep merely because fast bot
+    play can sometimes encounter rate limiting.
+  active_policy_wait: >
+    When API policy does require waiting, represent that restriction as an
+    absolute not-before/cooldown deadline and wait only the positive remaining
+    interval `max(0, deadline - now)`. Time already elapsed while search,
+    validation, another serialized request, or other work was occurring counts
+    toward satisfying that restriction; do not restart the full interval at move
+    submission unless a new server response/policy event actually creates a new
+    deadline.
+  http_429: >
+    A 429 creates or extends the provider-owned global/API-class cooldown according
+    to current Lichess minimum guidance, any valid stronger server signal, and the
+    provider's bounded escalation policy. No request class may bypass a global
+    cooldown merely because a move is urgent. Once the absolute deadline is
+    satisfied, move-priority dispatch resumes without another artificial delay.
+  serialization: >
+    The one-request-at-a-time rule is satisfied by the provider-owned serialized
+    request coordinator. Move priority may select the next request after the
+    current request completes; priority does not create concurrent HTTP requests.
+  forbidden:
+    - sleep_fixed_minimum_after_every_successful_move
+    - add_rate_limit_delay_to_chess_thinking_time_when_no_api_restriction_exists
+    - restart_existing_cooldown_from_zero_when_move_becomes_ready
+    - allow_urgent_move_to_bypass_active_global_429_cooldown
+
 post_bestmove_rule:
   invariant: >
     After the provider receives a legal authoritative bestmove for the current
     game state, it adds no artificial chess-thinking delay. It submits as soon as
-    provider-owned state validation, serialized move priority, rate-limit/cooldown
-    policy, and transport safety permit.
+    provider-owned state validation, serialized move priority, current
+    rate-limit/cooldown policy, and transport safety permit.
   forbidden:
     - sleep_until_a_chess_timing_curve_deadline_after_bestmove
     - duplicate_engine_time_management
@@ -69,7 +124,8 @@ post_bestmove_rule:
   note: >
     API cooldown, queue serialization, authoritative-state revalidation, and
     transport safety are real provider constraints and are not artificial chess
-    delay.
+    delay. A real constraint delays only until that constraint is actually
+    satisfied.
 
 extended_timing_validation:
   rule: >
@@ -102,6 +158,7 @@ transport_evidence:
     - "Current transport-profile qualification and bootstrap reserve remain valid safety machinery."
     - "Transport evidence may change the reserve supplied to future games only through its declared completed-game evidence lifecycle."
     - "Transport samples must not be fed back as minimum useful search blocks or allocation-strategy evidence without an explicit external evidence contract that preserves their distinct meaning."
+    - "A transport reserve is not evidence for a mandatory post-bestmove delay."
 
 search_boundary:
   rules:
@@ -115,5 +172,10 @@ validation:
   - "An extended explicit timing-not-applicable move can be accepted without fabricating normal timing telemetry when the versioned Engine contract permits it."
   - "The provider never infers timing-not-applicable from book/tablebase availability alone."
   - "After legal bestmove receipt, no provider timer intentionally delays submission for chess-thinking purposes."
+  - "With no active API restriction and an idle serialized coordinator, a validated move dispatches without a fixed minimum pacing delay."
+  - "A 429-created one-minute cooldown blocks a queued move until the absolute deadline; advancing all but the final millisecond keeps it blocked and advancing the final millisecond permits dispatch without another minute."
+  - "Time elapsed before a move reaches the head of the queue reduces the remaining wait for an already-active absolute API deadline rather than restarting the interval."
+  - "Transport reserve changes Engine-safe spend through the declared overhead input and never becomes a post-bestmove sleep."
+  - "Move priority preserves one-request-at-a-time serialization rather than creating concurrent requests."
   - "Transport queue, cooldown, state-revalidation, and acknowledgement timing remain independently observable."
   - "Changing transport reserve cannot change Engine search-attention policy through any provider control path."
