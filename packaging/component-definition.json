@@ -21,6 +21,8 @@
     {"source": "lichess-scheduler.mjs", "target": "lichess-scheduler.mjs"},
     {"source": "lichess-store.mjs", "target": "lichess-store.mjs"},
     {"source": "process-instance-identity.mjs", "target": "process-instance-identity.mjs"},
+    {"source": "runtime-status-publisher.mjs", "target": "runtime-status-publisher.mjs"},
+    {"source": "runtime-status-worker.mjs", "target": "runtime-status-worker.mjs"},
     {"source": "installer-integration.mjs", "target": "installer-integration.mjs"},
     {"source": "linux-startup.mjs", "target": "linux-startup.mjs"},
     {"source": "live-acceptance.mjs", "target": "live-acceptance.mjs"},

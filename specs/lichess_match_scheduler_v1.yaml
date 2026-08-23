@@ -273,6 +273,46 @@ storage:
     - "Reservation consumption is one SQLite transaction so a concurrent Manager cancellation or replacement cannot decrement or delete a different reservation."
     - "Persisting API safety state never shortens cooldown or replaces a newer strike observation with stale state."
 
+transactional_game_activation_and_status_publication_2026_08_24:
+  status: active
+  owning_issue: https://github.com/iteathen/uci-arena-lichess-bot/issues/6
+  activation_owner:
+    owner: bot_controller_game_activation
+    rules:
+      - "The activation owner captures one exact slot generation before any transition and coordinates durable challenge acceptance, one-time reservation consumption, an activating game row, session construction, map publication, slot activation, execution, and cleanup."
+      - "A pending/preparing slot may be adopted only when its challenge id exactly matches the authoritative game/challenge correlation id. Opponent identity or pending-slot cardinality alone has no adoption authority."
+      - "The store transaction is idempotent by remote game id. Duplicate gameStart, reconnect, and startup reconciliation cannot consume a reservation twice or increment challenge acceptance twice."
+      - "The session object and its observed execution task are published coherently before execution may begin. Slot active authority is published only after durable activation succeeds."
+      - "A pre-publication failure removes only maps owned by that activation, marks the activating game with a bounded provider activation failure, releases only the captured slot generation, and closes its engine exactly once."
+      - "Session failure is persisted as provider_error without fabricating a Lichess result. Cleanup failures are bounded and attached to the primary diagnostic; they never replace or hide the session failure."
+      - "Cleanup is idempotent by activation generation and cannot release or close a later slot occupant."
+  durable_sequence:
+    transaction:
+      - challenge_acceptance_transition_if_present
+      - one_time_matching_reservation_consumption
+      - idempotent_activating_game_row
+    compensation:
+      - bounded_activation_failure_state_on_the_same_game_identity
+      - generation_owned_slot_and_engine_release
+    later_game_full:
+      - "Authoritative gameFull metadata and immutable runtime provenance fill only blank activating-row fields. Existing nonblank provenance is never replaced."
+  status_publisher:
+    owner: serialized_runtime_status_publisher
+    projection_source: bounded_in_memory_owner_snapshots
+    rules:
+      - "Heartbeat scheduling performs no SQLite query, opponent aggregation, transport-sample traversal, JSON serialization, synchronous file write, or rename on the Lichess/game-clock event loop."
+      - "The store maintains bounded cached control, opponent, and lease projections when their owning mutations commit. Transport sample/game counts and active game summaries are maintained incrementally."
+      - "One unrefed worker owns JSON serialization and exact atomic runtime.json publication. Publications are serialized and newer pending generations coalesce; a stale writer can never activate after a newer writer."
+      - "The worker uses the provider exact-file authority for a random private exclusive temporary file, bounded bytes, durable write, atomic same-directory activation, and identity-safe cleanup."
+      - "A status failure never changes gameplay authority. The next successfully published projection includes one bounded status-publication blocker and the last successful generation/time."
+      - "Initial and terminal status publication may be explicitly flushed; periodic and event-driven updates enqueue without delaying Lichess traffic. Shutdown drains the latest generation before terminating the worker."
+  performance:
+    - "Status scheduling records build time, activated write time, serialized byte count, coalesced generations, and failures without adding raw paths or output to runtime status."
+    - "The event-loop and move-submit acceptance compares status enabled and disabled under the same bounded workload and rejects a material p95 or p99 regression."
+  validation:
+    - "Fixtures cover failure at durable activation, session construction, map publication, immediate session completion, primary plus cleanup failure, duplicate events, and simultaneous same-opponent challenges."
+    - "Publisher fixtures cover overlap, coalescing, delayed completion, failure recovery, stale generation, temporary collision, write/activation failure, and shutdown drain."
+
 planned_provider_resilience_and_incidents_2026_08_23:
   status: approved_plan_not_runtime_authoritative
   suite_record: https://github.com/iteathen/uci-arena-installer/issues/166

@@ -13,6 +13,7 @@
     "check:vendor": "node tools/verify-vendor-lock.mjs",
     "check:boundary": "node tools/repository-boundary-check.mjs",
     "check": "npm run check:contracts && npm run check:github && npm run check:vendor && npm run check:boundary && npm test",
+    "benchmark:status": "node tools/benchmark-status-publication.mjs",
     "acceptance:live": "node live-acceptance.mjs"
   },
   "dependencies": {
