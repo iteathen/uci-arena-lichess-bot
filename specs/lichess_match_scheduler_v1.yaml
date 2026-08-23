@@ -938,6 +938,40 @@ protected_live_acceptance_2026_07_26:
     - "Mock process/event tests prove the confirmation gate, attempt cap, wall-clock cap, target-only completion requirement, and fail-closed rerun result."
     - "Tests never read a token file or contact Lichess."
 
+provider_exit_supervision_contract_2026_08_23:
+  status: active
+  owner: lichess_provider_startup_and_native_launcher
+  purpose: >
+    Recover one provider authority after an unexpected exit while preserving
+    bounded durable evidence that remains useful after the replacement process
+    starts.
+  windows:
+    registration: per_user_task_scheduler
+    multiple_instances: IgnoreNew
+    retry_interval_seconds: 60
+    rules:
+      - "The one provider-owned logon trigger repeats every minute without a duration. IgnoreNew prevents a repetition from creating a concurrent launcher while the prior instance is active."
+      - "RestartOnFailure retains the same one-minute interval as immediate scheduler evidence; logon repetition supplies indefinite recovery after the bounded native restart count."
+      - "Install and post-requalification reconciliation upgrade legacy owned task XML idempotently. They reject duplicate trigger, settings, repetition, multiple-instance, or restart policy blocks rather than guessing ownership."
+      - "Replacement and uninstall disable the task before terminating the exact owned launcher tree, so an intentional operator shutdown cannot enter the repetition loop."
+      - "The native GUI launcher records the exact child PID plus Windows creation-time identity, child start/exit UTC timestamps, the full unsigned 32-bit exit code, disposition, and restart eligibility. Exit zero is clean and expected; every nonzero child exit is unexpected and restart-eligible."
+      - "The receipt is a closed JSON document atomically replaced through one private same-directory temporary file after exact non-reparse directory admission. Receipt publication failure returns launcher code 71 so Task Scheduler state cannot silently claim the child result was durably recorded."
+      - "The receipt never contains arguments, commands, paths, environment values, credentials, headers, or child output."
+      - "Startup status validates the bounded receipt before projection and distinguishes active, restart_pending, clean_stopped, disabled, inactive, and unregistered supervision. A malformed, unsafe, oversized, or unwritable receipt remains a closed error code."
+  linux:
+    service_restart: on-failure
+    restart_seconds: 60
+    rules:
+      - "The existing systemd user service remains the sole Linux startup authority and never introduces a second watchdog."
+      - "Startup status distinguishes active, restart_pending, disabled, inactive, and unregistered service state."
+  provider_status_v3_compatibility:
+    - "The credential-free provider status operation retains its closed v3 schema and maps failed receipt publication, pending recovery, abnormal last exit, and enabled inactive registration to bounded blocker codes."
+    - "Additive supervision and incident summaries in the main status document require the separately planned v4 contract; this contract does not add undeclared v3 fields."
+  validation:
+    - "Tests cover 0xC0000409 as unsigned 3221226505, signed and hexadecimal Task Scheduler result parsing, strict receipt shape and disposition checks, legacy task upgrade idempotence, receipt-write failure, clean stop, pending restart, and active recovery."
+    - "The Windows native launcher is compiled with warnings enabled; its probe declares atomic receipt support, and an actual nonzero child exit produces the expected atomically published receipt without sensitive fields."
+    - "No validation reads a credential or contacts Lichess."
+
 manager_account_and_options_contract_2026_07_31:
   status: active
   owner: lichess_node_adapter_with_manager_typed_projection

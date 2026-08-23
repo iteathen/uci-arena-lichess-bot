@@ -83,6 +83,20 @@ test("provider status distinguishes inactive, disconnected, and ready states", (
   assert.equal(disabled.active, false);
   assert.equal(disabled.blockers.includes("startup_registration_disabled"), true);
 
+  const restartPending = providerStatusProjection({
+    startup: {
+      installed: true,
+      enabled: true,
+      active: false,
+      restartPending: true,
+      exitReceiptState: "failed",
+      lastUnexpectedExit: { child_exit_code: 3221226505 },
+    },
+  });
+  assert.equal(restartPending.blockers.includes("provider_restart_pending"), true);
+  assert.equal(restartPending.blockers.includes("provider_last_exit_unexpected"), true);
+  assert.equal(restartPending.blockers.includes("startup_exit_receipt_unavailable"), true);
+
   const runtime = {
     schema: "uci_arena_lichess_runtime_v3",
     pid: 42,

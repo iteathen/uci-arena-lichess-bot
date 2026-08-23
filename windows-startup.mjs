@@ -9,6 +9,7 @@ import {
   createExactTemporaryFileSync,
   ensureExactDirectorySync,
   publishExactJsonSync,
+  readExactJsonSync,
   removeExactPublishedFileSync,
 } from "./exact-file.mjs";
 
@@ -19,6 +20,9 @@ const ADAPTER = path.join(HERE, "lichess-adapter.mjs");
 export const STARTUP_TASK_NAME = "UCI Arena Lichess Adapter";
 export const NATIVE_LAUNCHER = path.join(HERE, "native", "lichess_adapter_launcher.exe");
 const STARTUP_FILE_LIMIT = 1024 * 1024;
+const EXIT_RECEIPT_FILE = "launcher-exit.json";
+const EXIT_RECEIPT_LIMIT = 16 * 1024;
+const EXIT_RECEIPT_WRITE_FAILURE = 71;
 
 function exactRegularFileExistsSync(filename, label) {
   const admission = classifyExactPathSync(filename, { label });
@@ -181,7 +185,7 @@ export function buildTaskXml(options, userSid) {
     <URI>\\${STARTUP_TASK_NAME}</URI>
   </RegistrationInfo>
   <Triggers>
-    <LogonTrigger><Enabled>true</Enabled><Delay>PT15S</Delay><UserId>${xmlEscape(userSid)}</UserId></LogonTrigger>
+    <LogonTrigger><Repetition><Interval>PT1M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition><Enabled>true</Enabled><Delay>PT15S</Delay><UserId>${xmlEscape(userSid)}</UserId></LogonTrigger>
   </Triggers>
   <Principals>
     <Principal id="Author"><UserId>${xmlEscape(userSid)}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal>
@@ -203,6 +207,34 @@ export function buildTaskXml(options, userSid) {
   </Actions>
 </Task>
 `;
+}
+
+function replaceOrInsertSingleton(block, name, replacement, insertAtEnd = false) {
+  const matches = [...block.matchAll(new RegExp(`<${name}(?:\\s[^>]*)?>[\\s\\S]*?<\\/${name}>`, "giu"))];
+  if (matches.length > 1) {
+    throw new Error(`Existing Lichess startup task has duplicate ${name} policy`);
+  }
+  if (matches.length === 1) return block.replace(matches[0][0], replacement);
+  return insertAtEnd
+    ? block.replace(/<\/[^>]+>$/u, `${replacement}$&`)
+    : block.replace(/^(<[^>]+>)/u, `$1${replacement}`);
+}
+
+export function ensureWindowsSupervisionXml(taskXml) {
+  const triggerMatches = [...taskXml.matchAll(/<LogonTrigger(?:\s[^>]*)?>[\s\S]*?<\/LogonTrigger>/giu)];
+  const settingsMatches = [...taskXml.matchAll(/<Settings(?:\s[^>]*)?>[\s\S]*?<\/Settings>/giu)];
+  if (triggerMatches.length !== 1 || settingsMatches.length !== 1) {
+    throw new Error("Existing Lichess startup task must contain one LogonTrigger and Settings block");
+  }
+  const repetition = "<Repetition><Interval>PT1M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>";
+  const instances = "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>";
+  const restart = "<RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure>";
+  const trigger = replaceOrInsertSingleton(triggerMatches[0][0], "Repetition", repetition);
+  let settings = replaceOrInsertSingleton(settingsMatches[0][0], "MultipleInstancesPolicy", instances);
+  settings = replaceOrInsertSingleton(settings, "RestartOnFailure", restart, true);
+  return taskXml
+    .replace(triggerMatches[0][0], trigger)
+    .replace(settingsMatches[0][0], settings);
 }
 
 export function reconcileWindowsTaskXml(taskXml, options) {
@@ -228,7 +260,7 @@ export function reconcileWindowsTaskXml(taskXml, options) {
     nativeLauncher: expectedLauncher,
   });
   const replacementExec = `<Exec><Command>${xmlEscape(action.command)}</Command><Arguments>${xmlEscape(action.arguments)}</Arguments><WorkingDirectory>${xmlEscape(action.workingDirectory)}</WorkingDirectory></Exec>`;
-  return taskXml.replace(existingExec, replacementExec);
+  return ensureWindowsSupervisionXml(taskXml.replace(existingExec, replacementExec));
 }
 
 async function currentUserSid() {
@@ -246,7 +278,140 @@ function missingTaskError(error) {
   return /cannot find|not found|does not exist|specified task name does not exist/iu.test(detail);
 }
 
-async function queryStartupTask(execute = execFileAsync) {
+export function parseWindowsTaskResult(value) {
+  const text = String(value ?? "").trim();
+  if (!/^(?:0x[0-9a-f]+|-?\d+)$/iu.test(text)) return null;
+  try {
+    let parsed = BigInt(text);
+    if (parsed < 0n) parsed += 0x1_0000_0000n;
+    return parsed >= 0n && parsed <= 0xffff_ffffn ? Number(parsed) : null;
+  } catch {
+    return null;
+  }
+}
+
+function requireExactKeys(value, keys, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).length !== keys.length
+      || keys.some((key) => !Object.hasOwn(value, key))) {
+    throw new Error(`${label} has an invalid shape`);
+  }
+}
+
+export function validateWindowsExitReceipt(value) {
+  const keys = [
+    "schema", "process_instance", "started_at", "exited_at", "child_exit_code",
+    "clean", "expected", "disposition", "restart_eligible",
+  ];
+  requireExactKeys(value, keys, "Lichess launcher exit receipt");
+  if (value.schema !== "uci_arena_lichess_exit_receipt_v1") {
+    throw new Error("Lichess launcher exit receipt schema is incompatible");
+  }
+  requireExactKeys(
+    value.process_instance,
+    ["schema", "platform", "pid", "creation_time_100ns"],
+    "Lichess launcher process instance",
+  );
+  const identity = value.process_instance;
+  if (identity.schema !== "uci_arena_process_instance_receipt_v1"
+      || identity.platform !== "win32"
+      || !Number.isSafeInteger(identity.pid) || identity.pid < 1 || identity.pid > 0xffff_ffff
+      || !/^[1-9]\d{0,19}$/u.test(identity.creation_time_100ns)) {
+    throw new Error("Lichess launcher process instance is invalid");
+  }
+  for (const [field, timestamp] of [["started_at", value.started_at], ["exited_at", value.exited_at]]) {
+    if (typeof timestamp !== "string"
+        || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(timestamp)
+        || !Number.isFinite(Date.parse(timestamp))) {
+      throw new Error(`Lichess launcher exit receipt ${field} is invalid`);
+    }
+  }
+  if (Date.parse(value.exited_at) < Date.parse(value.started_at)
+      || !Number.isSafeInteger(value.child_exit_code)
+      || value.child_exit_code < 0 || value.child_exit_code > 0xffff_ffff) {
+    throw new Error("Lichess launcher exit receipt chronology or code is invalid");
+  }
+  const clean = value.child_exit_code === 0;
+  if (typeof value.clean !== "boolean" || typeof value.expected !== "boolean"
+      || typeof value.restart_eligible !== "boolean"
+      || value.clean !== clean || value.expected !== clean
+      || value.restart_eligible !== !clean
+      || value.disposition !== (clean ? "clean_exit" : "unexpected_exit")) {
+    throw new Error("Lichess launcher exit receipt disposition is inconsistent");
+  }
+  return Object.freeze({
+    ...value,
+    process_instance: Object.freeze({ ...identity }),
+  });
+}
+
+export function loadWindowsExitReceipt(runtimeDir) {
+  if (!runtimeDir) return { state: "unavailable", receipt: null, error: null };
+  const target = path.join(path.resolve(runtimeDir), EXIT_RECEIPT_FILE);
+  try {
+    const admission = classifyExactPathSync(target, { label: "Lichess launcher exit receipt" });
+    if (admission.kind === "missing") {
+      return { state: "unavailable", receipt: null, error: null };
+    }
+    if (admission.kind !== "file") throw new Error("exit receipt is not an exact file");
+    const { value } = readExactJsonSync(target, {
+      maximumBytes: EXIT_RECEIPT_LIMIT,
+      label: "Lichess launcher exit receipt",
+    });
+    return { state: "ready", receipt: validateWindowsExitReceipt(value), error: null };
+  } catch (error) {
+    const code = typeof error?.code === "string" && /^[A-Z0-9_]{1,64}$/u.test(error.code)
+      ? error.code.toLowerCase()
+      : "exit_receipt_invalid";
+    return { state: "failed", receipt: null, error: code };
+  }
+}
+
+export function classifyWindowsStartup(task, exitReceipt = {
+  state: "unavailable", receipt: null, error: null,
+}) {
+  if (!task.installed) {
+    return {
+      ...task,
+      supervisionState: "unregistered",
+      restartPending: false,
+      exitReceiptState: exitReceipt.state,
+      exitReceiptError: exitReceipt.error,
+      lastExit: exitReceipt.receipt,
+      lastUnexpectedExit: exitReceipt.receipt?.disposition === "unexpected_exit"
+        ? exitReceipt.receipt
+        : null,
+    };
+  }
+  const lastResultCode = parseWindowsTaskResult(task.lastResult);
+  const receiptWriteFailed = lastResultCode === EXIT_RECEIPT_WRITE_FAILURE;
+  const lastUnexpectedExit = exitReceipt.receipt?.disposition === "unexpected_exit"
+    ? exitReceipt.receipt
+    : null;
+  const restartPending = task.enabled === true && !task.active
+    && (lastUnexpectedExit !== null || receiptWriteFailed);
+  const supervisionState = task.enabled === false
+    ? "disabled"
+    : task.active
+      ? "active"
+      : restartPending
+        ? "restart_pending"
+        : exitReceipt.receipt?.disposition === "clean_exit"
+          ? "clean_stopped"
+          : "inactive";
+  return {
+    ...task,
+    lastResultCode,
+    supervisionState,
+    restartPending,
+    exitReceiptState: receiptWriteFailed ? "failed" : exitReceipt.state,
+    exitReceiptError: receiptWriteFailed ? "exit_receipt_write_failed" : exitReceipt.error,
+    lastExit: exitReceipt.receipt,
+    lastUnexpectedExit,
+  };
+}
+
+async function queryStartupTask(execute = execFileAsync, runtimeDir) {
   try {
     const { stdout } = await execute("schtasks.exe", ["/Query", "/TN", STARTUP_TASK_NAME, "/FO", "LIST", "/V"], {
       windowsHide: true,
@@ -257,7 +422,7 @@ async function queryStartupTask(execute = execFileAsync) {
     const scheduledState = /Scheduled Task State:\s*([^\r\n]+)/i
       .exec(stdout)?.[1]?.trim() ?? "unknown";
     const lastResult = /Last Result:\s*([^\r\n]+)/i.exec(stdout)?.[1]?.trim() ?? "unknown";
-    return {
+    return classifyWindowsStartup({
       installed: true,
       active: /^running$/iu.test(status),
       enabled: /^enabled$/iu.test(scheduledState)
@@ -268,16 +433,21 @@ async function queryStartupTask(execute = execFileAsync) {
       taskName: STARTUP_TASK_NAME,
       taskStatus: status,
       lastResult,
-    };
+    }, loadWindowsExitReceipt(runtimeDir));
   } catch (error) {
-    if (missingTaskError(error)) return { installed: false, taskName: STARTUP_TASK_NAME };
+    if (missingTaskError(error)) {
+      return classifyWindowsStartup(
+        { installed: false, taskName: STARTUP_TASK_NAME },
+        loadWindowsExitReceipt(runtimeDir),
+      );
+    }
     throw new Error(`Could not query Lichess startup task: ${error.stderr?.trim() || error.message}`);
   }
 }
 
-export async function queryWindowsStartup() {
+export async function queryWindowsStartup({ runtimeDir, execute = execFileAsync } = {}) {
   requireWindows();
-  return queryStartupTask();
+  return queryStartupTask(execute, runtimeDir);
 }
 
 export async function recoverWindowsStartup({
@@ -636,7 +806,7 @@ export async function installWindowsStartup(options) {
     windowsHide: true,
     timeout: 10_000,
   });
-  return { ...(await queryWindowsStartup()), started: true, launcher };
+  return { ...(await queryWindowsStartup({ runtimeDir })), started: true, launcher };
 }
 
 export async function uninstallWindowsStartup(runtimeDir) {
