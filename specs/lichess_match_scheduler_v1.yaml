@@ -273,15 +273,159 @@ storage:
     - "Reservation consumption is one SQLite transaction so a concurrent Manager cancellation or replacement cannot decrement or delete a different reservation."
     - "Persisting API safety state never shortens cooldown or replaces a newer strike observation with stale state."
 
-future_game_archive_and_training_export_2026_08_09:
-  status: architecture_reserved_not_runtime_implemented
-  purpose: >
-    Preserve completed Lichess games once as provider-owned canonical records
-    so future Manager history/replay and optional Restaurant training ingestion
-    can consume typed projections without reading matches.sqlite or inventing a
-    second game-capture path.
+planned_provider_resilience_and_incidents_2026_08_23:
+  status: approved_plan_not_runtime_authoritative
+  suite_record: https://github.com/iteathen/uci-arena-installer/issues/166
+  owning_issues:
+    supervision: https://github.com/iteathen/uci-arena-lichess-bot/issues/40
+    incidents: https://github.com/iteathen/uci-arena-lichess-bot/issues/41
   activation:
-    - "This section reserves a compatibility contract only. It does not enable capture, export, retention, Manager operations, or training ingestion in the current provider."
+    - "This section records the approved target and test gates. It does not change the current launcher, startup definition, service/status contract, schemas, or release authority."
+    - "Runtime authority requires issue-owned spec-first implementation PRs, exact schemas, migrations where needed, cross-platform tests, and compatible component releases."
+  startup_authority:
+    rules:
+      - "Each platform retains exactly one provider-owned startup authority. Manager and Installer never add a second daemon supervisor."
+      - "Linux retains Restart=on-failure with a sixty-second restart delay."
+      - "Windows retains one hidden least-privilege logon task and IgnoreNew, and adds an indefinite one-minute repetition to the logon trigger so an unexpected exit is retried without admitting a concurrent duplicate."
+      - "A clean expected shutdown is not restart-eligible and never produces a crash incident or restart loop."
+  exit_receipt:
+    owner: provider_native_launcher
+    publication: bounded_exact_file_atomic_replacement
+    fields:
+      - process_instance_identity
+      - started_at
+      - exited_at
+      - child_exit_code
+      - expected_clean_or_unexpected_disposition
+      - restart_eligible
+    forbidden:
+      - command_lines
+      - executable_or_working_directory_paths
+      - arguments_or_environment
+      - credentials_or_headers
+      - raw_child_output
+    rules:
+      - "The receipt binds the exact supervised child instance and survives abrupt child termination so later status and incident reconciliation can explain the exit."
+      - "Publication is bounded and atomic; an invalid or stale receipt has no process-liveness authority."
+  incident_ledger:
+    prerequisite: "Provider issue 7 storage hardening and migration authority must land first."
+    owner: provider_runtime_store
+    retention: bounded_aggregated_ledger
+    stable_fields:
+      - provider_owned_code
+      - first_occurrence
+      - last_occurrence
+      - count
+      - severity
+      - active_or_resolved
+      - operation
+      - optional_http_status
+      - optional_retry_deadline
+      - optional_game_id
+      - sanitized_detail_maximum_512_characters
+    covered_failures:
+      - api
+      - scheduler
+      - stream
+      - startup
+      - engine_child
+      - storage
+      - status_publication
+    rules:
+      - "Repeated events aggregate by one stable provider-owned code without losing first/last occurrence, count, severity, and recovery state."
+      - "Sanitization rejects credentials, headers, command lines, paths, raw output, and arbitrary response documents before persistence or publication."
+      - "HTTP 429 and retry incidents expose the provider-owned cooldown deadline but recovery never clears, shortens, or bypasses it."
+  planned_contract:
+    service_contract_minor: "v1.1 additive incidents_list operation"
+    status_schema: "uci_arena_lichess_status_v4 adds supervision and active-incident summaries"
+    compatibility: "Manager continues accepting current status v3 and marks incident features unavailable when the declared operations are absent."
+    paging: "Stable provider-owned keyset cursor; bounded page and response schemas are defined by the implementation PR."
+  validation:
+    - "Unexpected Windows and Linux exits restart within two minutes, never produce duplicate authorities, and remain visible after recovery."
+    - "Clean shutdown neither produces a crash incident nor restarts."
+    - "HTTP 400 and 429, cooldown recovery, scheduler faults, stream failures, malformed error bodies, startup failures, engine-child failures, storage failures, and status-publication failures create bounded sanitized incidents."
+    - "Provider issue 31 remains closed; the new projection exposes its existing rate-limit authority and never reimplements or weakens cooldown behavior."
+    - "No fixture, receipt, incident, status, log, or diagnostic reads or exposes credential contents."
+
+planned_operational_game_archive_2026_08_23:
+  status: approved_plan_not_runtime_authoritative
+  suite_record: https://github.com/iteathen/uci-arena-installer/issues/166
+  owning_issue: https://github.com/iteathen/uci-arena-lichess-bot/issues/42
+  prerequisites:
+    - "Provider issue 6 lands atomic game activation and abnormal-termination behavior."
+    - "Provider issue 7 lands safe SQLite migration and storage authority."
+  activation:
+    - "This section activates architectural planning for the operational archive and Manager history/replay contract only. It does not change the current schema_version 5 store, operation catalog, schemas, retention behavior, or release authority."
+    - "Training export remains reserved by future_game_archive_and_training_export_2026_08_09 and receives no runtime authority from this section."
+  migration:
+    from_schema: 5
+    to_schema: 6
+    transaction: provider_owned_atomic_migration
+    games_additions:
+      - immutable_completion_cursor
+      - initial_position
+      - archive_completeness
+      - provider_release_identity
+      - optional_neutral_engine_component_identity
+    game_plies:
+      primary_key: [game_id, ply]
+      fields:
+        - uci_move
+        - before_fen
+        - after_fen
+        - actor
+        - available_clocks
+    provenance:
+      - "Every newly captured game binds provider component id, version, and manifest digest."
+      - "Engine component id, version, and manifest digest are bound only when explicitly supplied through the public component-manifest binding."
+      - "External UCI engines bind executable digest plus normalized UCI identities and explicitly omit component version rather than inventing it."
+      - "Historical component versions are never guessed. Unknown fields remain absent and visibly incomplete."
+  reconciliation:
+    - "Authoritative streamed plies append or reconcile idempotently by game id and ply. Reconnect, duplicate gameStart, duplicate stream records, and startup reconciliation cannot create a second logical game."
+    - "A takeback may rewrite only the nonterminal current line. Once authoritative terminal truth commits, the canonical replay and completion cursor are immutable."
+    - "Archive-complete replay is reconstructed from provider-authored before/after FEN snapshots; no downstream consumer fabricates positions."
+  historical_backfill:
+    source: provider_api_safety_coordinator
+    export_by_ids_maximum: 300
+    requested_evidence: [moves, clocks]
+    rules:
+      - "Attempt every known summary-only row in batches of at most 300 ids without blocking move submission, challenge readiness, or higher-priority API work."
+      - "Historical PGN and SAN pass through one bounded provider-owned parser and canonical legality reconstruction."
+      - "Conflict, unavailable remote data, invalid legality, or unsupported history remains summary_only with a bounded reason; the provider never invents moves, clocks, positions, or provenance."
+      - "Backfill obeys the existing global cooldown and request priority. It never shortens retry deadlines or competes with live move submission."
+  retention:
+    games: indefinite_in_v1
+    reporting: [total_games, incomplete_games, storage_bytes]
+    deferred: [automatic_pruning, training_export]
+  planned_operations:
+    games_list:
+      scopes: [live, history]
+      cursor: stable_keyset
+      maximum_page_size: 100
+    game_get:
+      maximum_plies: 2048
+      output: bounded_canonical_replay_and_provenance
+    rules:
+      - "Operations are credential-free, declared in the provider service contract, and return closed project-owned schemas."
+      - "Manager receives only bounded public records and never receives SQLite rows, paths, raw provider output, or credential material."
+  validation:
+    - "Crash, reconnect, takeback, duplicate-stream, and duplicate-start fixtures produce one canonical game and immutable terminal replay."
+    - "All known summary rows are attempted in bounded batches; unresolved rows and unknown historical versions remain visibly incomplete."
+    - "At 646 or more games, stable cursor pagination reaches every record without a full-store response or scan on the Manager request path."
+    - "Every archive-complete replay reconstructs from provider-authored FEN snapshots and never exceeds 2,048 plies."
+    - "Operational records are retained without automatic deletion in v1."
+    - "No archive, migration diagnostic, backfill request, or operation reads or exposes credential contents."
+
+future_game_archive_and_training_export_2026_08_09:
+  status: training_export_reserved_operational_archive_superseded_by_approved_plan_not_runtime_implemented
+  purpose: >
+    Reserve optional Restaurant training export derived from the provider-owned
+    canonical archive without reading matches.sqlite or inventing a second
+    game-capture path. The operational archive and Manager history/replay target
+    are now planned separately above; this section grants no training authority.
+  activation:
+    - "This section reserves a training-export compatibility contract only. It does not enable export or training ingestion in the current provider."
+    - "The approved operational archive plan above remains non-runtime-authoritative until its issue-owned implementation, migration, schemas, tests, and release land."
     - "Implementation requires a later explicit spec-first change, bounded storage policy, contract schemas, migration behavior, tests, and operator-visible controls."
   ownership:
     provider:
