@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   ox-alpha:
-    uses: iteathen/DevBridge/.github/workflows/ox-alpha-reusable.yml@753140ac186a5221650d5d313369d9896b95c0ac
+    uses: iteathen/DevBridge/.github/workflows/ox-alpha-reusable.yml@ad1dea49570dcc5476693cc1d4d4ac8fc511f8f3
     with:
       task: ${{ inputs.task }}
     secrets:
