@@ -57,6 +57,7 @@ export class SlotPool {
     slot.opponent = details.opponent?.toLocaleLowerCase() ?? null;
     slot.direction = details.direction ?? null;
     slot.challengeId = details.challengeId ? String(details.challengeId) : null;
+    slot.correlationToken = details.correlationToken ? String(details.correlationToken) : null;
     slot.gameId = null;
     slot.engine = null;
     slot.cancelRetryAt = null;
@@ -100,21 +101,45 @@ export class SlotPool {
   findPending(game) {
     const gameId = String(game?.gameId ?? game?.id ?? "");
     const challengeId = String(game?.challengeId ?? gameId);
-    const exact = this.slots.find((slot) => ["preparing", "pending", "cancelling"].includes(slot.state)
-      && (slot.challengeId === challengeId || slot.challengeId === gameId));
+    const exact = challengeId ? this.slots.find((slot) => (
+      ["preparing", "pending", "cancelling"].includes(slot.state)
+      && slot.challengeId !== null
+      && (slot.challengeId === challengeId || slot.challengeId === gameId)
+    )) : null;
     if (exact) return exact;
     const opponent = String(game?.opponent?.id ?? game?.opponent?.username
       ?? game?.opponent?.name ?? "").toLocaleLowerCase();
-    if (opponent) {
-      return this.slots
-        .filter((slot) => ["preparing", "pending", "cancelling"].includes(slot.state)
-          && slot.opponent === opponent)
-        .sort((left, right) => left.createdAt - right.createdAt)[0] ?? null;
-    }
-    const pending = this.slots.filter((slot) => (
-      ["preparing", "pending", "cancelling"].includes(slot.state)
+    if (!opponent) return null;
+    const reserved = this.slots.filter((slot) => (
+      slot.state === "preparing"
+      && slot.direction === "outbound"
+      && slot.opponent === opponent
+      && typeof slot.correlationToken === "string"
+      && slot.correlationToken.length > 0
     ));
-    return pending.length === 1 ? pending[0] : null;
+    return reserved.length === 1 ? reserved[0] : null;
+  }
+
+  correlatesGame(slot, game) {
+    if (!slot || !this.slots.includes(slot)) return false;
+    const gameId = String(game?.gameId ?? game?.id ?? "");
+    const challengeId = String(game?.challengeId ?? gameId);
+    if (slot.challengeId !== null
+        && (slot.challengeId === challengeId || slot.challengeId === gameId)) return true;
+    const opponent = String(game?.opponent?.id ?? game?.opponent?.username
+      ?? game?.opponent?.name ?? "").toLocaleLowerCase();
+    return slot.state === "preparing"
+      && slot.direction === "outbound"
+      && slot.opponent === opponent
+      && typeof slot.correlationToken === "string"
+      && slot.correlationToken.length > 0
+      && this.slots.filter((candidate) => (
+        candidate.state === "preparing"
+        && candidate.direction === "outbound"
+        && candidate.opponent === opponent
+        && typeof candidate.correlationToken === "string"
+        && candidate.correlationToken.length > 0
+      )).length === 1;
   }
 
   findChallenge(challengeId) {
@@ -165,6 +190,7 @@ export class SlotPool {
       slot.opponent = null;
       slot.direction = null;
       slot.challengeId = null;
+      slot.correlationToken = null;
       slot.gameId = null;
       slot.cancelRetryAt = null;
       slot.cancelAttempts = null;

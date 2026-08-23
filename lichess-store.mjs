@@ -67,6 +67,9 @@ export class LichessStore {
     this.db = new DatabaseSync(this.filePath);
     this.db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
     this.migrate();
+    this.statusControl = this.readControlProjection();
+    this.statusOpponents = this.queryOpponentStats();
+    this.statusApiLeases = new Map(this.listApiLeaseRows().map((lease) => [lease.authority_key, lease]));
   }
 
   migrate() {
@@ -296,6 +299,82 @@ export class LichessStore {
     this.db.close();
   }
 
+  readControlProjection(now = Date.now()) {
+    this.db.prepare("DELETE FROM reservations WHERE expires_at <= ?").run(now);
+    return {
+      paused: Boolean(this.db.prepare("SELECT paused FROM scheduler_control WHERE id=1").get()?.paused),
+      reservation: this.db.prepare(`
+        SELECT opponent, games_remaining, expires_at, created_at
+        FROM reservations WHERE id=1
+      `).get() ?? null,
+    };
+  }
+
+  refreshControlProjection(now = Date.now()) {
+    this.statusControl = this.readControlProjection(now);
+    return this.statusControl;
+  }
+
+  queryOpponentStats(limit = 100) {
+    return this.db.prepare(`
+      SELECT g.opponent, COALESCE(MAX(o.rating), 0) AS rating,
+        COUNT(*) AS games,
+        SUM(CASE WHEN g.result='win' THEN 1 ELSE 0 END) AS wins,
+        SUM(CASE WHEN g.result='draw' THEN 1 ELSE 0 END) AS draws,
+        SUM(CASE WHEN g.result='loss' THEN 1 ELSE 0 END) AS losses,
+        COALESCE(MAX(o.accepts), 0) AS accepts,
+        COALESCE(MAX(o.declines), 0) AS declines,
+        COALESCE(MAX(o.timeouts), 0) AS timeouts,
+        MAX(g.finished_at) AS last_game_at
+      FROM games g LEFT JOIN opponents o ON o.username=g.opponent
+      WHERE g.finished_at>0 GROUP BY g.opponent ORDER BY games DESC, g.opponent LIMIT ?
+    `).all(integer(limit, 100));
+  }
+
+  refreshOpponentProjection() {
+    this.statusOpponents = this.queryOpponentStats();
+    return this.statusOpponents;
+  }
+
+  listApiLeaseRows() {
+    return this.db.prepare(`
+      SELECT authority_key, owner_id, pid, process_identity_json, heartbeat_at, expires_at
+      FROM api_client_leases ORDER BY authority_key
+    `).all();
+  }
+
+  refreshApiLeaseProjection(key) {
+    const normalized = authorityKey(key);
+    const lease = this.apiLease(normalized);
+    if (lease) this.statusApiLeases.set(normalized, lease);
+    else this.statusApiLeases.delete(normalized);
+    return lease;
+  }
+
+  apiLeaseSnapshot(key) {
+    const lease = this.statusApiLeases.get(authorityKey(key));
+    return lease ? { ...lease } : null;
+  }
+
+  activeApiLeaseCount(now = Date.now()) {
+    let count = 0;
+    for (const lease of this.statusApiLeases.values()) {
+      if (lease.expires_at > now) count += 1;
+    }
+    return count;
+  }
+
+  statusProjection(now = Date.now()) {
+    const reservation = this.statusControl.reservation;
+    return {
+      control: {
+        paused: this.statusControl.paused,
+        reservation: reservation && reservation.expires_at > now ? { ...reservation } : null,
+      },
+      opponents: this.statusOpponents.map((opponent) => ({ ...opponent })),
+    };
+  }
+
   addOwner(username, now = Date.now()) {
     const normalized = normalizedUsername(username);
     this.db.prepare("INSERT OR IGNORE INTO owners(username, created_at) VALUES(?, ?)").run(normalized, now);
@@ -330,7 +409,8 @@ export class LichessStore {
         games_remaining=excluded.games_remaining, expires_at=excluded.expires_at,
         created_at=excluded.created_at
     `).run(normalized, count, expiresAt, now);
-    return this.getReservation(now);
+    this.refreshControlProjection(now);
+    return this.statusControl.reservation ? { ...this.statusControl.reservation } : null;
   }
 
   getReservation(now = Date.now()) {
@@ -348,6 +428,7 @@ export class LichessStore {
       `).get();
       if (!reservation || reservation.opponent !== normalized) {
         this.db.exec("COMMIT");
+        this.refreshControlProjection(now);
         return false;
       }
       if (reservation.games_remaining <= 1) {
@@ -359,6 +440,7 @@ export class LichessStore {
         `).run(normalized);
       }
       this.db.exec("COMMIT");
+      this.refreshControlProjection(now);
       return true;
     } catch (error) {
       if (this.db.isTransaction) this.db.exec("ROLLBACK");
@@ -367,17 +449,21 @@ export class LichessStore {
   }
 
   cancelReservation() {
-    return this.db.prepare("DELETE FROM reservations WHERE id=1").run().changes > 0;
+    const removed = this.db.prepare("DELETE FROM reservations WHERE id=1").run().changes > 0;
+    this.refreshControlProjection();
+    return removed;
   }
 
   setPaused(paused, now = Date.now()) {
     this.db.prepare("UPDATE scheduler_control SET paused=?, updated_at=? WHERE id=1").run(paused ? 1 : 0, now);
+    this.refreshControlProjection(now);
   }
 
   control(now = Date.now()) {
+    const control = this.refreshControlProjection(now);
     return {
-      paused: Boolean(this.db.prepare("SELECT paused FROM scheduler_control WHERE id=1").get()?.paused),
-      reservation: this.getReservation(now),
+      paused: control.paused,
+      reservation: control.reservation ? { ...control.reservation } : null,
     };
   }
 
@@ -599,7 +685,7 @@ export class LichessStore {
       this.db.exec("ROLLBACK");
       throw error;
     }
-    return this.apiLease(normalized);
+    return this.refreshApiLeaseProjection(normalized);
   }
 
   heartbeatApiLease(
@@ -630,12 +716,15 @@ export class LichessStore {
       error.code = "LICHESS_API_LEASE_LOST";
       throw error;
     }
-    return this.apiLease(normalized);
+    return this.refreshApiLeaseProjection(normalized);
   }
 
   releaseApiLease(key, ownerId) {
-    return this.db.prepare("DELETE FROM api_client_leases WHERE authority_key=? AND owner_id=?")
-      .run(authorityKey(key), String(ownerId)).changes > 0;
+    const normalized = authorityKey(key);
+    const removed = this.db.prepare("DELETE FROM api_client_leases WHERE authority_key=? AND owner_id=?")
+      .run(normalized, String(ownerId)).changes > 0;
+    this.refreshApiLeaseProjection(normalized);
+    return removed;
   }
 
   apiLease(key) {
@@ -668,6 +757,7 @@ export class LichessStore {
         upsert.run(username, String(bot.title ?? "BOT"), botRating(bot), now, now);
       }
       this.db.exec("COMMIT");
+      this.refreshOpponentProjection();
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;
@@ -720,6 +810,98 @@ export class LichessStore {
       this.db.prepare("UPDATE opponents SET cooldown_until=MAX(cooldown_until, ?) WHERE username=?")
         .run(now + cooldownMinutes * 60_000, row.opponent);
     }
+    this.refreshOpponentProjection();
+  }
+
+  beginGameActivation({ id, opponent, audience, challengeId = null }, now = Date.now()) {
+    const gameId = String(id ?? "");
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(gameId)) throw new Error("Game activation id is invalid");
+    const normalizedOpponent = normalizedUsername(opponent);
+    if (audience !== "human" && audience !== "bot") {
+      throw new Error(`Unsupported game activation audience: ${audience}`);
+    }
+    const correlationId = challengeId ? String(challengeId) : null;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const existing = this.db.prepare(`
+        SELECT status FROM games WHERE game_id=?
+      `).get(gameId);
+      const inserted = !existing;
+      if (inserted) {
+        this.db.prepare(`
+          INSERT INTO games(game_id, opponent, audience, status, started_at)
+          VALUES(?, ?, ?, 'activating', ?)
+        `).run(gameId, normalizedOpponent, audience, now);
+      } else if (existing.status === "activation_failed") {
+        this.db.prepare(`
+          UPDATE games SET status='activating', finished_at=0
+          WHERE game_id=? AND status='activation_failed'
+        `).run(gameId);
+      }
+
+      let challengeTransitioned = false;
+      if (correlationId) {
+        const challenge = this.db.prepare(`
+          SELECT opponent, status FROM challenge_attempts WHERE challenge_id=?
+        `).get(correlationId);
+        if (challenge && challenge.status !== "accepted") {
+          this.db.prepare(`
+            UPDATE challenge_attempts SET status='accepted', updated_at=? WHERE challenge_id=?
+          `).run(now, correlationId);
+          this.db.prepare("UPDATE opponents SET accepts=accepts+1 WHERE username=?")
+            .run(challenge.opponent);
+          challengeTransitioned = true;
+        }
+      }
+
+      let reservationConsumed = false;
+      if (inserted && audience === "human") {
+        this.db.prepare("DELETE FROM reservations WHERE expires_at <= ?").run(now);
+        const reservation = this.db.prepare(`
+          SELECT opponent, games_remaining FROM reservations WHERE id=1
+        `).get();
+        if (reservation?.opponent === normalizedOpponent) {
+          if (reservation.games_remaining <= 1) {
+            this.db.prepare("DELETE FROM reservations WHERE id=1 AND opponent=?")
+              .run(normalizedOpponent);
+          } else {
+            this.db.prepare(`
+              UPDATE reservations SET games_remaining=games_remaining-1
+              WHERE id=1 AND opponent=?
+            `).run(normalizedOpponent);
+          }
+          reservationConsumed = true;
+        }
+      }
+      this.db.exec("COMMIT");
+      this.refreshControlProjection(now);
+      if (challengeTransitioned) this.refreshOpponentProjection();
+      return Object.freeze({
+        gameId,
+        inserted,
+        reservationConsumed,
+        challengeTransitioned,
+      });
+    } catch (error) {
+      if (this.db.isTransaction) this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  failGameActivation(id, now = Date.now()) {
+    this.db.prepare(`
+      UPDATE games SET status='activation_failed', finished_at=?
+      WHERE game_id=? AND status='activating'
+    `).run(now, String(id));
+    this.refreshOpponentProjection();
+  }
+
+  markGameProviderError(id, now = Date.now()) {
+    this.db.prepare(`
+      UPDATE games SET status='provider_error', finished_at=?
+      WHERE game_id=? AND finished_at=0
+    `).run(now, String(id));
+    this.refreshOpponentProjection();
   }
 
   beginGame(game) {
@@ -738,7 +920,40 @@ export class LichessStore {
       ON CONFLICT(game_id) DO UPDATE SET opponent=excluded.opponent,
         audience=excluded.audience, color=excluded.color, rated=excluded.rated,
         speed=excluded.speed, clock_limit=excluded.clock_limit,
-        clock_increment=excluded.clock_increment
+        clock_increment=excluded.clock_increment,
+        status=CASE WHEN games.status IN ('activating', 'activation_failed')
+          THEN 'started' ELSE games.status END,
+        finished_at=CASE WHEN games.status='activation_failed' THEN 0 ELSE games.finished_at END,
+        engine_build_fingerprint=CASE WHEN games.engine_build_fingerprint=''
+          THEN excluded.engine_build_fingerprint ELSE games.engine_build_fingerprint END,
+        model_fingerprint=CASE WHEN games.model_fingerprint=''
+          THEN excluded.model_fingerprint ELSE games.model_fingerprint END,
+        provider_fingerprint=CASE WHEN games.provider_fingerprint=''
+          THEN excluded.provider_fingerprint ELSE games.provider_fingerprint END,
+        book_identity=CASE WHEN games.book_identity=''
+          THEN excluded.book_identity ELSE games.book_identity END,
+        model_id=CASE WHEN games.model_id='' THEN excluded.model_id ELSE games.model_id END,
+        checkpoint_hash=CASE WHEN games.checkpoint_hash=''
+          THEN excluded.checkpoint_hash ELSE games.checkpoint_hash END,
+        adapter_id=CASE WHEN games.adapter_id='' THEN excluded.adapter_id ELSE games.adapter_id END,
+        provider=CASE WHEN games.provider='' THEN excluded.provider ELSE games.provider END,
+        hardware_driver_fingerprint=CASE WHEN games.hardware_driver_fingerprint=''
+          THEN excluded.hardware_driver_fingerprint ELSE games.hardware_driver_fingerprint END,
+        onnx_runtime_version=CASE WHEN games.onnx_runtime_version=''
+          THEN excluded.onnx_runtime_version ELSE games.onnx_runtime_version END,
+        search_core=CASE WHEN games.search_core='' THEN excluded.search_core ELSE games.search_core END,
+        threads=CASE WHEN games.threads=0 THEN excluded.threads ELSE games.threads END,
+        root_workers=CASE WHEN games.root_workers=0 THEN excluded.root_workers ELSE games.root_workers END,
+        split_depth=CASE WHEN games.split_depth=0 THEN excluded.split_depth ELSE games.split_depth END,
+        batch_size=CASE WHEN games.batch_size=0 THEN excluded.batch_size ELSE games.batch_size END,
+        batch_wait_us=CASE WHEN games.batch_wait_us=0
+          THEN excluded.batch_wait_us ELSE games.batch_wait_us END,
+        time_profile_identity=CASE WHEN games.time_profile_identity=''
+          THEN excluded.time_profile_identity ELSE games.time_profile_identity END,
+        runtime_provenance_sha256=CASE WHEN games.runtime_provenance_sha256=''
+          THEN excluded.runtime_provenance_sha256 ELSE games.runtime_provenance_sha256 END,
+        runtime_provenance_json=CASE WHEN games.runtime_provenance_sha256=''
+          THEN excluded.runtime_provenance_json ELSE games.runtime_provenance_json END
     `).run(String(game.id), normalizedUsername(game.opponent), game.audience, game.color,
       game.rated ? 1 : 0, game.speed ?? "", integer(game.clockLimit), integer(game.clockIncrement),
       now, game.engineBuildFingerprint ?? "", game.modelFingerprint ?? "",
@@ -894,6 +1109,7 @@ export class LichessStore {
     this.db.prepare(`UPDATE games SET status=?, result=?, winner=?, plies=?, finished_at=?
       WHERE game_id=? AND finished_at=0`)
       .run(status ?? "unknown", result ?? "", winner ?? "", integer(plies), finishedAt, String(id));
+    this.refreshOpponentProjection();
   }
 
   opponentAudience(username) {
@@ -904,19 +1120,9 @@ export class LichessStore {
   }
 
   opponentStats(limit = 100) {
-    return this.db.prepare(`
-      SELECT g.opponent, COALESCE(MAX(o.rating), 0) AS rating,
-        COUNT(*) AS games,
-        SUM(CASE WHEN g.result='win' THEN 1 ELSE 0 END) AS wins,
-        SUM(CASE WHEN g.result='draw' THEN 1 ELSE 0 END) AS draws,
-        SUM(CASE WHEN g.result='loss' THEN 1 ELSE 0 END) AS losses,
-        COALESCE(MAX(o.accepts), 0) AS accepts,
-        COALESCE(MAX(o.declines), 0) AS declines,
-        COALESCE(MAX(o.timeouts), 0) AS timeouts,
-        MAX(g.finished_at) AS last_game_at
-      FROM games g LEFT JOIN opponents o ON o.username=g.opponent
-      WHERE g.finished_at>0 GROUP BY g.opponent ORDER BY games DESC, g.opponent LIMIT ?
-    `).all(integer(limit, 100));
+    const opponents = this.queryOpponentStats(limit);
+    if (integer(limit, 100) === 100) this.statusOpponents = opponents;
+    return opponents;
   }
 
   status(now = Date.now()) {

@@ -53,6 +53,7 @@ import {
   probeProcessInstance,
   processInstanceIsCurrent,
 } from "./process-instance-identity.mjs";
+import { RuntimeStatusPublisher } from "./runtime-status-publisher.mjs";
 import {
   admitExactDirectorySync,
   appendExactFileSync,
@@ -372,6 +373,7 @@ export class TransportProfileTracker {
     }
     const accepted = loadTransportProfile(profilePath, this.now());
     if (accepted.qualified) this.effectiveReserveMs = accepted.reserveMs;
+    this.statusGameCount = new Set(this.samples.map((sample) => sample.game_id)).size;
   }
 
   record(gameId, timing) {
@@ -422,6 +424,7 @@ export class TransportProfileTracker {
     this.samples = this.samples.slice(-TRANSPORT_PROFILE_MAXIMUM_SAMPLES);
     const values = this.samples.map((sample) => sample.bestmove_to_ack_ms);
     const gameCount = new Set(this.samples.map((sample) => sample.game_id)).size;
+    this.statusGameCount = gameCount;
     const p50 = percentile(values, 0.50);
     const p95 = percentile(values, 0.95);
     const p99 = percentile(values, 0.99);
@@ -455,6 +458,13 @@ export class TransportProfileTracker {
       p99_ms: p99,
     });
     return this.effectiveReserveMs;
+  }
+
+  statusSnapshot() {
+    return Object.freeze({
+      sample_count: this.samples.length,
+      game_count: this.statusGameCount,
+    });
   }
 }
 
@@ -4975,6 +4985,8 @@ export class BotController {
     now = Date.now,
     reconnectDelay = delay,
     apiLeaseStatus = null,
+    sessionFactory = null,
+    statusPublisher = null,
   }) {
     this.client = client;
     this.config = { ...config, timing: { ...DEFAULT_TIMING_CONFIG, ...(config.timing ?? {}) } };
@@ -4990,10 +5002,14 @@ export class BotController {
       ? apiLeaseStatus
       : () => ({
         state: "unknown",
-        active_clients: this.store.activeApiLeases().length,
+        active_clients: this.store.activeApiLeaseCount(this.now()),
         heartbeat_at: null,
         expires_at: null,
       });
+    this.sessionFactory = typeof sessionFactory === "function"
+      ? sessionFactory
+      : (options) => new GameSession(options);
+    this.statusPublisher = statusPublisher;
     this.slots = new SlotPool(config.capacity);
     this.engineStarts = new AsyncSemaphore(config.capacity.startup_parallelism);
     this.activeGames = new Map();
@@ -5023,6 +5039,13 @@ export class BotController {
     this.config.timing.initial_transport_reserve_ms = this.transportProfile.effectiveReserveMs;
   }
 
+  runtimeStatusPublisher() {
+    if (!this.statusPublisher) {
+      this.statusPublisher = new RuntimeStatusPublisher(this.runtimeDir, { now: this.now });
+    }
+    return this.statusPublisher;
+  }
+
   async run(opponent) {
     this.manualOpponent = opponent ? normalizedUsername(opponent) : null;
     this.needsReconciliation = true;
@@ -5034,7 +5057,7 @@ export class BotController {
     }, 5_000);
     let reconnectDelay = 1_000;
     try {
-      await this.writeStatus();
+      await this.writeStatus({ flush: true });
       while (!this.signal.aborted) {
         try {
           if (this.needsReconciliation) {
@@ -5086,7 +5109,11 @@ export class BotController {
       await Promise.allSettled(this.activeGames.values());
       await this.slots.drainAll();
       await schedulerTask;
-      await this.writeStatus();
+      try {
+        await this.writeStatus({ flush: true });
+      } finally {
+        await this.statusPublisher?.close();
+      }
     }
   }
 
@@ -5307,6 +5334,7 @@ export class BotController {
 
   async startGameOnce(game, suppliedSlot, gameId) {
     let slot = suppliedSlot ?? this.slots.findPending(game);
+    const adoptingExistingSlot = Boolean(slot);
     if (!slot) {
       const opponent = normalizedUsername(game?.opponent?.id ?? game?.opponent?.username ?? game?.opponent?.name);
       const audience = await this.resolveAudience(opponent, game?.opponent?.title);
@@ -5315,47 +5343,160 @@ export class BotController {
       await this.prepareSlot(slot);
     }
     const slotGeneration = slot.generation;
-    this.slots.active(slot, gameId, slotGeneration);
-    if (slot.challengeId) this.store.updateChallenge(slot.challengeId, "accepted");
-    if (slot.audience === "human" && slot.opponent) this.store.consumeReservation(slot.opponent);
-    const session = new GameSession({
-      client: this.client,
-      config: this.config,
-      account: this.account,
-      gameId,
-      signal: this.signal,
-      slot,
-      store: this.store,
-      foregroundCoordinator: this.foregroundCoordinator,
-      onMoveTransportSample: (id, timing) => this.transportProfile.record(id, timing),
-    });
-    this.gameSessions.set(gameId, session);
-    const task = session.run().catch((error) => {
-      log("game_error", { game_id: gameId, message: error.message });
-    }).finally(async () => {
-      this.activeGames.delete(gameId);
-      this.gameSessions.delete(gameId);
-      await this.slots.release(slot, slotGeneration);
-      let reserve = this.transportProfile.effectiveReserveMs;
-      if (session.finished) {
-        reserve = this.transportProfile.finishGame(gameId);
-      } else {
-        this.transportProfile.abandonGame(gameId);
+    let activationPersisted = false;
+    let session = null;
+    let rejectExecution = null;
+    let observedTask = null;
+    const cleanupDiagnostics = [];
+    try {
+      if (adoptingExistingSlot && !this.slots.correlatesGame(slot, game)) {
+        throw new Error(`Started game ${gameId} has no exact slot correlation`);
       }
+      this.slots.requireOwned(
+        slot,
+        ["preparing", "pending", "cancelling"],
+        slotGeneration,
+      );
+      session = this.sessionFactory({
+        client: this.client,
+        config: this.config,
+        account: this.account,
+        gameId,
+        signal: this.signal,
+        slot,
+        store: this.store,
+        foregroundCoordinator: this.foregroundCoordinator,
+        onMoveTransportSample: (id, timing) => this.transportProfile.record(id, timing),
+      });
+      if (!session || typeof session.run !== "function") {
+        throw new Error("Game session factory returned an invalid session");
+      }
+      this.store.beginGameActivation({
+        id: gameId,
+        opponent: slot.opponent,
+        audience: slot.audience,
+        challengeId: slot.challengeId,
+      }, this.now());
+      activationPersisted = true;
+
+      let releaseExecution;
+      const executionGate = new Promise((resolve, reject) => {
+        releaseExecution = resolve;
+        rejectExecution = reject;
+      });
+      const execution = executionGate.then(() => this.runActivatedGame({
+        gameId,
+        slot,
+        slotGeneration,
+        session,
+        task: () => observedTask,
+      }));
+      observedTask = execution.catch((error) => {
+        log("game_task_observer_error", {
+          game_id: gameId,
+          message: String(error?.message ?? "game task failed").slice(0, 512),
+        });
+        return { status: "failed" };
+      });
+      this.gameSessions.set(gameId, session);
+      this.activeGames.set(gameId, observedTask);
+      this.slots.active(slot, gameId, slotGeneration);
+      releaseExecution();
+      log("game_started", {
+        game_id: gameId,
+        audience: slot.audience,
+        opponent: slot.opponent,
+        slot_id: slot.id,
+        slot_generation: slotGeneration,
+      });
+      return slot;
+    } catch (primaryError) {
+      rejectExecution?.(primaryError);
+      if (this.activeGames.get(gameId) === observedTask) this.activeGames.delete(gameId);
+      if (this.gameSessions.get(gameId) === session) this.gameSessions.delete(gameId);
+      if (activationPersisted) {
+        try {
+          this.store.failGameActivation(gameId, this.now());
+        } catch (error) {
+          cleanupDiagnostics.push(`store:${String(error?.message ?? "failure").slice(0, 256)}`);
+        }
+      }
+      try {
+        await this.slots.release(slot, slotGeneration);
+      } catch (error) {
+        cleanupDiagnostics.push(`slot:${String(error?.message ?? "failure").slice(0, 256)}`);
+      }
+      if (cleanupDiagnostics.length > 0) {
+        primaryError.cleanupDiagnostics = cleanupDiagnostics;
+      }
+      throw primaryError;
+    }
+  }
+
+  async runActivatedGame({ gameId, slot, slotGeneration, session, task }) {
+    let primaryError = null;
+    const cleanupDiagnostics = [];
+    try {
+      await session.run();
+    } catch (error) {
+      primaryError = error;
+      try {
+        this.store.markGameProviderError(gameId, this.now());
+      } catch (storeError) {
+        cleanupDiagnostics.push(`store:${String(storeError?.message ?? "failure").slice(0, 256)}`);
+      }
+    }
+    if (this.activeGames.get(gameId) === task()) this.activeGames.delete(gameId);
+    if (this.gameSessions.get(gameId) === session) this.gameSessions.delete(gameId);
+    try {
+      await this.slots.release(slot, slotGeneration);
+    } catch (error) {
+      cleanupDiagnostics.push(`slot:${String(error?.message ?? "failure").slice(0, 256)}`);
+    }
+    try {
+      let reserve = this.transportProfile.effectiveReserveMs;
+      if (session.finished) reserve = this.transportProfile.finishGame(gameId);
+      else this.transportProfile.abandonGame(gameId);
       this.config.timing.initial_transport_reserve_ms = reserve;
       this.config.engine.timing.initial_transport_reserve_ms = reserve;
+    } catch (error) {
+      cleanupDiagnostics.push(`transport:${String(error?.message ?? "failure").slice(0, 256)}`);
+    }
+    try {
       await this.writeStatus();
-    });
-    this.activeGames.set(gameId, task);
-    log("game_started", { game_id: gameId, audience: slot.audience, opponent: slot.opponent, slot_id: slot.id });
-    return slot;
+    } catch (error) {
+      cleanupDiagnostics.push(`status:${String(error?.message ?? "failure").slice(0, 256)}`);
+    }
+    if (primaryError) {
+      log("game_error", {
+        game_id: gameId,
+        message: String(primaryError.message ?? "game session failed").slice(0, 512),
+        cleanup_diagnostics: cleanupDiagnostics.slice(0, 8),
+      });
+      return { status: "failed", error: primaryError };
+    }
+    if (cleanupDiagnostics.length > 0) {
+      try {
+        this.store.markGameProviderError(gameId, this.now());
+      } catch {}
+      log("game_cleanup_error", {
+        game_id: gameId,
+        cleanup_diagnostics: cleanupDiagnostics.slice(0, 8),
+      });
+      return { status: "cleanup_failed" };
+    }
+    return { status: "completed" };
   }
 
   async createChallenge(opponent, audience) {
     const normalized = normalizedUsername(opponent);
     if (normalized === this.account || this.slots.hasOpponent(normalized)
         || this.client.isRequestClassBlocked?.("challenge_create")) return false;
-    const slot = this.slots.acquire(audience, { opponent: normalized, direction: "outbound" });
+    const slot = this.slots.acquire(audience, {
+      opponent: normalized,
+      direction: "outbound",
+      correlationToken: randomUUID(),
+    });
     if (!slot) return false;
     const slotGeneration = slot.generation;
     try {
@@ -5614,13 +5755,17 @@ export class BotController {
     }
   }
 
-  async writeStatus() {
+  async writeStatus({ flush = false } = {}) {
+    const buildStartedAt = performance.now();
+    const publisher = this.runtimeStatusPublisher();
+    const storeProjection = this.store.statusProjection(this.now());
+    const transportProjection = this.transportProfile.statusSnapshot();
     const streamLifecycle = this.streamConnected
       ? "connected"
       : this.client.isCoolingDown?.()
         ? "waiting_for_api_cooldown"
         : this.streamLifecycle;
-    writeRuntimeMetadata(this.runtimeDir, {
+    const snapshot = {
       schema: "uci_arena_lichess_runtime_v3",
       adapter_id: "lichess_node_adapter_v2",
       pid: process.pid,
@@ -5641,10 +5786,10 @@ export class BotController {
         reconciliation_pending: this.needsReconciliation,
         fault: this.schedulerFault,
         request_queue: this.client.requestQueue?.snapshot?.() ?? null,
-        ...this.store.control(),
+        ...storeProjection.control,
       },
       api_safety: {
-        ...this.client.safetySnapshot(),
+        ...(this.client.safetySnapshot?.() ?? {}),
         client_lease: this.apiLeaseStatus(),
       },
       timing: {
@@ -5653,10 +5798,8 @@ export class BotController {
         transport_reserve_ms: this.config.timing.initial_transport_reserve_ms,
         bootstrap_transport_reserve_ms: this.config.timing.bootstrap_transport_reserve_ms,
         transport_profile_path: this.transportProfile.profilePath,
-        transport_profile_sample_count: this.transportProfile.samples.length,
-        transport_profile_game_count: new Set(
-          this.transportProfile.samples.map((sample) => sample.game_id),
-        ).size,
+        transport_profile_sample_count: transportProjection.sample_count,
+        transport_profile_game_count: transportProjection.game_count,
         active_foreground_games: Array.from(this.foregroundCoordinator.activeGames),
         games: Array.from(this.gameSessions.values(), (session) => ({
           game_id: session.gameId,
@@ -5665,7 +5808,7 @@ export class BotController {
           ponder_predicted: Boolean(session.pendingOwnMove?.predictedMove),
         })),
       },
-      opponents: this.store.opponentStats(),
+      opponents: storeProjection.opponents,
       engine: this.config.engine.executable,
       engine_adapter: this.config.engine.adapter,
       deployment_bundle: this.config.engine.selected_bundle,
@@ -5678,7 +5821,14 @@ export class BotController {
       model_id: this.config.engine.qualification_profile?.model_id ?? null,
       provider: this.config.engine.qualification_profile?.provider ?? null,
       updated_at: new Date().toISOString(),
-    });
+      status_publication: {
+        ...publisher.health(),
+        build_duration_ms: Math.round((performance.now() - buildStartedAt) * 1_000) / 1_000,
+      },
+    };
+    const generation = publisher.schedule(snapshot);
+    if (flush) await publisher.flush(generation);
+    return generation;
   }
 }
 
@@ -5692,7 +5842,7 @@ function writeRuntimeMetadata(runtimeDir, metadata) {
 }
 
 function localApiLeaseStatus(store, authority, leaseOwner, processIdentity, now = Date.now()) {
-  const lease = store.apiLease(authority);
+  const lease = store.apiLeaseSnapshot(authority);
   const active = lease && Number(lease.expires_at) > now;
   const authoritative = active
     && lease.owner_id === leaseOwner
