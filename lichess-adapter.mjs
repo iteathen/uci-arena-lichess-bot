@@ -6018,6 +6018,16 @@ export function providerStatusProjection({
   }
   if (schedulerFault) blockers.push("scheduler_fault");
   if (startupError) blockers.push("startup_status_unavailable");
+  if (startup?.exitReceiptState === "failed") blockers.push("startup_exit_receipt_unavailable");
+  if (startup?.restartPending === true) blockers.push("provider_restart_pending");
+  if (startup?.lastUnexpectedExit && startup?.active === false) {
+    blockers.push("provider_last_exit_unexpected");
+  }
+  if (startup?.installed === true && startup?.active === false
+      && startup?.enabled !== false && startup?.enabled !== "disabled"
+      && startup?.restartPending !== true) {
+    blockers.push("startup_registration_inactive");
+  }
   if (startup?.installed === true &&
       (startup.enabled === false || startup.enabled === "disabled")) {
     blockers.push("startup_registration_disabled");
@@ -6751,7 +6761,7 @@ export async function main(argv = process.argv.slice(2)) {
     let startupError = null;
     try {
       startup = process.platform === "win32"
-        ? await queryWindowsStartup()
+        ? await queryWindowsStartup({ runtimeDir })
         : process.platform === "linux"
           ? await queryLinuxStartup()
           : { installed: false };
@@ -6768,7 +6778,7 @@ export async function main(argv = process.argv.slice(2)) {
   }
   if (options.command === "startup" && options.action === "status") {
     const startup = process.platform === "win32"
-      ? await queryWindowsStartup()
+      ? await queryWindowsStartup({ runtimeDir })
       : process.platform === "linux"
         ? await queryLinuxStartup()
         : (() => { throw new Error(`Unsupported startup platform: ${process.platform}`); })();
@@ -6777,7 +6787,7 @@ export async function main(argv = process.argv.slice(2)) {
   }
   if (options.command === "startup" && options.action === "recover") {
     const startup = process.platform === "win32"
-      ? await recoverWindowsStartup()
+      ? await recoverWindowsStartup({ query: () => queryWindowsStartup({ runtimeDir }) })
       : process.platform === "linux"
         ? await recoverLinuxStartup()
         : (() => { throw new Error(`Unsupported startup platform: ${process.platform}`); })();
@@ -6837,7 +6847,7 @@ export async function main(argv = process.argv.slice(2)) {
     }
     if (requalification) {
       const startup = process.platform === "win32"
-        ? await queryWindowsStartup()
+        ? await queryWindowsStartup({ runtimeDir })
         : process.platform === "linux"
           ? await queryLinuxStartup()
           : (() => { throw new Error(`Unsupported startup platform: ${process.platform}`); })();
@@ -6960,7 +6970,7 @@ export async function main(argv = process.argv.slice(2)) {
       );
       failureStage = "startup_safety";
       const startup = process.platform === "win32"
-        ? await queryWindowsStartup()
+        ? await queryWindowsStartup({ runtimeDir })
         : process.platform === "linux"
           ? await queryLinuxStartup()
           : { installed: false };
