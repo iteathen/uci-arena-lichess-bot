@@ -1,21 +1,19 @@
 import { createHash } from "node:crypto";
-import { mkdirSync } from "node:fs";
-import path from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import {
   sameProcessInstance,
   validProcessIdentity,
 } from "./process-instance-identity.mjs";
+import {
+  LichessStorageError,
+  LICHESS_STORAGE_SCHEMA_VERSION,
+  openLichessStorage,
+  safeInteger,
+} from "./lichess-storage.mjs";
 
 function normalizedUsername(value) {
   const username = String(value ?? "").trim().toLocaleLowerCase();
   if (!/^[a-z0-9_-]{1,32}$/.test(username)) throw new Error(`Invalid Lichess username: ${value}`);
   return username;
-}
-
-function integer(value, fallback = 0) {
-  const parsed = Number(value);
-  return Number.isSafeInteger(parsed) ? parsed : fallback;
 }
 
 function authorityKey(value) {
@@ -26,8 +24,8 @@ function authorityKey(value) {
 
 function botRating(bot) {
   for (const key of ["blitz", "rapid", "classical", "bullet"]) {
-    const rating = Number(bot?.perfs?.[key]?.rating);
-    if (Number.isFinite(rating)) return Math.round(rating);
+    const rating = bot?.perfs?.[key]?.rating;
+    if (typeof rating === "number" && Number.isFinite(rating)) return Math.round(rating);
   }
   return 0;
 }
@@ -61,248 +59,48 @@ function exactIdentity(value, label) {
 }
 
 export class LichessStore {
-  constructor(filePath) {
-    this.filePath = path.resolve(filePath);
-    mkdirSync(path.dirname(this.filePath), { recursive: true });
-    this.db = new DatabaseSync(this.filePath);
-    this.db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
-    this.migrate();
+  constructor(filePath, storageOptions = {}) {
+    this.storage = openLichessStorage(filePath, storageOptions);
+    this.filePath = this.storage.filePath;
+    this.db = this.storage.db;
     this.statusControl = this.readControlProjection();
     this.statusOpponents = this.queryOpponentStats();
     this.statusApiLeases = new Map(this.listApiLeaseRows().map((lease) => [lease.authority_key, lease]));
   }
 
-  migrate() {
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS schema_meta(version INTEGER NOT NULL);
-      INSERT INTO schema_meta(version) SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM schema_meta);
-      CREATE TABLE IF NOT EXISTS owners(
-        username TEXT PRIMARY KEY,
-        created_at INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS reservations(
-        id INTEGER PRIMARY KEY CHECK(id=1),
-        opponent TEXT NOT NULL,
-        games_remaining INTEGER NOT NULL CHECK(games_remaining > 0),
-        expires_at INTEGER NOT NULL,
-        created_at INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS scheduler_control(
-        id INTEGER PRIMARY KEY CHECK(id=1),
-        paused INTEGER NOT NULL DEFAULT 0,
-        updated_at INTEGER NOT NULL
-      );
-      INSERT OR IGNORE INTO scheduler_control(id, paused, updated_at) VALUES(1, 0, 0);
-      CREATE TABLE IF NOT EXISTS opponents(
-        username TEXT PRIMARY KEY,
-        title TEXT NOT NULL DEFAULT '',
-        rating INTEGER NOT NULL DEFAULT 0,
-        online INTEGER NOT NULL DEFAULT 0,
-        first_seen_at INTEGER NOT NULL,
-        last_seen_at INTEGER NOT NULL,
-        cooldown_until INTEGER NOT NULL DEFAULT 0,
-        accepts INTEGER NOT NULL DEFAULT 0,
-        declines INTEGER NOT NULL DEFAULT 0,
-        timeouts INTEGER NOT NULL DEFAULT 0
-      );
-      CREATE TABLE IF NOT EXISTS challenge_attempts(
-        challenge_id TEXT PRIMARY KEY,
-        opponent TEXT NOT NULL,
-        audience TEXT NOT NULL,
-        direction TEXT NOT NULL,
-        status TEXT NOT NULL,
-        color TEXT NOT NULL DEFAULT 'random',
-        clock_limit INTEGER NOT NULL DEFAULT 0,
-        clock_increment INTEGER NOT NULL DEFAULT 0,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS games(
-        game_id TEXT PRIMARY KEY,
-        opponent TEXT NOT NULL DEFAULT '',
-        audience TEXT NOT NULL,
-        color TEXT NOT NULL DEFAULT '',
-        rated INTEGER NOT NULL DEFAULT 0,
-        speed TEXT NOT NULL DEFAULT '',
-        clock_limit INTEGER NOT NULL DEFAULT 0,
-        clock_increment INTEGER NOT NULL DEFAULT 0,
-        status TEXT NOT NULL DEFAULT 'started',
-        result TEXT NOT NULL DEFAULT '',
-        winner TEXT NOT NULL DEFAULT '',
-        plies INTEGER NOT NULL DEFAULT 0,
-        started_at INTEGER NOT NULL,
-        finished_at INTEGER NOT NULL DEFAULT 0,
-        engine_build_fingerprint TEXT NOT NULL DEFAULT '',
-        model_fingerprint TEXT NOT NULL DEFAULT '',
-        provider_fingerprint TEXT NOT NULL DEFAULT '',
-        book_identity TEXT NOT NULL DEFAULT ''
-      );
-      CREATE INDEX IF NOT EXISTS games_opponent_finished ON games(opponent, finished_at);
-      CREATE INDEX IF NOT EXISTS challenges_opponent_created ON challenge_attempts(opponent, created_at);
-    `);
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS api_safety_state(
-        authority_key TEXT PRIMARY KEY,
-        cooldown_until INTEGER NOT NULL DEFAULT 0,
-        strike_count INTEGER NOT NULL DEFAULT 0,
-        last_429_at INTEGER NOT NULL DEFAULT 0,
-        last_retry_after_ms INTEGER NOT NULL DEFAULT 0,
-        challenge_blocked_until INTEGER NOT NULL DEFAULT 0,
-        challenge_strike_count INTEGER NOT NULL DEFAULT 0,
-        challenge_last_429_at INTEGER NOT NULL DEFAULT 0,
-        challenge_recovered_at INTEGER NOT NULL DEFAULT 0,
-        challenge_half_open INTEGER NOT NULL DEFAULT 0,
-        updated_at INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS api_client_leases(
-        authority_key TEXT PRIMARY KEY,
-        owner_id TEXT NOT NULL,
-        pid INTEGER NOT NULL,
-        process_identity_json TEXT NOT NULL DEFAULT '',
-        heartbeat_at INTEGER NOT NULL,
-        expires_at INTEGER NOT NULL
-      );
-    `);
-    const legacyRateLimit = this.db.prepare(`
-      SELECT 1 AS present FROM sqlite_master
-      WHERE type='table' AND name='api_rate_limit'
-    `).get();
-    if (legacyRateLimit) {
-      this.db.exec(`
-        INSERT INTO api_safety_state(
-          authority_key, cooldown_until, strike_count, last_429_at,
-          last_retry_after_ms, updated_at
-        )
-        SELECT '*', blocked_until, consecutive_429, last_429_at, 0,
-          MAX(last_429_at, blocked_until)
-        FROM api_rate_limit WHERE id=1
-        ON CONFLICT(authority_key) DO UPDATE SET
-          cooldown_until=MAX(api_safety_state.cooldown_until, excluded.cooldown_until),
-          strike_count=CASE
-            WHEN excluded.last_429_at >= api_safety_state.last_429_at
-              THEN excluded.strike_count
-            ELSE api_safety_state.strike_count
-          END,
-          last_429_at=MAX(api_safety_state.last_429_at, excluded.last_429_at),
-          updated_at=MAX(api_safety_state.updated_at, excluded.updated_at);
-      `);
-    }
-    let version = this.db.prepare("SELECT version FROM schema_meta LIMIT 1").get()?.version;
-    if (version === 1) {
-      this.db.exec("BEGIN IMMEDIATE");
-      try {
-        this.db.exec(`
-          CREATE TABLE IF NOT EXISTS api_safety_state(
-            authority_key TEXT PRIMARY KEY,
-            cooldown_until INTEGER NOT NULL DEFAULT 0,
-            strike_count INTEGER NOT NULL DEFAULT 0,
-            last_429_at INTEGER NOT NULL DEFAULT 0,
-            last_retry_after_ms INTEGER NOT NULL DEFAULT 0,
-            challenge_blocked_until INTEGER NOT NULL DEFAULT 0,
-            challenge_strike_count INTEGER NOT NULL DEFAULT 0,
-            challenge_last_429_at INTEGER NOT NULL DEFAULT 0,
-            challenge_recovered_at INTEGER NOT NULL DEFAULT 0,
-            challenge_half_open INTEGER NOT NULL DEFAULT 0,
-            updated_at INTEGER NOT NULL
-          );
-          CREATE TABLE IF NOT EXISTS api_client_leases(
-            authority_key TEXT PRIMARY KEY,
-            owner_id TEXT NOT NULL,
-            pid INTEGER NOT NULL,
-            process_identity_json TEXT NOT NULL DEFAULT '',
-            heartbeat_at INTEGER NOT NULL,
-            expires_at INTEGER NOT NULL
-          );
-          UPDATE schema_meta SET version=2;
-        `);
-        this.db.exec("COMMIT");
-      } catch (error) {
-        this.db.exec("ROLLBACK");
-        throw error;
-      }
-      version = 2;
-    }
-    if (version === 2) {
-      this.db.exec("BEGIN IMMEDIATE");
-      try {
-        this.db.exec(`
-          ALTER TABLE games ADD COLUMN model_id TEXT NOT NULL DEFAULT '';
-          ALTER TABLE games ADD COLUMN checkpoint_hash TEXT NOT NULL DEFAULT '';
-          ALTER TABLE games ADD COLUMN adapter_id TEXT NOT NULL DEFAULT '';
-          ALTER TABLE games ADD COLUMN provider TEXT NOT NULL DEFAULT '';
-          ALTER TABLE games ADD COLUMN hardware_driver_fingerprint TEXT NOT NULL DEFAULT '';
-          ALTER TABLE games ADD COLUMN onnx_runtime_version TEXT NOT NULL DEFAULT '';
-          ALTER TABLE games ADD COLUMN search_core TEXT NOT NULL DEFAULT '';
-          ALTER TABLE games ADD COLUMN threads INTEGER NOT NULL DEFAULT 0;
-          ALTER TABLE games ADD COLUMN root_workers INTEGER NOT NULL DEFAULT 0;
-          ALTER TABLE games ADD COLUMN split_depth INTEGER NOT NULL DEFAULT 0;
-          ALTER TABLE games ADD COLUMN batch_size INTEGER NOT NULL DEFAULT 0;
-          ALTER TABLE games ADD COLUMN batch_wait_us INTEGER NOT NULL DEFAULT 0;
-          ALTER TABLE games ADD COLUMN time_profile_identity TEXT NOT NULL DEFAULT '';
-          ALTER TABLE games ADD COLUMN runtime_provenance_sha256 TEXT NOT NULL DEFAULT '';
-          ALTER TABLE games ADD COLUMN runtime_provenance_json TEXT NOT NULL DEFAULT '{}';
-          UPDATE schema_meta SET version=3;
-        `);
-        this.db.exec("COMMIT");
-      } catch (error) {
-        this.db.exec("ROLLBACK");
-        throw error;
-      }
-      version = 3;
-    }
-    if (version === 3) {
-      this.db.exec("BEGIN IMMEDIATE");
-      try {
-        const columns = new Set(this.db.prepare("PRAGMA table_info(api_client_leases)").all()
-          .map((column) => column.name));
-        if (!columns.has("process_identity_json")) {
-          this.db.exec(
-            "ALTER TABLE api_client_leases ADD COLUMN process_identity_json TEXT NOT NULL DEFAULT ''",
-          );
-        }
-        this.db.exec("UPDATE schema_meta SET version=4");
-        this.db.exec("COMMIT");
-      } catch (error) {
-        this.db.exec("ROLLBACK");
-        throw error;
-      }
-      version = 4;
-    }
-    if (version === 4) {
-      this.db.exec("BEGIN IMMEDIATE");
-      try {
-        const columns = new Set(this.db.prepare("PRAGMA table_info(api_safety_state)").all()
-          .map((column) => column.name));
-        for (const [name, definition] of [
-          ["challenge_blocked_until", "INTEGER NOT NULL DEFAULT 0"],
-          ["challenge_strike_count", "INTEGER NOT NULL DEFAULT 0"],
-          ["challenge_last_429_at", "INTEGER NOT NULL DEFAULT 0"],
-          ["challenge_recovered_at", "INTEGER NOT NULL DEFAULT 0"],
-          ["challenge_half_open", "INTEGER NOT NULL DEFAULT 0"],
-        ]) {
-          if (!columns.has(name)) {
-            this.db.exec(`ALTER TABLE api_safety_state ADD COLUMN ${name} ${definition}`);
-          }
-        }
-        this.db.exec("UPDATE schema_meta SET version=5");
-        this.db.exec("COMMIT");
-      } catch (error) {
-        this.db.exec("ROLLBACK");
-        throw error;
-      }
-      version = 5;
-    }
-    if (version !== 5) throw new Error(`Unsupported Lichess store schema version: ${version}`);
+  close() {
+    this.storage.close();
   }
 
-  close() {
-    this.db.close();
+  withImmediateTransaction(operation) {
+    this.storage.assertPaths();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = operation();
+      this.db.exec("COMMIT");
+      this.storage.assertPaths();
+      return result;
+    } catch (error) {
+      if (this.db.isTransaction) {
+        try {
+          this.db.exec("ROLLBACK");
+        } catch {
+          throw new LichessStorageError(
+            "LICHESS_STORAGE_OPERATION_AND_ROLLBACK_FAILED",
+            "Lichess storage operation and rollback both failed",
+            error,
+          );
+        }
+      }
+      throw error;
+    }
   }
 
   readControlProjection(now = Date.now()) {
+    now = safeInteger(now, "control projection timestamp");
     this.db.prepare("DELETE FROM reservations WHERE expires_at <= ?").run(now);
     return {
-      paused: Boolean(this.db.prepare("SELECT paused FROM scheduler_control WHERE id=1").get()?.paused),
+      paused: this.db.prepare("SELECT paused FROM scheduler_control WHERE id=1").get()?.paused === 1,
       reservation: this.db.prepare(`
         SELECT opponent, games_remaining, expires_at, created_at
         FROM reservations WHERE id=1
@@ -328,7 +126,7 @@ export class LichessStore {
         MAX(g.finished_at) AS last_game_at
       FROM games g LEFT JOIN opponents o ON o.username=g.opponent
       WHERE g.finished_at>0 GROUP BY g.opponent ORDER BY games DESC, g.opponent LIMIT ?
-    `).all(integer(limit, 100));
+    `).all(safeInteger(limit, "opponent statistics limit", { minimum: 1, maximum: 100 }));
   }
 
   refreshOpponentProjection() {
@@ -365,6 +163,7 @@ export class LichessStore {
   }
 
   statusProjection(now = Date.now()) {
+    now = safeInteger(now, "status projection timestamp");
     const reservation = this.statusControl.reservation;
     return {
       control: {
@@ -376,6 +175,7 @@ export class LichessStore {
   }
 
   addOwner(username, now = Date.now()) {
+    now = safeInteger(now, "owner creation timestamp");
     const normalized = normalizedUsername(username);
     this.db.prepare("INSERT OR IGNORE INTO owners(username, created_at) VALUES(?, ?)").run(normalized, now);
     return normalized;
@@ -395,9 +195,10 @@ export class LichessStore {
   }
 
   reserve(opponent, games, minutes, now = Date.now()) {
+    now = safeInteger(now, "reservation creation timestamp");
     const normalized = normalizedUsername(opponent);
-    const count = integer(games);
-    const duration = integer(minutes);
+    const count = safeInteger(games, "reservation games", { minimum: 1, maximum: 100 });
+    const duration = safeInteger(minutes, "reservation minutes", { minimum: 1, maximum: 1_440 });
     if (count < 1 || count > 100) throw new Error("Reservation games must be in 1..100");
     if (duration < 1 || duration > 1440) throw new Error("Reservation minutes must be in 1..1440");
     if (!this.isOwner(normalized)) throw new Error(`Reservation opponent is not a registered owner: ${normalized}`);
@@ -414,21 +215,20 @@ export class LichessStore {
   }
 
   getReservation(now = Date.now()) {
+    now = safeInteger(now, "reservation lookup timestamp");
     this.db.prepare("DELETE FROM reservations WHERE expires_at <= ?").run(now);
     return this.db.prepare("SELECT opponent, games_remaining, expires_at, created_at FROM reservations WHERE id=1").get() ?? null;
   }
 
   consumeReservation(opponent, now = Date.now()) {
+    now = safeInteger(now, "reservation consumption timestamp");
     const normalized = normalizedUsername(opponent);
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
+    const consumed = this.withImmediateTransaction(() => {
       this.db.prepare("DELETE FROM reservations WHERE expires_at <= ?").run(now);
       const reservation = this.db.prepare(`
         SELECT opponent, games_remaining FROM reservations WHERE id=1
       `).get();
       if (!reservation || reservation.opponent !== normalized) {
-        this.db.exec("COMMIT");
-        this.refreshControlProjection(now);
         return false;
       }
       if (reservation.games_remaining <= 1) {
@@ -439,13 +239,10 @@ export class LichessStore {
           WHERE id=1 AND opponent=?
         `).run(normalized);
       }
-      this.db.exec("COMMIT");
-      this.refreshControlProjection(now);
       return true;
-    } catch (error) {
-      if (this.db.isTransaction) this.db.exec("ROLLBACK");
-      throw error;
-    }
+    });
+    this.refreshControlProjection(now);
+    return consumed;
   }
 
   cancelReservation() {
@@ -455,6 +252,8 @@ export class LichessStore {
   }
 
   setPaused(paused, now = Date.now()) {
+    if (typeof paused !== "boolean") throw new Error("Scheduler paused state must be boolean");
+    now = safeInteger(now, "scheduler control timestamp");
     this.db.prepare("UPDATE scheduler_control SET paused=?, updated_at=? WHERE id=1").run(paused ? 1 : 0, now);
     this.refreshControlProjection(now);
   }
@@ -484,13 +283,13 @@ export class LichessStore {
     }, null);
     const challengeLatest = rows.reduce((selected, row) => {
       const eventAt = Math.max(
-        Number(row.challenge_last_429_at),
-        Number(row.challenge_recovered_at),
+        row.challenge_last_429_at,
+        row.challenge_recovered_at,
       );
       const selectedAt = selected
         ? Math.max(
-          Number(selected.challenge_last_429_at),
-          Number(selected.challenge_recovered_at),
+          selected.challenge_last_429_at,
+          selected.challenge_recovered_at,
         )
         : -1;
       if (!selected || eventAt > selectedAt) return row;
@@ -498,17 +297,17 @@ export class LichessStore {
       return selected;
     }, null);
     return latest ? {
-      cooldownUntil: Math.max(...rows.map((row) => Number(row.cooldown_until))),
-      strikeCount: Number(latest.strike_count),
-      last429At: Number(latest.last_429_at),
-      lastRetryAfterMs: Number(latest.last_retry_after_ms),
+      cooldownUntil: Math.max(...rows.map((row) => row.cooldown_until)),
+      strikeCount: latest.strike_count,
+      last429At: latest.last_429_at,
+      lastRetryAfterMs: latest.last_retry_after_ms,
       challengeBlockedUntil: Math.max(
-        ...rows.map((row) => Number(row.challenge_blocked_until)),
+        ...rows.map((row) => row.challenge_blocked_until),
       ),
-      challengeStrikeCount: Number(challengeLatest.challenge_strike_count),
-      challengeLast429At: Number(challengeLatest.challenge_last_429_at),
-      challengeRecoveredAt: Number(challengeLatest.challenge_recovered_at),
-      challengeHalfOpen: Boolean(challengeLatest.challenge_half_open),
+      challengeStrikeCount: challengeLatest.challenge_strike_count,
+      challengeLast429At: challengeLatest.challenge_last_429_at,
+      challengeRecoveredAt: challengeLatest.challenge_recovered_at,
+      challengeHalfOpen: challengeLatest.challenge_half_open === 1,
     } : {
       cooldownUntil: 0,
       strikeCount: 0,
@@ -523,6 +322,7 @@ export class LichessStore {
   }
 
   saveApiSafetyState(key, state, now = Date.now()) {
+    now = safeInteger(now, "API safety update timestamp");
     const normalized = authorityKey(key);
     this.db.prepare(`
       INSERT INTO api_safety_state(authority_key, cooldown_until, strike_count,
@@ -597,14 +397,14 @@ export class LichessStore {
         updated_at=MAX(api_safety_state.updated_at, excluded.updated_at)
     `).run(
       normalized,
-      integer(state.cooldownUntil),
-      integer(state.strikeCount),
-      integer(state.last429At),
-      integer(state.lastRetryAfterMs),
-      integer(state.challengeBlockedUntil),
-      integer(state.challengeStrikeCount),
-      integer(state.challengeLast429At),
-      integer(state.challengeRecoveredAt),
+      safeInteger(state.cooldownUntil, "API cooldown deadline", { defaultValue: 0 }),
+      safeInteger(state.strikeCount, "API strike count", { defaultValue: 0 }),
+      safeInteger(state.last429At, "API last 429 timestamp", { defaultValue: 0 }),
+      safeInteger(state.lastRetryAfterMs, "API retry duration", { defaultValue: 0 }),
+      safeInteger(state.challengeBlockedUntil, "challenge cooldown deadline", { defaultValue: 0 }),
+      safeInteger(state.challengeStrikeCount, "challenge strike count", { defaultValue: 0 }),
+      safeInteger(state.challengeLast429At, "challenge last 429 timestamp", { defaultValue: 0 }),
+      safeInteger(state.challengeRecoveredAt, "challenge recovery timestamp", { defaultValue: 0 }),
       state.challengeHalfOpen ? 1 : 0,
       now,
     );
@@ -636,17 +436,22 @@ export class LichessStore {
     if (ownerProcessProbe !== null && typeof ownerProcessProbe !== "function") {
       throw new Error("Lichess API lease owner process probe is invalid");
     }
-    if (!validProcessIdentity(processIdentity, Number(pid))) {
+    const leasePid = safeInteger(pid, "API lease pid", { minimum: 1, maximum: 2_147_483_647 });
+    const leaseTtl = safeInteger(ttlMs, "API lease TTL", {
+      minimum: 1,
+      maximum: 86_400_000,
+      defaultValue: 60_000,
+    });
+    if (!validProcessIdentity(processIdentity, leasePid)) {
       throw new Error("Lichess API lease process identity is invalid");
     }
-    const expiresAt = now + integer(ttlMs, 60_000);
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
+    const expiresAt = safeInteger(now, "API lease timestamp") + leaseTtl;
+    this.withImmediateTransaction(() => {
       const active = this.db.prepare(`
         SELECT owner_id, pid, process_identity_json, heartbeat_at, expires_at
         FROM api_client_leases WHERE authority_key=?
       `).get(normalized);
-      const activePid = Number(active?.pid);
+      const activePid = active?.pid ?? null;
       let ownerProvenReplaced = false;
       if (active && active.owner_id !== owner && Number.isSafeInteger(activePid)
           && activePid > 0 && ownerProcessProbe) {
@@ -663,13 +468,13 @@ export class LichessStore {
           || (recordedIdentity && observed.state === "present"
             && !sameProcessInstance(recordedIdentity, observed.identity));
       }
-      if (active && active.owner_id !== owner && Number(active.expires_at) > now
+      if (active && active.owner_id !== owner && active.expires_at > now
           && !ownerProvenReplaced) {
         const error = new Error(
           `Lichess API authority ${normalized} is already leased by process ${active.pid}`,
         );
         error.code = "LICHESS_API_LEASE_HELD";
-        error.expiresAt = Number(active.expires_at);
+        error.expiresAt = active.expires_at;
         throw error;
       }
       this.db.prepare(`
@@ -679,12 +484,8 @@ export class LichessStore {
         ON CONFLICT(authority_key) DO UPDATE SET owner_id=excluded.owner_id,
           pid=excluded.pid, process_identity_json=excluded.process_identity_json,
           heartbeat_at=excluded.heartbeat_at, expires_at=excluded.expires_at
-      `).run(normalized, owner, integer(pid), JSON.stringify(processIdentity), now, expiresAt);
-      this.db.exec("COMMIT");
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
+      `).run(normalized, owner, leasePid, JSON.stringify(processIdentity), now, expiresAt);
+    });
     return this.refreshApiLeaseProjection(normalized);
   }
 
@@ -697,7 +498,13 @@ export class LichessStore {
     processIdentity = null,
   ) {
     const normalized = authorityKey(key);
-    if (!validProcessIdentity(processIdentity, Number(pid))) {
+    const leasePid = safeInteger(pid, "API lease pid", { minimum: 1, maximum: 2_147_483_647 });
+    const leaseTtl = safeInteger(ttlMs, "API lease TTL", {
+      minimum: 1,
+      maximum: 86_400_000,
+      defaultValue: 60_000,
+    });
+    if (!validProcessIdentity(processIdentity, leasePid)) {
       throw new Error("Lichess API lease process identity is invalid");
     }
     const result = this.db.prepare(`
@@ -705,10 +512,10 @@ export class LichessStore {
       WHERE authority_key=? AND owner_id=? AND pid=? AND process_identity_json=?
     `).run(
       now,
-      now + integer(ttlMs, 60_000),
+      safeInteger(now, "API lease heartbeat timestamp") + leaseTtl,
       normalized,
       String(ownerId),
-      integer(pid),
+      leasePid,
       JSON.stringify(processIdentity),
     );
     if (result.changes !== 1) {
@@ -735,6 +542,7 @@ export class LichessStore {
   }
 
   activeApiLeases(now = Date.now()) {
+    now = safeInteger(now, "API lease listing timestamp");
     return this.db.prepare(`
       SELECT authority_key, pid, heartbeat_at, expires_at
       FROM api_client_leases WHERE expires_at>? ORDER BY authority_key
@@ -742,6 +550,7 @@ export class LichessStore {
   }
 
   replaceOnlineBots(bots, now = Date.now()) {
+    now = safeInteger(now, "online discovery timestamp");
     const reset = this.db.prepare("UPDATE opponents SET online=0");
     const upsert = this.db.prepare(`
       INSERT INTO opponents(username, title, rating, online, first_seen_at, last_seen_at)
@@ -749,22 +558,22 @@ export class LichessStore {
       ON CONFLICT(username) DO UPDATE SET title=excluded.title, rating=excluded.rating,
         online=1, last_seen_at=excluded.last_seen_at
     `);
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
+    this.withImmediateTransaction(() => {
       reset.run();
       for (const bot of bots) {
         const username = normalizedUsername(bot.username ?? bot.name ?? bot.id);
         upsert.run(username, String(bot.title ?? "BOT"), botRating(bot), now, now);
       }
-      this.db.exec("COMMIT");
-      this.refreshOpponentProjection();
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
+    });
+    this.refreshOpponentProjection();
   }
 
   eligibleBots({ self, now = Date.now(), maximumGamesPerDay = 2 } = {}) {
+    now = safeInteger(now, "opponent selection timestamp");
+    maximumGamesPerDay = safeInteger(maximumGamesPerDay, "maximum games per opponent", {
+      minimum: 1,
+      maximum: 100,
+    });
     const dayStart = now - 24 * 60 * 60 * 1000;
     return this.db.prepare(`
       SELECT o.*,
@@ -780,13 +589,15 @@ export class LichessStore {
   }
 
   setOpponentCooldown(username, minutes, now = Date.now()) {
-    const until = now + integer(minutes) * 60_000;
+    const until = safeInteger(now, "opponent cooldown timestamp")
+      + safeInteger(minutes, "opponent cooldown minutes", { maximum: 525_600 }) * 60_000;
     this.db.prepare("UPDATE opponents SET cooldown_until=MAX(cooldown_until, ?) WHERE username=?")
       .run(until, normalizedUsername(username));
     return until;
   }
 
   recordChallenge({ id, opponent, audience, direction, status, color, clockLimit, clockIncrement }, now = Date.now()) {
+    now = safeInteger(now, "challenge creation timestamp");
     if (!id) throw new Error("Challenge id is required");
     const username = normalizedUsername(opponent);
     this.db.prepare(`
@@ -795,25 +606,39 @@ export class LichessStore {
       VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(challenge_id) DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at
     `).run(String(id), username, audience, direction, status, color ?? "random",
-      integer(clockLimit), integer(clockIncrement), now, now);
+      safeInteger(clockLimit, "challenge clock limit", { defaultValue: 0 }),
+      safeInteger(clockIncrement, "challenge clock increment", { defaultValue: 0 }), now, now);
   }
 
   updateChallenge(id, status, { cooldownMinutes = 0 } = {}, now = Date.now()) {
-    const row = this.db.prepare("SELECT opponent, status FROM challenge_attempts WHERE challenge_id=?").get(String(id));
-    this.db.prepare("UPDATE challenge_attempts SET status=?, updated_at=? WHERE challenge_id=?").run(status, now, String(id));
-    if (!row) return;
-    const column = status === "accepted" ? "accepts" : status === "declined" ? "declines" : status === "timeout" ? "timeouts" : null;
-    if (column && row.status !== status) {
-      this.db.prepare(`UPDATE opponents SET ${column}=${column}+1 WHERE username=?`).run(row.opponent);
-    }
-    if (cooldownMinutes > 0) {
-      this.db.prepare("UPDATE opponents SET cooldown_until=MAX(cooldown_until, ?) WHERE username=?")
-        .run(now + cooldownMinutes * 60_000, row.opponent);
-    }
+    now = safeInteger(now, "challenge update timestamp");
+    cooldownMinutes = safeInteger(cooldownMinutes, "challenge cooldown minutes", {
+      maximum: 525_600,
+      defaultValue: 0,
+    });
+    this.withImmediateTransaction(() => {
+      const row = this.db.prepare("SELECT opponent, status FROM challenge_attempts WHERE challenge_id=?")
+        .get(String(id));
+      this.db.prepare("UPDATE challenge_attempts SET status=?, updated_at=? WHERE challenge_id=?")
+        .run(status, now, String(id));
+      if (!row) return;
+      const column = status === "accepted" ? "accepts"
+        : status === "declined" ? "declines"
+          : status === "timeout" ? "timeouts" : null;
+      if (column && row.status !== status) {
+        this.db.prepare(`UPDATE opponents SET ${column}=${column}+1 WHERE username=?`)
+          .run(row.opponent);
+      }
+      if (cooldownMinutes > 0) {
+        this.db.prepare("UPDATE opponents SET cooldown_until=MAX(cooldown_until, ?) WHERE username=?")
+          .run(now + cooldownMinutes * 60_000, row.opponent);
+      }
+    });
     this.refreshOpponentProjection();
   }
 
   beginGameActivation({ id, opponent, audience, challengeId = null }, now = Date.now()) {
+    now = safeInteger(now, "game activation timestamp");
     const gameId = String(id ?? "");
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(gameId)) throw new Error("Game activation id is invalid");
     const normalizedOpponent = normalizedUsername(opponent);
@@ -821,8 +646,7 @@ export class LichessStore {
       throw new Error(`Unsupported game activation audience: ${audience}`);
     }
     const correlationId = challengeId ? String(challengeId) : null;
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
+    const activation = this.withImmediateTransaction(() => {
       const existing = this.db.prepare(`
         SELECT status FROM games WHERE game_id=?
       `).get(gameId);
@@ -873,22 +697,20 @@ export class LichessStore {
           reservationConsumed = true;
         }
       }
-      this.db.exec("COMMIT");
-      this.refreshControlProjection(now);
-      if (challengeTransitioned) this.refreshOpponentProjection();
       return Object.freeze({
         gameId,
         inserted,
         reservationConsumed,
         challengeTransitioned,
       });
-    } catch (error) {
-      if (this.db.isTransaction) this.db.exec("ROLLBACK");
-      throw error;
-    }
+    });
+    this.refreshControlProjection(now);
+    if (activation.challengeTransitioned) this.refreshOpponentProjection();
+    return activation;
   }
 
   failGameActivation(id, now = Date.now()) {
+    now = safeInteger(now, "game activation failure timestamp");
     this.db.prepare(`
       UPDATE games SET status='activation_failed', finished_at=?
       WHERE game_id=? AND status='activating'
@@ -897,6 +719,7 @@ export class LichessStore {
   }
 
   markGameProviderError(id, now = Date.now()) {
+    now = safeInteger(now, "game provider error timestamp");
     this.db.prepare(`
       UPDATE games SET status='provider_error', finished_at=?
       WHERE game_id=? AND finished_at=0
@@ -905,7 +728,7 @@ export class LichessStore {
   }
 
   beginGame(game) {
-    const now = game.startedAt ?? Date.now();
+    const now = safeInteger(game.startedAt, "game start timestamp", { defaultValue: Date.now() });
     const runtimeProvenanceJson = JSON.stringify(game.runtimeProvenance ?? {});
     this.db.prepare(`
       INSERT INTO games(game_id, opponent, audience, color, rated, speed, clock_limit,
@@ -955,13 +778,18 @@ export class LichessStore {
         runtime_provenance_json=CASE WHEN games.runtime_provenance_sha256=''
           THEN excluded.runtime_provenance_json ELSE games.runtime_provenance_json END
     `).run(String(game.id), normalizedUsername(game.opponent), game.audience, game.color,
-      game.rated ? 1 : 0, game.speed ?? "", integer(game.clockLimit), integer(game.clockIncrement),
+      game.rated ? 1 : 0, game.speed ?? "",
+      safeInteger(game.clockLimit, "game clock limit", { defaultValue: 0 }),
+      safeInteger(game.clockIncrement, "game clock increment", { defaultValue: 0 }),
       now, game.engineBuildFingerprint ?? "", game.modelFingerprint ?? "",
       game.providerFingerprint ?? "", game.bookIdentity ?? "", game.modelId ?? "",
       game.checkpointHash ?? "", game.adapterId ?? "", game.provider ?? "",
       game.hardwareDriverFingerprint ?? "", game.onnxRuntimeVersion ?? "",
-      game.searchCore ?? "", integer(game.threads), integer(game.rootWorkers),
-      integer(game.splitDepth), integer(game.batchSize), integer(game.batchWaitUs),
+      game.searchCore ?? "", safeInteger(game.threads, "game threads", { defaultValue: 0 }),
+      safeInteger(game.rootWorkers, "game root workers", { defaultValue: 0 }),
+      safeInteger(game.splitDepth, "game split depth", { defaultValue: 0 }),
+      safeInteger(game.batchSize, "game batch size", { defaultValue: 0 }),
+      safeInteger(game.batchWaitUs, "game batch wait", { defaultValue: 0 }),
       game.timeProfileIdentity ?? "", game.runtimeProvenanceSha256 ?? "",
       runtimeProvenanceJson);
   }
@@ -971,6 +799,7 @@ export class LichessStore {
       throw new Error("Historical provenance backfill requires at least one evidence entry");
     }
     const reports = [];
+    this.storage.assertPaths();
     this.db.exec("BEGIN IMMEDIATE");
     try {
       for (const entry of entries) {
@@ -991,8 +820,9 @@ export class LichessStore {
             || gameIds.some((gameId) => !/^[A-Za-z0-9]{8}$/.test(gameId))) {
           throw new Error(`Invalid historical game_ids selector for ${deploymentId}`);
         }
-        const expectedGames = integer(entry.expected_game_count, -1);
-        if (expectedGames < 1) throw new Error(`Invalid expected_game_count for ${deploymentId}`);
+        const expectedGames = safeInteger(entry.expected_game_count, "historical expected game count", {
+          minimum: 1,
+        });
         const values = entry.values ?? {};
         for (const field of Object.keys(values)) {
           if (!Object.hasOwn(GAME_PROVENANCE_BACKFILL_COLUMNS, field)) {
@@ -1062,7 +892,7 @@ export class LichessStore {
           const conflicts = columns.filter((field) => {
             const existing = row[field];
             const kind = GAME_PROVENANCE_BACKFILL_COLUMNS[field];
-            const populated = kind === "integer" ? Number(existing) !== 0 : String(existing ?? "") !== "";
+            const populated = kind === "integer" ? existing !== 0 : String(existing ?? "") !== "";
             return populated && existing !== values[field];
           });
           if (row.runtime_provenance_sha256) {
@@ -1098,6 +928,7 @@ export class LichessStore {
         throw error;
       }
       this.db.exec(apply ? "COMMIT" : "ROLLBACK");
+      this.storage.assertPaths();
       return reports;
     } catch (error) {
       if (this.db.isTransaction) this.db.exec("ROLLBACK");
@@ -1106,9 +937,12 @@ export class LichessStore {
   }
 
   finishGame({ id, status, result, winner, plies, finishedAt = Date.now() }) {
+    finishedAt = safeInteger(finishedAt, "game finish timestamp");
     this.db.prepare(`UPDATE games SET status=?, result=?, winner=?, plies=?, finished_at=?
       WHERE game_id=? AND finished_at=0`)
-      .run(status ?? "unknown", result ?? "", winner ?? "", integer(plies), finishedAt, String(id));
+      .run(status ?? "unknown", result ?? "", winner ?? "",
+        safeInteger(plies, "game plies", { defaultValue: 0, maximum: 2_048 }),
+        finishedAt, String(id));
     this.refreshOpponentProjection();
   }
 
@@ -1121,13 +955,16 @@ export class LichessStore {
 
   opponentStats(limit = 100) {
     const opponents = this.queryOpponentStats(limit);
-    if (integer(limit, 100) === 100) this.statusOpponents = opponents;
+    if (safeInteger(limit, "opponent statistics limit", {
+      minimum: 1, maximum: 100, defaultValue: 100,
+    }) === 100) this.statusOpponents = opponents;
     return opponents;
   }
 
   status(now = Date.now()) {
+    now = safeInteger(now, "store status timestamp");
     return {
-      schemaVersion: 5,
+      schemaVersion: LICHESS_STORAGE_SCHEMA_VERSION,
       control: this.control(now),
       owners: this.listOwners(),
       opponents: this.db.prepare("SELECT COUNT(*) AS count FROM opponents").get().count,
