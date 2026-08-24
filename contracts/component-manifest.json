@@ -3,7 +3,7 @@
   "component": {
     "id": "lichess.adapter",
     "product_id": "uci_arena.lichess_bot",
-    "version": "1.0.23",
+    "version": "1.0.24",
     "repository": "iteathen/uci-arena-lichess-bot"
   },
   "runtime": {
@@ -14,7 +14,7 @@
       {
         "type": "typed_cli_json",
         "arguments": ["status"],
-        "expected": {"schema": "uci_arena_lichess_status_v4", "installed": true},
+        "expected": {"schema": "uci_arena_lichess_status_v5", "installed": true},
         "credential_required": false
       }
     ]
@@ -35,6 +35,7 @@
       "provider_configuration",
       "provider_status",
       "provider_incidents",
+      "provider_games",
       "installed_qualification",
       "startup_install",
       "startup_recover",
@@ -63,6 +64,7 @@
       "dependency_bindings": [
         {"name": "default_engine", "component_id": "uci_arena.engine", "source": "entrypoint", "entrypoint": "uci", "required": false},
         {"name": "default_engine_root", "component_id": "uci_arena.engine", "source": "active_root", "required": false},
+        {"name": "default_engine_manifest", "component_id": "uci_arena.engine", "source": "component_path", "path": "arena-component.json", "required": false},
         {"name": "default_model_root", "component_id": "uci_arena.engine", "source": "component_path", "path": "models/default", "required": false},
         {"name": "complete_game_entrypoint", "component_id": "uci_arena_evidence.runtime", "source": "entrypoint", "entrypoint": "complete_game", "required": false},
         {"name": "referee", "component_id": "uci_arena_evidence.runtime", "source": "entrypoint", "entrypoint": "referee", "required": false},
@@ -127,6 +129,8 @@
     "configuration_update": "contracts/configuration-update-schema.json",
     "status": "contracts/status-schema.json",
     "incident_page": "contracts/incident-page-schema.json",
+    "game_page": "contracts/game-page-schema.json",
+    "game_detail": "contracts/game-detail-schema.json",
     "qualification_result": "contracts/qualification-result-schema.json",
     "manager_operations": "contracts/manager-operations-schema.json"
   },

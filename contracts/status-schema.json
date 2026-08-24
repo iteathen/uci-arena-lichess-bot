@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://uci-arena.example/contracts/lichess-status-v4.json",
+  "$id": "https://uci-arena.example/contracts/lichess-status-v5.json",
   "title": "UCI Arena Lichess Bot Status",
   "type": "object",
   "required": [
@@ -22,7 +22,7 @@
     "blockers"
   ],
   "properties": {
-    "schema": {"const": "uci_arena_lichess_status_v4"},
+    "schema": {"const": "uci_arena_lichess_status_v5"},
     "installed": {"type": "boolean"},
     "registered": {"type": "boolean"},
     "active": {"type": "boolean"},
@@ -65,13 +65,21 @@
     },
     "games": {
       "type": "object",
-      "required": ["active", "preparing", "pending", "cancelling", "draining"],
+      "required": [
+        "active", "preparing", "pending", "cancelling", "draining",
+        "archive_available", "total", "complete", "incomplete", "storage_bytes"
+      ],
       "properties": {
         "active": {"$ref": "#/$defs/count"},
         "preparing": {"$ref": "#/$defs/count"},
         "pending": {"$ref": "#/$defs/count"},
         "cancelling": {"$ref": "#/$defs/count"},
-        "draining": {"$ref": "#/$defs/count"}
+        "draining": {"$ref": "#/$defs/count"},
+        "archive_available": {"type": "boolean"},
+        "total": {"$ref": "#/$defs/nullable_nonnegative_integer"},
+        "complete": {"$ref": "#/$defs/nullable_nonnegative_integer"},
+        "incomplete": {"$ref": "#/$defs/nullable_nonnegative_integer"},
+        "storage_bytes": {"$ref": "#/$defs/nullable_nonnegative_integer"}
       },
       "additionalProperties": false
     },

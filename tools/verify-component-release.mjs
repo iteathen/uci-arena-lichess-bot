@@ -202,11 +202,12 @@ function verify(args) {
     timeout: 15_000,
   });
   const status = JSON.parse(output);
-  if (status.schema !== "uci_arena_lichess_status_v4"
+  if (status.schema !== "uci_arena_lichess_status_v5"
       || status.installed !== true
       || status.active !== false
       || !status.blockers.includes("provider_process_inactive")
       || !status.blockers.includes("incident_storage_unavailable")
+      || !status.blockers.includes("game_archive_storage_unavailable")
       || status.incidents?.available !== false) {
     throw new Error("packaged provider status smoke failed");
   }

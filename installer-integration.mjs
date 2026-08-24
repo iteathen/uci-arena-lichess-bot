@@ -152,6 +152,7 @@ export function renderInstallerConfiguration(context) {
     delete configuration.engine.single_game_profile;
     delete configuration.engine.time_profile;
     delete configuration.engine.temporal_curve_profile;
+    delete configuration.engine.component_manifest;
     delete configuration.engine.fallback_bundle;
     configuration.capacity.total_slots = 1;
     configuration.capacity.startup_parallelism = 1;
@@ -163,6 +164,10 @@ export function renderInstallerConfiguration(context) {
     delete configuration.qualification;
   } else {
     const engineRoot = requireAbsolutePath(bindings.default_engine_root, 'bindings.default_engine_root');
+    const engineManifest = optionalAbsolutePath(
+      bindings.default_engine_manifest,
+      'bindings.default_engine_manifest',
+    );
     const modelRoot = requireAbsolutePath(bindings.default_model_root, 'bindings.default_model_root');
     const completeGame = optionalAbsolutePath(
       bindings.complete_game_entrypoint,
@@ -186,6 +191,8 @@ export function renderInstallerConfiguration(context) {
     configuration.engine.adapter = 'uci_arena_extended_v1';
     configuration.engine.executable = defaultEngine;
     configuration.engine.working_directory = engineRoot;
+    if (engineManifest) configuration.engine.component_manifest = engineManifest;
+    else delete configuration.engine.component_manifest;
     configuration.engine.uci_options.ModelRoot = modelRoot;
     const timing = optionalAbsolutePath(locators.timing_profile, 'locators.timing_profile');
     const single = optionalAbsolutePath(

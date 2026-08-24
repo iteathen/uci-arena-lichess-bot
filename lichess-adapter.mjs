@@ -59,6 +59,13 @@ import {
   providerIncidentSummaryUnavailable,
 } from "./provider-incidents.mjs";
 import {
+  PROVIDER_GAME_BACKFILL_MAXIMUM_IDS,
+  normalizeProviderGameId,
+  normalizeProviderGamePageRequest,
+  normalizeProviderComponentIdentity,
+  parseProviderHistoricalGame,
+} from "./provider-games.mjs";
+import {
   admitExactDirectorySync,
   appendExactFileSync,
   classifyExactPathSync,
@@ -83,6 +90,7 @@ export const RATED_PLAY_CONFIRMATION = "I_ACCEPT_RATED_BOT_GAMES";
 export const OUTBOUND_CHALLENGE_CONFIRMATION = "I_ACCEPT_AUTOMATIC_OUTBOUND_CHALLENGES";
 export const MANAGER_OPTIONS_SCHEMA = "uci_arena_lichess_manager_options_v1";
 const FIRST_MOVE_ABORT_RETRY_MS = Object.freeze([15_000, 30_000, 60_000, 120_000, 300_000]);
+const HISTORICAL_GAME_EXPORT_MAXIMUM_BYTES = 16_777_216;
 const EXACT_FILE_LIMITS = Object.freeze({
   credential: 4_096,
   configuration: 1_048_576,
@@ -1412,6 +1420,7 @@ export function loadRuntimeConfig({
     config.timing.bootstrap_transport_reserve_ms = config.timing.initial_transport_reserve_ms;
     config.engine.timing = config.timing;
     config.engine.selected_bundle = "standard_uci";
+    config.engine.component_identity = engineComponentIdentity(config);
     return validateBotPolicyConfig(validateCapacityConfig(config));
   }
   const selectedModelRoot = selectRuntimePath(
@@ -1482,6 +1491,7 @@ export function loadRuntimeConfig({
   if (transportProfile.qualified) {
     config.timing.initial_transport_reserve_ms = transportProfile.reserveMs;
   }
+  config.engine.component_identity = engineComponentIdentity(config);
   return validateBotPolicyConfig(validateCapacityConfig(config));
 }
 
@@ -2231,6 +2241,7 @@ function apiRequestClass(endpoint, method = "GET") {
   if (normalized.startsWith("api/bot/online") || normalized.startsWith("api/user/")) {
     return "discovery";
   }
+  if (normalized.startsWith("api/games/export/_ids")) return "archive_backfill";
   if (normalized.startsWith("api/challenge/")) {
     if (method === "POST" && !/\/(?:accept|decline|cancel)$/.test(normalized)) {
       return "challenge_create";
@@ -2273,6 +2284,8 @@ export class LichessClient {
   async requestDirect(endpoint, {
     method = "GET",
     form,
+    bodyText,
+    accept,
     stream = false,
     signal,
     requestClass = apiRequestClass(endpoint, method),
@@ -2282,14 +2295,23 @@ export class LichessClient {
       throw new Error("Lichess request credential is invalid");
     }
     const headers = {
-      Accept: stream ? "application/x-ndjson" : "application/json",
+      Accept: accept ?? (stream ? "application/x-ndjson" : "application/json"),
       Authorization: `Bearer ${token}`,
       "User-Agent": "UCI-Arena-Lichess-Adapter/1",
     };
     let body;
+    if (form && bodyText !== undefined) {
+      throw new Error("Lichess request cannot combine form and raw body authority");
+    }
     if (form) {
       body = new URLSearchParams(Object.entries(form).map(([key, value]) => [key, String(value)]));
       headers["Content-Type"] = "application/x-www-form-urlencoded";
+    } else if (bodyText !== undefined) {
+      if (typeof bodyText !== "string" || Buffer.byteLength(bodyText, "utf8") > 32_768) {
+        throw new Error("Lichess request body exceeds its typed bound");
+      }
+      body = bodyText;
+      headers["Content-Type"] = "text/plain; charset=utf-8";
     }
     const response = await this.fetchImpl(new URL(endpoint, this.baseUrl), {
       method,
@@ -2422,6 +2444,44 @@ export class LichessClient {
       }
       return items;
     });
+  }
+
+  exportGamesByIds(ids, signal) {
+    if (!Array.isArray(ids) || ids.length === 0
+        || ids.length > PROVIDER_GAME_BACKFILL_MAXIMUM_IDS) {
+      throw new Error("Historical game export requires 1 through 300 ids");
+    }
+    const normalized = ids.map((id) => normalizeProviderGameId(String(id)));
+    if (new Set(normalized).size !== normalized.length) {
+      throw new Error("Historical game export ids must be unique");
+    }
+    return this.dispatch(
+      "api/games/export/_ids?clocks=true&evals=false&opening=false&literate=false",
+      {
+        method: "POST",
+        bodyText: normalized.join(","),
+        accept: "application/x-ndjson",
+        signal,
+        requestClass: "archive_backfill",
+      },
+      async (response) => {
+        const games = [];
+        let admittedBytes = 0;
+        for await (const game of parseNdjsonStream(response.body)) {
+          if (games.length >= normalized.length) {
+            await response.body?.cancel?.().catch?.(() => {});
+            throw new Error("Historical game export returned too many records");
+          }
+          admittedBytes += Buffer.byteLength(JSON.stringify(game), "utf8");
+          if (admittedBytes > HISTORICAL_GAME_EXPORT_MAXIMUM_BYTES) {
+            await response.body?.cancel?.().catch?.(() => {});
+            throw new Error("Historical game export exceeds its response bound");
+          }
+          games.push(game);
+        }
+        return games;
+      },
+    );
   }
 
   safetySnapshot() {
@@ -3816,6 +3876,86 @@ function optionalFileFingerprint(filePath, workingDirectory) {
   return exactRegularFileExistsSync(resolved, "Optional provenance file") ? sha256File(resolved) : "";
 }
 
+let packagedProviderComponentIdentity = null;
+
+export function providerComponentIdentity() {
+  if (packagedProviderComponentIdentity) return packagedProviderComponentIdentity;
+  const admitted = readExactJsonSync(path.join(ROOT, "contracts", "component-manifest.json"), {
+    maximumBytes: EXACT_FILE_LIMITS.profile,
+    label: "Provider component manifest",
+  });
+  const manifest = admitted.value;
+  if (manifest?.schema !== "uci_arena_component_manifest_v1"
+      || manifest.component?.id !== "lichess.adapter") {
+    throw new Error("Provider component manifest identity is invalid");
+  }
+
+  packagedProviderComponentIdentity = normalizeProviderComponentIdentity({
+    componentId: manifest.component.id,
+    version: manifest.component.version,
+    manifestSha256: admitted.sha256,
+  }, "provider");
+  return packagedProviderComponentIdentity;
+}
+
+function samePlatformPath(left, right) {
+  const normalizedLeft = path.resolve(left);
+  const normalizedRight = path.resolve(right);
+  return process.platform === "win32"
+    ? normalizedLeft.toLocaleLowerCase() === normalizedRight.toLocaleLowerCase()
+    : normalizedLeft === normalizedRight;
+}
+
+export function engineComponentIdentity(config) {
+  const manifestPath = config.engine?.component_manifest;
+  if (manifestPath === null || manifestPath === undefined || manifestPath === "") return null;
+  if (typeof manifestPath !== "string" || !path.isAbsolute(manifestPath)) {
+    throw new Error("Engine component manifest must be an explicit absolute path");
+  }
+  const admitted = readExactJsonSync(manifestPath, {
+    maximumBytes: EXACT_FILE_LIMITS.profile,
+    label: "Engine component manifest",
+  });
+  const manifest = admitted.value;
+  if (manifest?.schema !== "arena_install_component_v1" || manifest.schema_version !== 1
+      || typeof manifest.component_id !== "string" || typeof manifest.component_version !== "string"
+      || !Array.isArray(manifest.files) || manifest.files.length === 0
+      || manifest.files.length > 100_000) {
+    throw new Error("Engine component manifest has an invalid closed identity");
+  }
+  const manifestRoot = path.dirname(path.resolve(manifestPath));
+  const executable = path.resolve(config.engine.executable);
+  const matches = manifest.files.filter((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)
+        || typeof entry.path !== "string" || !entry.path
+        || entry.path.includes("\\") || path.isAbsolute(entry.path)
+        || entry.path.split("/").some((segment) => !segment || segment === "." || segment === "..")) {
+      throw new Error("Engine component manifest contains an unsafe file path");
+    }
+    return samePlatformPath(path.join(manifestRoot, ...entry.path.split("/")), executable);
+  });
+  if (matches.length !== 1) {
+    throw new Error("Engine component manifest does not own the exact selected executable");
+  }
+  const [entry] = matches;
+  if (!Number.isSafeInteger(entry.size_bytes) || entry.size_bytes < 0
+      || typeof entry.sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(entry.sha256)) {
+    throw new Error("Engine component executable inventory is malformed");
+  }
+  const exact = hashExactFileSync(executable, {
+    maximumBytes: EXACT_FILE_LIMITS.largeAsset,
+    label: "Engine component executable",
+  });
+  if (exact.byteLength !== entry.size_bytes || exact.sha256 !== `sha256:${entry.sha256}`) {
+    throw new Error("Engine component executable does not match its manifest inventory");
+  }
+  return normalizeProviderComponentIdentity({
+    componentId: manifest.component_id,
+    version: manifest.component_version,
+    manifestSha256: admitted.sha256,
+  }, "engine");
+}
+
 export function gameRuntimeProvenance(config, engine) {
   const profile = config.engine.qualification_profile ?? {};
   const qualification = engine.qualificationStatus ?? {};
@@ -4331,6 +4471,10 @@ export class GameSession {
       bookIdentity: bookConfigurationIdentity(this.config),
       runtimeProvenanceSha256: runtimeProvenance.sha256,
       runtimeProvenance: runtimeProvenance.provenance,
+      initialFen: this.legalityState.canonicalInitialFen,
+      variant: "standard",
+      providerComponent: providerComponentIdentity(),
+      engineComponent: this.config.engine.component_identity ?? null,
     });
     this.initialized = true;
     log("game_ready", {
@@ -4697,6 +4841,20 @@ export class GameSession {
     observation.legalitySynchronization = this.legalityState.synchronize(moves, {
       forceRebuild: observation.reconciled,
     });
+    const archivePlies = observation.legalitySynchronization.plies;
+    if (archivePlies.length > 0) {
+      const last = archivePlies.at(-1);
+      const clockValue = last.actorColor === "white" ? state.wtime : state.btime;
+      if (typeof clockValue === "number" && Number.isSafeInteger(clockValue) && clockValue >= 0) {
+        archivePlies[archivePlies.length - 1] = { ...last, clockMs: clockValue };
+      }
+    }
+    this.store.reconcileGameLine({
+      id: this.gameId,
+      initialFen: observation.legalitySynchronization.initialFen,
+      variant: "standard",
+      plies: archivePlies,
+    });
     observation.authorityValidatedAt = performance.now();
     observation.authorityValidationMs = observation.authorityValidatedAt - receivedAt;
     this.lastClock = observation.clock;
@@ -5024,6 +5182,7 @@ export class BotController {
     now = Date.now,
     reconnectDelay = delay,
     schedulerDelay = delay,
+    archiveDelay = delay,
     apiLeaseStatus = null,
     lifecycleOwner = null,
     sessionFactory = null,
@@ -5041,6 +5200,7 @@ export class BotController {
     this.now = now;
     this.reconnectDelay = reconnectDelay;
     this.schedulerDelay = schedulerDelay;
+    this.archiveDelay = archiveDelay;
     this.apiLeaseStatus = typeof apiLeaseStatus === "function"
       ? apiLeaseStatus
       : () => ({
@@ -5076,6 +5236,7 @@ export class BotController {
     this.schedulerRecoveryPending = false;
     this.tickRunning = false;
     this.schedulerFault = null;
+    this.archiveBackfillRunning = false;
     const transportProfilePath = this.config.timing.transport_profile_path
       || path.join(runtimeDir, "transport_profile_v2.json");
     this.transportProfile = new TransportProfileTracker({
@@ -5162,6 +5323,7 @@ export class BotController {
     this.manualOpponent = opponent ? normalizedUsername(opponent) : null;
     this.needsReconciliation = true;
     const schedulerTask = this.schedulerLoop();
+    const archiveTask = this.archiveBackfillLoop();
     const statusHeartbeat = setInterval(() => {
       void this.writeStatus().catch((error) => {
         log("runtime_status_write_error", { message: error.message });
@@ -5242,6 +5404,7 @@ export class BotController {
       await Promise.allSettled(this.activeGames.values());
       await this.drainProviderSlots();
       await schedulerTask;
+      await archiveTask;
       try {
         await this.writeStatus({ flush: true });
       } finally {
@@ -5753,6 +5916,107 @@ export class BotController {
     }
   }
 
+  async archiveBackfillLoop() {
+    while (!this.signal.aborted) {
+      try {
+        if (this.streamConnected && !this.needsReconciliation
+            && !this.client.isCoolingDown?.()) {
+          await this.backfillProviderGames();
+        }
+      } catch (error) {
+        if (!this.signal.aborted) {
+          log("game_archive_backfill_error", {
+            message: String(error?.message ?? "archive backfill failed").slice(0, 512),
+          });
+        }
+      }
+      try {
+        await this.archiveDelay(30_000, this.signal);
+      } catch {
+        break;
+      }
+    }
+  }
+
+  async backfillProviderGames() {
+    if (this.archiveBackfillRunning) return 0;
+    this.archiveBackfillRunning = true;
+    try {
+      const candidates = this.store.listProviderGameBackfillIds(
+        PROVIDER_GAME_BACKFILL_MAXIMUM_IDS,
+      ).filter((id) => !this.activeGames.has(id) && !this.startingGames.has(id));
+      if (candidates.length === 0) return 0;
+      const exports = await this.client.exportGamesByIds(candidates, this.signal);
+      const byId = new Map();
+      const candidateIds = new Set(candidates);
+      const invalidIds = new Set();
+      for (const record of exports) {
+        let id;
+        try {
+          id = normalizeProviderGameId(String(record?.id ?? record?.gameId ?? ""));
+        } catch {
+          continue;
+        }
+        if (!candidateIds.has(id)) continue;
+        if (byId.has(id) || invalidIds.has(id)) {
+          byId.delete(id);
+          invalidIds.add(id);
+          continue;
+        }
+        byId.set(id, record);
+      }
+      let reconciled = 0;
+      let incomplete = 0;
+      for (const id of candidates) {
+        if (invalidIds.has(id)) {
+          this.store.recordProviderGameBackfillFailure(
+            id,
+            "historical_export_malformed",
+            this.now(),
+          );
+          incomplete += 1;
+          continue;
+        }
+        const record = byId.get(id);
+        if (!record) {
+          this.store.recordProviderGameBackfillFailure(
+            id,
+            "historical_export_unavailable",
+            this.now(),
+          );
+          incomplete += 1;
+          continue;
+        }
+        try {
+          const parsed = parseProviderHistoricalGame(record);
+          if (this.store.reconcileHistoricalGame(parsed, this.now())) reconciled += 1;
+        } catch (error) {
+          if (error?.code?.startsWith?.("LICHESS_STORAGE_")) throw error;
+          const message = String(error?.message ?? "");
+          const reason = message.includes("variant")
+            ? "historical_variant_unsupported"
+            : message.includes("illegal") || message.includes("replay")
+              ? "historical_replay_invalid"
+              : message.includes("conflict") || message.includes("immutable")
+                ? "historical_archive_conflict"
+                : "historical_export_malformed";
+          this.store.recordProviderGameBackfillFailure(id, reason, this.now());
+          incomplete += 1;
+        }
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      log("game_archive_backfill_complete", {
+        requested: candidates.length,
+        returned: exports.length,
+        reconciled,
+        incomplete,
+      });
+      return reconciled;
+    } finally {
+      this.archiveBackfillRunning = false;
+    }
+  }
+
   async schedulerTick(now = Date.now()) {
     if (this.tickRunning || !this.streamConnected) return;
     this.tickRunning = true;
@@ -6016,6 +6280,7 @@ export class BotController {
       },
       opponents: storeProjection.opponents,
       incidents: storeProjection.incidents,
+      game_archive: storeProjection.gameArchive,
       engine: this.config.engine.executable,
       engine_adapter: this.config.engine.adapter,
       deployment_bundle: this.config.engine.selected_bundle,
@@ -6106,6 +6371,7 @@ function writeStartingRuntimeStatus({
       client_lease: apiLeaseStatus(),
     },
     incidents: store.providerIncidentSummary(),
+    game_archive: store.gameArchiveSummary(),
     engine_adapter: config.engine.adapter,
     updated_at: new Date().toISOString(),
   });
@@ -6234,6 +6500,34 @@ function boundedIncidentSummary(runtimeDir) {
   }
 }
 
+function providerGameArchiveSummaryUnavailable() {
+  return {
+    available: false,
+    total_games: null,
+    complete_games: null,
+    incomplete_games: null,
+    live_games: null,
+    logical_storage_bytes: null,
+  };
+}
+
+function boundedGameArchiveSummary(runtimeDir) {
+  const target = path.join(path.resolve(runtimeDir), "matches.sqlite");
+  try {
+    if (!exactRegularFileExistsSync(target, "Lichess game archive storage")) {
+      return providerGameArchiveSummaryUnavailable();
+    }
+    const store = new LichessStore(target);
+    try {
+      return store.gameArchiveSummary();
+    } finally {
+      store.close();
+    }
+  } catch {
+    return providerGameArchiveSummaryUnavailable();
+  }
+}
+
 export function providerStatusProjection({
   runtime = null,
   runtimeError = runtime ? null : "runtime_status_missing",
@@ -6243,6 +6537,7 @@ export function providerStatusProjection({
   now = Date.now(),
   runtimeMaximumAgeMs = RUNTIME_STATUS_MAXIMUM_AGE_MS,
   incidents = runtime?.incidents ?? providerIncidentSummaryUnavailable(),
+  gameArchive = runtime?.game_archive ?? providerGameArchiveSummaryUnavailable(),
 } = {}) {
   const updatedAt = Date.parse(runtime?.updated_at ?? "");
   const freshnessError = runtime && (!Number.isFinite(updatedAt)
@@ -6348,6 +6643,17 @@ export function providerStatusProjection({
     && typeof incidents.truncated === "boolean"
     && Number.isSafeInteger(incidents.truncated_rows) && incidents.truncated_rows >= 0;
   if (!incidentAvailable) blockers.push("incident_storage_unavailable");
+  const gameArchiveAvailable = gameArchive?.available === true
+    && [
+      gameArchive.total_games,
+      gameArchive.complete_games,
+      gameArchive.incomplete_games,
+      gameArchive.live_games,
+      gameArchive.logical_storage_bytes,
+    ].every((value) => Number.isSafeInteger(value) && value >= 0)
+    && gameArchive.complete_games + gameArchive.incomplete_games + gameArchive.live_games
+      === gameArchive.total_games;
+  if (!gameArchiveAvailable) blockers.push("game_archive_storage_unavailable");
   const supervisionStates = new Set([
     "unregistered", "disabled", "active", "restart_pending", "clean_stopped", "inactive",
   ]);
@@ -6366,7 +6672,7 @@ export function providerStatusProjection({
       }
     : null;
   return {
-    schema: "uci_arena_lichess_status_v4",
+    schema: "uci_arena_lichess_status_v5",
     installed: true,
     registered: startup?.installed === true,
     active: effectiveActive,
@@ -6393,6 +6699,11 @@ export function providerStatusProjection({
       pending: slotCounts.pending,
       cancelling: slotCounts.cancelling,
       draining: slotCounts.draining,
+      archive_available: gameArchiveAvailable,
+      total: gameArchiveAvailable ? gameArchive.total_games : null,
+      complete: gameArchiveAvailable ? gameArchive.complete_games : null,
+      incomplete: gameArchiveAvailable ? gameArchive.incomplete_games : null,
+      storage_bytes: gameArchiveAvailable ? gameArchive.logical_storage_bytes : null,
     },
     scheduler: {
       enabled: runtime?.scheduler?.enabled === true,
@@ -6502,7 +6813,7 @@ export function parseArguments(argv) {
   if (!command) throw new Error("Expected a Lichess adapter command");
   const rest = [...argumentsList];
   const options = { command };
-  if (new Set(["owner", "reservation", "scheduler", "incidents", "startup", "config", "qualification"])
+  if (new Set(["owner", "reservation", "scheduler", "incidents", "games", "game", "startup", "config", "qualification"])
     .has(command)
       && rest[0] && !rest[0].startsWith("--")) {
     options.action = rest.shift();
@@ -7070,9 +7381,22 @@ function runStoreCommand(options) {
         limit: integerOption(options.limit, "--limit", 100),
       })
     : null;
-  if (incidentPageRequest && !exactRegularFileExistsSync(storeFile, "Lichess incident storage")) {
-    const error = new Error("Provider incident storage is unavailable");
-    error.code = "LICHESS_PROVIDER_INCIDENT_STORAGE_UNAVAILABLE";
+  const gamePageRequest = options.command === "games" && options.action === "list"
+    ? normalizeProviderGamePageRequest({
+        scope: options.scope ?? "history",
+        beforeCursor: integerOption(options.before, "--before", 0),
+        limit: integerOption(options.limit, "--limit", 100),
+      })
+    : null;
+  const gameId = options.command === "game" && options.action === "get"
+    ? normalizeProviderGameId(String(options.game_id ?? ""))
+    : null;
+  if ((incidentPageRequest || gamePageRequest || gameId)
+      && !exactRegularFileExistsSync(storeFile, "Lichess provider storage")) {
+    const error = new Error("Provider read-only storage is unavailable");
+    error.code = incidentPageRequest
+      ? "LICHESS_PROVIDER_INCIDENT_STORAGE_UNAVAILABLE"
+      : "LICHESS_PROVIDER_GAME_STORAGE_UNAVAILABLE";
     throw error;
   }
   const store = new LichessStore(storeFile);
@@ -7108,6 +7432,18 @@ function runStoreCommand(options) {
     } else if (options.command === "incidents" && options.action === "list") {
       const page = store.listProviderIncidents(incidentPageRequest);
       console.log(JSON.stringify(page));
+      return 0;
+    } else if (options.command === "games" && options.action === "list") {
+      console.log(JSON.stringify(store.listProviderGames(gamePageRequest)));
+      return 0;
+    } else if (options.command === "game" && options.action === "get") {
+      const game = store.getProviderGame(gameId);
+      if (!game) {
+        const error = new Error("Provider game is unavailable");
+        error.code = "LICHESS_PROVIDER_GAME_NOT_FOUND";
+        throw error;
+      }
+      console.log(JSON.stringify(game));
       return 0;
     } else {
       throw new Error(`Unknown local control command: ${options.command}${options.action ? ` ${options.action}` : ""}`);
@@ -7177,7 +7513,8 @@ export async function main(argv = process.argv.slice(2)) {
   assertSupportedNode();
   const options = parseArguments(argv);
   if (options.command === "reserve"
-      || new Set(["owner", "reservation", "scheduler", "incidents"]).has(options.command)) {
+      || new Set(["owner", "reservation", "scheduler", "incidents", "games", "game"])
+        .has(options.command)) {
     return runStoreCommand(options);
   }
   const runtimeDir = resolveProviderRuntimeDirectory(options);
@@ -7185,6 +7522,7 @@ export async function main(argv = process.argv.slice(2)) {
   if (options.command === "status") {
     const { runtime, error: runtimeError } = boundedRuntimeMetadata(runtimeDir);
     const incidents = boundedIncidentSummary(runtimeDir);
+    const gameArchive = boundedGameArchiveSummary(runtimeDir);
     let startup = { installed: false };
     let startupError = null;
     try {
@@ -7202,6 +7540,7 @@ export async function main(argv = process.argv.slice(2)) {
       startup,
       startupError,
       incidents,
+      gameArchive,
     })));
     return 0;
   }

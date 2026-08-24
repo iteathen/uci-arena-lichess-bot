@@ -159,11 +159,11 @@ node .\lichess-adapter.mjs status `
   --runtime-dir C:\ProgramData\UCI Arena\lichess
 ```
 
-It returns `uci_arena_lichess_status_v4` with explicit values for installed,
+It returns `uci_arena_lichess_status_v5` with explicit values for installed,
 registered, active, ready, stream lifecycle, capacity, active/pending games,
 scheduler state, global API cooldown, outbound-challenge quarantine, local API
-lease health, startup supervision, the bounded active-incident summary, and
-blockers. A supervised process waiting for a persisted API
+lease health, startup supervision, the bounded active-incident summary, game
+archive availability/counts/logical storage, and blockers. A supervised process waiting for a persisted API
 cooldown is reported as `waiting_for_api_cooldown`, not as an unexplained stream
 disconnect. A stale or missing `runtime.json` never claims that the provider is
 active. Status never returns raw config, credential data, logs, SQLite rows,
@@ -181,6 +181,26 @@ node .\lichess-adapter.mjs incidents list `
 The response is `uci_arena_provider_incident_page_v1`. Cursor order is stable,
 retention/truncation is explicit, and credential values, paths, command lines,
 raw API documents, and engine protocol output are rejected before persistence.
+
+The provider also owns the canonical operational game archive. Manager accesses
+only its closed `games_list` and `game_get` DTOs; it never opens SQLite, logs,
+runtime files, raw Lichess responses, or engine output:
+
+```powershell
+node .\lichess-adapter.mjs games list `
+  --scope history --before 0 --limit 100 `
+  --runtime-dir C:\ProgramData\UCI Arena\lichess
+node .\lichess-adapter.mjs game get `
+  --game-id <lichess-game-id> `
+  --runtime-dir C:\ProgramData\UCI Arena\lichess
+```
+
+History and live pages use immutable keyset cursors. A game detail returns at
+most 2,048 canonical UCI plies with pre/post FEN, actor color, and only an exact
+observed actor clock. Component identities are nullable and evidence-bound;
+public runtime provenance is allowlisted and path-free. Existing summary-only
+history remains explicitly incomplete until bounded low-priority Lichess export
+evidence reconstructs a legal terminal replay.
 
 ## Qualification and execution
 
@@ -258,6 +278,8 @@ node .\lichess-adapter.mjs reserve --opponent trusted-user --games 1 --minutes 1
 node .\lichess-adapter.mjs reservation status --runtime-dir C:\ProgramData\UCI Arena\lichess
 node .\lichess-adapter.mjs scheduler pause --runtime-dir C:\ProgramData\UCI Arena\lichess
 node .\lichess-adapter.mjs scheduler resume --runtime-dir C:\ProgramData\UCI Arena\lichess
+node .\lichess-adapter.mjs games list --scope live --limit 100 --runtime-dir C:\ProgramData\UCI Arena\lichess
+node .\lichess-adapter.mjs game get --game-id <lichess-game-id> --runtime-dir C:\ProgramData\UCI Arena\lichess
 ```
 
 Manager-editable configuration is restricted to capacity, inbound challenge,
@@ -330,7 +352,9 @@ node .\live-acceptance.mjs `
 
 The provider owns a WAL-mode SQLite store. It persists owners, reservations,
 scheduler controls, opponents, challenge attempts, games, API safety state, and
-single-client leases. Restart reconciles active games before admitting new work.
+single-client leases. Schema 6 adds immutable archive and completion cursors,
+canonical per-ply replay snapshots, completeness evidence, content identity,
+and truthfully nullable component identities. Restart reconciles active games before admitting new work.
 Rate-limit cooldowns survive restart and cannot be shortened by local config.
 Every 429 stops all new Lichess requests for at least one minute. Repeated
 challenge-create 429s additionally open a durable challenge-only circuit up to

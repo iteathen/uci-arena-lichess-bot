@@ -25,6 +25,7 @@ import {
   applySingleGameProfile,
   bookMoveWasUsed,
   exactEvidenceRequalification,
+  engineComponentIdentity,
   gameRuntimeProvenance,
   loadAdaptiveTemporalCurveProfile,
   loadCapacityProfile,
@@ -36,6 +37,7 @@ import {
   parseArguments,
   parseRuntimeStatus,
   probeAccount,
+  providerComponentIdentity,
   providerStatusProjection,
   replacementStartupReadiness,
   qualificationFailureProjection,
@@ -80,9 +82,11 @@ test("provider status distinguishes inactive, disconnected, and ready states", (
     "runtime_status_missing",
     "provider_process_inactive",
     "incident_storage_unavailable",
+    "game_archive_storage_unavailable",
   ]);
-  assert.equal(missing.schema, "uci_arena_lichess_status_v4");
+  assert.equal(missing.schema, "uci_arena_lichess_status_v5");
   assert.equal(missing.incidents.available, false);
+  assert.equal(missing.games.archive_available, false);
 
   const disabled = providerStatusProjection({
     startup: { installed: true, enabled: false, active: false },
@@ -138,6 +142,14 @@ test("provider status distinguishes inactive, disconnected, and ready states", (
       truncated: false,
       truncated_rows: 0,
     },
+    game_archive: {
+      available: true,
+      total_games: 3,
+      complete_games: 1,
+      incomplete_games: 1,
+      live_games: 1,
+      logical_storage_bytes: 16_384,
+    },
     updated_at: "2026-08-01T00:00:00.000Z",
   };
   const disconnected = providerStatusProjection({
@@ -152,6 +164,8 @@ test("provider status distinguishes inactive, disconnected, and ready states", (
   assert.deepEqual(disconnected.blockers, ["event_stream_disconnected"]);
   assert.equal(disconnected.games.active, 1);
   assert.equal(disconnected.games.cancelling, 1);
+  assert.equal(disconnected.games.archive_available, true);
+  assert.equal(disconnected.games.total, 3);
 
   const recovering = providerStatusProjection({
     runtime: {
@@ -973,6 +987,7 @@ class ClockCorrectionEngine extends MockGameEngine {
 function mockStore() {
   return {
     beginGame() {},
+    reconcileGameLine() {},
     finishGame() {},
   };
 }
@@ -997,6 +1012,46 @@ function createGameSession(engine, client, config = gameConfig(), overrides = {}
   sessions = [session];
   return session;
 }
+
+test("game sessions publish one canonical replay port with only the exact actor clock", async () => {
+  const begins = [];
+  const lines = [];
+  const finishes = [];
+  const store = {
+    beginGame: (game) => begins.push(game),
+    reconcileGameLine: (line) => lines.push(line),
+    finishGame: (game) => finishes.push(game),
+  };
+  const engine = new MockGameEngine();
+  const session = createGameSession(engine, { post: async () => {} }, gameConfig(), { store });
+  const initial = startedState("");
+  await session.initialize(gameFull(initial), engine);
+  await session.onState(startedState("e2e4", {
+    status: "resign",
+    winner: "black",
+    wtime: 179_123,
+    btime: 180_000,
+  }), engine);
+
+  assert.equal(begins.length, 1);
+  assert.equal(begins[0].initialFen,
+    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+  assert.equal(begins[0].providerComponent.componentId, "lichess.adapter");
+  assert.equal(begins[0].engineComponent, null);
+  assert.equal(lines.length, 1);
+  assert.deepEqual(lines[0].plies.map((ply) => ({
+    move: ply.uciMove,
+    actor: ply.actorColor,
+    clock: ply.clockMs,
+  })), [{ move: "e2e4", actor: "white", clock: 179_123 }]);
+  assert.deepEqual(finishes, [{
+    id: "game-1",
+    status: "resign",
+    result: "loss",
+    winner: "black",
+    plies: 1,
+  }]);
+});
 
 test("runtime config is credential-free and resolves repository paths", () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-lichess-config-"));
@@ -1023,6 +1078,45 @@ test("runtime config is credential-free and resolves repository paths", () => {
   assert.equal(config.engine.temporal_curve_profile, null);
   assert.equal(config.engine.uci_options.OwnBook, true);
   assert.equal(config.engine.executable.includes(ROOT.replaceAll("\\", "/")), true);
+});
+
+test("component identity is explicit, inventory-bound, and null for external UCI engines", () => {
+  assert.equal(engineComponentIdentity({ engine: { executable: process.execPath } }), null);
+  const provider = providerComponentIdentity();
+  assert.deepEqual(provider, {
+    componentId: "lichess.adapter",
+    version: "1.0.24",
+    manifestSha256: sha256(readFileSync(path.join(ROOT, "contracts", "component-manifest.json"))),
+  });
+
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-engine-component-"));
+  const executable = path.join(directory, "bin", "engine.exe");
+  mkdirSync(path.dirname(executable), { recursive: true });
+  writeFileSync(executable, "exact-engine-binary", "utf8");
+  const manifestPath = path.join(directory, "arena-component.json");
+  writeFileSync(manifestPath, JSON.stringify({
+    schema: "arena_install_component_v1",
+    schema_version: 1,
+    component_id: "uci_arena.engine",
+    component_version: "0.9.0",
+    files: [{
+      path: "bin/engine.exe",
+      sha256: createHash("sha256").update(readFileSync(executable)).digest("hex"),
+      size_bytes: readFileSync(executable).byteLength,
+    }],
+  }), "utf8");
+  assert.deepEqual(engineComponentIdentity({
+    engine: { executable, component_manifest: manifestPath },
+  }), {
+    componentId: "uci_arena.engine",
+    version: "0.9.0",
+    manifestSha256: sha256(readFileSync(manifestPath)),
+  });
+  writeFileSync(executable, "tampered-engine-binary", "utf8");
+  assert.throws(
+    () => engineComponentIdentity({ engine: { executable, component_manifest: manifestPath } }),
+    /does not match its manifest inventory/,
+  );
 });
 
 test("configuration recursively rejects hidden credential fields and bearer values", () => {
@@ -2950,7 +3044,11 @@ test("black aborts one zero-ply game after the first-move deadline", async () =>
   const config = gameConfig();
   config.scheduler = { first_move_timeout_seconds: 60 };
   const session = createGameSession(engine, client, config, {
-    store: { beginGame() {}, finishGame: (game) => finishes.push(game) },
+    store: {
+      beginGame() {},
+      reconcileGameLine() {},
+      finishGame: (game) => finishes.push(game),
+    },
     scheduleTimeout: (callback, milliseconds) => {
       scheduled = { callback, milliseconds };
       return { unref() {} };
@@ -3512,6 +3610,103 @@ test("API client keeps credentials in the authorization header", async () => {
   assert.equal(JSON.stringify(request.options).includes("test-token"), true);
 });
 
+test("historical exports use one bounded lowest-priority NDJSON request without evaluations", async () => {
+  const encoder = new TextEncoder();
+  let request;
+  const body = new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode('{"id":"game-a"}\n{"id":"game-b"}\n'));
+      controller.close();
+    },
+  });
+  const client = new LichessClient({
+    token: "test-token",
+    fetchImpl: async (url, options) => {
+      request = { url: String(url), options };
+      return { ok: true, status: 200, body };
+    },
+  });
+  assert.deepEqual(await client.exportGamesByIds(["game-a", "game-b"]), [
+    { id: "game-a" },
+    { id: "game-b" },
+  ]);
+  const requested = new URL(request.url);
+  assert.equal(requested.pathname, "/api/games/export/_ids");
+  assert.equal(requested.searchParams.get("clocks"), "true");
+  assert.equal(requested.searchParams.get("evals"), "false");
+  assert.equal(requested.searchParams.get("opening"), "false");
+  assert.equal(requested.searchParams.get("literate"), "false");
+  assert.equal(request.options.method, "POST");
+  assert.equal(request.options.body, "game-a,game-b");
+  assert.equal(request.options.headers.Accept, "application/x-ndjson");
+  assert.equal(request.options.headers["Content-Type"], "text/plain; charset=utf-8");
+  assert.throws(
+    () => client.exportGamesByIds(Array.from({ length: 301 }, (_, index) => `g-${index}`)),
+    /1 through 300 ids/,
+  );
+});
+
+test("archive backfill excludes live sessions and reconciles each returned game independently", async () => {
+  const requested = [];
+  const reconciled = [];
+  const failures = [];
+  let candidates = ["active-game", "historical-game"];
+  const controller = Object.assign(Object.create(BotController.prototype), {
+    archiveBackfillRunning: false,
+    activeGames: new Map([["active-game", {}]]),
+    startingGames: new Map(),
+    signal: new AbortController().signal,
+    now: () => 1_100,
+    store: {
+      listProviderGameBackfillIds: () => candidates,
+      reconcileHistoricalGame: (game) => {
+        reconciled.push(game);
+        return true;
+      },
+      recordProviderGameBackfillFailure: (id, reason) => failures.push({ id, reason }),
+    },
+    client: {
+      exportGamesByIds: async (ids) => {
+        requested.push(ids);
+        const historical = {
+          id: "historical-game",
+          moves: "e4 e5",
+          clocks: [6_000, 5_950],
+          status: "mate",
+          winner: "white",
+          lastMoveAt: 1_000,
+        };
+        if (ids[0] === "historical-game") return [historical];
+        if (ids[0] === "duplicate-game") {
+          return [
+            { ...historical, id: "duplicate-game" },
+            { ...historical, id: "duplicate-game" },
+          ];
+        }
+        return [];
+      },
+    },
+  });
+  assert.equal(await controller.backfillProviderGames(), 1);
+  assert.deepEqual(requested, [["historical-game"]]);
+  assert.deepEqual(reconciled[0].plies.map((ply) => ply.uciMove), ["e2e4", "e7e5"]);
+  assert.deepEqual(failures, []);
+
+  candidates = ["missing-game"];
+  assert.equal(await controller.backfillProviderGames(), 0);
+  assert.deepEqual(failures, [{
+    id: "missing-game",
+    reason: "historical_export_unavailable",
+  }]);
+
+  candidates = ["duplicate-game", "duplicate-companion"];
+  assert.equal(await controller.backfillProviderGames(), 0);
+  assert.deepEqual(failures.slice(-2), [
+    { id: "duplicate-game", reason: "historical_export_malformed" },
+    { id: "duplicate-companion", reason: "historical_export_unavailable" },
+  ]);
+});
+
 test("API client applies at least sixty seconds of global backoff after 429", async () => {
   const client = new LichessClient({
     token: "test-token",
@@ -3797,6 +3992,12 @@ test("nested local control commands parse without touching credentials", () => {
   assert.deepEqual(parseArguments(["incidents", "list", "--filter", "all", "--limit", "10"]), {
     command: "incidents", action: "list", filter: "all", limit: "10",
   });
+  assert.deepEqual(parseArguments(["games", "list", "--scope", "history", "--before", "7"]), {
+    command: "games", action: "list", scope: "history", before: "7",
+  });
+  assert.deepEqual(parseArguments(["game", "get", "--game-id", "game-1"]), {
+    command: "game", action: "get", game_id: "game-1",
+  });
 });
 
 test("incident pagination rejects invalid input before creating provider storage", async () => {
@@ -3809,6 +4010,20 @@ test("incident pagination rejects invalid input before creating provider storage
   await assert.rejects(
     main(["incidents", "list", "--filter", "recent", "--runtime-dir", runtimeDir]),
     /filter must be active or all/u,
+  );
+  assert.equal(existsSync(path.join(runtimeDir, "matches.sqlite")), false);
+});
+
+test("game archive input rejects invalid pages and ids before creating provider storage", async () => {
+  const runtimeDir = mkdtempSync(path.join(os.tmpdir(), "uci-arena-invalid-game-page-"));
+  await assert.rejects(
+    main(["games", "list", "--scope", "all", "--runtime-dir", runtimeDir]),
+    /scope must be live or history/u,
+  );
+  assert.equal(existsSync(path.join(runtimeDir, "matches.sqlite")), false);
+  await assert.rejects(
+    main(["game", "get", "--game-id", "../../private", "--runtime-dir", runtimeDir]),
+    /game id is invalid/u,
   );
   assert.equal(existsSync(path.join(runtimeDir, "matches.sqlite")), false);
 });

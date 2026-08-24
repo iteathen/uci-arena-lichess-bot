@@ -27,6 +27,30 @@ function initializedDatabase(prefix) {
   return file;
 }
 
+const ARCHIVE_COLUMNS = Object.freeze([
+  "backfill_last_attempted_at", "backfill_attempts",
+  "engine_component_manifest_sha256", "engine_component_version", "engine_component_id",
+  "provider_component_manifest_sha256", "provider_component_version", "provider_component_id",
+  "archive_sha256", "archive_reason", "archive_completeness", "variant", "initial_fen",
+  "completion_cursor", "archive_cursor",
+]);
+
+function downgradeToSchemaFive(file) {
+  const database = new DatabaseSync(file);
+  database.exec(`
+    DROP INDEX games_live_cursor;
+    DROP INDEX games_completion_cursor;
+    DROP INDEX games_archive_cursor;
+    DROP TABLE game_plies;
+    DROP TABLE game_archive_control;
+  `);
+  for (const column of ARCHIVE_COLUMNS) {
+    database.exec(`ALTER TABLE games DROP COLUMN ${column}`);
+  }
+  database.exec("UPDATE schema_meta SET version=5");
+  database.close();
+}
+
 function replaceSchemaMeta(file, values) {
   const database = new DatabaseSync(file);
   database.exec("DROP TABLE schema_meta; CREATE TABLE schema_meta(version INTEGER NOT NULL);");
@@ -124,6 +148,7 @@ test("unversioned nonempty and malformed migration authorities are rejected", ()
 
 test("schema-five lifecycle extension migrates exactly and preserves admitted authority", () => {
   const legacyFile = initializedDatabase("uci-arena-storage-lifecycle-legacy-");
+  downgradeToSchemaFive(legacyFile);
   const legacy = new DatabaseSync(legacyFile);
   legacy.exec(`
     DROP TABLE provider_incidents;
@@ -151,6 +176,7 @@ test("schema-five lifecycle extension migrates exactly and preserves admitted au
     WHERE id=1
   `);
   retained.close();
+  downgradeToSchemaFive(retainedFile);
   const reopened = new LichessStore(retainedFile);
   try {
     assert.deepEqual(reopened.providerLifecycleSnapshot(), {
@@ -164,8 +190,104 @@ test("schema-five lifecycle extension migrates exactly and preserves admitted au
   }
 });
 
+test("schema-five game summaries migrate to deterministic archive cursors without invented replay", () => {
+  const file = initializedDatabase("uci-arena-storage-game-archive-v5-");
+  downgradeToSchemaFive(file);
+  const legacy = new DatabaseSync(file);
+  legacy.exec(`
+    INSERT INTO games(game_id, opponent, audience, status, plies, started_at, finished_at)
+    VALUES
+      ('game-b', 'bot-b', 'bot', 'mate', 31, 20, 200),
+      ('game-a', 'bot-a', 'bot', 'resign', 42, 10, 300),
+      ('game-live', 'bot-live', 'bot', 'started', 7, 5, 0)
+  `);
+  legacy.close();
+
+  const migrated = new LichessStore(file);
+  try {
+    assert.equal(migrated.status().schemaVersion, 6);
+    assert.deepEqual(migrated.db.prepare(`
+      SELECT game_id, archive_cursor, completion_cursor, archive_completeness,
+        archive_reason, archive_sha256, provider_component_id, engine_component_id
+      FROM games ORDER BY archive_cursor
+    `).all().map((row) => ({ ...row })), [
+      {
+        game_id: "game-live", archive_cursor: 1, completion_cursor: 0,
+        archive_completeness: "live", archive_reason: "", archive_sha256: "",
+        provider_component_id: "", engine_component_id: "",
+      },
+      {
+        game_id: "game-a", archive_cursor: 2, completion_cursor: 2,
+        archive_completeness: "summary_only",
+        archive_reason: "historical_moves_unavailable", archive_sha256: "",
+        provider_component_id: "", engine_component_id: "",
+      },
+      {
+        game_id: "game-b", archive_cursor: 3, completion_cursor: 1,
+        archive_completeness: "summary_only",
+        archive_reason: "historical_moves_unavailable", archive_sha256: "",
+        provider_component_id: "", engine_component_id: "",
+      },
+    ]);
+    assert.deepEqual({ ...migrated.db.prepare(`
+      SELECT next_archive_cursor, next_completion_cursor FROM game_archive_control WHERE id=1
+    `).get() }, { next_archive_cursor: 4, next_completion_cursor: 3 });
+    assert.equal(migrated.gamePlyRows("game-a").length, 0);
+  } finally {
+    migrated.close();
+  }
+});
+
+test("schema-five archive migration rolls back completely and retries deterministically", () => {
+  const file = initializedDatabase("uci-arena-storage-game-archive-rollback-");
+  downgradeToSchemaFive(file);
+  const legacy = new DatabaseSync(file);
+  legacy.exec(`
+    INSERT INTO games(game_id, opponent, audience, status, plies, started_at, finished_at)
+    VALUES('rollback-game', 'fixture-bot', 'bot', 'mate', 0, 10, 20)
+  `);
+  legacy.close();
+
+  assert.throws(
+    () => new LichessStore(file, {
+      failureInjector: (stage) => {
+        if (stage === "before_commit") throw new Error("fixture archive migration interruption");
+      },
+    }),
+    (error) => error.code === "LICHESS_STORAGE_INITIALIZATION_FAILED",
+  );
+  const rolledBack = new DatabaseSync(file);
+  try {
+    assert.equal(rolledBack.prepare("SELECT version FROM schema_meta").get().version, 5);
+    assert.equal(rolledBack.prepare(`
+      SELECT COUNT(*) AS count FROM pragma_table_info('games') WHERE name='archive_cursor'
+    `).get().count, 0);
+    assert.equal(rolledBack.prepare(`
+      SELECT COUNT(*) AS count FROM sqlite_master WHERE name='game_archive_control'
+    `).get().count, 0);
+  } finally {
+    rolledBack.close();
+  }
+
+  const retried = new LichessStore(file);
+  try {
+    const game = retried.db.prepare(`
+      SELECT archive_cursor, completion_cursor, archive_completeness
+      FROM games WHERE game_id='rollback-game'
+    `).get();
+    assert.deepEqual({ ...game }, {
+      archive_cursor: 1,
+      completion_cursor: 1,
+      archive_completeness: "summary_only",
+    });
+  } finally {
+    retried.close();
+  }
+});
+
 test("malformed schema-five lifecycle extensions fail closed", () => {
   const file = initializedDatabase("uci-arena-storage-lifecycle-malformed-");
+  downgradeToSchemaFive(file);
   const database = new DatabaseSync(file);
   database.exec(`
     DROP TABLE provider_lifecycle_control;
@@ -185,6 +307,7 @@ test("malformed schema-five lifecycle extensions fail closed", () => {
   );
 
   const reorderedFile = initializedDatabase("uci-arena-storage-lifecycle-reordered-");
+  downgradeToSchemaFive(reorderedFile);
   const reordered = new DatabaseSync(reorderedFile);
   reordered.exec(`
     DROP TABLE provider_lifecycle_control;
@@ -208,6 +331,7 @@ test("malformed schema-five lifecycle extensions fail closed", () => {
 
 test("incident extension completeness and stored sanitization fail closed", () => {
   const partialFile = initializedDatabase("uci-arena-storage-incidents-partial-");
+  downgradeToSchemaFive(partialFile);
   const partial = new DatabaseSync(partialFile);
   partial.exec("DROP TABLE provider_incidents");
   partial.close();
@@ -299,7 +423,7 @@ test("pragma refusal is typed and initialization failure closes for deterministi
   );
   const retried = new LichessStore(file);
   try {
-    assert.equal(retried.status().schemaVersion, 5);
+    assert.equal(retried.status().schemaVersion, 6);
   } finally {
     retried.close();
   }

@@ -346,6 +346,7 @@ export const API_REQUEST_PRIORITY = Object.freeze({
   challenge_create: 30,
   discovery: 40,
   ordinary: 50,
+  archive_backfill: 60,
 });
 
 export const API_RATE_LIMIT_BACKOFF_MS = Object.freeze([

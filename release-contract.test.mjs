@@ -23,6 +23,7 @@ test("component definition packages runtime contracts without test or source-tre
   assert.equal(sources.includes("vendor/time-profile-contract/src"), true);
   assert.equal(sources.includes("lichess-adapter.mjs"), true);
   assert.equal(sources.includes("provider-incidents.mjs"), true);
+  assert.equal(sources.includes("provider-games.mjs"), true);
   assert.equal(sources.includes("process-instance-identity.mjs"), true);
   assert.equal(sources.some((source) => source.includes("fake-api")
     || source.includes("test-fixtures")
@@ -79,6 +80,18 @@ test("component manifest separates operator engine overrides from managed suite 
     true,
   );
   assert.deepEqual(manifest.installation.external_user_data, ["provider_workspace"]);
+  assert.deepEqual(
+    manifest.installation.installer_integration.dependency_bindings.find(
+      (binding) => binding.name === "default_engine_manifest",
+    ),
+    {
+      name: "default_engine_manifest",
+      component_id: "uci_arena.engine",
+      source: "component_path",
+      path: "arena-component.json",
+      required: false,
+    },
+  );
 });
 
 test("component release accepts safe declarative workspace mappings", () => {
@@ -94,6 +107,8 @@ test("Manager configuration and status contracts are closed and separate request
   const update = JSON.parse(readFileSync(path.join(root, "contracts", "configuration-update-schema.json"), "utf8"));
   const status = JSON.parse(readFileSync(path.join(root, "contracts", "status-schema.json"), "utf8"));
   const incidents = JSON.parse(readFileSync(path.join(root, "contracts", "incident-page-schema.json"), "utf8"));
+  const gamePage = JSON.parse(readFileSync(path.join(root, "contracts", "game-page-schema.json"), "utf8"));
+  const gameDetail = JSON.parse(readFileSync(path.join(root, "contracts", "game-detail-schema.json"), "utf8"));
   assert.deepEqual(configuration.required, [
     "schema",
     "capacity",
@@ -110,16 +125,22 @@ test("Manager configuration and status contracts are closed and separate request
   assert.equal(status.properties.capacity.additionalProperties, false);
   assert.equal(status.$defs.slot_counts.required.includes("cancelling"), true);
   assert.equal(status.properties.games.required.includes("cancelling"), true);
-  assert.equal(status.properties.schema.const, "uci_arena_lichess_status_v4");
+  assert.equal(status.properties.schema.const, "uci_arena_lichess_status_v5");
+  assert.equal(status.properties.games.required.includes("archive_available"), true);
+  assert.equal(status.properties.games.required.includes("storage_bytes"), true);
   assert.equal(status.properties.supervision.additionalProperties, false);
   assert.equal(status.properties.incidents.additionalProperties, false);
   assert.equal(incidents.$id, "uci_arena_provider_incident_page_v1");
   assert.equal(incidents.additionalProperties, false);
   assert.equal(incidents.$defs.incident.additionalProperties, false);
   assert.equal(incidents.$defs.incident.properties.detail.maxLength, 512);
+  assert.equal(gamePage.$id, "uci_arena_provider_game_page_v1");
+  assert.equal(gamePage.$defs.game_summary.additionalProperties, false);
+  assert.equal(gameDetail.$id, "uci_arena_provider_game_v1");
+  assert.equal(gameDetail.additionalProperties, false);
 });
 
-test("fake Manager invokes incident pages only through declared runtime and provider ports", () => {
+test("fake Manager invokes incident and game DTOs only through declared runtime and provider ports", () => {
   const service = JSON.parse(readFileSync(
     path.join(root, "contracts", "service-contract.json"), "utf8"));
   const operations = JSON.parse(readFileSync(
@@ -134,6 +155,28 @@ test("fake Manager invokes incident pages only through declared runtime and prov
   assert.equal(operations.transport.entrypoint, service.service.entrypoint);
   const workspace = mkdtempSync(path.join(os.tmpdir(), "uci-arena-fake-manager-incidents-"));
   const providerFixture = new LichessStore(path.join(workspace, "matches.sqlite"));
+  providerFixture.beginGame({
+    id: "manager-game",
+    opponent: "fixture-bot",
+    audience: "bot",
+    color: "white",
+    startedAt: 100,
+    initialFen: "startpos",
+    variant: "standard",
+    providerComponent: {
+      componentId: "lichess.adapter",
+      version: "1.0.24",
+      manifestSha256: `sha256:${"a".repeat(64)}`,
+    },
+  });
+  providerFixture.finishGame({
+    id: "manager-game",
+    status: "aborted",
+    result: "",
+    winner: "",
+    plies: 0,
+    finishedAt: 200,
+  });
   providerFixture.close();
   const output = execFileSync(runtime, [
     path.join(root, operations.transport.entrypoint),
@@ -153,6 +196,38 @@ test("fake Manager invokes incident pages only through declared runtime and prov
   assert.deepEqual(page.incidents, []);
   assert.equal(page.filter, "all");
   assert.equal(page.retention.maximum_rows, 2048);
+
+  const gamePageOperation = operations.operations.games_list;
+  const gamePage = JSON.parse(execFileSync(runtime, [
+    path.join(root, operations.transport.entrypoint),
+    ...gamePageOperation.arguments,
+    "--scope", "history",
+    "--limit", "10",
+    "--runtime-dir", workspace,
+  ], {
+    cwd: path.parse(root).root,
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 15_000,
+  }));
+  assert.equal(gamePage.schema, gamePageOperation.response);
+  assert.deepEqual(gamePage.games.map((game) => game.game_id), ["manager-game"]);
+
+  const gameGetOperation = operations.operations.game_get;
+  const game = JSON.parse(execFileSync(runtime, [
+    path.join(root, operations.transport.entrypoint),
+    ...gameGetOperation.arguments,
+    "--game-id", "manager-game",
+    "--runtime-dir", workspace,
+  ], {
+    cwd: path.parse(root).root,
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 15_000,
+  }));
+  assert.equal(game.schema, gameGetOperation.response);
+  assert.equal(game.game_id, "manager-game");
+  assert.deepEqual(game.replay, []);
 });
 
 test("installed qualification contract separates authoritative success from bounded failure", () => {

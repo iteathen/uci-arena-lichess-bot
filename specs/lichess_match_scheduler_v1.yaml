@@ -288,8 +288,8 @@ opponent_scheduler:
 storage:
   engine: node_sqlite
   journal_mode: WAL
-  schema_version: 5
-  tables: [schema_meta, owners, reservations, scheduler_control, opponents, challenge_attempts, games, api_safety_state, api_client_leases]
+  schema_version: 6
+  tables: [schema_meta, owners, reservations, scheduler_control, opponents, challenge_attempts, games, game_archive_control, game_plies, api_safety_state, api_client_leases, provider_lifecycle_control, provider_incident_control, provider_incidents]
   invariants:
     - "Opening an existing schema-v3 or schema-v4 store idempotently materializes every required table. A superseded api_rate_limit singleton is imported as a conservative legacy-global safety row so a branch or adapter upgrade cannot erase or shorten an unexpired 429 cooldown. Schema-v5 adds durable challenge-create circuit fields without weakening imported global cooldown authority."
     - "The API-client lease persists the exact process-instance identity captured at acquisition. A replacement may take over a still-fresh lease only when an OS probe proves that exact instance is absent or the pid now names a different process; an exact live or unverifiable owner remains exclusive until normal expiry."
@@ -371,11 +371,12 @@ sqlite_storage_foundation_2026_08_24:
     rules:
       - "Refusal of any required effective pragma is a typed initialization failure. The connection and any transaction are closed or rolled back before the failure escapes."
   migration:
-    current_schema: 5
+    current_schema: 6
     rules:
       - "A valid empty SQLite database initializes in one exclusive transaction. A nonempty database must contain exactly one typed supported schema authority before any table creation or repair."
-      - "Versions one through five are admitted only after exact table, column, primary-key, constraint, named-index, object-set, SQLite storage-class, boolean-domain, nonnegative-domain, and JavaScript-safe-integer verification for that historical version."
-      - "Schema five admits exactly two known object sets: the base schema used before the provider lifecycle interlock and that same base plus the exact provider_lifecycle_control extension. Initialization adds the extension transactionally when absent, preserves an admitted existing singleton when present, and requires the extended object set at final verification without changing the base schema version."
+      - "Versions one through six are admitted only after exact table, column, primary-key, constraint, named-index, object-set, SQLite storage-class, boolean-domain, nonnegative-domain, and JavaScript-safe-integer verification for that historical version."
+      - "Schema five admits exactly three known object sets: the historical base schema, base plus the exact provider_lifecycle_control extension, and base plus lifecycle plus the exact incident extension. Incident authority without lifecycle authority is malformed. Migration materializes any missing admitted extensions transactionally before advancing the base schema version."
+      - "Migration to schema six preserves lifecycle and incident authority as required tables and transactionally adds the exact game archive control, game columns, ply table, indexes, and deterministic historical cursors."
       - "The prior ALTER migrations' append-order layouts for the schema-four lease identity column and schema-five challenge-safety columns, plus the corresponding fresh-create layouts, are the only admitted column-order variants. Arbitrary column reordering remains malformed."
       - "Known version-two legacy rate-limit authority is a named migration variant. Unknown, missing, duplicate, partial, malformed, or ambiguous authority is rejected rather than repaired."
       - "Every migration step and final quick_check executes inside the same exclusive transaction. Failure rolls back all DDL and data changes, closes the connection, and leaves deterministic retry authority."
@@ -519,6 +520,112 @@ provider_incident_ledger_2026_08_24:
     - "Oversized, multiline, path-bearing, header-bearing, credential-like, JSON-document, and engine-protocol details never persist or project."
     - "A fake Manager resolves the dependency runtime plus provider CLI entrypoint and invokes incidents_list through the declared command prefix."
 
+provider_game_archive_2026_08_24:
+  status: active
+  owning_issue: https://github.com/iteathen/uci-arena-lichess-bot/issues/42
+  owner: provider_game_domain_and_runtime_store
+  purpose: >
+    Retain one canonical operational record for every provider game and expose
+    bounded live, history, and replay projections without transferring storage,
+    legality reconstruction, or provenance interpretation to Manager.
+  lego_boundary:
+    provided_ports:
+      - games_list_v1
+      - game_get_v1
+      - status_v5_archive_summary
+    rules:
+      - "The provider game-domain module owns closed game identifiers, canonical replay validation, FEN snapshots, archive content identity, provenance projection, and public DTO validation. The provider store adapter alone owns SQLite schema, migration, transactions, cursors, and queries."
+      - "Live stream and historical-export adapters submit typed observations through the same game-domain/store port. They never expose transport responses or create a parallel game archive."
+      - "Manager invokes only receipt-declared games_list and game_get operations and renders their closed records. Manager never opens matches.sqlite, runtime files, logs, component paths, raw engine output, or Lichess response documents."
+      - "Installer composes optional component-manifest bindings and preserves the provider workspace. It never interprets games, plies, archive completeness, or provenance. Training export remains reserved and has no runtime authority."
+  storage:
+    migration:
+      from_schema: 5
+      to_schema: 6
+      transaction: provider_owned_exclusive_migration
+      rules:
+        - "Migration admits the exact schema-five base plus lifecycle and incident extensions, preserves every existing row, adds archive columns and tables, assigns immutable deterministic archive cursors to all known games, and assigns completion cursors to existing terminal rows ordered by finished time and game id."
+        - "Existing terminal summaries become summary_only with no invented moves, positions, component versions, or archive hash. Existing unfinished rows become live and retain completion cursor zero."
+        - "Failure rolls back the schema version, columns, tables, indexes, cursor allocation, and row changes as one transaction."
+    control:
+      table: game_archive_control
+      fields: [next_archive_cursor, next_completion_cursor, updated_at]
+    games_additions:
+      - immutable_archive_cursor
+      - immutable_completion_cursor
+      - canonical_initial_fen
+      - variant
+      - archive_completeness
+      - bounded_incomplete_reason
+      - archive_content_sha256
+      - provider_component_id
+      - provider_component_version
+      - provider_component_manifest_sha256
+      - optional_engine_component_id
+      - optional_engine_component_version
+      - optional_engine_component_manifest_sha256
+      - backfill_attempt_count_and_time
+    game_plies:
+      primary_key: [game_id, zero_based_ply]
+      fields: [uci_move, before_fen, after_fen, actor_color, optional_actor_clock_ms]
+      maximum_plies: 2048
+    rules:
+      - "One immediate transaction allocates each game/archive cursor. Completion allocates one strictly increasing completion cursor and atomically commits terminal metadata plus the SHA-256 identity of the complete canonical replay."
+      - "Streamed positions reconcile idempotently by game id and zero-based ply. Append and exact duplicate observations preserve existing plies; a takeback may replace only the suffix of a nonterminal line."
+      - "After completion cursor allocation, terminal metadata, initial FEN, canonical plies, clocks, archive completeness, component identities, and content identity are immutable. Exact terminal replay is idempotent; any conflict fails closed."
+      - "A live observation records a clock only for the exact final observed actor when Lichess supplied that typed clock. Missing intermediate reconnect clocks remain absent and are never derived."
+  provenance:
+    provider:
+      - "Every newly initialized game binds the packaged provider component id, component version, and exact product component-manifest SHA-256."
+    engine:
+      - "A selected engine binds component id, version, and manifest SHA-256 only when an explicit public component-manifest path is supplied and its exact non-link file inventory contains the exact selected executable with matching size and SHA-256."
+      - "A standard or otherwise external UCI executable without that binding retains its executable/build and normalized UCI identity in runtime provenance while public component identity is null. Historical versions are never inferred from the current installation."
+    public_projection:
+      - "Public provenance is an allowlisted path-free projection of immutable game/runtime identities. Raw UCI id lines, applied command arguments, paths, environment, logs, and arbitrary provenance JSON never cross the Manager boundary."
+  historical_backfill:
+    owner: provider_archive_backfill_loop
+    source: existing_api_safety_coordinator
+    export_by_ids_maximum: 300
+    maximum_admitted_response_bytes: 16777216
+    request_priority: below_discovery
+    requested_evidence: [moves, clocks]
+    rules:
+      - "The background owner requests summary_only game ids plus legacy unresolved live rows in bounded batches, excludes every currently active or starting game, never runs before startup reconciliation, and uses the existing one-request-at-a-time cooldown authority with evaluations, opening, and literate annotations disabled. An exact terminal export may promote a legacy live row; otherwise that row remains live without an invented finish."
+      - "The bounded provider-owned parser admits standard-variant export records, replays at most 2,048 SAN moves through the existing chess legality implementation, and emits canonical UCI plus before/after six-field FEN snapshots."
+      - "A successful exact match becomes reconciled and immutable. Missing, malformed, illegal, unsupported, or conflicting history remains summary_only with a closed reason and attempt evidence; runtime provenance and historical component versions are never rewritten."
+      - "Transport or cooldown failure leaves the batch unattempted for retry. Backfill work is separately scheduled and never blocks the event-stream, reconciliation, scheduler, or status loops on local parsing or SQLite scans."
+  retention:
+    games: indefinite_in_v1
+    automatic_pruning: forbidden
+    summary_fields: [total_games, complete_games, incomplete_games, live_games, logical_storage_bytes]
+  public_contract:
+    service_contract_minor: "1.1"
+    operations:
+      games_list:
+        arguments: [scope_live_or_history, before_cursor, limit]
+        maximum_page_size: 100
+        response_schema: uci_arena_provider_game_page_v1
+      game_get:
+        arguments: [game_id]
+        response_schema: uci_arena_provider_game_v1
+        maximum_plies: 2048
+    rules:
+      - "History uses immutable completion cursor descending; live uses immutable archive cursor descending. The page returns rows strictly before the requested cursor and fetches limit plus one, so new games cannot duplicate or skip previously observed history."
+      - "The game detail record includes bounded metadata, truthfully nullable component identities, archive completeness, content identity, allowlisted runtime provenance, and provider-authored replay snapshots with canonical white-or-black actor color. Manager may derive local-versus-remote only when the recorded bot color is present."
+      - "Invalid scope, cursor, limit, or game id fails before storage creation. Read-only operations refuse missing storage instead of creating a new authority."
+  status_v5:
+    schema: uci_arena_lichess_status_v5
+    additions: [archive_available, total, complete, incomplete, storage_bytes]
+    compatibility:
+      - "Status v5 preserves every status-v4 supervision and incident field and extends only the closed games projection. Manager remains responsible for accepting conforming v3 and v4 providers and treating archive operations as unavailable when capabilities or declared operations are absent."
+  validation:
+    - "Migration fixtures prove deterministic cursor assignment, preservation of every version-five row and incident/lifecycle authority, exact schema/index admission, rollback, and retry."
+    - "Crash, reconnect, duplicate gameFull/gameState, clock correction, stream gap, takeback, and startup-reconciliation fixtures produce one canonical nonterminal line and one immutable terminal replay."
+    - "Bounded historical exports prove SAN-to-UCI/FEN reconstruction, optional clocks, unavailable/malformed/conflicting records, cooldown preservation, no evaluation request, and at most 300 ids per batch."
+    - "At 646 or more records, stable keyset pages reach every history row exactly once without returning a full-store response. Game detail never exceeds 2,048 plies."
+    - "Substitution fixtures cover an external standard UCI executable with null component identity and an explicitly bound installed engine manifest whose exact executable inventory is validated."
+    - "Schemas and adversarial projections prove no credential, token path, component/runtime path, command, header, raw response, SQLite row, raw engine output, or arbitrary provenance JSON crosses the boundary."
+
 planned_provider_resilience_and_incidents_2026_08_23:
   status: superseded_by_active_supervision_and_incident_contracts
   suite_record: https://github.com/iteathen/uci-arena-installer/issues/166
@@ -593,14 +700,14 @@ planned_provider_resilience_and_incidents_2026_08_23:
     - "No fixture, receipt, incident, status, log, or diagnostic reads or exposes credential contents."
 
 planned_operational_game_archive_2026_08_23:
-  status: approved_plan_not_runtime_authoritative
+  status: superseded_by_provider_game_archive_2026_08_24
   suite_record: https://github.com/iteathen/uci-arena-installer/issues/166
   owning_issue: https://github.com/iteathen/uci-arena-lichess-bot/issues/42
   prerequisites:
     - "Provider issue 6 lands atomic game activation and abnormal-termination behavior."
     - "Provider issue 7 lands safe SQLite migration and storage authority."
   activation:
-    - "This section activates architectural planning for the operational archive and Manager history/replay contract only. It does not change the current schema_version 5 store, operation catalog, schemas, retention behavior, or release authority."
+    - "This section preserves the approved planning record. Runtime authority is provider_game_archive_2026_08_24."
     - "Training export remains reserved by future_game_archive_and_training_export_2026_08_09 and receives no runtime authority from this section."
   migration:
     from_schema: 5
@@ -662,15 +769,16 @@ planned_operational_game_archive_2026_08_23:
     - "No archive, migration diagnostic, backfill request, or operation reads or exposes credential contents."
 
 future_game_archive_and_training_export_2026_08_09:
-  status: training_export_reserved_operational_archive_superseded_by_approved_plan_not_runtime_implemented
+  status: training_export_reserved_operational_archive_active_elsewhere
   purpose: >
     Reserve optional Restaurant training export derived from the provider-owned
     canonical archive without reading matches.sqlite or inventing a second
-    game-capture path. The operational archive and Manager history/replay target
-    are now planned separately above; this section grants no training authority.
+    game-capture path. The operational archive and Manager history/replay authority
+    are active under provider_game_archive_2026_08_24; this section grants no
+    training authority.
   activation:
     - "This section reserves a training-export compatibility contract only. It does not enable export or training ingestion in the current provider."
-    - "The approved operational archive plan above remains non-runtime-authoritative until its issue-owned implementation, migration, schemas, tests, and release land."
+    - "The operational archive above is runtime authority. This section grants no training-export runtime behavior, cursor, schema, or publication authority."
     - "Implementation requires a later explicit spec-first change, bounded storage policy, contract schemas, migration behavior, tests, and operator-visible controls."
   ownership:
     provider:
@@ -1230,6 +1338,8 @@ manager_account_and_options_contract_2026_07_31:
       - startup_uninstall
       - provider_status
       - incidents_list
+      - games_list
+      - game_get
       - qualification_run
     rules:
       - "Owner, reservation, and pause state remain in the adapter-owned WAL-mode SQLite store and survive restart. They are never copied into tracked config."
@@ -1250,12 +1360,13 @@ manager_account_and_options_contract_2026_07_31:
       - "Manager may validate and project the bounded failure result for operator remediation, but it must not interpret provider domain semantics or expose unstructured process diagnostics. Transport, timeout, and invalid-output failures remain Manager-owned generic diagnostics."
       - "An exact completed content-addressed result is idempotently reusable. Interrupted output without a completion marker has no authority and is removed before the same identity is retried."
   provider_status:
-    schema: uci_arena_lichess_status_v4
+    schema: uci_arena_lichess_status_v5
     rules:
       - "Every operation Manager can expose is named in the published operation catalog. Manager resolves the fixed command prefix from that receipt-verified catalog; adding or replacing a conforming provider never relies on Manager-owned copies of provider command verbs."
       - "The service contract declares whether its CLI entrypoint executes directly or through one named dependency runtime and entrypoint. Manager never infers Node.js from a filename, provider id, or source layout."
       - "The status operation is credential-free and projects only bounded provider-owned runtime and startup evidence."
       - "Installed, registered, active, ready, stream connectivity, capacity, games, scheduler, rate-limit state, supervision, active incident summary, and actionable blockers are explicit; a stale runtime file never implies an active process."
+      - "The closed games status group reports archive availability, total, complete, incomplete, and logical storage bytes from a provider-owned bounded summary. Missing or inconsistent archive evidence is nullable and adds one blocker rather than fabricating zero authoritative history."
       - "Every provider slot lifecycle state that affects admission is represented, including cancelling; status must not make occupied capacity disappear during remote challenge cancellation."
       - "Missing runtime evidence reports an inactive provider with blockers instead of failing the status operation."
       - "Status never returns credential contents, raw configuration, arbitrary logs, SQLite rows, or child-process command lines."
