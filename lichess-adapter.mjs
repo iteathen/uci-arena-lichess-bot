@@ -1688,7 +1688,10 @@ export function applyAdaptiveTemporalCurveProfile(config) {
   return artifact;
 }
 
-export function applySingleGameProfile(config) {
+export function applySingleGameProfile(config, { onValidationProgress } = {}) {
+  if (onValidationProgress !== undefined && typeof onValidationProgress !== "function") {
+    throw new Error("Single-game profile validation progress must be a function");
+  }
   const profile = loadSingleGameProfile(config.engine.single_game_profile);
   if (profile.search_core !== "mcgs") {
     throw new Error("Live deployment requires a qualified MCGS single-game profile");
@@ -1745,7 +1748,7 @@ export function applySingleGameProfile(config) {
       : path.resolve(config.engine.working_directory, profile.tablebase.path);
     let hasMaximumWdl = false;
     let hasMaximumDtz = false;
-    for (const entry of manifest.files) {
+    for (const [index, entry] of manifest.files.entries()) {
       if (!entry || typeof entry !== "object"
           || typeof entry.name !== "string"
           || path.basename(entry.name) !== entry.name
@@ -1764,8 +1767,16 @@ export function applySingleGameProfile(config) {
         tableAdmission = exactFileMetadataSync(tableFile, {
           maximumBytes: EXACT_FILE_LIMITS.largeAsset,
           label: "Syzygy tablebase asset",
+          onProgress: ({ bytesRead, totalBytes }) => onValidationProgress?.({
+            phase: "tablebase_asset_validation",
+            completed: index,
+            total: manifest.files.length,
+            current_bytes_read: bytesRead,
+            current_bytes_total: totalBytes,
+          }),
         });
-      } catch {
+      } catch (error) {
+        if (error?.code === "EXACT_FILE_PROGRESS_FAILED") throw error;
         throw new Error(`Single-game profile Syzygy table file is missing or partial: ${entry.name}`);
       }
       if (tableAdmission.byteLength !== entry.bytes) {
@@ -1774,6 +1785,13 @@ export function applySingleGameProfile(config) {
       if (tableAdmission.sha256 !== `sha256:${entry.sha256}`) {
         throw new Error(`Single-game profile Syzygy table file identity mismatch: ${entry.name}`);
       }
+      onValidationProgress?.({
+        phase: "tablebase_asset_validation",
+        completed: index + 1,
+        total: manifest.files.length,
+        current_bytes_read: null,
+        current_bytes_total: null,
+      });
     }
     if (!hasMaximumWdl || !hasMaximumDtz) {
       throw new Error("Single-game profile Syzygy manifest lacks maximum-cardinality WDL or DTZ files");
@@ -7816,8 +7834,9 @@ export async function main(argv = process.argv.slice(2)) {
     ? resolveExternalTokenFile(options)
     : null;
   let qualificationStatus;
-  if (new Set(["qualify", "capacity-qualify", "run"]).has(options.command)) {
-    const qualificationProfile = usesExtendedEngineAdapter(config)
+  let qualificationProfile = null;
+  if (new Set(["qualify", "capacity-qualify"]).has(options.command)) {
+    qualificationProfile = usesExtendedEngineAdapter(config)
       ? applySingleGameProfile(config)
       : null;
     if (options.command === "capacity-qualify") {
@@ -7847,13 +7866,6 @@ export async function main(argv = process.argv.slice(2)) {
       return 0;
     }
     qualificationStatus = await preflightQualifiedEngine(config);
-    if (options.command === "run"
-        && usesExtendedEngineAdapter(config)
-        && config.engine.time_profile_status?.accepted !== true) {
-      throw new Error(
-        `MCGS timing profile was rejected: ${config.engine.time_profile_status?.reason ?? "unknown reason"}`,
-      );
-    }
     if (options.command === "qualify") {
       console.log(JSON.stringify({
         status: "qualified",
@@ -7959,6 +7971,14 @@ export async function main(argv = process.argv.slice(2)) {
       leaseOwner,
       processIdentity,
     );
+    const refreshApiLease = () => store.heartbeatApiLease(
+      authority,
+      leaseOwner,
+      process.pid,
+      Date.now(),
+      60_000,
+      processIdentity,
+    );
     if (options.command === "probe" && safetyCoordinator.isCoolingDown()) {
       throw new Error(
         `Lichess API cooldown is active until ${new Date(safetyCoordinator.cooldownUntil).toISOString()}`,
@@ -8003,18 +8023,38 @@ export async function main(argv = process.argv.slice(2)) {
       }, 5_000);
       leaseHeartbeat = setInterval(() => {
         try {
-          store.heartbeatApiLease(
-            authority,
-            leaseOwner,
-            process.pid,
-            Date.now(),
-            60_000,
-            processIdentity,
-          );
+          refreshApiLease();
         } catch (error) {
           controller.abort(error);
         }
       }, 10_000);
+
+      let lastValidationHeartbeat = Date.now();
+      const maintainStartingLifecycle = () => {
+        const now = Date.now();
+        if (now - lastValidationHeartbeat < 2_000) return;
+        refreshApiLease();
+        publishStartingStatus();
+        lastValidationHeartbeat = now;
+      };
+      qualificationProfile = usesExtendedEngineAdapter(config)
+        ? applySingleGameProfile(config, { onValidationProgress: maintainStartingLifecycle })
+        : null;
+      qualificationStatus = await preflightQualifiedEngine(config);
+      if (usesExtendedEngineAdapter(config)
+          && config.engine.time_profile_status?.accepted !== true) {
+        throw new Error(
+          `MCGS timing profile was rejected: ${config.engine.time_profile_status?.reason ?? "unknown reason"}`,
+        );
+      }
+      config.capacity_profile = loadCapacityProfile(
+        options.capacity_profile ?? config.capacity.capacity_profile,
+        config,
+        qualificationProfile,
+        qualificationStatus,
+      );
+      refreshApiLease();
+      publishStartingStatus();
     }
     const client = new LichessClient({
       tokenProvider: () => readTokenForRuntime(tokenFile),
