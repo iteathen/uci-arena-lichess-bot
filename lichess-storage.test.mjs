@@ -238,6 +238,65 @@ test("schema-five game summaries migrate to deterministic archive cursors withou
   }
 });
 
+test("current storage heals only exact legacy archive defaults written after migration", () => {
+  const file = initializedDatabase("uci-arena-storage-legacy-archive-defaults-");
+  const legacy = new DatabaseSync(file);
+  legacy.exec(`
+    INSERT INTO games(game_id, opponent, audience, status, plies, started_at, finished_at)
+    VALUES
+      ('legacy-live', 'bot-live', 'bot', 'started', 4, 30, 0),
+      ('legacy-terminal-b', 'bot-b', 'bot', 'mate', 31, 20, 200),
+      ('legacy-terminal-a', 'bot-a', 'bot', 'resign', 42, 10, 300)
+  `);
+  legacy.close();
+
+  const repaired = new LichessStore(file);
+  try {
+    assert.deepEqual(repaired.db.prepare(`
+      SELECT game_id, archive_cursor, completion_cursor, archive_completeness, archive_reason
+      FROM games ORDER BY archive_cursor
+    `).all().map((row) => ({ ...row })), [
+      {
+        game_id: "legacy-terminal-a", archive_cursor: 1, completion_cursor: 2,
+        archive_completeness: "summary_only",
+        archive_reason: "historical_moves_unavailable",
+      },
+      {
+        game_id: "legacy-terminal-b", archive_cursor: 2, completion_cursor: 1,
+        archive_completeness: "summary_only",
+        archive_reason: "historical_moves_unavailable",
+      },
+      {
+        game_id: "legacy-live", archive_cursor: 3, completion_cursor: 0,
+        archive_completeness: "live", archive_reason: "",
+      },
+    ]);
+    assert.deepEqual({ ...repaired.db.prepare(`
+      SELECT next_archive_cursor, next_completion_cursor FROM game_archive_control WHERE id=1
+    `).get() }, { next_archive_cursor: 4, next_completion_cursor: 3 });
+  } finally {
+    repaired.close();
+  }
+
+  const reopened = new LichessStore(file);
+  reopened.close();
+});
+
+test("current storage rejects non-default malformed archive authority", () => {
+  const file = initializedDatabase("uci-arena-storage-malformed-archive-defaults-");
+  const malformed = new DatabaseSync(file);
+  malformed.exec(`
+    INSERT INTO games(
+      game_id, opponent, audience, status, plies, started_at, finished_at, archive_reason
+    ) VALUES('malformed-terminal', 'bot', 'bot', 'mate', 0, 10, 20, 'unexpected')
+  `);
+  malformed.close();
+  assert.throws(
+    () => new LichessStore(file),
+    (error) => error.code === "LICHESS_STORAGE_ROW_INVALID",
+  );
+});
+
 test("schema-five archive migration rolls back completely and retries deterministically", () => {
   const file = initializedDatabase("uci-arena-storage-game-archive-rollback-");
   downgradeToSchemaFive(file);
