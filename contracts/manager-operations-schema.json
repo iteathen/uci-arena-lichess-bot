@@ -1,6 +1,6 @@
 {
   "schema": "uci_arena_lichess_manager_api_v1",
-  "version": "1.0",
+  "version": "1.1",
   "transport": {
     "kind": "cli_json",
     "entrypoint": "lichess-adapter.mjs",
@@ -91,7 +91,15 @@
       "arguments": ["status"],
       "mutates": false,
       "credential": "forbidden",
-      "response": "uci_arena_lichess_status_v3"
+      "response": "uci_arena_lichess_status_v4"
+    },
+    "incidents_list": {
+      "arguments": ["incidents", "list"],
+      "optional_arguments": ["--filter", "--after-cursor", "--limit", "--runtime-dir"],
+      "mutates": false,
+      "credential": "forbidden",
+      "response": "uci_arena_provider_incident_page_v1",
+      "response_schema": "contracts/incident-page-schema.json"
     },
     "qualification_run": {
       "arguments": ["qualification", "run"],

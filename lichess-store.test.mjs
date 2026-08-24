@@ -44,6 +44,8 @@ const PROVENANCE_COLUMNS = Object.freeze([
 function downgradeToLegacyV1(file, { version = 1, legacyRateLimit = false } = {}) {
   const database = new DatabaseSync(file);
   database.exec(`
+    DROP TABLE provider_incidents;
+    DROP TABLE provider_incident_control;
     DROP TABLE api_safety_state;
     DROP TABLE api_client_leases;
     DROP TABLE provider_lifecycle_control;
@@ -80,7 +82,7 @@ const EMPTY_CHALLENGE_SAFETY = Object.freeze({
   challengeHalfOpen: false,
 });
 
-test("store keeps schema five and adds the compatible lifecycle extension", () => {
+test("store keeps schema five and adds exact lifecycle and incident extensions", () => {
   const store = storeFixture();
   try {
     assert.equal(store.status().schemaVersion, 5);
@@ -91,6 +93,14 @@ test("store keeps schema five and adds the compatible lifecycle extension", () =
       owned: false,
       activeWork: 0,
       updatedAt: 0,
+    });
+    assert.deepEqual(store.providerIncidentSummary(), {
+      available: true,
+      active_count: 0,
+      highest_severity: null,
+      latest_cursor: 0,
+      truncated: false,
+      truncated_rows: 0,
     });
   } finally {
     store.close();

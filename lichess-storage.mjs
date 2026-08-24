@@ -7,6 +7,11 @@ import {
   ensureExactDirectorySync,
   publishExactFileSync,
 } from "./exact-file.mjs";
+import {
+  PROVIDER_INCIDENT_SEVERITIES,
+  PROVIDER_INCIDENT_SOURCES,
+  sanitizeProviderIncidentDetail,
+} from "./provider-incidents.mjs";
 
 const DATABASE_MAXIMUM_BYTES = 1_099_511_627_776;
 const BUSY_TIMEOUT_MS = 5_000;
@@ -88,6 +93,21 @@ const PROVIDER_LIFECYCLE_COLUMNS = Object.freeze([
   ["updated_at", "INTEGER", 0],
 ]);
 
+const PROVIDER_INCIDENT_CONTROL_COLUMNS = Object.freeze([
+  ["id", "INTEGER", 1], ["next_cursor", "INTEGER", 0],
+  ["last_truncated_cursor", "INTEGER", 0], ["truncated_rows", "INTEGER", 0],
+  ["truncated_active_rows", "INTEGER", 0], ["updated_at", "INTEGER", 0],
+]);
+
+const PROVIDER_INCIDENT_COLUMNS = Object.freeze([
+  ["cursor", "INTEGER", 1], ["identity_key", "TEXT", 0], ["code", "TEXT", 0],
+  ["severity", "TEXT", 0], ["source", "TEXT", 0], ["operation", "TEXT", 0],
+  ["first_occurrence", "INTEGER", 0], ["last_occurrence", "INTEGER", 0],
+  ["occurrence_count", "INTEGER", 0], ["active", "INTEGER", 0],
+  ["resolved_at", "INTEGER", 0], ["http_status", "INTEGER", 0],
+  ["retry_deadline", "INTEGER", 0], ["game_id", "TEXT", 0], ["detail", "TEXT", 0],
+]);
+
 const EXPECTED_COLUMN_DEFAULTS = Object.freeze({
   "scheduler_control.paused": "0",
   "opponents.title": "''",
@@ -148,6 +168,16 @@ const EXPECTED_COLUMN_DEFAULTS = Object.freeze({
   "provider_lifecycle_control.owner_id": "''",
   "provider_lifecycle_control.active_work": "0",
   "provider_lifecycle_control.updated_at": "0",
+  "provider_incident_control.next_cursor": "1",
+  "provider_incident_control.last_truncated_cursor": "0",
+  "provider_incident_control.truncated_rows": "0",
+  "provider_incident_control.truncated_active_rows": "0",
+  "provider_incident_control.updated_at": "0",
+  "provider_incidents.active": "1",
+  "provider_incidents.resolved_at": "0",
+  "provider_incidents.http_status": "0",
+  "provider_incidents.retry_deadline": "0",
+  "provider_incidents.game_id": "''",
 });
 
 const EXPECTED_CHECKS = Object.freeze({
@@ -156,6 +186,21 @@ const EXPECTED_CHECKS = Object.freeze({
   api_rate_limit: ["check(id=1)"],
   provider_lifecycle_control: [
     "check(id=1)", "check(admission_blockedin(0,1))", "check(active_work>=0)",
+  ],
+  provider_incident_control: [
+    "check(id=1)", "check(next_cursor>=1)", "check(last_truncated_cursor>=0)",
+    "check(truncated_rows>=0)", "check(truncated_active_rows>=0)",
+  ],
+  provider_incidents: [
+    "check(cursor>0)", "check(length(identity_key)=64)",
+    "check(length(code)between1and64)",
+    "check(severityin('info','warning','error','critical'))",
+    "check(sourcein('api','scheduler','stream','startup','engine_child','storage','status_publication'))",
+    "check(length(operation)between1and64)", "check(first_occurrence>=0)",
+    "check(last_occurrence>=first_occurrence)", "check(occurrence_count>=1)",
+    "check(activein(0,1))", "check((active=1andresolved_at=0)or(active=0andresolved_at>=last_occurrence))",
+    "check(http_status=0orhttp_statusbetween100and599)", "check(retry_deadline>=0)",
+    "check(length(game_id)<=64)", "check(length(detail)between1and512)",
   ],
 });
 
@@ -275,6 +320,46 @@ const PROVIDER_LIFECYCLE_SQL = `
   ) VALUES(1, 0, '', 0, 0);
 `;
 
+const PROVIDER_INCIDENT_SQL = `
+  CREATE TABLE provider_incident_control(
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    next_cursor INTEGER NOT NULL DEFAULT 1 CHECK(next_cursor >= 1),
+    last_truncated_cursor INTEGER NOT NULL DEFAULT 0 CHECK(last_truncated_cursor >= 0),
+    truncated_rows INTEGER NOT NULL DEFAULT 0 CHECK(truncated_rows >= 0),
+    truncated_active_rows INTEGER NOT NULL DEFAULT 0 CHECK(truncated_active_rows >= 0),
+    updated_at INTEGER NOT NULL DEFAULT 0
+  ) STRICT;
+  INSERT INTO provider_incident_control(
+    id, next_cursor, last_truncated_cursor, truncated_rows,
+    truncated_active_rows, updated_at
+  ) VALUES(1, 1, 0, 0, 0, 0);
+  CREATE TABLE provider_incidents(
+    cursor INTEGER PRIMARY KEY CHECK(cursor > 0),
+    identity_key TEXT NOT NULL CHECK(length(identity_key)=64),
+    code TEXT NOT NULL CHECK(length(code) BETWEEN 1 AND 64),
+    severity TEXT NOT NULL CHECK(severity IN ('info','warning','error','critical')),
+    source TEXT NOT NULL CHECK(source IN (
+      'api','scheduler','stream','startup','engine_child','storage','status_publication'
+    )),
+    operation TEXT NOT NULL CHECK(length(operation) BETWEEN 1 AND 64),
+    first_occurrence INTEGER NOT NULL CHECK(first_occurrence >= 0),
+    last_occurrence INTEGER NOT NULL CHECK(last_occurrence >= first_occurrence),
+    occurrence_count INTEGER NOT NULL CHECK(occurrence_count >= 1),
+    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+    resolved_at INTEGER NOT NULL DEFAULT 0 CHECK(
+      (active=1 AND resolved_at=0) OR (active=0 AND resolved_at>=last_occurrence)
+    ),
+    http_status INTEGER NOT NULL DEFAULT 0 CHECK(http_status=0 OR http_status BETWEEN 100 AND 599),
+    retry_deadline INTEGER NOT NULL DEFAULT 0 CHECK(retry_deadline >= 0),
+    game_id TEXT NOT NULL DEFAULT '' CHECK(length(game_id) <= 64),
+    detail TEXT NOT NULL CHECK(length(detail) BETWEEN 1 AND 512)
+  ) STRICT;
+  CREATE UNIQUE INDEX provider_incidents_active_identity
+    ON provider_incidents(identity_key) WHERE active=1;
+  CREATE INDEX provider_incidents_active_cursor ON provider_incidents(active, cursor);
+  CREATE INDEX provider_incidents_retention ON provider_incidents(active, last_occurrence, cursor);
+`;
+
 const CURRENT_SCHEMA_SQL = `
   CREATE TABLE schema_meta(
     id INTEGER PRIMARY KEY CHECK(id=1),
@@ -304,6 +389,7 @@ const CURRENT_SCHEMA_SQL = `
     expires_at INTEGER NOT NULL
   );
   ${PROVIDER_LIFECYCLE_SQL}
+  ${PROVIDER_INCIDENT_SQL}
 `;
 
 export class LichessStorageError extends Error {
@@ -538,7 +624,7 @@ function schemaVersion(database) {
   return rawInteger(rows[0].version, "schema_meta.version");
 }
 
-function expectedTables(version, legacyRateLimit, includeLifecycle = false) {
+function expectedTables(version, legacyRateLimit, includeLifecycle = false, includeIncidents = false) {
   const tables = { ...CORE_TABLES, games: version >= 3
     ? [...GAME_COLUMNS_V1, ...GAME_PROVENANCE_COLUMNS]
     : GAME_COLUMNS_V1 };
@@ -554,6 +640,10 @@ function expectedTables(version, legacyRateLimit, includeLifecycle = false) {
     }
   }
   if (includeLifecycle) tables.provider_lifecycle_control = PROVIDER_LIFECYCLE_COLUMNS;
+  if (includeIncidents) {
+    tables.provider_incident_control = PROVIDER_INCIDENT_CONTROL_COLUMNS;
+    tables.provider_incidents = PROVIDER_INCIDENT_COLUMNS;
+  }
   return tables;
 }
 
@@ -613,6 +703,27 @@ function expectedIndexes(table, columns) {
       origin: "c",
       columns: ["opponent", "created_at"],
     });
+  } else if (table === "provider_incidents") {
+    indexes.push({
+      name: "provider_incidents_active_identity",
+      unique: 1,
+      origin: "c",
+      partial: 1,
+      columns: ["identity_key"],
+      where: "whereactive=1",
+    }, {
+      name: "provider_incidents_active_cursor",
+      unique: 0,
+      origin: "c",
+      partial: 0,
+      columns: ["active", "cursor"],
+    }, {
+      name: "provider_incidents_retention",
+      unique: 0,
+      origin: "c",
+      partial: 0,
+      columns: ["active", "last_occurrence", "cursor"],
+    });
   }
   return indexes;
 }
@@ -627,10 +738,14 @@ function verifyIndexes(database, tables) {
     const byName = new Map(actual.map((index) => [index.name, index]));
     for (const index of expected) {
       const admitted = byName.get(index.name);
+      const definition = String(database.prepare(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+      ).get(index.name)?.sql ?? "").toLocaleLowerCase().replaceAll(/[\s"`\[\]]/gu, "");
       const actualColumns = database.prepare(`PRAGMA index_xinfo("${index.name}")`).all()
         .filter((column) => Number(column.key) === 1);
       if (!admitted || Number(admitted.unique) !== index.unique
-          || admitted.origin !== index.origin || Number(admitted.partial) !== 0
+          || admitted.origin !== index.origin || Number(admitted.partial) !== (index.partial ?? 0)
+          || (index.where && !definition.includes(index.where))
           || actualColumns.length !== index.columns.length
           || actualColumns.some((column, position) => column.name !== index.columns[position]
             || Number(column.desc) !== 0 || column.coll !== "BINARY")) {
@@ -650,10 +765,12 @@ function verifyTableDefinitions(database, tables, { currentMeta }) {
       : EXPECTED_CHECKS[table] ?? [];
     const checkCount = normalized.match(/check\(/gu)?.length ?? 0;
     const strict = normalized.endsWith("strict");
+    const expectedStrict = (table === "schema_meta" && currentMeta)
+      || table === "provider_incident_control" || table === "provider_incidents";
     if (!normalized.startsWith(`createtable${table}(`)
         || checks.some((fragment) => !normalized.includes(fragment))
         || checkCount !== checks.length
-        || strict !== (table === "schema_meta" && currentMeta)
+        || strict !== expectedStrict
         || [
           "asselect", "autoincrement", "collate", "foreignkey", "generated",
           "onconflict", "primarykeyasc", "primarykeydesc", "references", "withoutrowid",
@@ -670,6 +787,7 @@ function verifyStoredTypes(database, tables) {
     "scheduler_control.paused", "opponents.online", "games.rated",
     "api_safety_state.challenge_half_open", "api_rate_limit.half_open",
     "provider_lifecycle_control.admission_blocked",
+    "provider_incidents.active",
   ]);
   for (const [table, columns] of Object.entries(tables)) {
     const invalidPredicates = columns.map(([column, type]) => {
@@ -693,11 +811,43 @@ function verifyStoredTypes(database, tables) {
   }
 }
 
-function verifySchema(database, version, { requireLifecycle = false } = {}) {
+function verifyIncidentRows(database) {
+  const controls = database.prepare("SELECT * FROM provider_incident_control").all();
+  const rows = database.prepare("SELECT * FROM provider_incidents ORDER BY cursor").all();
+  if (controls.length !== 1 || controls[0].id !== 1n
+      || controls[0].truncated_active_rows > controls[0].truncated_rows
+      || controls[0].last_truncated_cursor >= controls[0].next_cursor
+      || rows.some((row) => row.cursor >= controls[0].next_cursor)) {
+    throw storageError("LICHESS_STORAGE_ROW_INVALID", "incident control authority is invalid");
+  }
+  const identifier = /^[a-z][a-z0-9_]{0,63}$/u;
+  const gameId = /^[A-Za-z0-9_-]{1,64}$/u;
+  for (const row of rows) {
+    try {
+      if (!/^[a-f0-9]{64}$/u.test(row.identity_key)
+          || !identifier.test(row.code) || !identifier.test(row.operation)
+          || !PROVIDER_INCIDENT_SEVERITIES.includes(row.severity)
+          || !PROVIDER_INCIDENT_SOURCES.includes(row.source)
+          || (row.game_id !== "" && !gameId.test(row.game_id))) {
+        throw new Error("closed incident value is invalid");
+      }
+      sanitizeProviderIncidentDetail(row.detail);
+    } catch (error) {
+      throw storageError("LICHESS_STORAGE_ROW_INVALID", "provider_incidents contains unsafe data", error);
+    }
+  }
+}
+
+function verifySchema(database, version, {
+  requireLifecycle = false,
+  requireIncidents = false,
+} = {}) {
   const hasLegacyRate = tableExists(database, "api_rate_limit");
   const hasSafety = tableExists(database, "api_safety_state");
   const hasLeases = tableExists(database, "api_client_leases");
   const hasLifecycle = tableExists(database, "provider_lifecycle_control");
+  const hasIncidentControl = tableExists(database, "provider_incident_control");
+  const hasIncidents = tableExists(database, "provider_incidents");
   if (version === 2 && hasLegacyRate === hasSafety) {
     throw storageError(
       "LICHESS_STORAGE_SCHEMA_MALFORMED",
@@ -713,10 +863,18 @@ function verifySchema(database, version, { requireLifecycle = false } = {}) {
   if (requireLifecycle && !hasLifecycle) {
     throw storageError("LICHESS_STORAGE_SCHEMA_MALFORMED", "Lifecycle authority is unavailable");
   }
+  if (hasIncidentControl !== hasIncidents || (hasIncidents && (!hasLifecycle
+      || version !== CURRENT_SCHEMA_VERSION))) {
+    throw storageError("LICHESS_STORAGE_SCHEMA_MALFORMED", "Incident authority is incomplete or misplaced");
+  }
+  if (requireIncidents && !hasIncidents) {
+    throw storageError("LICHESS_STORAGE_SCHEMA_MALFORMED", "Incident authority is unavailable");
+  }
   const tables = expectedTables(
     version,
     version === 2 && hasLegacyRate,
     hasLifecycle,
+    hasIncidents,
   );
   const expectedObjects = new Set([
     "schema_meta",
@@ -724,6 +882,11 @@ function verifySchema(database, version, { requireLifecycle = false } = {}) {
     "games_opponent_finished",
     "challenges_opponent_created",
   ]);
+  if (hasIncidents) {
+    expectedObjects.add("provider_incidents_active_identity");
+    expectedObjects.add("provider_incidents_active_cursor");
+    expectedObjects.add("provider_incidents_retention");
+  }
   if (version >= 3 && hasLegacyRate) expectedObjects.add("api_rate_limit");
   const objects = schemaObjects(database);
   if (objects.some((object) => !expectedObjects.has(object.name))
@@ -749,7 +912,17 @@ function verifySchema(database, version, { requireLifecycle = false } = {}) {
   verifyTableDefinitions(database, Object.keys(admittedTables), {
     currentMeta: metaColumns.length === 2,
   });
-  verifyStoredTypes(database, tables);
+  const ordinaryTables = Object.fromEntries(
+    Object.entries(tables).filter(([table]) => !table.startsWith("provider_incident")),
+  );
+  verifyStoredTypes(database, ordinaryTables);
+  if (hasIncidents) {
+    verifyStoredTypes(database, {
+      provider_incident_control: PROVIDER_INCIDENT_CONTROL_COLUMNS,
+      provider_incidents: PROVIDER_INCIDENT_COLUMNS,
+    });
+    verifyIncidentRows(database);
+  }
   if (version >= 3 && hasLegacyRate) {
     verifyStoredTypes(database, { api_rate_limit: LEGACY_RATE_LIMIT_COLUMNS });
   }
@@ -853,6 +1026,9 @@ function migrateDatabase(database, initialVersion, { hasLegacyRate }) {
   if (version === CURRENT_SCHEMA_VERSION && !tableExists(database, "provider_lifecycle_control")) {
     database.exec(PROVIDER_LIFECYCLE_SQL);
   }
+  if (version === CURRENT_SCHEMA_VERSION && !tableExists(database, "provider_incident_control")) {
+    database.exec(PROVIDER_INCIDENT_SQL);
+  }
   return version;
 }
 
@@ -924,7 +1100,7 @@ function initializeOrMigrate(database, empty, failureInjector) {
     if (finalVersion !== CURRENT_SCHEMA_VERSION) {
       throw storageError("LICHESS_STORAGE_SCHEMA_UNSUPPORTED", "SQLite migration did not reach the current schema");
     }
-    verifySchema(database, finalVersion, { requireLifecycle: true });
+    verifySchema(database, finalVersion, { requireLifecycle: true, requireIncidents: true });
     const quickCheck = database.prepare("PRAGMA quick_check").get()?.quick_check;
     if (quickCheck !== "ok") {
       throw storageError("LICHESS_STORAGE_INTEGRITY_FAILED", "SQLite quick_check rejected the database");

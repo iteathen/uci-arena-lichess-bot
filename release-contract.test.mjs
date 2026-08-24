@@ -8,6 +8,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { safeWorkspaceRelative } from "./tools/build-component-release.mjs";
+import { LichessStore } from "./lichess-store.mjs";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 
@@ -21,6 +22,7 @@ test("component definition packages runtime contracts without test or source-tre
   assert.equal(sources.includes("vendor/time-profile-contract/package.json"), true);
   assert.equal(sources.includes("vendor/time-profile-contract/src"), true);
   assert.equal(sources.includes("lichess-adapter.mjs"), true);
+  assert.equal(sources.includes("provider-incidents.mjs"), true);
   assert.equal(sources.includes("process-instance-identity.mjs"), true);
   assert.equal(sources.some((source) => source.includes("fake-api")
     || source.includes("test-fixtures")
@@ -91,6 +93,7 @@ test("Manager configuration and status contracts are closed and separate request
   const configuration = JSON.parse(readFileSync(path.join(root, "contracts", "configuration-schema.json"), "utf8"));
   const update = JSON.parse(readFileSync(path.join(root, "contracts", "configuration-update-schema.json"), "utf8"));
   const status = JSON.parse(readFileSync(path.join(root, "contracts", "status-schema.json"), "utf8"));
+  const incidents = JSON.parse(readFileSync(path.join(root, "contracts", "incident-page-schema.json"), "utf8"));
   assert.deepEqual(configuration.required, [
     "schema",
     "capacity",
@@ -107,6 +110,49 @@ test("Manager configuration and status contracts are closed and separate request
   assert.equal(status.properties.capacity.additionalProperties, false);
   assert.equal(status.$defs.slot_counts.required.includes("cancelling"), true);
   assert.equal(status.properties.games.required.includes("cancelling"), true);
+  assert.equal(status.properties.schema.const, "uci_arena_lichess_status_v4");
+  assert.equal(status.properties.supervision.additionalProperties, false);
+  assert.equal(status.properties.incidents.additionalProperties, false);
+  assert.equal(incidents.$id, "uci_arena_provider_incident_page_v1");
+  assert.equal(incidents.additionalProperties, false);
+  assert.equal(incidents.$defs.incident.additionalProperties, false);
+  assert.equal(incidents.$defs.incident.properties.detail.maxLength, 512);
+});
+
+test("fake Manager invokes incident pages only through declared runtime and provider ports", () => {
+  const service = JSON.parse(readFileSync(
+    path.join(root, "contracts", "service-contract.json"), "utf8"));
+  const operations = JSON.parse(readFileSync(
+    path.join(root, "contracts", "manager-operations-schema.json"), "utf8"));
+  const runtimeBindings = new Map([
+    [`${service.invocation.runtime_component_id}:${service.invocation.runtime_entrypoint}`, process.execPath],
+  ]);
+  const runtime = runtimeBindings.get(
+    `${service.invocation.runtime_component_id}:${service.invocation.runtime_entrypoint}`,
+  );
+  const operation = operations.operations.incidents_list;
+  assert.equal(operations.transport.entrypoint, service.service.entrypoint);
+  const workspace = mkdtempSync(path.join(os.tmpdir(), "uci-arena-fake-manager-incidents-"));
+  const providerFixture = new LichessStore(path.join(workspace, "matches.sqlite"));
+  providerFixture.close();
+  const output = execFileSync(runtime, [
+    path.join(root, operations.transport.entrypoint),
+    ...operation.arguments,
+    "--filter", "all",
+    "--after-cursor", "0",
+    "--limit", "10",
+    "--runtime-dir", workspace,
+  ], {
+    cwd: path.parse(root).root,
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 15_000,
+  });
+  const page = JSON.parse(output);
+  assert.equal(page.schema, operation.response);
+  assert.deepEqual(page.incidents, []);
+  assert.equal(page.filter, "all");
+  assert.equal(page.retention.maximum_rows, 2048);
 });
 
 test("installed qualification contract separates authoritative success from bounded failure", () => {

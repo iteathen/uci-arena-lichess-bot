@@ -2,9 +2,9 @@
   "schema": "uci_arena_service_contract_v1",
   "service": {
     "component_id": "lichess.adapter",
-    "component_version": "1.0.22",
+    "component_version": "1.0.23",
     "product_id": "uci_arena.lichess_bot",
-    "contract_version": "1.0",
+    "contract_version": "1.1",
     "transport": "cli_json",
     "entrypoint": "lichess-adapter.mjs"
   },
@@ -21,6 +21,7 @@
     "lichess.owner_reservations",
     "lichess.provider_configuration",
     "lichess.provider_status",
+    "lichess.provider_incidents",
     "lichess.installed_qualification",
     "lichess.startup"
   ],
@@ -55,6 +56,7 @@
   "configuration_schema": "contracts/configuration-schema.json",
   "configuration_update_schema": "contracts/configuration-update-schema.json",
   "status_schema": "contracts/status-schema.json",
+  "incident_page_schema": "contracts/incident-page-schema.json",
   "qualification_result_schema": "contracts/qualification-result-schema.json",
   "error_contract": {
     "format": "bounded_typed_json",

@@ -55,6 +55,10 @@ import {
 } from "./process-instance-identity.mjs";
 import { RuntimeStatusPublisher } from "./runtime-status-publisher.mjs";
 import {
+  normalizeProviderIncidentPageRequest,
+  providerIncidentSummaryUnavailable,
+} from "./provider-incidents.mjs";
+import {
   admitExactDirectorySync,
   appendExactFileSync,
   classifyExactPathSync,
@@ -2253,6 +2257,7 @@ export class LichessClient {
     fetchImpl = globalThis.fetch,
     requestQueue,
     safetyCoordinator,
+    incidentSink = null,
   }) {
     if (typeof tokenProvider !== "function" && typeof token !== "string") {
       throw new Error("Lichess client requires a request-scoped credential provider");
@@ -2261,6 +2266,7 @@ export class LichessClient {
     this.baseUrl = baseUrl;
     this.fetchImpl = fetchImpl;
     this.requestQueue = safetyCoordinator ?? requestQueue ?? new ApiSafetyCoordinator();
+    this.incidentSink = typeof incidentSink === "function" ? incidentSink : null;
     this.activeStreamKeys = new Set();
   }
 
@@ -2298,6 +2304,18 @@ export class LichessClient {
           response.headers?.get?.("retry-after"),
           requestClass,
         );
+      }
+      if (response.status >= 400 && response.status < 500 && response.status !== 429) {
+        try {
+          this.incidentSink?.({
+            code: "api_permanent_error",
+            severity: "error",
+            source: "api",
+            operation: requestClass,
+            httpStatus: response.status,
+            detail: "Lichess API permanently rejected a provider request",
+          });
+        } catch {}
       }
       const detail = await boundedApiErrorDetail(response);
       throw new LichessHttpError(
@@ -4108,6 +4126,16 @@ export class GameSession {
     this.firstMoveAbortInFlight = false;
     this.firstMoveAbortAttempts = 0;
     this.finishRecorded = false;
+    this.gameStreamRecoveryPending = true;
+  }
+
+  gameStreamIncidentIdentity() {
+    return {
+      code: "game_stream_disconnected",
+      source: "stream",
+      operation: "game_stream",
+      gameId: this.gameId,
+    };
   }
 
   async run() {
@@ -4133,6 +4161,13 @@ export class GameSession {
           const retryMs = error instanceof LichessHttpError && error.status === 429
             ? Math.max(60_000, error.retryAfterMs)
             : reconnectDelay;
+          safeRecordProviderIncident(this.store, {
+            ...this.gameStreamIncidentIdentity(),
+            severity: "warning",
+            retryDeadline: Date.now() + retryMs,
+            detail: "Lichess game stream disconnected before authoritative completion",
+          });
+          this.gameStreamRecoveryPending = true;
           log("game_stream_error", {
             game_id: this.gameId,
             message: error.message,
@@ -4218,6 +4253,10 @@ export class GameSession {
             throw new Error(`Game state arrived before metadata for ${this.gameId}`);
           }
           await this.onState(event, engine, { observation });
+        }
+        if (this.gameStreamRecoveryPending) {
+          this.gameStreamRecoveryPending = false;
+          safeResolveProviderIncident(this.store, this.gameStreamIncidentIdentity());
         }
         if (this.finished) {
           connectionAbort.abort();
@@ -4984,10 +5023,12 @@ export class BotController {
     random = Math.random,
     now = Date.now,
     reconnectDelay = delay,
+    schedulerDelay = delay,
     apiLeaseStatus = null,
     lifecycleOwner = null,
     sessionFactory = null,
     statusPublisher = null,
+    startupIncidentIdentity = null,
   }) {
     this.client = client;
     this.config = { ...config, timing: { ...DEFAULT_TIMING_CONFIG, ...(config.timing ?? {}) } };
@@ -4999,6 +5040,7 @@ export class BotController {
     this.random = random;
     this.now = now;
     this.reconnectDelay = reconnectDelay;
+    this.schedulerDelay = schedulerDelay;
     this.apiLeaseStatus = typeof apiLeaseStatus === "function"
       ? apiLeaseStatus
       : () => ({
@@ -5013,6 +5055,7 @@ export class BotController {
       ? sessionFactory
       : (options) => new GameSession(options);
     this.statusPublisher = statusPublisher;
+    this.startupIncidentIdentity = startupIncidentIdentity;
     this.slots = new SlotPool(config.capacity);
     this.engineStarts = new AsyncSemaphore(config.capacity.startup_parallelism);
     this.activeGames = new Map();
@@ -5029,6 +5072,8 @@ export class BotController {
     this.needsReconciliation = false;
     this.streamConnected = false;
     this.streamLifecycle = "starting";
+    this.eventStreamRecoveryPending = true;
+    this.schedulerRecoveryPending = false;
     this.tickRunning = false;
     this.schedulerFault = null;
     const transportProfilePath = this.config.timing.transport_profile_path
@@ -5044,7 +5089,25 @@ export class BotController {
 
   runtimeStatusPublisher() {
     if (!this.statusPublisher) {
-      this.statusPublisher = new RuntimeStatusPublisher(this.runtimeDir, { now: this.now });
+      this.statusPublisher = new RuntimeStatusPublisher(this.runtimeDir, {
+        now: this.now,
+        onOutcome: (outcome) => {
+          const identity = {
+            code: "runtime_status_publication_failed",
+            source: "status_publication",
+            operation: "runtime_status_publish",
+          };
+          if (outcome.state === "failed") {
+            safeRecordProviderIncident(this.store, {
+              ...identity,
+              severity: "error",
+              detail: "Provider runtime status publication failed",
+            }, this.now());
+          } else {
+            safeResolveProviderIncident(this.store, identity, this.now());
+          }
+        },
+      });
     }
     return this.statusPublisher;
   }
@@ -5123,6 +5186,18 @@ export class BotController {
           this.streamConnected = true;
           this.streamLifecycle = "connected";
           await this.writeStatus();
+          if (this.eventStreamRecoveryPending) {
+            this.eventStreamRecoveryPending = false;
+            safeResolveProviderIncident(this.store, {
+              code: "event_stream_disconnected",
+              source: "stream",
+              operation: "event_stream",
+            }, this.now());
+          }
+          if (this.startupIncidentIdentity) {
+            safeResolveProviderIncident(this.store, this.startupIncidentIdentity, this.now());
+            this.startupIncidentIdentity = null;
+          }
           for await (const event of events) {
             reconnectDelay = 1_000;
             await this.onEvent(event);
@@ -5142,6 +5217,15 @@ export class BotController {
           const retryMs = error instanceof LichessHttpError && error.status === 429
             ? Math.max(60_000, error.retryAfterMs)
             : reconnectDelay;
+          safeRecordProviderIncident(this.store, {
+            code: "event_stream_disconnected",
+            severity: "warning",
+            source: "stream",
+            operation: "event_stream",
+            retryDeadline: this.now() + retryMs,
+            detail: "Lichess provider event stream disconnected",
+          }, this.now());
+          this.eventStreamRecoveryPending = true;
           log("event_stream_error", { message: error.message, retry_ms: retryMs });
           await this.writeStatus();
           try {
@@ -5497,11 +5581,35 @@ export class BotController {
       await session.run();
     } catch (error) {
       primaryError = error;
+      safeRecordProviderIncident(this.store, {
+        code: "game_execution_failed",
+        severity: "error",
+        source: "engine_child",
+        operation: "game_session",
+        gameId,
+        detail: "Provider game execution failed before authoritative completion",
+      }, this.now());
       try {
         this.store.markGameProviderError(gameId, this.now());
       } catch (storeError) {
+        safeRecordProviderIncident(this.store, {
+          code: "storage_operation_failed",
+          severity: "error",
+          source: "storage",
+          operation: "game_persistence",
+          gameId,
+          detail: "Provider game persistence operation failed",
+        }, this.now());
         cleanupDiagnostics.push(`store:${String(storeError?.message ?? "failure").slice(0, 256)}`);
       }
+    }
+    if (!primaryError) {
+      safeResolveProviderIncident(this.store, {
+        code: "game_execution_failed",
+        source: "engine_child",
+        operation: "game_session",
+        gameId,
+      }, this.now());
     }
     if (this.activeGames.get(gameId) === task()) this.activeGames.delete(gameId);
     if (this.gameSessions.get(gameId) === session) this.gameSessions.delete(gameId);
@@ -5616,11 +5724,29 @@ export class BotController {
     while (!this.signal.aborted) {
       try {
         await this.schedulerTick();
+        if (this.schedulerRecoveryPending) {
+          this.schedulerRecoveryPending = false;
+          safeResolveProviderIncident(this.store, {
+            code: "scheduler_tick_failed",
+            source: "scheduler",
+            operation: "scheduler_tick",
+          }, this.now());
+        }
       } catch (error) {
-        if (!this.signal.aborted) log("scheduler_error", { message: error.message });
+        if (!this.signal.aborted) {
+          safeRecordProviderIncident(this.store, {
+            code: "scheduler_tick_failed",
+            severity: "error",
+            source: "scheduler",
+            operation: "scheduler_tick",
+            detail: "Provider scheduler tick failed",
+          }, this.now());
+          this.schedulerRecoveryPending = true;
+          log("scheduler_error", { message: error.message });
+        }
       }
       try {
-        await delay(1_000, this.signal);
+        await this.schedulerDelay(1_000, this.signal);
       } catch {
         break;
       }
@@ -5759,6 +5885,14 @@ export class BotController {
             status,
             message: error.message,
           };
+          safeRecordProviderIncident(this.store, {
+            code: "scheduler_fault",
+            severity: "critical",
+            source: "scheduler",
+            operation: "challenge_cancel",
+            httpStatus: status,
+            detail: "Scheduler stopped after Lichess authentication rejection",
+          }, this.now());
           log("challenge_timeout_cancel_fatal", this.schedulerFault);
           continue;
         }
@@ -5770,6 +5904,14 @@ export class BotController {
             status,
             message: error.message,
           };
+          safeRecordProviderIncident(this.store, {
+            code: "scheduler_fault",
+            severity: "error",
+            source: "scheduler",
+            operation: "challenge_cancel",
+            httpStatus: status,
+            detail: "Scheduler stopped after permanent challenge cancellation rejection",
+          }, this.now());
           log("challenge_timeout_cancel_fatal", this.schedulerFault);
           continue;
         }
@@ -5782,6 +5924,13 @@ export class BotController {
             attempts: slot.cancelAttempts,
             message: error.message,
           };
+          safeRecordProviderIncident(this.store, {
+            code: "scheduler_fault",
+            severity: "error",
+            source: "scheduler",
+            operation: "challenge_cancel",
+            detail: "Scheduler stopped after challenge cancellation retries were exhausted",
+          }, this.now());
           log("challenge_timeout_cancel_fatal", this.schedulerFault);
           continue;
         }
@@ -5866,6 +6015,7 @@ export class BotController {
         })),
       },
       opponents: storeProjection.opponents,
+      incidents: storeProjection.incidents,
       engine: this.config.engine.executable,
       engine_adapter: this.config.engine.adapter,
       deployment_bundle: this.config.engine.selected_bundle,
@@ -5955,6 +6105,7 @@ function writeStartingRuntimeStatus({
       active_streams: [],
       client_lease: apiLeaseStatus(),
     },
+    incidents: store.providerIncidentSummary(),
     engine_adapter: config.engine.adapter,
     updated_at: new Date().toISOString(),
   });
@@ -5985,6 +6136,104 @@ function boundedRuntimeMetadata(runtimeDir) {
   }
 }
 
+function safeRecordProviderIncident(store, report, now = Date.now()) {
+  if (typeof store?.recordProviderIncident !== "function") return false;
+  try {
+    store.recordProviderIncident(report, now);
+    return true;
+  } catch (error) {
+    log("provider_incident_record_rejected", {
+      code: String(error?.code ?? "incident_record_failed").slice(0, 128),
+    });
+    return false;
+  }
+}
+
+function safeResolveProviderIncident(store, identity, now = Date.now()) {
+  if (typeof store?.resolveProviderIncident !== "function") return false;
+  try {
+    return store.resolveProviderIncident(identity, now);
+  } catch (error) {
+    log("provider_incident_resolution_rejected", {
+      code: String(error?.code ?? "incident_resolution_failed").slice(0, 128),
+    });
+    return false;
+  }
+}
+
+function apiRateLimitIncident(challenge = false) {
+  return {
+    code: challenge ? "api_challenge_quarantined" : "api_rate_limited",
+    source: "api",
+    operation: challenge ? "challenge_create" : "request_dispatch",
+    httpStatus: 429,
+  };
+}
+
+export function observeApiSafetyIncident(store, state, now = Date.now()) {
+  if (state.event === "api_rate_limit_entered"
+      || (state.event === "api_rate_limit_restored" && state.cooldownUntil > now)) {
+    safeRecordProviderIncident(store, {
+      ...apiRateLimitIncident(false),
+      severity: "warning",
+      occurredAt: now,
+      retryDeadline: state.cooldownUntil || null,
+      detail: "Lichess API request dispatch entered a provider cooldown",
+    }, now);
+  } else if (state.event === "api_rate_limit_cleared") {
+    safeResolveProviderIncident(store, apiRateLimitIncident(false), now);
+  }
+  if (new Set([
+    "api_challenge_quarantine_entered",
+    "api_challenge_quarantine_extended",
+    "api_challenge_quarantine_half_open",
+  ]).has(state.event)
+      || (state.event === "api_rate_limit_restored" && state.challengeStrikeCount > 0)) {
+    safeRecordProviderIncident(store, {
+      ...apiRateLimitIncident(true),
+      severity: "warning",
+      occurredAt: now,
+      retryDeadline: state.challengeBlockedUntil || null,
+      detail: "Lichess challenge creation entered provider quarantine",
+    }, now);
+  } else if (state.event === "api_challenge_quarantine_recovered") {
+    safeResolveProviderIncident(store, apiRateLimitIncident(true), now);
+  }
+}
+
+export function unexpectedStartupIncident(receipt) {
+  if (receipt?.disposition !== "unexpected_exit") return null;
+  const episodeScope = createHash("sha256").update(JSON.stringify({
+    started_at: receipt.started_at,
+    exited_at: receipt.exited_at,
+    child_exit_code: receipt.child_exit_code,
+    process_instance: receipt.process_instance,
+  })).digest("hex");
+  return {
+    code: "provider_unexpected_exit",
+    source: "startup",
+    operation: "provider_supervision",
+    episodeScope,
+  };
+}
+
+function boundedIncidentSummary(runtimeDir) {
+  const target = path.join(path.resolve(runtimeDir), "matches.sqlite");
+  try {
+    if (!exactRegularFileExistsSync(target, "Lichess incident storage")) {
+      return providerIncidentSummaryUnavailable();
+    }
+    const store = new LichessStore(target);
+    try {
+      return store.providerIncidentSummary();
+    } finally {
+      store.close();
+    }
+  } catch {
+    return providerIncidentSummaryUnavailable();
+  }
+}
+
 export function providerStatusProjection({
   runtime = null,
   runtimeError = runtime ? null : "runtime_status_missing",
@@ -5993,6 +6242,7 @@ export function providerStatusProjection({
   startupError = null,
   now = Date.now(),
   runtimeMaximumAgeMs = RUNTIME_STATUS_MAXIMUM_AGE_MS,
+  incidents = runtime?.incidents ?? providerIncidentSummaryUnavailable(),
 } = {}) {
   const updatedAt = Date.parse(runtime?.updated_at ?? "");
   const freshnessError = runtime && (!Number.isFinite(updatedAt)
@@ -6089,8 +6339,34 @@ export function providerStatusProjection({
       (startup.enabled === false || startup.enabled === "disabled")) {
     blockers.push("startup_registration_disabled");
   }
+  const allowedIncidentSeverities = new Set(["info", "warning", "error", "critical"]);
+  const incidentAvailable = incidents?.available === true
+    && Number.isSafeInteger(incidents.active_count) && incidents.active_count >= 0
+    && (incidents.highest_severity === null
+      || allowedIncidentSeverities.has(incidents.highest_severity))
+    && Number.isSafeInteger(incidents.latest_cursor) && incidents.latest_cursor >= 0
+    && typeof incidents.truncated === "boolean"
+    && Number.isSafeInteger(incidents.truncated_rows) && incidents.truncated_rows >= 0;
+  if (!incidentAvailable) blockers.push("incident_storage_unavailable");
+  const supervisionStates = new Set([
+    "unregistered", "disabled", "active", "restart_pending", "clean_stopped", "inactive",
+  ]);
+  const receiptStates = new Set(["unavailable", "ready", "failed"]);
+  const lastExit = startup?.lastExit;
+  const projectedLastExit = lastExit
+    && new Set(["clean_exit", "unexpected_exit"]).has(lastExit.disposition)
+    && typeof lastExit.exited_at === "string"
+    && Number.isFinite(Date.parse(lastExit.exited_at))
+    && Number.isSafeInteger(lastExit.child_exit_code)
+    && lastExit.child_exit_code >= 0 && lastExit.child_exit_code <= 0xffff_ffff
+    ? {
+        disposition: lastExit.disposition,
+        exited_at: lastExit.exited_at,
+        child_exit_code: lastExit.child_exit_code,
+      }
+    : null;
   return {
-    schema: "uci_arena_lichess_status_v3",
+    schema: "uci_arena_lichess_status_v4",
     installed: true,
     registered: startup?.installed === true,
     active: effectiveActive,
@@ -6153,6 +6429,29 @@ export function providerStatusProjection({
         expires_at: nullableStatusInteger(apiSafety.client_lease?.expires_at),
       },
     },
+    supervision: {
+      state: supervisionStates.has(startup?.supervisionState)
+        ? startup.supervisionState
+        : "unknown",
+      restart_pending: startup?.restartPending === true,
+      exit_receipt_state: receiptStates.has(startup?.exitReceiptState)
+        ? startup.exitReceiptState
+        : "unknown",
+      last_exit: projectedLastExit,
+    },
+    incidents: {
+      available: incidentAvailable,
+      active_count: incidentAvailable && Number.isSafeInteger(incidents.active_count)
+        && incidents.active_count >= 0 ? incidents.active_count : null,
+      highest_severity: incidentAvailable && allowedIncidentSeverities.has(incidents.highest_severity)
+        ? incidents.highest_severity : null,
+      latest_cursor: incidentAvailable && Number.isSafeInteger(incidents.latest_cursor)
+        && incidents.latest_cursor >= 0 ? incidents.latest_cursor : null,
+      truncated: incidentAvailable && typeof incidents.truncated === "boolean"
+        ? incidents.truncated : null,
+      truncated_rows: incidentAvailable && Number.isSafeInteger(incidents.truncated_rows)
+        && incidents.truncated_rows >= 0 ? incidents.truncated_rows : null,
+    },
     blockers: [...new Set(blockers)].slice(0, 64),
   };
 }
@@ -6203,7 +6502,7 @@ export function parseArguments(argv) {
   if (!command) throw new Error("Expected a Lichess adapter command");
   const rest = [...argumentsList];
   const options = { command };
-  if (new Set(["owner", "reservation", "scheduler", "startup", "config", "qualification"])
+  if (new Set(["owner", "reservation", "scheduler", "incidents", "startup", "config", "qualification"])
     .has(command)
       && rest[0] && !rest[0].startsWith("--")) {
     options.action = rest.shift();
@@ -6763,7 +7062,20 @@ export function resolveProviderRuntimeDirectory(options = {}, componentRoot = RO
 
 function runStoreCommand(options) {
   const runtimeDir = resolveProviderRuntimeDirectory(options);
-  const store = new LichessStore(path.resolve(options.store ?? path.join(runtimeDir, "matches.sqlite")));
+  const storeFile = path.resolve(options.store ?? path.join(runtimeDir, "matches.sqlite"));
+  const incidentPageRequest = options.command === "incidents" && options.action === "list"
+    ? normalizeProviderIncidentPageRequest({
+        filter: options.filter ?? "active",
+        afterCursor: integerOption(options.after_cursor, "--after-cursor", 0),
+        limit: integerOption(options.limit, "--limit", 100),
+      })
+    : null;
+  if (incidentPageRequest && !exactRegularFileExistsSync(storeFile, "Lichess incident storage")) {
+    const error = new Error("Provider incident storage is unavailable");
+    error.code = "LICHESS_PROVIDER_INCIDENT_STORAGE_UNAVAILABLE";
+    throw error;
+  }
+  const store = new LichessStore(storeFile);
   try {
     let result;
     if (options.command === "owner" && options.action === "add") {
@@ -6793,6 +7105,10 @@ function runStoreCommand(options) {
     } else if (options.command === "scheduler" && options.action === "resume") {
       store.setPaused(false);
       result = { scheduler: { paused: store.control().paused } };
+    } else if (options.command === "incidents" && options.action === "list") {
+      const page = store.listProviderIncidents(incidentPageRequest);
+      console.log(JSON.stringify(page));
+      return 0;
     } else {
       throw new Error(`Unknown local control command: ${options.command}${options.action ? ` ${options.action}` : ""}`);
     }
@@ -6861,13 +7177,14 @@ export async function main(argv = process.argv.slice(2)) {
   assertSupportedNode();
   const options = parseArguments(argv);
   if (options.command === "reserve"
-      || new Set(["owner", "reservation", "scheduler"]).has(options.command)) {
+      || new Set(["owner", "reservation", "scheduler", "incidents"]).has(options.command)) {
     return runStoreCommand(options);
   }
   const runtimeDir = resolveProviderRuntimeDirectory(options);
   if (options.command === "run") configureRuntimeLog(runtimeDir);
   if (options.command === "status") {
     const { runtime, error: runtimeError } = boundedRuntimeMetadata(runtimeDir);
+    const incidents = boundedIncidentSummary(runtimeDir);
     let startup = { installed: false };
     let startupError = null;
     try {
@@ -6884,6 +7201,7 @@ export async function main(argv = process.argv.slice(2)) {
       runtimeError,
       startup,
       startupError,
+      incidents,
     })));
     return 0;
   }
@@ -7236,7 +7554,9 @@ export async function main(argv = process.argv.slice(2)) {
   const processIdentity = currentProcessIdentity();
   let leaseHeartbeat = null;
   let startupStatusHeartbeat = null;
+  let startupStatusPublicationFailed = true;
   let lifecycleClaimed = false;
+  let startupIncidentIdentity = null;
   try {
     store.acquireApiLease(
       authority,
@@ -7250,21 +7570,50 @@ export async function main(argv = process.argv.slice(2)) {
     if (options.command === "run") {
       store.claimProviderLifecycle(leaseOwner);
       lifecycleClaimed = true;
+      try {
+        const startup = process.platform === "win32"
+          ? await queryWindowsStartup({ runtimeDir })
+          : process.platform === "linux"
+            ? await queryLinuxStartup()
+            : { installed: false };
+        startupIncidentIdentity = unexpectedStartupIncident(startup.lastUnexpectedExit);
+        if (startupIncidentIdentity) {
+          const occurredAt = Date.parse(startup.lastUnexpectedExit.exited_at);
+          safeRecordProviderIncident(store, {
+            ...startupIncidentIdentity,
+            severity: "critical",
+            occurredAt: Number.isSafeInteger(occurredAt) ? occurredAt : Date.now(),
+            idempotent: true,
+            detail: "Provider supervision observed an unexpected prior process exit",
+          });
+        }
+      } catch {
+        log("startup_incident_observation_unavailable", {});
+      }
     }
     const safetyCoordinator = new ApiSafetyCoordinator({
       initialState: store.apiSafetyState(authority),
       persistSafetyState: (state) => store.saveApiSafetyState(authority, state),
-      onStateChange: (state) => log(state.event, {
-        request_class: state.requestClass ?? null,
-        cooldown_until: state.cooldownUntil || null,
-        strike_count: state.strikeCount,
-        last_retry_after_ms: state.lastRetryAfterMs,
-        challenge_blocked_until: state.challengeBlockedUntil || null,
-        challenge_strike_count: state.challengeStrikeCount,
-        challenge_half_open: state.challengeHalfOpen,
-      }),
+      onStateChange: (state) => {
+        log(state.event, {
+          request_class: state.requestClass ?? null,
+          cooldown_until: state.cooldownUntil || null,
+          strike_count: state.strikeCount,
+          last_retry_after_ms: state.lastRetryAfterMs,
+          challenge_blocked_until: state.challengeBlockedUntil || null,
+          challenge_strike_count: state.challengeStrikeCount,
+          challenge_half_open: state.challengeHalfOpen,
+        });
+        observeApiSafetyIncident(store, state);
+      },
     });
     await safetyCoordinator.restorePersistedState();
+    if (!safetyCoordinator.isCoolingDown()) {
+      safeResolveProviderIncident(store, apiRateLimitIncident(false));
+    }
+    if (safetyCoordinator.challengeStrikeCount <= 0) {
+      safeResolveProviderIncident(store, apiRateLimitIncident(true));
+    }
     const apiLeaseStatus = () => localApiLeaseStatus(
       store,
       authority,
@@ -7277,13 +7626,34 @@ export async function main(argv = process.argv.slice(2)) {
       );
     }
     if (options.command === "run") {
-      const publishStartingStatus = () => writeStartingRuntimeStatus({
-        runtimeDir,
-        config,
-        store,
-        safetyCoordinator,
-        apiLeaseStatus,
-      });
+      const publishStartingStatus = () => {
+        const identity = {
+          code: "runtime_status_publication_failed",
+          source: "status_publication",
+          operation: "runtime_status_publish",
+        };
+        try {
+          writeStartingRuntimeStatus({
+            runtimeDir,
+            config,
+            store,
+            safetyCoordinator,
+            apiLeaseStatus,
+          });
+          if (startupStatusPublicationFailed) {
+            startupStatusPublicationFailed = false;
+            safeResolveProviderIncident(store, identity);
+          }
+        } catch (error) {
+          startupStatusPublicationFailed = true;
+          safeRecordProviderIncident(store, {
+            ...identity,
+            severity: "error",
+            detail: "Provider runtime status publication failed",
+          });
+          throw error;
+        }
+      };
       publishStartingStatus();
       startupStatusHeartbeat = setInterval(() => {
         try {
@@ -7311,6 +7681,7 @@ export async function main(argv = process.argv.slice(2)) {
       tokenProvider: () => readTokenForRuntime(tokenFile),
       baseUrl: config.url,
       safetyCoordinator,
+      incidentSink: (report) => safeRecordProviderIncident(store, report),
     });
     const profile = await probeAccount({ client, expectedAccount, url: config.url, signal: controller.signal });
     if (options.command === "probe") {
@@ -7358,6 +7729,7 @@ export async function main(argv = process.argv.slice(2)) {
       store,
       apiLeaseStatus,
       lifecycleOwner: leaseOwner,
+      startupIncidentIdentity,
     });
     await botController.writeStatus();
     if (startupStatusHeartbeat) {

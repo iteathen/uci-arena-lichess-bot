@@ -9,6 +9,17 @@ import {
   openLichessStorage,
   safeInteger,
 } from "./lichess-storage.mjs";
+import {
+  PROVIDER_INCIDENT_MAXIMUM_ROWS,
+  PROVIDER_INCIDENT_PAGE_SCHEMA,
+  PROVIDER_INCIDENT_RESOLVED_RETENTION_MS,
+  normalizeProviderIncidentPageRequest,
+  normalizeProviderIncidentReport,
+  normalizeProviderIncidentResolution,
+  projectProviderIncidentRow,
+  projectProviderIncidentSummary,
+  providerIncidentSeverityAtLeast,
+} from "./provider-incidents.mjs";
 
 function normalizedUsername(value) {
   const username = String(value ?? "").trim().toLocaleLowerCase();
@@ -66,6 +77,7 @@ export class LichessStore {
     this.statusControl = this.readControlProjection();
     this.statusOpponents = this.queryOpponentStats();
     this.statusApiLeases = new Map(this.listApiLeaseRows().map((lease) => [lease.authority_key, lease]));
+    this.statusIncidents = this.queryProviderIncidentSummary();
   }
 
   close() {
@@ -184,7 +196,199 @@ export class LichessStore {
         reservation: reservation && reservation.expires_at > now ? { ...reservation } : null,
       },
       opponents: this.statusOpponents.map((opponent) => ({ ...opponent })),
+      incidents: { ...this.statusIncidents },
     };
+  }
+
+  queryProviderIncidentSummary() {
+    const control = this.db.prepare(`
+      SELECT next_cursor, truncated_rows FROM provider_incident_control WHERE id=1
+    `).get();
+    const counts = this.db.prepare(`
+      SELECT COUNT(*) AS active_count FROM provider_incidents WHERE active=1
+    `).get();
+    const severities = this.db.prepare(`
+      SELECT DISTINCT severity FROM provider_incidents WHERE active=1
+    `).all().map((row) => row.severity);
+    return projectProviderIncidentSummary({
+      activeCount: counts.active_count,
+      severities,
+      latestCursor: control.next_cursor - 1,
+      truncatedRows: control.truncated_rows,
+    });
+  }
+
+  refreshProviderIncidentSummary() {
+    this.statusIncidents = this.queryProviderIncidentSummary();
+    return { ...this.statusIncidents };
+  }
+
+  providerIncidentSummary() {
+    return { ...this.statusIncidents };
+  }
+
+  applyProviderIncidentRetention(now) {
+    const cutoff = Math.max(0, now - PROVIDER_INCIDENT_RESOLVED_RETENTION_MS);
+    const expired = this.db.prepare(`
+      SELECT cursor, active FROM provider_incidents
+      WHERE active=0 AND resolved_at<=? ORDER BY resolved_at, cursor
+    `).all(cutoff);
+    if (expired.length > 0) {
+      this.db.prepare(`DELETE FROM provider_incidents WHERE active=0 AND resolved_at<=?`).run(cutoff);
+    }
+    const remaining = this.db.prepare("SELECT COUNT(*) AS count FROM provider_incidents").get().count;
+    const excess = Math.max(0, remaining - PROVIDER_INCIDENT_MAXIMUM_ROWS);
+    const capped = excess > 0 ? this.db.prepare(`
+      SELECT cursor, active FROM provider_incidents
+      ORDER BY active ASC, last_occurrence ASC, cursor ASC LIMIT ?
+    `).all(excess) : [];
+    if (capped.length > 0) {
+      const placeholders = capped.map(() => "?").join(",");
+      this.db.prepare(`DELETE FROM provider_incidents WHERE cursor IN (${placeholders})`)
+        .run(...capped.map((row) => row.cursor));
+    }
+    const deleted = [...expired, ...capped];
+    if (deleted.length === 0) return;
+    const lastTruncatedCursor = Math.max(...deleted.map((row) => row.cursor));
+    const activeRows = deleted.filter((row) => row.active === 1).length;
+    const control = this.db.prepare(`
+      SELECT truncated_rows, truncated_active_rows
+      FROM provider_incident_control WHERE id=1
+    `).get();
+    const truncatedRows = safeInteger(
+      control.truncated_rows + deleted.length,
+      "truncated incident count",
+    );
+    const truncatedActiveRows = safeInteger(
+      control.truncated_active_rows + activeRows,
+      "truncated active incident count",
+    );
+    this.db.prepare(`
+      UPDATE provider_incident_control
+      SET last_truncated_cursor=MAX(last_truncated_cursor, ?),
+        truncated_rows=?, truncated_active_rows=?, updated_at=?
+      WHERE id=1
+    `).run(lastTruncatedCursor, truncatedRows, truncatedActiveRows, now);
+  }
+
+  recordProviderIncident(report, now = Date.now()) {
+    const incident = normalizeProviderIncidentReport(report, now);
+    const retained = this.withImmediateTransaction(() => {
+      const active = this.db.prepare(`
+        SELECT * FROM provider_incidents WHERE identity_key=? AND active=1
+      `).get(incident.identityKey);
+      if (active) {
+        if (!incident.idempotent) {
+          const occurrenceCount = safeInteger(
+            active.occurrence_count + 1,
+            "incident occurrence count",
+            { minimum: 2 },
+          );
+          this.db.prepare(`
+            UPDATE provider_incidents SET severity=?, last_occurrence=?,
+              occurrence_count=?, retry_deadline=?, detail=?
+            WHERE cursor=? AND active=1
+          `).run(
+            providerIncidentSeverityAtLeast(incident.severity, active.severity),
+            Math.max(active.last_occurrence, incident.occurredAt),
+            occurrenceCount,
+            Math.max(active.retry_deadline, incident.retryDeadline ?? 0),
+            incident.detail,
+            active.cursor,
+          );
+        }
+        this.applyProviderIncidentRetention(incident.occurredAt);
+        return active.cursor;
+      }
+      if (incident.idempotent) {
+        const prior = this.db.prepare(`
+          SELECT cursor FROM provider_incidents WHERE identity_key=? ORDER BY cursor DESC LIMIT 1
+        `).get(incident.identityKey);
+        if (prior) {
+          this.applyProviderIncidentRetention(incident.occurredAt);
+          return prior.cursor;
+        }
+      }
+      const control = this.db.prepare(`
+        SELECT next_cursor FROM provider_incident_control WHERE id=1
+      `).get();
+      const cursor = safeInteger(control?.next_cursor, "incident cursor", { minimum: 1 });
+      safeInteger(cursor + 1, "next incident cursor", { minimum: 2 });
+      this.db.prepare(`
+        INSERT INTO provider_incidents(
+          cursor, identity_key, code, severity, source, operation,
+          first_occurrence, last_occurrence, occurrence_count, active,
+          resolved_at, http_status, retry_deadline, game_id, detail
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 1, 1, 0, ?, ?, ?, ?)
+      `).run(
+        cursor, incident.identityKey, incident.code, incident.severity,
+        incident.source, incident.operation, incident.occurredAt, incident.occurredAt,
+        incident.httpStatus ?? 0, incident.retryDeadline ?? 0, incident.gameId ?? "",
+        incident.detail,
+      );
+      this.db.prepare(`
+        UPDATE provider_incident_control SET next_cursor=?, updated_at=? WHERE id=1
+      `).run(cursor + 1, incident.occurredAt);
+      this.applyProviderIncidentRetention(incident.occurredAt);
+      return cursor;
+    });
+    this.refreshProviderIncidentSummary();
+    return retained;
+  }
+
+  resolveProviderIncident(identity, now = Date.now()) {
+    now = safeInteger(now, "incident resolution timestamp");
+    const { identityKey } = normalizeProviderIncidentResolution(identity);
+    const resolved = this.withImmediateTransaction(() => {
+      const row = this.db.prepare(`
+        SELECT cursor, last_occurrence FROM provider_incidents
+        WHERE identity_key=? AND active=1
+      `).get(identityKey);
+      if (!row) {
+        this.applyProviderIncidentRetention(now);
+        return false;
+      }
+      this.db.prepare(`
+        UPDATE provider_incidents SET active=0, resolved_at=? WHERE cursor=? AND active=1
+      `).run(Math.max(now, row.last_occurrence), row.cursor);
+      this.applyProviderIncidentRetention(now);
+      return true;
+    });
+    this.refreshProviderIncidentSummary();
+    return resolved;
+  }
+
+  listProviderIncidents(request = {}) {
+    const page = normalizeProviderIncidentPageRequest(request);
+    const rows = this.db.prepare(`
+      SELECT cursor, code, severity, source, operation, first_occurrence,
+        last_occurrence, occurrence_count, active, resolved_at, http_status,
+        retry_deadline, game_id, detail
+      FROM provider_incidents
+      WHERE cursor>? ${page.filter === "active" ? "AND active=1" : ""}
+      ORDER BY cursor ASC LIMIT ?
+    `).all(page.afterCursor, page.limit + 1);
+    const hasMore = rows.length > page.limit;
+    const incidents = rows.slice(0, page.limit).map(projectProviderIncidentRow);
+    const control = this.db.prepare(`
+      SELECT last_truncated_cursor, truncated_rows, truncated_active_rows
+      FROM provider_incident_control WHERE id=1
+    `).get();
+    return Object.freeze({
+      schema: PROVIDER_INCIDENT_PAGE_SCHEMA,
+      filter: page.filter,
+      after_cursor: page.afterCursor,
+      next_cursor: incidents.at(-1)?.cursor ?? page.afterCursor,
+      has_more: hasMore,
+      incidents,
+      retention: Object.freeze({
+        maximum_rows: PROVIDER_INCIDENT_MAXIMUM_ROWS,
+        resolved_retention_ms: PROVIDER_INCIDENT_RESOLVED_RETENTION_MS,
+        last_truncated_cursor: control.last_truncated_cursor || null,
+        truncated_rows: control.truncated_rows,
+        truncated_active_rows: control.truncated_active_rows,
+      }),
+    });
   }
 
   addOwner(username, now = Date.now()) {

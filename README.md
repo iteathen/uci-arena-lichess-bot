@@ -159,14 +159,28 @@ node .\lichess-adapter.mjs status `
   --runtime-dir C:\ProgramData\UCI Arena\lichess
 ```
 
-It returns `uci_arena_lichess_status_v3` with explicit values for installed,
+It returns `uci_arena_lichess_status_v4` with explicit values for installed,
 registered, active, ready, stream lifecycle, capacity, active/pending games,
 scheduler state, global API cooldown, outbound-challenge quarantine, local API
-lease health, and blockers. A supervised process waiting for a persisted API
+lease health, startup supervision, the bounded active-incident summary, and
+blockers. A supervised process waiting for a persisted API
 cooldown is reported as `waiting_for_api_cooldown`, not as an unexplained stream
 disconnect. A stale or missing `runtime.json` never claims that the provider is
 active. Status never returns raw config, credential data, logs, SQLite rows,
 lease owner ids, process identities, or engine command lines.
+
+Manager can page the Provider-owned sanitized incident ledger through the
+declared `incidents_list` operation without opening SQLite or reading logs:
+
+```powershell
+node .\lichess-adapter.mjs incidents list `
+  --filter active --after-cursor 0 --limit 100 `
+  --runtime-dir C:\ProgramData\UCI Arena\lichess
+```
+
+The response is `uci_arena_provider_incident_page_v1`. Cursor order is stable,
+retention/truncation is explicit, and credential values, paths, command lines,
+raw API documents, and engine protocol output are rejected before persistence.
 
 ## Qualification and execution
 

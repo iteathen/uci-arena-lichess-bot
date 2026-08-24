@@ -17,6 +17,7 @@ const operations = readJson("contracts/manager-operations-schema.json");
 const configuration = readJson("contracts/configuration-schema.json");
 const configurationUpdate = readJson("contracts/configuration-update-schema.json");
 const status = readJson("contracts/status-schema.json");
+const incidentPage = readJson("contracts/incident-page-schema.json");
 const qualificationResult = readJson("contracts/qualification-result-schema.json");
 const template = readFileSync(path.join(root, "config.uci_arena.template.yml"), "utf8");
 const errors = [];
@@ -94,8 +95,10 @@ const requiredOperations = new Set([
   "owner_remove", "provider_status", "reservation_cancel", "reservation_create",
   "reservation_status", "scheduler_pause", "scheduler_resume", "scheduler_status",
   "startup_install", "startup_recover", "startup_status", "startup_uninstall",
+  "incidents_list",
 ]);
 if (operations.schema !== "uci_arena_lichess_manager_api_v1"
+    || operations.version !== "1.1"
     || [...requiredOperations].some((name) => !operations.operations?.[name])) {
   errors.push("Manager operation catalog is missing required operations");
 }
@@ -126,8 +129,22 @@ if (configurationUpdate.required?.[0] !== "settings"
     || configurationUpdate.properties?.settings?.additionalProperties !== false) {
   errors.push("configuration update schema is not a closed settings request");
 }
-if (status.properties?.schema?.const !== "uci_arena_lichess_status_v3") {
+if (status.properties?.schema?.const !== "uci_arena_lichess_status_v4") {
   errors.push("status projection schema is incompatible");
+}
+if (service.service?.contract_version !== "1.1"
+    || JSON.stringify(operations.operations?.incidents_list?.arguments)
+      !== JSON.stringify(["incidents", "list"])
+    || operations.operations?.incidents_list?.mutates !== false
+    || operations.operations?.incidents_list?.credential !== "forbidden") {
+  errors.push("provider incident operation boundary is incomplete");
+}
+if (service.incident_page_schema !== "contracts/incident-page-schema.json"
+    || component.contracts?.incident_page !== service.incident_page_schema
+    || operations.operations?.incidents_list?.response_schema !== service.incident_page_schema
+    || operations.operations?.incidents_list?.response !== incidentPage.$id
+    || incidentPage.$id !== "uci_arena_provider_incident_page_v1") {
+  errors.push("provider incident contract bindings differ");
 }
 if (service.configuration_update_schema !== "contracts/configuration-update-schema.json"
     || component.contracts?.configuration_update !== service.configuration_update_schema
@@ -156,7 +173,7 @@ for (const group of configuration.required.filter((name) => name !== "schema")) 
 }
 const projectedStatus = providerStatusProjection();
 exactKeys(projectedStatus, status, "provider status");
-for (const group of ["capacity", "games", "scheduler", "rate_limit"]) {
+for (const group of ["capacity", "games", "scheduler", "rate_limit", "supervision", "incidents"]) {
   exactKeys(projectedStatus[group], status.properties[group], `provider status ${group}`);
 }
 exactKeys(

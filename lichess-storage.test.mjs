@@ -125,7 +125,11 @@ test("unversioned nonempty and malformed migration authorities are rejected", ()
 test("schema-five lifecycle extension migrates exactly and preserves admitted authority", () => {
   const legacyFile = initializedDatabase("uci-arena-storage-lifecycle-legacy-");
   const legacy = new DatabaseSync(legacyFile);
-  legacy.exec("DROP TABLE provider_lifecycle_control");
+  legacy.exec(`
+    DROP TABLE provider_incidents;
+    DROP TABLE provider_incident_control;
+    DROP TABLE provider_lifecycle_control;
+  `);
   legacy.close();
   const migrated = new LichessStore(legacyFile);
   try {
@@ -199,6 +203,34 @@ test("malformed schema-five lifecycle extensions fail closed", () => {
   assert.throws(
     () => new LichessStore(reorderedFile),
     (error) => error.code === "LICHESS_STORAGE_SCHEMA_MALFORMED",
+  );
+});
+
+test("incident extension completeness and stored sanitization fail closed", () => {
+  const partialFile = initializedDatabase("uci-arena-storage-incidents-partial-");
+  const partial = new DatabaseSync(partialFile);
+  partial.exec("DROP TABLE provider_incidents");
+  partial.close();
+  assert.throws(
+    () => new LichessStore(partialFile),
+    (error) => error.code === "LICHESS_STORAGE_SCHEMA_MALFORMED",
+  );
+
+  const unsafeFile = initializedDatabase("uci-arena-storage-incidents-unsafe-");
+  const unsafe = new DatabaseSync(unsafeFile);
+  unsafe.prepare(`
+    INSERT INTO provider_incidents(
+      cursor, identity_key, code, severity, source, operation,
+      first_occurrence, last_occurrence, occurrence_count, active,
+      resolved_at, http_status, retry_deadline, game_id, detail
+    ) VALUES(1, ?, 'storage_operation_failed', 'error', 'storage', 'storage_open',
+      1, 1, 1, 1, 0, 0, 0, '', 'Authorization header leaked')
+  `).run("a".repeat(64));
+  unsafe.exec("UPDATE provider_incident_control SET next_cursor=2 WHERE id=1");
+  unsafe.close();
+  assert.throws(
+    () => new LichessStore(unsafeFile),
+    (error) => error.code === "LICHESS_STORAGE_ROW_INVALID",
   );
 });
 

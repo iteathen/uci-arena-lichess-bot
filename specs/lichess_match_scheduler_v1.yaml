@@ -392,15 +392,141 @@ sqlite_storage_foundation_2026_08_24:
   validation:
     - "Fixtures cover database/ancestor/WAL/SHM link and type failures where the host exposes them, orphan sidecars, valid empty initialization, unversioned nonempty storage, duplicate/unknown/wrong-type authority, partial schema, exact lifecycle-extension migration and rejection, wrong storage classes, negative and unsafe integers, pragma refusal, injected migration failure and retry, abrupt process exit rollback, and WAL reopening."
 
+provider_incident_ledger_2026_08_24:
+  status: active
+  owning_issue: https://github.com/iteathen/uci-arena-lichess-bot/issues/41
+  owner: provider_runtime_store_and_incident_projection
+  purpose: >
+    Retain bounded sanitized provider failure episodes and expose typed pages
+    and active summaries without transferring provider storage or diagnostic
+    interpretation to Manager.
+  lego_boundary:
+    provided_ports:
+      - incidents_list_v1
+      - status_v4_active_incident_summary
+    rules:
+      - "The provider owns incident classification, sanitization, aggregation, resolution, retention, pagination, and SQLite mutation. Manager invokes the declared operation and presents closed fields without opening provider storage or interpreting logs."
+      - "Raw NDJSON, SQLite rows, startup files, response bodies, engine output, and provider-private paths never become Manager inputs. Installer has no incident operation or storage role."
+      - "The incident domain module validates bounded project-owned values; the store adapter alone owns SQL and transactions; API, scheduler, stream, startup, engine-child, storage, and status-publication owners report through that port without importing one another's internals."
+  storage:
+    schema_base: 5
+    compatible_extension_tables:
+      - provider_incident_control
+      - provider_incidents
+    migration:
+      - "The exact incident extension is added transactionally after the existing lifecycle extension while retaining schema base 5. Base-only, base-plus-lifecycle, and base-plus-lifecycle-plus-incidents are the only admitted version-five object sets; incidents without lifecycle authority are malformed."
+      - "The final store requires both compatible extensions. Existing scheduler, game, challenge, cooldown, lease, lifecycle, and provenance rows are preserved."
+    control_fields:
+      - next_cursor
+      - last_truncated_cursor
+      - truncated_rows
+      - truncated_active_rows
+      - updated_at
+    incident_fields:
+      - immutable_cursor
+      - private_stable_identity_sha256
+      - provider_owned_code
+      - severity
+      - source
+      - operation
+      - first_occurrence
+      - last_occurrence
+      - occurrence_count
+      - active_or_resolved
+      - resolved_at
+      - optional_http_status
+      - optional_retry_deadline
+      - optional_remote_game_id
+      - sanitized_detail
+    rules:
+      - "One immediate transaction allocates a strictly increasing JavaScript-safe cursor, inserts or aggregates one active stable identity, preserves the earliest occurrence, advances the latest occurrence and retry deadline monotonically, and applies retention."
+      - "A resolved identity receives a new cursor when a later failure episode begins. Exact startup-exit receipt identity is an idempotent episode scope so re-reading one unchanged receipt never creates or increments an incident."
+      - "Resolution is durable and never deletes or rewrites a cursor. An absent active identity resolves idempotently without inventing history."
+  stable_identity:
+    fields: [code, source, operation, optional_http_status, optional_remote_game_id, optional_episode_scope]
+    excluded: [detail, severity, occurrence_time, retry_deadline]
+    rules:
+      - "Identity is one provider-owned canonical JSON tuple hashed with SHA-256. Arbitrary detail cannot create notification storms."
+      - "Severity may only remain or escalate while an episode is active. Count increments once per admitted occurrence and duplicate idempotent startup evidence does not increment it."
+  retention:
+    maximum_rows: 2048
+    resolved_retention_ms: 7776000000
+    maximum_page_size: 100
+    rules:
+      - "Resolved rows older than ninety days are removed on provider maintenance. If the hard row cap is exceeded, oldest resolved rows are removed before oldest active rows."
+      - "Every deletion advances last_truncated_cursor and cumulative truncated_rows; removal of active rows additionally advances truncated_active_rows. Public pages and status expose truncation so absence is never presented as complete history."
+      - "Retention never changes cooldown, scheduler, lifecycle, game, startup, or API authority."
+  sanitization:
+    detail_maximum_characters: 512
+    rules:
+      - "Code, source, operation, severity, HTTP status, retry deadline, game id, occurrence time, and optional episode scope are closed and bounded before persistence. Numeric strings and non-integer timestamps are rejected."
+      - "Details become one whitespace-normalized line. Oversized input, credential/header markers, bearer-like values, path forms, command-line material, arbitrary JSON documents, and raw engine protocol output are rejected before SQL."
+      - "Call sites author safe summaries from typed facts. A rejected incident report is a bounded private diagnostic and never replaces the primary provider failure or interrupts gameplay."
+  recording:
+    covered:
+      - api_rate_limit_entry_and_recovery
+      - permanent_api_error
+      - scheduler_fault_and_recovery
+      - global_and_game_stream_disconnect_and_recovery
+      - unexpected_startup_exit_and_ready_recovery
+      - engine_child_or_game_session_failure
+      - storage_operation_failure
+      - status_publication_failure_and_recovery
+    rules:
+      - "Failure-path recording may perform one bounded provider-store transaction. Normal runtime-status heartbeat construction performs no incident query or SQLite scan."
+      - "HTTP 429 incidents copy the already-persisted provider cooldown deadline and resolution never clears, shortens, bypasses, or rewrites API safety state."
+      - "Status-publication recording runs only after a worker failure or recovery outcome; it cannot recursively publish status or change game authority."
+      - "Unexpected startup exit evidence is recorded before credential access and resolved only after the replacement provider reaches ready authority. Clean exit evidence creates no crash incident."
+  public_contract:
+    service_contract_minor: "1.1"
+    operation: incidents_list
+    arguments:
+      - filter_active_or_all
+      - after_cursor
+      - limit
+    response_schema: uci_arena_provider_incident_page_v1
+    page_fields:
+      - filter
+      - after_cursor
+      - next_cursor
+      - has_more
+      - incidents
+      - retention
+    rules:
+      - "Rows are ordered by immutable cursor ascending and fetched with cursor greater than after_cursor. New inserts cannot duplicate or reorder prior rows."
+      - "The closed item projection includes cursor, code, severity, source, operation, first/last occurrence, count, state, resolved_at, optional HTTP status/retry deadline/game id, and safe detail. Private identity hashes are never returned."
+      - "The CLI command prefix and entrypoint come from the provider component and operation contracts; a substituted Manager never hard-codes Node, a provider path, or SQLite knowledge."
+  status_v4:
+    schema: uci_arena_lichess_status_v4
+    additions:
+      - closed_supervision_projection
+      - closed_active_incident_summary
+    incident_summary_fields:
+      - available
+      - active_count
+      - highest_severity
+      - latest_cursor
+      - truncated
+      - truncated_rows
+    compatibility:
+      - "Provider status v4 replaces the provider's published current status schema only with the declared additive fields. Manager remains responsible for accepting conforming v3 providers and marking incidents unavailable when v1.1 operations are absent."
+  errors:
+    - "Invalid public pagination input fails before opening a credential or returning a partial page. Unknown filters and cursors outside the safe-integer domain are rejected."
+    - "Storage-unavailable status returns incidents.available false and one bounded blocker; it never opens logs or fabricates an empty authoritative ledger."
+  validation:
+    - "Fixtures cover HTTP 400/429 and malformed error detail, cooldown and quarantine recovery, scheduler faults, global and game stream failures, startup exit idempotency, engine-child/game failure, storage failure, and status-publication failure/recovery."
+    - "Aggregation, escalation, resolution, new episodes, ninety-day pruning, hard-cap pruning, active-row truncation, and cursor pages are deterministic under concurrent inserts."
+    - "Oversized, multiline, path-bearing, header-bearing, credential-like, JSON-document, and engine-protocol details never persist or project."
+    - "A fake Manager resolves the dependency runtime plus provider CLI entrypoint and invokes incidents_list through the declared command prefix."
+
 planned_provider_resilience_and_incidents_2026_08_23:
-  status: approved_plan_not_runtime_authoritative
+  status: superseded_by_active_supervision_and_incident_contracts
   suite_record: https://github.com/iteathen/uci-arena-installer/issues/166
   owning_issues:
     supervision: https://github.com/iteathen/uci-arena-lichess-bot/issues/40
     incidents: https://github.com/iteathen/uci-arena-lichess-bot/issues/41
   activation:
-    - "This section records the approved target and test gates. It does not change the current launcher, startup definition, service/status contract, schemas, or release authority."
-    - "Runtime authority requires issue-owned spec-first implementation PRs, exact schemas, migrations where needed, cross-platform tests, and compatible component releases."
+    - "This section retains the approved planning record. Runtime supervision authority is provider_exit_supervision_contract_2026_08_23; runtime incident authority is provider_incident_ledger_2026_08_24."
   startup_authority:
     rules:
       - "Each platform retains exactly one provider-owned startup authority. Manager and Installer never add a second daemon supervisor."
@@ -1103,6 +1229,7 @@ manager_account_and_options_contract_2026_07_31:
       - startup_recover
       - startup_uninstall
       - provider_status
+      - incidents_list
       - qualification_run
     rules:
       - "Owner, reservation, and pause state remain in the adapter-owned WAL-mode SQLite store and survive restart. They are never copied into tracked config."
@@ -1123,12 +1250,12 @@ manager_account_and_options_contract_2026_07_31:
       - "Manager may validate and project the bounded failure result for operator remediation, but it must not interpret provider domain semantics or expose unstructured process diagnostics. Transport, timeout, and invalid-output failures remain Manager-owned generic diagnostics."
       - "An exact completed content-addressed result is idempotently reusable. Interrupted output without a completion marker has no authority and is removed before the same identity is retried."
   provider_status:
-    schema: uci_arena_lichess_status_v3
+    schema: uci_arena_lichess_status_v4
     rules:
       - "Every operation Manager can expose is named in the published operation catalog. Manager resolves the fixed command prefix from that receipt-verified catalog; adding or replacing a conforming provider never relies on Manager-owned copies of provider command verbs."
       - "The service contract declares whether its CLI entrypoint executes directly or through one named dependency runtime and entrypoint. Manager never infers Node.js from a filename, provider id, or source layout."
       - "The status operation is credential-free and projects only bounded provider-owned runtime and startup evidence."
-      - "Installed, registered, active, ready, stream connectivity, capacity, games, scheduler, rate-limit state, and actionable blockers are explicit; a stale runtime file never implies an active process."
+      - "Installed, registered, active, ready, stream connectivity, capacity, games, scheduler, rate-limit state, supervision, active incident summary, and actionable blockers are explicit; a stale runtime file never implies an active process."
       - "Every provider slot lifecycle state that affects admission is represented, including cancelling; status must not make occupied capacity disappear during remote challenge cancellation."
       - "Missing runtime evidence reports an inactive provider with blockers instead of failing the status operation."
       - "Status never returns credential contents, raw configuration, arbitrary logs, SQLite rows, or child-process command lines."

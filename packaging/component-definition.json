@@ -18,6 +18,7 @@
     {"source": "contracts", "target": "contracts"},
     {"source": "exact-file.mjs", "target": "exact-file.mjs"},
     {"source": "lichess-adapter.mjs", "target": "lichess-adapter.mjs"},
+    {"source": "provider-incidents.mjs", "target": "provider-incidents.mjs"},
     {"source": "lichess-scheduler.mjs", "target": "lichess-scheduler.mjs"},
     {"source": "lichess-storage.mjs", "target": "lichess-storage.mjs"},
     {"source": "lichess-store.mjs", "target": "lichess-store.mjs"},

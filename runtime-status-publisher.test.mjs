@@ -39,6 +39,7 @@ test("serialized status publication coalesces pending generations without overla
 });
 
 test("status publication failure is bounded and a later generation recovers", async () => {
+  const outcomes = [];
   const publisher = new SerializedStatusPublisher({
     write: async (_snapshot, generation) => {
       if (generation === 1) {
@@ -48,6 +49,7 @@ test("status publication failure is bounded and a later generation recovers", as
       }
       return { byteLength: 10, activatedAt: 20 };
     },
+    onOutcome: (outcome) => outcomes.push(outcome),
   });
   const failed = publisher.schedule({ value: 1 });
   await assert.rejects(publisher.flush(failed), { code: "WRITE_FAILED" });
@@ -58,6 +60,8 @@ test("status publication failure is bounded and a later generation recovers", as
   await publisher.flush(recovered);
   assert.equal(publisher.health().state, "ready");
   assert.equal(publisher.health().failures, 1);
+  assert.deepEqual(outcomes.map((outcome) => outcome.state), ["failed", "recovered"]);
+  assert.equal(outcomes[0].failure.code, "WRITE_FAILED");
   await publisher.close();
 });
 

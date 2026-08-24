@@ -44,7 +44,9 @@ import {
   startupIsExplicitlyDisabledAndInactive,
   managerOptionsProjection,
   main,
+  observeApiSafetyIncident,
   updateManagerOptions,
+  unexpectedStartupIncident,
   validateRuntimeStatus,
 } from "./lichess-adapter.mjs";
 import {
@@ -74,7 +76,13 @@ test("provider status distinguishes inactive, disconnected, and ready states", (
   const missing = providerStatusProjection();
   assert.equal(missing.active, false);
   assert.equal(missing.ready, false);
-  assert.deepEqual(missing.blockers, ["runtime_status_missing", "provider_process_inactive"]);
+  assert.deepEqual(missing.blockers, [
+    "runtime_status_missing",
+    "provider_process_inactive",
+    "incident_storage_unavailable",
+  ]);
+  assert.equal(missing.schema, "uci_arena_lichess_status_v4");
+  assert.equal(missing.incidents.available, false);
 
   const disabled = providerStatusProjection({
     startup: { installed: true, enabled: false, active: false },
@@ -121,6 +129,14 @@ test("provider status distinguishes inactive, disconnected, and ready states", (
         heartbeat_at: Date.parse("2026-08-01T00:00:00.000Z"),
         expires_at: Date.parse("2026-08-01T00:01:00.000Z"),
       },
+    },
+    incidents: {
+      available: true,
+      active_count: 0,
+      highest_severity: null,
+      latest_cursor: 0,
+      truncated: false,
+      truncated_rows: 0,
     },
     updated_at: "2026-08-01T00:00:00.000Z",
   };
@@ -177,14 +193,54 @@ test("provider status distinguishes inactive, disconnected, and ready states", (
   ]);
 
   const ready = providerStatusProjection({
-    runtime: { ...runtime, stream_connected: true, stream_lifecycle: "connected" },
+    runtime: {
+      ...runtime,
+      stream_connected: true,
+      stream_lifecycle: "connected",
+      incidents: {
+        available: true,
+        active_count: 2,
+        highest_severity: "critical",
+        latest_cursor: 7,
+        truncated: true,
+        truncated_rows: 3,
+      },
+    },
     active: true,
-    startup: { installed: true },
+    startup: {
+      installed: true,
+      supervisionState: "active",
+      restartPending: false,
+      exitReceiptState: "ready",
+      lastExit: {
+        disposition: "unexpected_exit",
+        exited_at: "2026-07-31T23:59:00.000Z",
+        child_exit_code: 1,
+      },
+    },
     now: Date.parse(runtime.updated_at),
   });
   assert.equal(ready.ready, true);
   assert.deepEqual(ready.blockers, []);
   assert.deepEqual(Object.keys(ready.account), ["username", "bot"]);
+  assert.deepEqual(ready.supervision, {
+    state: "active",
+    restart_pending: false,
+    exit_receipt_state: "ready",
+    last_exit: {
+      disposition: "unexpected_exit",
+      exited_at: "2026-07-31T23:59:00.000Z",
+      child_exit_code: 1,
+    },
+  });
+  assert.deepEqual(ready.incidents, {
+    available: true,
+    active_count: 2,
+    highest_severity: "critical",
+    latest_cursor: 7,
+    truncated: true,
+    truncated_rows: 3,
+  });
 
   const stale = providerStatusProjection({
     runtime: { ...runtime, stream_connected: true, stream_lifecycle: "connected" },
@@ -195,6 +251,28 @@ test("provider status distinguishes inactive, disconnected, and ready states", (
   assert.equal(stale.active, false);
   assert.equal(stale.ready, false);
   assert.deepEqual(stale.blockers, ["runtime_status_stale", "provider_process_inactive"]);
+});
+
+test("startup incident identity excludes clean exits and is stable for one unexpected receipt", () => {
+  assert.equal(unexpectedStartupIncident({ disposition: "clean_exit" }), null);
+  const receipt = {
+    disposition: "unexpected_exit",
+    started_at: "2026-08-01T00:00:00.000Z",
+    exited_at: "2026-08-01T00:00:01.000Z",
+    child_exit_code: 1,
+    process_instance: {
+      schema: "uci_arena_process_instance_receipt_v1",
+      platform: "win32",
+      pid: 42,
+      creation_time_100ns: "123",
+    },
+  };
+  const first = unexpectedStartupIncident(receipt);
+  const second = unexpectedStartupIncident({ ...receipt });
+  assert.deepEqual(first, second);
+  assert.match(first.episodeScope, /^[a-f0-9]{64}$/u);
+  assert.equal(JSON.stringify(first).includes("started_at"), false);
+  assert.equal(JSON.stringify(first).includes("process_instance"), false);
 });
 
 test("post-replacement deferral accepts only exact Engine evidence drift", () => {
@@ -3448,7 +3526,41 @@ test("API client applies at least sixty seconds of global backoff after 429", as
   assert.ok(client.requestQueue.cooldownUntil >= before + 60_000);
 });
 
+test("API safety incidents mirror cooldown authority and resolve without interpreting it", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-api-safety-incidents-"));
+  const store = new LichessStore(path.join(directory, "matches.sqlite"));
+  try {
+    observeApiSafetyIncident(store, {
+      event: "api_rate_limit_entered",
+      cooldownUntil: 1_000,
+      challengeBlockedUntil: 0,
+      challengeStrikeCount: 0,
+    }, 100);
+    observeApiSafetyIncident(store, {
+      event: "api_challenge_quarantine_entered",
+      cooldownUntil: 1_000,
+      challengeBlockedUntil: 2_000,
+      challengeStrikeCount: 1,
+    }, 110);
+    assert.deepEqual(store.listProviderIncidents({ filter: "active" }).incidents.map((incident) => ({
+      code: incident.code,
+      retry_deadline: incident.retry_deadline,
+    })), [
+      { code: "api_rate_limited", retry_deadline: 1_000 },
+      { code: "api_challenge_quarantined", retry_deadline: 2_000 },
+    ]);
+    observeApiSafetyIncident(store, { event: "api_rate_limit_cleared" }, 1_000);
+    observeApiSafetyIncident(store, { event: "api_challenge_quarantine_recovered" }, 2_000);
+    assert.equal(store.listProviderIncidents({ filter: "active" }).incidents.length, 0);
+    assert.equal(store.listProviderIncidents({ filter: "all" }).incidents
+      .every((incident) => incident.state === "resolved"), true);
+  } finally {
+    store.close();
+  }
+});
+
 test("API client exposes only bounded sanitized Lichess error detail", async () => {
+  const incidents = [];
   const client = new LichessClient({
     token: "test-token",
     fetchImpl: async () => ({
@@ -3460,6 +3572,7 @@ test("API client exposes only bounded sanitized Lichess error detail", async () 
         ignored: "arbitrary response document",
       }),
     }),
+    incidentSink: (incident) => incidents.push(incident),
   });
   await assert.rejects(
     client.postJson("api/challenge/test-bot", { rated: false }),
@@ -3474,6 +3587,16 @@ test("API client exposes only bounded sanitized Lichess error detail", async () 
       return true;
     },
   );
+  assert.deepEqual(incidents, [{
+    code: "api_permanent_error",
+    severity: "error",
+    source: "api",
+    operation: "challenge_create",
+    httpStatus: 400,
+    detail: "Lichess API permanently rejected a provider request",
+  }]);
+  assert.equal(JSON.stringify(incidents).includes("Challenge rejected"), false);
+  assert.equal(JSON.stringify(incidents).includes("test-token"), false);
 });
 
 test("API client holds the single-flight permit through finite response consumption", async () => {
@@ -3671,6 +3794,23 @@ test("nested local control commands parse without touching credentials", () => {
   assert.deepEqual(parseArguments(["qualification", "run", "--config", "local.json"]), {
     command: "qualification", action: "run", config: "local.json",
   });
+  assert.deepEqual(parseArguments(["incidents", "list", "--filter", "all", "--limit", "10"]), {
+    command: "incidents", action: "list", filter: "all", limit: "10",
+  });
+});
+
+test("incident pagination rejects invalid input before creating provider storage", async () => {
+  const runtimeDir = mkdtempSync(path.join(os.tmpdir(), "uci-arena-invalid-incident-page-"));
+  await assert.rejects(
+    main(["incidents", "list", "--after-cursor", "1.5", "--runtime-dir", runtimeDir]),
+    /must be an integer/u,
+  );
+  assert.equal(existsSync(path.join(runtimeDir, "matches.sqlite")), false);
+  await assert.rejects(
+    main(["incidents", "list", "--filter", "recent", "--runtime-dir", runtimeDir]),
+    /filter must be active or all/u,
+  );
+  assert.equal(existsSync(path.join(runtimeDir, "matches.sqlite")), false);
 });
 
 test("installed qualification failures are bounded typed and path-redacted", () => {
@@ -4125,9 +4265,52 @@ test("initial reconciliation failure remains supervised and retries before strea
     assert.equal(recoveryCalls, 2);
     assert.equal(pendingObserved, true);
     assert.equal(connectedAfterRecovery, true);
+    const incidents = store.listProviderIncidents({ filter: "all" }).incidents;
+    assert.equal(incidents.some((incident) => incident.code === "event_stream_disconnected"
+      && incident.state === "resolved"), true);
   } finally {
     lifetime.abort();
     await controller.slots.drainAll();
+    store.close();
+  }
+});
+
+test("scheduler tick incidents aggregate failure and close on the next successful tick", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-scheduler-incidents-"));
+  const store = new LichessStore(path.join(directory, "matches.sqlite"));
+  const lifetime = new AbortController();
+  const config = gameConfig();
+  config.scheduler = { ...config.scheduler, enabled: false };
+  config.capacity = {
+    total_slots: 1,
+    startup_parallelism: 1,
+    human: { slots: 0, allow_borrowing: false, accept_public: false },
+    bot: { slots: 1, target_active: 0 },
+  };
+  const controller = new BotController({
+    client: {},
+    config,
+    account: "self",
+    runtimeDir: directory,
+    signal: lifetime.signal,
+    store,
+    schedulerDelay: async () => {},
+  });
+  let ticks = 0;
+  controller.schedulerTick = async () => {
+    ticks += 1;
+    if (ticks === 1) throw new Error("scheduler fixture failure");
+    lifetime.abort(new Error("scheduler fixture complete"));
+  };
+  try {
+    await controller.schedulerLoop();
+    const incidents = store.listProviderIncidents({ filter: "all" }).incidents;
+    assert.equal(incidents.length, 1);
+    assert.equal(incidents[0].code, "scheduler_tick_failed");
+    assert.equal(incidents[0].occurrence_count, 1);
+    assert.equal(incidents[0].state, "resolved");
+  } finally {
+    lifetime.abort();
     store.close();
   }
 });
@@ -4227,6 +4410,19 @@ test("permanent timeout cancellation failure retains the slot and faults outboun
     assert.equal(slot.cancelRetryAt, Number.POSITIVE_INFINITY);
     assert.equal(controller.schedulerFault.kind, "permanent_cancel_error");
     assert.equal(closes, 0);
+    assert.deepEqual(store.listProviderIncidents({ filter: "active" }).incidents.map((incident) => ({
+      code: incident.code,
+      source: incident.source,
+      operation: incident.operation,
+      http_status: incident.http_status,
+      detail: incident.detail,
+    })), [{
+      code: "scheduler_fault",
+      source: "scheduler",
+      operation: "challenge_cancel",
+      http_status: 400,
+      detail: "Scheduler stopped after permanent challenge cancellation rejection",
+    }]);
   } finally {
     await controller.slots.drainAll();
     store.close();
