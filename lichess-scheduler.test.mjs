@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  API_REQUEST_PRIORITY,
   API_RATE_LIMIT_BACKOFF_MS,
   API_RATE_LIMIT_STRIKE_RESET_MS,
   CHALLENGE_RATE_LIMIT_BACKOFF_MS,
@@ -15,6 +16,11 @@ import {
   retryAfterMilliseconds,
   selectWeightedCandidate,
 } from "./lichess-scheduler.mjs";
+
+test("historical archive work is the lowest API request priority", () => {
+  assert.ok(API_REQUEST_PRIORITY.archive_backfill > API_REQUEST_PRIORITY.ordinary);
+  assert.ok(API_REQUEST_PRIORITY.archive_backfill > API_REQUEST_PRIORITY.discovery);
+});
 
 function capacity({ humans = 1, bots = 1, borrowing = false } = {}) {
   return {

@@ -40,6 +40,8 @@ export class AuthoritativeChessState {
     this.now = now;
     this.chess = createInitialPosition(initialFen);
     this.moves = [];
+    this.plySnapshots = [];
+    this.canonicalInitialFen = this.chess.fen();
   }
 
   synchronize(moves, { forceRebuild = false } = {}) {
@@ -49,13 +51,24 @@ export class AuthoritativeChessState {
     if (rebuild) {
       this.chess = createInitialPosition(this.initialFen);
       this.moves = [];
+      this.plySnapshots = [];
     }
     const firstPly = this.moves.length;
     for (let ply = firstPly; ply < moves.length; ply += 1) {
+      const beforeFen = this.chess.fen();
+      const moveActorColor = this.chess.turn() === "w" ? "white" : "black";
       if (!applyLegalMove(this.chess, moves[ply])) {
         throw new Error(`Authoritative move list is illegal at ply ${ply + 1}: ${moves[ply]}`);
       }
       this.moves.push(moves[ply]);
+      this.plySnapshots.push(Object.freeze({
+        ply,
+        uciMove: moves[ply],
+        beforeFen,
+        afterFen: this.chess.fen(),
+        actorColor: moveActorColor,
+        clockMs: null,
+      }));
     }
     return {
       elapsedMs: this.now() - startedAt,
@@ -63,6 +76,8 @@ export class AuthoritativeChessState {
       rebuilt: rebuild,
       rootKey: this.moves.join(" "),
       rootFen: this.chess.fen(),
+      initialFen: this.canonicalInitialFen,
+      plies: this.plySnapshots.map((ply) => ({ ...ply })),
     };
   }
 

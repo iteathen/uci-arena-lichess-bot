@@ -6,6 +6,26 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import { LichessStore } from "./lichess-store.mjs";
+import { parseProviderHistoricalGame } from "./provider-games.mjs";
+
+const PROVIDER_COMPONENT = Object.freeze({
+  componentId: "lichess.adapter",
+  version: "1.0.24",
+  manifestSha256: `sha256:${"a".repeat(64)}`,
+});
+
+function gameFixture(overrides = {}) {
+  return {
+    id: "game",
+    opponent: "opponent",
+    audience: "bot",
+    color: "white",
+    initialFen: "startpos",
+    variant: "standard",
+    providerComponent: PROVIDER_COMPONENT,
+    ...overrides,
+  };
+}
 
 function storeFixture() {
   const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-lichess-store-"));
@@ -41,8 +61,30 @@ const PROVENANCE_COLUMNS = Object.freeze([
   "model_id",
 ]);
 
+const ARCHIVE_COLUMNS = Object.freeze([
+  "backfill_last_attempted_at", "backfill_attempts",
+  "engine_component_manifest_sha256", "engine_component_version", "engine_component_id",
+  "provider_component_manifest_sha256", "provider_component_version", "provider_component_id",
+  "archive_sha256", "archive_reason", "archive_completeness", "variant", "initial_fen",
+  "completion_cursor", "archive_cursor",
+]);
+
+function removeArchiveSchema(database) {
+  database.exec(`
+    DROP INDEX games_live_cursor;
+    DROP INDEX games_completion_cursor;
+    DROP INDEX games_archive_cursor;
+    DROP TABLE game_plies;
+    DROP TABLE game_archive_control;
+  `);
+  for (const column of ARCHIVE_COLUMNS) {
+    database.exec(`ALTER TABLE games DROP COLUMN ${column}`);
+  }
+}
+
 function downgradeToLegacyV1(file, { version = 1, legacyRateLimit = false } = {}) {
   const database = new DatabaseSync(file);
+  removeArchiveSchema(database);
   database.exec(`
     DROP TABLE provider_incidents;
     DROP TABLE provider_incident_control;
@@ -82,12 +124,12 @@ const EMPTY_CHALLENGE_SAFETY = Object.freeze({
   challengeHalfOpen: false,
 });
 
-test("store keeps schema five and adds exact lifecycle and incident extensions", () => {
+test("store keeps schema six and adds exact lifecycle, incident, and archive extensions", () => {
   const store = storeFixture();
   try {
-    assert.equal(store.status().schemaVersion, 5);
+    assert.equal(store.status().schemaVersion, 6);
     assert.equal(store.db.prepare("PRAGMA journal_mode").get().journal_mode, "wal");
-    assert.equal(store.db.prepare("SELECT version FROM schema_meta").get().version, 5);
+    assert.equal(store.db.prepare("SELECT version FROM schema_meta").get().version, 6);
     assert.deepEqual(store.providerLifecycleSnapshot(), {
       admissionBlocked: false,
       owned: false,
@@ -116,7 +158,7 @@ test("schema-one stores migrate without losing existing control state", () => {
   downgradeToLegacyV1(file);
   const store = new LichessStore(file);
   try {
-    assert.equal(store.status().schemaVersion, 5);
+    assert.equal(store.status().schemaVersion, 6);
     assert.equal(store.control().paused, true);
     assert.deepEqual(store.apiSafetyState("https://lichess.org|arena-bot"), {
       cooldownUntil: 0,
@@ -171,7 +213,7 @@ test("legacy schema-two rate-limit state migrates without shortening cooldown", 
       processIdentity(101),
     ).owner_id, "repair-owner");
     assert.equal(store.releaseApiLease(key, "repair-owner"), true);
-    assert.equal(store.status().schemaVersion, 5);
+    assert.equal(store.status().schemaVersion, 6);
   } finally {
     store.close();
   }
@@ -523,7 +565,9 @@ test("online discovery, cooldown, and daily game caps filter candidates", () => 
     store.setOpponentCooldown("botone", 30, now);
     assert.deepEqual(store.eligibleBots({ self: "self", now }).map((row) => row.username), ["bottwo"]);
     for (const id of ["game-one", "game-two"]) {
-      store.beginGame({ id, opponent: "bottwo", audience: "bot", color: "white", startedAt: now });
+      store.beginGame(gameFixture({
+        id, opponent: "bottwo", audience: "bot", color: "white", startedAt: now,
+      }));
     }
     assert.deepEqual(store.eligibleBots({ self: "self", now, maximumGamesPerDay: 2 }), []);
   } finally {
@@ -541,7 +585,7 @@ test("challenge and game completion writes are idempotent", () => {
     store.updateChallenge("challenge", "accepted", {}, 300);
     store.updateChallenge("challenge", "accepted", {}, 400);
     assert.equal(store.db.prepare("SELECT accepts FROM opponents WHERE username='opponent'").get().accepts, 1);
-    store.beginGame({
+    store.beginGame(gameFixture({
       id: "game", opponent: "opponent", audience: "bot", color: "black", startedAt: 500,
       engineBuildFingerprint: "engine-a", modelFingerprint: "model-a", providerFingerprint: "provider-a",
       modelId: "model-id-a", checkpointHash: "checkpoint-a", adapterId: "adapter-a",
@@ -550,15 +594,21 @@ test("challenge and game completion writes are idempotent", () => {
       splitDepth: 2, batchSize: 64, batchWaitUs: 0, timeProfileIdentity: "time-a",
       runtimeProvenanceSha256: "sha256:provenance-a",
       runtimeProvenance: { schema: "uci_arena_game_runtime_provenance_v1", version: "a" },
-    });
-    store.beginGame({
+    }));
+    store.beginGame(gameFixture({
       id: "game", opponent: "opponent", audience: "bot", color: "black", startedAt: 501,
       engineBuildFingerprint: "engine-b", modelFingerprint: "model-b",
       runtimeProvenanceSha256: "sha256:provenance-b",
       runtimeProvenance: { schema: "uci_arena_game_runtime_provenance_v1", version: "b" },
-    });
-    store.finishGame({ id: "game", status: "mate", result: "win", winner: "black", plies: 42, finishedAt: 600 });
-    store.finishGame({ id: "game", status: "resign", result: "loss", winner: "white", plies: 43, finishedAt: 700 });
+    }));
+    store.finishGame({ id: "game", status: "mate", result: "win", winner: "black", plies: 0, finishedAt: 600 });
+    assert.throws(
+      () => store.finishGame({
+        id: "game", status: "resign", result: "loss", winner: "white", plies: 0,
+        finishedAt: 700,
+      }),
+      /immutable/,
+    );
     assert.deepEqual(store.opponentStats().map((entry) => ({ ...entry })), [
       {
         opponent: "opponent", rating: 0, games: 1, wins: 1, draws: 0, losses: 0,
@@ -600,10 +650,180 @@ test("challenge and game completion writes are idempotent", () => {
   }
 });
 
+test("provider game archive reconciles takebacks, closes immutably, and paginates by cursor", () => {
+  const store = storeFixture();
+  try {
+    const first = parseProviderHistoricalGame({
+      id: "archive-one",
+      moves: "e4 c5 Nf3",
+      clocks: [18_000, 17_900, 17_800],
+      status: "resign",
+      winner: "black",
+      lastMoveAt: 900,
+    });
+    store.beginGame(gameFixture({ id: first.id, color: "white", startedAt: 100 }));
+    assert.equal(store.reconcileGameLine(first), true);
+
+    const corrected = parseProviderHistoricalGame({
+      id: "archive-one",
+      moves: "e4 e5",
+      clocks: [18_000, 17_950],
+      status: "resign",
+      winner: "black",
+      lastMoveAt: 900,
+    });
+    assert.equal(store.reconcileGameLine(corrected), true);
+    assert.deepEqual(store.gamePlyRows(first.id).map((ply) => ply.uci_move), ["e2e4", "e7e5"]);
+    assert.equal(store.finishGame({
+      id: first.id,
+      status: "resign",
+      result: "loss",
+      winner: "black",
+      plies: 2,
+      finishedAt: 900,
+    }), true);
+    assert.equal(store.finishGame({
+      id: first.id,
+      status: "resign",
+      result: "loss",
+      winner: "black",
+      plies: 2,
+      finishedAt: 900,
+    }), false);
+    assert.throws(() => store.reconcileGameLine(first), /immutable/);
+
+    store.beginGame(gameFixture({ id: "archive-two", startedAt: 200 }));
+    store.beginGame(gameFixture({ id: "archive-three", startedAt: 300 }));
+    const liveFirst = store.listProviderGames({ scope: "live", limit: 1 });
+    assert.equal(liveFirst.games[0].game_id, "archive-three");
+    assert.equal(liveFirst.has_more, true);
+    const liveSecond = store.listProviderGames({
+      scope: "live",
+      beforeCursor: liveFirst.next_cursor,
+      limit: 2,
+    });
+    assert.deepEqual(liveSecond.games.map((game) => game.game_id), ["archive-two"]);
+
+    const history = store.listProviderGames({ scope: "history", limit: 2 });
+    assert.deepEqual(history.games.map((game) => game.game_id), [first.id]);
+    const detail = store.getProviderGame(first.id);
+    assert.equal(detail.archive_completeness, "complete");
+    assert.deepEqual(detail.replay.map((ply) => ply.uci_move), ["e2e4", "e7e5"]);
+    assert.match(detail.archive_sha256, /^sha256:[a-f0-9]{64}$/u);
+    assert.deepEqual(store.gameArchiveSummary(), {
+      available: true,
+      total_games: 3,
+      complete_games: 1,
+      incomplete_games: 0,
+      live_games: 2,
+      logical_storage_bytes: store.gameArchiveSummary().logical_storage_bytes,
+    });
+  } finally {
+    store.close();
+  }
+});
+
+test("historical archive reconciliation is evidence-only and component identity is immutable", () => {
+  const store = storeFixture();
+  try {
+    const game = gameFixture({ id: "historical-one", startedAt: 100, color: "black" });
+    store.beginGame(game);
+    assert.throws(
+      () => store.beginGame({
+        ...game,
+        providerComponent: { ...PROVIDER_COMPONENT, version: "invented" },
+      }),
+      /component identity conflicts/,
+    );
+    store.db.prepare(`
+      UPDATE games SET archive_completeness='summary_only',
+        archive_reason='historical_moves_unavailable' WHERE game_id=?
+    `).run(game.id);
+    const parsed = parseProviderHistoricalGame({
+      id: game.id,
+      moves: "e4 e5",
+      clocks: [6_000, 5_950],
+      status: "mate",
+      winner: "white",
+      lastMoveAt: 1_000,
+    });
+    assert.equal(store.reconcileHistoricalGame(parsed, 1_100), true);
+    const detail = store.getProviderGame(game.id);
+    assert.equal(detail.archive_completeness, "reconciled");
+    assert.equal(detail.result, "loss");
+    assert.equal(detail.engine_component, null);
+    assert.equal(detail.replay.length, 2);
+    assert.deepEqual(store.listProviderGameBackfillIds(), []);
+    assert.equal(store.reconcileHistoricalGame(parsed, 1_200), false);
+    assert.throws(
+      () => store.reconcileHistoricalGame({ ...parsed, status: "resign" }, 1_300),
+      /status conflicts|archive conflicts/,
+    );
+  } finally {
+    store.close();
+  }
+});
+
+test("history keyset pagination reaches all 646 records exactly once", () => {
+  const store = storeFixture();
+  try {
+    const insert = store.db.prepare(`
+      INSERT INTO games(
+        game_id, opponent, audience, color, status, plies, started_at, finished_at,
+        archive_cursor, completion_cursor, initial_fen, variant,
+        archive_completeness, archive_reason
+      ) VALUES(?, 'fixture-bot', 'bot', 'white', 'mate', 0, ?, ?, ?, ?, ?,
+        'standard', 'summary_only', 'historical_moves_unavailable')
+    `);
+    const initialFen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+    store.db.exec("BEGIN IMMEDIATE");
+    for (let cursor = 1; cursor <= 646; cursor += 1) {
+      insert.run(
+        `game-${String(cursor).padStart(4, "0")}`,
+        cursor,
+        cursor + 1_000,
+        cursor,
+        cursor,
+        initialFen,
+      );
+    }
+    store.db.prepare(`
+      UPDATE game_archive_control
+      SET next_archive_cursor=647, next_completion_cursor=647, updated_at=1646
+      WHERE id=1
+    `).run();
+    store.db.exec("COMMIT");
+
+    const visited = [];
+    let beforeCursor = 0;
+    let pages = 0;
+    do {
+      const page = store.listProviderGames({ scope: "history", beforeCursor, limit: 100 });
+      assert.ok(page.games.length > 0 && page.games.length <= 100);
+      visited.push(...page.games.map((game) => game.game_id));
+      beforeCursor = page.next_cursor;
+      pages += 1;
+      if (!page.has_more) break;
+    } while (pages < 10);
+    assert.equal(pages, 7);
+    assert.equal(visited.length, 646);
+    assert.equal(new Set(visited).size, 646);
+    assert.equal(visited[0], "game-0646");
+    assert.equal(visited.at(-1), "game-0001");
+    assert.throws(
+      () => store.listProviderGames({ scope: "history", limit: 101 }),
+      /page limit must be an exact safe integer/,
+    );
+  } finally {
+    if (store.db.isTransaction) store.db.exec("ROLLBACK");
+    store.close();
+  }
+});
+
 test("historical provenance backfill is dry-run-first, idempotent, and never overwrites identity", () => {
   const store = storeFixture();
   const startedAt = Date.parse("2026-07-20T12:00:00Z");
-  const baseGame = {
+  const baseGame = gameFixture({
     id: "historical-game",
     opponent: "opponent",
     audience: "bot",
@@ -613,7 +833,7 @@ test("historical provenance backfill is dry-run-first, idempotent, and never ove
     modelFingerprint: "historical-model-fingerprint",
     providerFingerprint: "historical-provider-fingerprint",
     bookIdentity: "sha256:historical-book",
-  };
+  });
   const entry = {
     deployment_id: "historical-deployment",
     started_at_or_after: "2026-07-20T11:59:00Z",

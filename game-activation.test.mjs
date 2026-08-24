@@ -45,6 +45,22 @@ function processIdentity(pid) {
   };
 }
 
+function initializeGameArchive(store, gameId) {
+  store.beginGame({
+    id: gameId,
+    opponent: "fixture-bot",
+    audience: "bot",
+    color: "white",
+    initialFen: "startpos",
+    variant: "standard",
+    providerComponent: {
+      componentId: "lichess.adapter",
+      version: "1.0.24",
+      manifestSha256: `sha256:${"a".repeat(64)}`,
+    },
+  });
+}
+
 test("pre-replacement leaves an active game and startup control untouched", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-game-interlock-"));
   const storeFile = path.join(directory, "matches.sqlite");
@@ -82,12 +98,13 @@ test("pre-replacement leaves an active game and startup control untouched", asyn
       run: async () => {
         sessionStarted();
         await sessionFinishPromise;
+        initializeGameArchive(store, gameId);
         store.finishGame({
           id: gameId,
           status: "mate",
           result: "win",
           winner: "white",
-          plies: 1,
+          plies: 0,
         });
       },
     }),
@@ -174,6 +191,7 @@ test("activation publishes maps and active slot before immediate session executi
         observedPublishedAuthority = controller.gameSessions.has(gameId)
           && controller.activeGames.has(gameId)
           && controller.slots.findGame(gameId)?.state === "active";
+        initializeGameArchive(store, gameId);
         store.finishGame({ id: gameId, status: "aborted", result: "", winner: "", plies: 0 });
       },
     }),

@@ -112,6 +112,7 @@ test('installer integration binds complete suite evidence and bounded knowledge 
   writeFileSync(path.join(books, 'strong_rare_v1.stats'), 'stats', 'utf8');
   writeFileSync(path.join(books, 'strong_rare_v1.policy'), 'policy', 'utf8');
   const engineRoot = path.join(root, 'engine');
+  const engineManifest = path.join(engineRoot, 'arena-component.json');
   const result = renderInstallerConfiguration({
     schema: 'arena_provider_install_context_v1',
     schema_version: 1,
@@ -120,6 +121,7 @@ test('installer integration binds complete suite evidence and bounded knowledge 
     bindings: {
       default_engine: path.join(engineRoot, 'bin', 'uci_arena_engine.exe'),
       default_engine_root: engineRoot,
+      default_engine_manifest: engineManifest,
       default_model_root: path.join(engineRoot, 'models', 'default'),
       complete_game_entrypoint: path.join(root, 'evidence', 'arena', 'run_complete_game_matrix.mjs'),
       referee: path.join(root, 'evidence', 'bin', 'referee.exe'),
@@ -136,6 +138,7 @@ test('installer integration binds complete suite evidence and bounded knowledge 
   });
 
   assert.equal(result.configuration.engine.adapter, 'uci_arena_extended_v1');
+  assert.equal(result.configuration.engine.component_manifest, engineManifest);
   assert.equal(result.configuration.engine.uci_options.ModelRoot,
     path.join(engineRoot, 'models', 'default'));
   assert.equal(result.configuration.engine.uci_options.BookFile,

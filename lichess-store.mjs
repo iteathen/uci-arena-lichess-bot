@@ -20,6 +20,17 @@ import {
   projectProviderIncidentSummary,
   providerIncidentSeverityAtLeast,
 } from "./provider-incidents.mjs";
+import {
+  PROVIDER_GAME_BACKFILL_MAXIMUM_IDS,
+  normalizeProviderComponentIdentity,
+  normalizeProviderGameId,
+  normalizeProviderGameLine,
+  normalizeProviderGamePageRequest,
+  normalizeProviderGameTerminal,
+  projectProviderGame,
+  projectProviderGamePage,
+  providerGameArchiveSha256,
+} from "./provider-games.mjs";
 
 function normalizedUsername(value) {
   const username = String(value ?? "").trim().toLocaleLowerCase();
@@ -78,6 +89,7 @@ export class LichessStore {
     this.statusOpponents = this.queryOpponentStats();
     this.statusApiLeases = new Map(this.listApiLeaseRows().map((lease) => [lease.authority_key, lease]));
     this.statusIncidents = this.queryProviderIncidentSummary();
+    this.statusGameArchive = this.queryGameArchiveSummary();
   }
 
   close() {
@@ -197,7 +209,45 @@ export class LichessStore {
       },
       opponents: this.statusOpponents.map((opponent) => ({ ...opponent })),
       incidents: { ...this.statusIncidents },
+      gameArchive: { ...this.statusGameArchive },
     };
+  }
+
+  queryGameArchiveSummary() {
+    const counts = this.db.prepare(`
+      SELECT COUNT(*) AS total_games,
+        SUM(CASE WHEN archive_completeness IN ('complete','reconciled') THEN 1 ELSE 0 END)
+          AS complete_games,
+        SUM(CASE WHEN archive_completeness='summary_only' THEN 1 ELSE 0 END)
+          AS incomplete_games,
+        SUM(CASE WHEN archive_completeness='live' THEN 1 ELSE 0 END) AS live_games
+      FROM games
+    `).get();
+    const pageCount = this.db.prepare("PRAGMA page_count").get()?.page_count ?? 0;
+    const pageSize = this.db.prepare("PRAGMA page_size").get()?.page_size ?? 0;
+    return Object.freeze({
+      available: true,
+      total_games: safeInteger(counts.total_games ?? 0, "game archive total"),
+      complete_games: safeInteger(counts.complete_games ?? 0, "complete game archive total"),
+      incomplete_games: safeInteger(
+        counts.incomplete_games ?? 0,
+        "incomplete game archive total",
+      ),
+      live_games: safeInteger(counts.live_games ?? 0, "live game archive total"),
+      logical_storage_bytes: safeInteger(
+        pageCount * pageSize,
+        "game archive logical storage bytes",
+      ),
+    });
+  }
+
+  refreshGameArchiveSummary() {
+    this.statusGameArchive = this.queryGameArchiveSummary();
+    return { ...this.statusGameArchive };
+  }
+
+  gameArchiveSummary() {
+    return { ...this.statusGameArchive };
   }
 
   queryProviderIncidentSummary() {
@@ -1059,14 +1109,25 @@ export class LichessStore {
     const correlationId = challengeId ? String(challengeId) : null;
     const activation = this.withImmediateTransaction(() => {
       const existing = this.db.prepare(`
-        SELECT status FROM games WHERE game_id=?
+        SELECT status, archive_cursor FROM games WHERE game_id=?
       `).get(gameId);
       const inserted = !existing;
       if (inserted) {
+        const control = this.db.prepare(`
+          SELECT next_archive_cursor FROM game_archive_control WHERE id=1
+        `).get();
+        const archiveCursor = safeInteger(
+          control.next_archive_cursor,
+          "next game archive cursor",
+          { minimum: 1 },
+        );
         this.db.prepare(`
-          INSERT INTO games(game_id, opponent, audience, status, started_at)
-          VALUES(?, ?, ?, 'activating', ?)
-        `).run(gameId, normalizedOpponent, audience, now);
+          UPDATE game_archive_control SET next_archive_cursor=?, updated_at=? WHERE id=1
+        `).run(safeInteger(archiveCursor + 1, "next game archive cursor"), now);
+        this.db.prepare(`
+          INSERT INTO games(game_id, opponent, audience, status, started_at, archive_cursor)
+          VALUES(?, ?, ?, 'activating', ?, ?)
+        `).run(gameId, normalizedOpponent, audience, now, archiveCursor);
       } else if (existing.status === "activation_failed") {
         this.db.prepare(`
           UPDATE games SET status='activating', finished_at=0
@@ -1117,31 +1178,96 @@ export class LichessStore {
     });
     this.refreshControlProjection(now);
     if (activation.challengeTransitioned) this.refreshOpponentProjection();
+    if (activation.inserted) this.refreshGameArchiveSummary();
     return activation;
   }
 
   failGameActivation(id, now = Date.now()) {
     now = safeInteger(now, "game activation failure timestamp");
     this.db.prepare(`
-      UPDATE games SET status='activation_failed', finished_at=?
+      UPDATE games SET status='activation_failed'
       WHERE game_id=? AND status='activating'
-    `).run(now, String(id));
+    `).run(String(id));
     this.refreshOpponentProjection();
+    this.refreshGameArchiveSummary();
   }
 
   markGameProviderError(id, now = Date.now()) {
     now = safeInteger(now, "game provider error timestamp");
     this.db.prepare(`
-      UPDATE games SET status='provider_error', finished_at=?
+      UPDATE games SET status='provider_error'
       WHERE game_id=? AND finished_at=0
-    `).run(now, String(id));
+    `).run(String(id));
     this.refreshOpponentProjection();
+    this.refreshGameArchiveSummary();
   }
 
   beginGame(game) {
+    const id = normalizeProviderGameId(String(game.id));
+    if (game.audience !== "human" && game.audience !== "bot") {
+      throw new Error(`Unsupported provider game audience: ${game.audience}`);
+    }
+    if (game.color !== "white" && game.color !== "black") {
+      throw new Error(`Unsupported provider game color: ${game.color}`);
+    }
+    if (game.rated !== undefined && typeof game.rated !== "boolean") {
+      throw new Error("Provider game rated authority must be boolean");
+    }
     const now = safeInteger(game.startedAt, "game start timestamp", { defaultValue: Date.now() });
+    const line = normalizeProviderGameLine({
+      initialFen: game.initialFen,
+      variant: game.variant ?? "standard",
+      plies: [],
+    });
+    const providerComponent = normalizeProviderComponentIdentity(
+      game.providerComponent,
+      "provider",
+    );
+    const engineComponent = normalizeProviderComponentIdentity(
+      game.engineComponent,
+      "engine",
+      { optional: true },
+    );
     const runtimeProvenanceJson = JSON.stringify(game.runtimeProvenance ?? {});
-    this.db.prepare(`
+    this.withImmediateTransaction(() => {
+      const existing = this.db.prepare(`
+        SELECT archive_cursor, initial_fen, variant,
+          provider_component_id, provider_component_version,
+          provider_component_manifest_sha256, engine_component_id,
+          engine_component_version, engine_component_manifest_sha256
+        FROM games WHERE game_id=?
+      `).get(id);
+      if (existing?.initial_fen && existing.initial_fen !== line.initialFen) {
+        throw new Error(`Provider game initial FEN conflicts with ${id}`);
+      }
+      if (existing?.initial_fen && existing.variant !== line.variant) {
+        throw new Error(`Provider game variant conflicts with ${id}`);
+      }
+      const componentConflicts = (prefix, component) => {
+        const componentId = existing?.[`${prefix}_component_id`] ?? "";
+        if (!componentId || !component) return false;
+        return componentId !== component.componentId
+          || existing[`${prefix}_component_version`] !== component.version
+          || existing[`${prefix}_component_manifest_sha256`] !== component.manifestSha256;
+      };
+      if (componentConflicts("provider", providerComponent)
+          || componentConflicts("engine", engineComponent)) {
+        throw new Error(`Provider game component identity conflicts with ${id}`);
+      }
+      let archiveCursor = existing?.archive_cursor ?? 0;
+      if (!existing) {
+        const control = this.db.prepare(`
+          SELECT next_archive_cursor FROM game_archive_control WHERE id=1
+        `).get();
+        archiveCursor = safeInteger(control.next_archive_cursor, "next game archive cursor", {
+          minimum: 1,
+        });
+        this.db.prepare(`
+          UPDATE game_archive_control
+          SET next_archive_cursor=?, updated_at=? WHERE id=1
+        `).run(safeInteger(archiveCursor + 1, "next game archive cursor"), now);
+      }
+      this.db.prepare(`
       INSERT INTO games(game_id, opponent, audience, color, rated, speed, clock_limit,
         clock_increment, status, started_at, engine_build_fingerprint, model_fingerprint,
         provider_fingerprint, book_identity, model_id, checkpoint_hash, adapter_id,
@@ -1155,9 +1281,10 @@ export class LichessStore {
         audience=excluded.audience, color=excluded.color, rated=excluded.rated,
         speed=excluded.speed, clock_limit=excluded.clock_limit,
         clock_increment=excluded.clock_increment,
-        status=CASE WHEN games.status IN ('activating', 'activation_failed')
+        status=CASE WHEN games.status IN ('activating', 'activation_failed', 'provider_error')
           THEN 'started' ELSE games.status END,
-        finished_at=CASE WHEN games.status='activation_failed' THEN 0 ELSE games.finished_at END,
+        finished_at=CASE WHEN games.status IN ('activation_failed', 'provider_error')
+          THEN 0 ELSE games.finished_at END,
         engine_build_fingerprint=CASE WHEN games.engine_build_fingerprint=''
           THEN excluded.engine_build_fingerprint ELSE games.engine_build_fingerprint END,
         model_fingerprint=CASE WHEN games.model_fingerprint=''
@@ -1188,7 +1315,7 @@ export class LichessStore {
           THEN excluded.runtime_provenance_sha256 ELSE games.runtime_provenance_sha256 END,
         runtime_provenance_json=CASE WHEN games.runtime_provenance_sha256=''
           THEN excluded.runtime_provenance_json ELSE games.runtime_provenance_json END
-    `).run(String(game.id), normalizedUsername(game.opponent), game.audience, game.color,
+      `).run(id, normalizedUsername(game.opponent), game.audience, game.color,
       game.rated ? 1 : 0, game.speed ?? "",
       safeInteger(game.clockLimit, "game clock limit", { defaultValue: 0 }),
       safeInteger(game.clockIncrement, "game clock increment", { defaultValue: 0 }),
@@ -1203,6 +1330,313 @@ export class LichessStore {
       safeInteger(game.batchWaitUs, "game batch wait", { defaultValue: 0 }),
       game.timeProfileIdentity ?? "", game.runtimeProvenanceSha256 ?? "",
       runtimeProvenanceJson);
+      this.db.prepare(`
+        UPDATE games SET archive_cursor=CASE WHEN archive_cursor=0 THEN ? ELSE archive_cursor END,
+          initial_fen=CASE WHEN initial_fen='' THEN ? ELSE initial_fen END,
+          variant=CASE WHEN initial_fen='' THEN ? ELSE variant END,
+          provider_component_id=CASE WHEN provider_component_id='' THEN ? ELSE provider_component_id END,
+          provider_component_version=CASE WHEN provider_component_id='' THEN ? ELSE provider_component_version END,
+          provider_component_manifest_sha256=CASE WHEN provider_component_id=''
+            THEN ? ELSE provider_component_manifest_sha256 END,
+          engine_component_id=CASE WHEN engine_component_id='' THEN ? ELSE engine_component_id END,
+          engine_component_version=CASE WHEN engine_component_id='' THEN ? ELSE engine_component_version END,
+          engine_component_manifest_sha256=CASE WHEN engine_component_id=''
+            THEN ? ELSE engine_component_manifest_sha256 END
+        WHERE game_id=?
+      `).run(
+        archiveCursor,
+        line.initialFen,
+        line.variant,
+        providerComponent.componentId,
+        providerComponent.version,
+        providerComponent.manifestSha256,
+        engineComponent?.componentId ?? "",
+        engineComponent?.version ?? "",
+        engineComponent?.manifestSha256 ?? "",
+        id,
+      );
+    });
+    this.refreshGameArchiveSummary();
+  }
+
+  gamePlyRows(id) {
+    return this.db.prepare(`
+      SELECT game_id, ply, uci_move, before_fen, after_fen, actor_color,
+        clock_available, clock_ms
+      FROM game_plies WHERE game_id=? ORDER BY ply
+    `).all(normalizeProviderGameId(String(id)));
+  }
+
+  reconcileGameLine({ id, initialFen, variant = "standard", plies }) {
+    const gameId = normalizeProviderGameId(String(id));
+    const line = normalizeProviderGameLine({ initialFen, variant, plies });
+    return this.withImmediateTransaction(() => {
+      const game = this.db.prepare(`
+        SELECT finished_at, initial_fen, variant FROM games WHERE game_id=?
+      `).get(gameId);
+      if (!game) throw new Error(`Provider game is unavailable: ${gameId}`);
+      if (game.initial_fen && game.initial_fen !== line.initialFen) {
+        throw new Error(`Provider game initial FEN conflicts with ${gameId}`);
+      }
+      if (game.initial_fen && game.variant !== line.variant) {
+        throw new Error(`Provider game variant conflicts with ${gameId}`);
+      }
+      const stored = this.gamePlyRows(gameId);
+      const samePly = (left, right) => left.uci_move === right.uciMove
+        && left.before_fen === right.beforeFen && left.after_fen === right.afterFen
+        && left.actor_color === right.actorColor;
+      if (game.finished_at > 0) {
+        if (stored.length !== line.plies.length
+            || stored.some((entry, index) => !samePly(entry, line.plies[index])
+              || (line.plies[index].clockMs !== null
+                && (entry.clock_available !== 1
+                  || entry.clock_ms !== line.plies[index].clockMs)))) {
+          throw new Error(`Terminal provider game replay is immutable: ${gameId}`);
+        }
+        return false;
+      }
+      let common = 0;
+      while (common < stored.length && common < line.plies.length
+          && samePly(stored[common], line.plies[common])) common += 1;
+      if (common < stored.length) {
+        this.db.prepare("DELETE FROM game_plies WHERE game_id=? AND ply>=?")
+          .run(gameId, common);
+      }
+      const insert = this.db.prepare(`
+        INSERT INTO game_plies(
+          game_id, ply, uci_move, before_fen, after_fen, actor_color,
+          clock_available, clock_ms
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (let index = common; index < line.plies.length; index += 1) {
+        const ply = line.plies[index];
+        insert.run(
+          gameId,
+          ply.ply,
+          ply.uciMove,
+          ply.beforeFen,
+          ply.afterFen,
+          ply.actorColor,
+          ply.clockMs === null ? 0 : 1,
+          ply.clockMs ?? 0,
+        );
+      }
+      const updateClock = this.db.prepare(`
+        UPDATE game_plies SET clock_available=1, clock_ms=?
+        WHERE game_id=? AND ply=?
+      `);
+      for (let index = 0; index < common; index += 1) {
+        const clockMs = line.plies[index].clockMs;
+        if (clockMs !== null
+            && (stored[index].clock_available !== 1 || stored[index].clock_ms !== clockMs)) {
+          updateClock.run(clockMs, gameId, index);
+        }
+      }
+      this.db.prepare(`
+        UPDATE games SET initial_fen=CASE WHEN initial_fen='' THEN ? ELSE initial_fen END,
+          variant=?, plies=?, archive_completeness='live', archive_reason=''
+        WHERE game_id=? AND finished_at=0
+      `).run(line.initialFen, line.variant, line.plies.length, gameId);
+      return common !== stored.length || stored.length !== line.plies.length
+        || line.plies.some((ply, index) => ply.clockMs !== null
+          && (stored[index]?.clock_available !== 1 || stored[index]?.clock_ms !== ply.clockMs));
+    });
+  }
+
+  listProviderGameBackfillIds(limit = PROVIDER_GAME_BACKFILL_MAXIMUM_IDS) {
+    limit = safeInteger(limit, "game backfill id limit", {
+      minimum: 1,
+      maximum: PROVIDER_GAME_BACKFILL_MAXIMUM_IDS,
+    });
+    return this.db.prepare(`
+      SELECT game_id FROM games
+      WHERE archive_completeness IN ('summary_only','live') AND backfill_attempts=0
+      ORDER BY archive_cursor LIMIT ?
+    `).all(limit).map((row) => row.game_id);
+  }
+
+  recordProviderGameBackfillFailure(id, reason, now = Date.now()) {
+    const gameId = normalizeProviderGameId(String(id));
+    now = safeInteger(now, "game backfill failure timestamp");
+    if (typeof reason !== "string" || !/^[a-z][a-z0-9_]{0,63}$/u.test(reason)) {
+      throw new Error("game backfill failure reason is invalid");
+    }
+    this.withImmediateTransaction(() => {
+      const row = this.db.prepare(`
+        SELECT backfill_attempts FROM games
+        WHERE game_id=? AND archive_completeness IN ('summary_only','live')
+      `).get(gameId);
+      if (!row) return;
+      const attempts = safeInteger(
+        safeInteger(row.backfill_attempts, "game backfill attempt count") + 1,
+        "game backfill attempt count",
+      );
+      this.db.prepare(`
+        UPDATE games SET archive_reason=?, backfill_attempts=?,
+          backfill_last_attempted_at=? WHERE game_id=?
+      `).run(reason, attempts, now, gameId);
+    });
+    this.refreshGameArchiveSummary();
+  }
+
+  reconcileHistoricalGame(record, now = Date.now()) {
+    const gameId = normalizeProviderGameId(record.id);
+    const line = normalizeProviderGameLine(record);
+    now = safeInteger(now, "historical game reconciliation timestamp");
+    const finishedAt = safeInteger(record.finishedAt, "historical game finish timestamp", {
+      minimum: 1,
+    });
+    const changed = this.withImmediateTransaction(() => {
+      const game = this.db.prepare("SELECT * FROM games WHERE game_id=?").get(gameId);
+      if (!game) throw new Error(`Historical provider game is unavailable: ${gameId}`);
+      if (game.initial_fen && game.initial_fen !== line.initialFen) {
+        throw new Error(`Historical provider game initial FEN conflicts with ${gameId}`);
+      }
+      if (game.variant && game.variant !== line.variant) {
+        throw new Error(`Historical provider game variant conflicts with ${gameId}`);
+      }
+      const replaceableStatus = new Set(["started", "activating", "activation_failed", "provider_error"]);
+      if (game.status && !replaceableStatus.has(game.status) && game.status !== record.status) {
+        throw new Error(`Historical provider game status conflicts with ${gameId}`);
+      }
+      if (game.winner && game.winner !== record.winner) {
+        throw new Error(`Historical provider game winner conflicts with ${gameId}`);
+      }
+      if (game.plies !== 0 && game.plies !== line.plies.length) {
+        throw new Error(`Historical provider game ply count conflicts with ${gameId}`);
+      }
+      const winner = record.winner;
+      const derivedResult = winner && (game.color === "white" || game.color === "black")
+        ? winner === game.color ? "win" : "loss"
+        : new Set(["draw", "stalemate"]).has(record.status) ? "draw" : "";
+      if (game.result && derivedResult && game.result !== derivedResult) {
+        throw new Error(`Historical provider game result conflicts with ${gameId}`);
+      }
+      const result = derivedResult || game.result;
+      const archiveSha256 = providerGameArchiveSha256({
+        gameId,
+        initialFen: line.initialFen,
+        variant: line.variant,
+        status: record.status,
+        result,
+        winner,
+        plies: line.plies,
+      });
+      if (game.archive_completeness === "complete" || game.archive_completeness === "reconciled") {
+        if (game.archive_sha256 !== archiveSha256) {
+          throw new Error(`Historical provider game archive conflicts with ${gameId}`);
+        }
+        return false;
+      }
+      const stored = this.gamePlyRows(gameId);
+      if (stored.some((entry, index) => {
+        const ply = line.plies[index];
+        return !ply || entry.uci_move !== ply.uciMove || entry.before_fen !== ply.beforeFen
+          || entry.after_fen !== ply.afterFen || entry.actor_color !== ply.actorColor;
+      })) {
+        throw new Error(`Historical provider game replay conflicts with ${gameId}`);
+      }
+      const insert = this.db.prepare(`
+        INSERT INTO game_plies(
+          game_id, ply, uci_move, before_fen, after_fen, actor_color,
+          clock_available, clock_ms
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (let index = stored.length; index < line.plies.length; index += 1) {
+        const ply = line.plies[index];
+        insert.run(
+          gameId,
+          ply.ply,
+          ply.uciMove,
+          ply.beforeFen,
+          ply.afterFen,
+          ply.actorColor,
+          ply.clockMs === null ? 0 : 1,
+          ply.clockMs ?? 0,
+        );
+      }
+      const updateClock = this.db.prepare(`
+        UPDATE game_plies SET clock_available=1, clock_ms=? WHERE game_id=? AND ply=?
+      `);
+      for (let index = 0; index < stored.length; index += 1) {
+        const clockMs = line.plies[index].clockMs;
+        if (clockMs !== null && stored[index].clock_available !== 1) {
+          updateClock.run(clockMs, gameId, index);
+        } else if (clockMs !== null && stored[index].clock_ms !== clockMs) {
+          throw new Error(`Historical provider game clock conflicts with ${gameId}`);
+        }
+      }
+      let completionCursor = game.completion_cursor;
+      if (completionCursor === 0) {
+        const control = this.db.prepare(`
+          SELECT next_completion_cursor FROM game_archive_control WHERE id=1
+        `).get();
+        completionCursor = safeInteger(
+          control.next_completion_cursor,
+          "next game completion cursor",
+          { minimum: 1 },
+        );
+        this.db.prepare(`
+          UPDATE game_archive_control SET next_completion_cursor=?, updated_at=? WHERE id=1
+        `).run(safeInteger(completionCursor + 1, "next game completion cursor"), now);
+      }
+      const backfillAttempts = safeInteger(
+        safeInteger(game.backfill_attempts, "game backfill attempt count") + 1,
+        "game backfill attempt count",
+      );
+      this.db.prepare(`
+        UPDATE games SET completion_cursor=?, initial_fen=?, variant=?, status=?, result=?,
+          winner=?, plies=?, finished_at=?, archive_completeness='reconciled',
+          archive_reason='', archive_sha256=?, backfill_attempts=?,
+          backfill_last_attempted_at=?
+        WHERE game_id=?
+      `).run(
+        completionCursor,
+        line.initialFen,
+        line.variant,
+        record.status,
+        result,
+        winner,
+        line.plies.length,
+        finishedAt,
+        archiveSha256,
+        backfillAttempts,
+        now,
+        gameId,
+      );
+      return true;
+    });
+    if (changed) {
+      this.refreshOpponentProjection();
+      this.refreshGameArchiveSummary();
+    }
+    return changed;
+  }
+
+  listProviderGames(request = {}) {
+    const normalized = normalizeProviderGamePageRequest(request);
+    const cursorColumn = normalized.scope === "live" ? "archive_cursor" : "completion_cursor";
+    const statePredicate = normalized.scope === "live" ? "finished_at=0" : "finished_at>0";
+    const cursorPredicate = normalized.beforeCursor > 0 ? `AND ${cursorColumn}<?` : "";
+    const rows = this.db.prepare(`
+      SELECT * FROM games WHERE ${statePredicate} ${cursorPredicate}
+      ORDER BY ${cursorColumn} DESC LIMIT ?
+    `).all(
+      ...(normalized.beforeCursor > 0 ? [normalized.beforeCursor] : []),
+      normalized.limit + 1,
+    );
+    const hasMore = rows.length > normalized.limit;
+    return projectProviderGamePage({
+      request: normalized,
+      rows: rows.slice(0, normalized.limit),
+      hasMore,
+    });
+  }
+
+  getProviderGame(id) {
+    const gameId = normalizeProviderGameId(String(id));
+    const row = this.db.prepare("SELECT * FROM games WHERE game_id=?").get(gameId);
+    return row ? projectProviderGame(row, this.gamePlyRows(gameId)) : null;
   }
 
   backfillGameProvenance(entries, { apply = false } = {}) {
@@ -1347,13 +1781,78 @@ export class LichessStore {
   }
 
   finishGame({ id, status, result, winner, plies, finishedAt = Date.now() }) {
+    const gameId = normalizeProviderGameId(String(id));
     finishedAt = safeInteger(finishedAt, "game finish timestamp");
-    this.db.prepare(`UPDATE games SET status=?, result=?, winner=?, plies=?, finished_at=?
-      WHERE game_id=? AND finished_at=0`)
-      .run(status ?? "unknown", result ?? "", winner ?? "",
-        safeInteger(plies, "game plies", { defaultValue: 0, maximum: 2_048 }),
-        finishedAt, String(id));
+    const terminal = normalizeProviderGameTerminal({ status, result, winner });
+    const terminalStatus = terminal.status;
+    const terminalResult = terminal.result;
+    const terminalWinner = terminal.winner;
+    const terminalPlies = safeInteger(plies, "game plies", {
+      defaultValue: 0,
+      maximum: 2_048,
+    });
+    const changed = this.withImmediateTransaction(() => {
+      const game = this.db.prepare("SELECT * FROM games WHERE game_id=?").get(gameId);
+      if (!game) throw new Error(`Provider game is unavailable: ${gameId}`);
+      const replay = this.gamePlyRows(gameId);
+      if (!game.initial_fen || replay.length !== terminalPlies) {
+        throw new Error(`Provider game replay is incomplete at terminal state: ${gameId}`);
+      }
+      const line = replay.map((entry) => ({
+        ply: entry.ply,
+        uciMove: entry.uci_move,
+        beforeFen: entry.before_fen,
+        afterFen: entry.after_fen,
+        actorColor: entry.actor_color,
+        clockMs: entry.clock_available === 1 ? entry.clock_ms : null,
+      }));
+      const archiveSha256 = providerGameArchiveSha256({
+        gameId,
+        initialFen: game.initial_fen,
+        variant: game.variant,
+        status: terminalStatus,
+        result: terminalResult,
+        winner: terminalWinner,
+        plies: line,
+      });
+      if (game.finished_at > 0) {
+        if (game.status !== terminalStatus || game.result !== terminalResult
+            || game.winner !== terminalWinner || game.plies !== terminalPlies
+            || game.archive_sha256 !== archiveSha256) {
+          throw new Error(`Terminal provider game metadata is immutable: ${gameId}`);
+        }
+        return false;
+      }
+      const control = this.db.prepare(`
+        SELECT next_completion_cursor FROM game_archive_control WHERE id=1
+      `).get();
+      const completionCursor = safeInteger(
+        control.next_completion_cursor,
+        "next game completion cursor",
+        { minimum: 1 },
+      );
+      this.db.prepare(`
+        UPDATE game_archive_control SET next_completion_cursor=?, updated_at=? WHERE id=1
+      `).run(safeInteger(completionCursor + 1, "next game completion cursor"), finishedAt);
+      this.db.prepare(`
+        UPDATE games SET completion_cursor=?, status=?, result=?, winner=?, plies=?,
+          finished_at=?, archive_completeness='complete', archive_reason='', archive_sha256=?
+        WHERE game_id=? AND finished_at=0
+      `).run(
+        completionCursor,
+        terminalStatus,
+        terminalResult,
+        terminalWinner,
+        terminalPlies,
+        finishedAt,
+        archiveSha256,
+        gameId,
+      );
+      return true;
+    });
     this.refreshOpponentProjection();
+    this.refreshGameArchiveSummary();
+    return changed;
   }
 
   opponentAudience(username) {
@@ -1380,6 +1879,7 @@ export class LichessStore {
       opponents: this.db.prepare("SELECT COUNT(*) AS count FROM opponents").get().count,
       challenges: this.db.prepare("SELECT COUNT(*) AS count FROM challenge_attempts").get().count,
       games: this.db.prepare("SELECT COUNT(*) AS count FROM games").get().count,
+      gameArchive: this.gameArchiveSummary(),
       opponentStats: this.opponentStats(),
       apiSafety: this.listApiSafetyState(),
       apiLeases: this.activeApiLeases(now),

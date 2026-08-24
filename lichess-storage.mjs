@@ -15,7 +15,7 @@ import {
 
 const DATABASE_MAXIMUM_BYTES = 1_099_511_627_776;
 const BUSY_TIMEOUT_MS = 5_000;
-const CURRENT_SCHEMA_VERSION = 5;
+const CURRENT_SCHEMA_VERSION = 6;
 const MAXIMUM_SAFE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
 
 const CORE_TABLES = Object.freeze({
@@ -62,6 +62,29 @@ const GAME_PROVENANCE_COLUMNS = Object.freeze([
   ["split_depth", "INTEGER", 0], ["batch_size", "INTEGER", 0],
   ["batch_wait_us", "INTEGER", 0], ["time_profile_identity", "TEXT", 0],
   ["runtime_provenance_sha256", "TEXT", 0], ["runtime_provenance_json", "TEXT", 0],
+]);
+
+const GAME_ARCHIVE_COLUMNS = Object.freeze([
+  ["archive_cursor", "INTEGER", 0], ["completion_cursor", "INTEGER", 0],
+  ["initial_fen", "TEXT", 0], ["variant", "TEXT", 0],
+  ["archive_completeness", "TEXT", 0], ["archive_reason", "TEXT", 0],
+  ["archive_sha256", "TEXT", 0],
+  ["provider_component_id", "TEXT", 0], ["provider_component_version", "TEXT", 0],
+  ["provider_component_manifest_sha256", "TEXT", 0],
+  ["engine_component_id", "TEXT", 0], ["engine_component_version", "TEXT", 0],
+  ["engine_component_manifest_sha256", "TEXT", 0],
+  ["backfill_attempts", "INTEGER", 0], ["backfill_last_attempted_at", "INTEGER", 0],
+]);
+
+const GAME_ARCHIVE_CONTROL_COLUMNS = Object.freeze([
+  ["id", "INTEGER", 1], ["next_archive_cursor", "INTEGER", 0],
+  ["next_completion_cursor", "INTEGER", 0], ["updated_at", "INTEGER", 0],
+]);
+
+const GAME_PLY_COLUMNS = Object.freeze([
+  ["game_id", "TEXT", 1], ["ply", "INTEGER", 2], ["uci_move", "TEXT", 0],
+  ["before_fen", "TEXT", 0], ["after_fen", "TEXT", 0], ["actor_color", "TEXT", 0],
+  ["clock_available", "INTEGER", 0], ["clock_ms", "INTEGER", 0],
 ]);
 
 const API_SAFETY_COLUMNS_V2 = Object.freeze([
@@ -150,6 +173,21 @@ const EXPECTED_COLUMN_DEFAULTS = Object.freeze({
   "games.time_profile_identity": "''",
   "games.runtime_provenance_sha256": "''",
   "games.runtime_provenance_json": "'{}'",
+  "games.archive_cursor": "0",
+  "games.completion_cursor": "0",
+  "games.initial_fen": "''",
+  "games.variant": "'standard'",
+  "games.archive_completeness": "'live'",
+  "games.archive_reason": "''",
+  "games.archive_sha256": "''",
+  "games.provider_component_id": "''",
+  "games.provider_component_version": "''",
+  "games.provider_component_manifest_sha256": "''",
+  "games.engine_component_id": "''",
+  "games.engine_component_version": "''",
+  "games.engine_component_manifest_sha256": "''",
+  "games.backfill_attempts": "0",
+  "games.backfill_last_attempted_at": "0",
   "api_safety_state.cooldown_until": "0",
   "api_safety_state.strike_count": "0",
   "api_safety_state.last_429_at": "0",
@@ -178,6 +216,11 @@ const EXPECTED_COLUMN_DEFAULTS = Object.freeze({
   "provider_incidents.http_status": "0",
   "provider_incidents.retry_deadline": "0",
   "provider_incidents.game_id": "''",
+  "game_archive_control.next_archive_cursor": "1",
+  "game_archive_control.next_completion_cursor": "1",
+  "game_archive_control.updated_at": "0",
+  "game_plies.clock_available": "0",
+  "game_plies.clock_ms": "0",
 });
 
 const EXPECTED_CHECKS = Object.freeze({
@@ -201,6 +244,31 @@ const EXPECTED_CHECKS = Object.freeze({
     "check(activein(0,1))", "check((active=1andresolved_at=0)or(active=0andresolved_at>=last_occurrence))",
     "check(http_status=0orhttp_statusbetween100and599)", "check(retry_deadline>=0)",
     "check(length(game_id)<=64)", "check(length(detail)between1and512)",
+  ],
+  games: [
+    "check(archive_cursor>=0)", "check(completion_cursor>=0)",
+    "check(length(initial_fen)<=128)", "check(variant='standard')",
+    "check(archive_completenessin('live','summary_only','complete','reconciled'))",
+    "check(length(archive_reason)<=64)",
+    "check(archive_sha256=''or(length(archive_sha256)=71andarchive_sha256like'sha256:%'))",
+    "check(length(provider_component_id)<=128)",
+    "check(length(provider_component_version)<=128)",
+    "check(provider_component_manifest_sha256=''or(length(provider_component_manifest_sha256)=71andprovider_component_manifest_sha256like'sha256:%'))",
+    "check(length(engine_component_id)<=128)",
+    "check(length(engine_component_version)<=128)",
+    "check(engine_component_manifest_sha256=''or(length(engine_component_manifest_sha256)=71andengine_component_manifest_sha256like'sha256:%'))",
+    "check(backfill_attempts>=0)", "check(backfill_last_attempted_at>=0)",
+  ],
+  game_archive_control: [
+    "check(id=1)", "check(next_archive_cursor>=1)",
+    "check(next_completion_cursor>=1)", "check(updated_at>=0)",
+  ],
+  game_plies: [
+    "check(length(game_id)between1and64)", "check(ply>=0andply<2048)",
+    "check(length(uci_move)between4and5)",
+    "check(length(before_fen)between1and128)", "check(length(after_fen)between1and128)",
+    "check(actor_colorin('white','black'))", "check(clock_availablein(0,1))",
+    "check(clock_ms>=0)",
   ],
 });
 
@@ -279,7 +347,35 @@ const BASE_SCHEMA_SQL = `
     batch_wait_us INTEGER NOT NULL DEFAULT 0,
     time_profile_identity TEXT NOT NULL DEFAULT '',
     runtime_provenance_sha256 TEXT NOT NULL DEFAULT '',
-    runtime_provenance_json TEXT NOT NULL DEFAULT '{}'
+    runtime_provenance_json TEXT NOT NULL DEFAULT '{}',
+    archive_cursor INTEGER NOT NULL DEFAULT 0 CHECK(archive_cursor >= 0),
+    completion_cursor INTEGER NOT NULL DEFAULT 0 CHECK(completion_cursor >= 0),
+    initial_fen TEXT NOT NULL DEFAULT '' CHECK(length(initial_fen) <= 128),
+    variant TEXT NOT NULL DEFAULT 'standard' CHECK(variant = 'standard'),
+    archive_completeness TEXT NOT NULL DEFAULT 'live'
+      CHECK(archive_completeness IN ('live','summary_only','complete','reconciled')),
+    archive_reason TEXT NOT NULL DEFAULT '' CHECK(length(archive_reason) <= 64),
+    archive_sha256 TEXT NOT NULL DEFAULT '' CHECK(
+      archive_sha256='' OR (length(archive_sha256)=71 AND archive_sha256 LIKE 'sha256:%')
+    ),
+    provider_component_id TEXT NOT NULL DEFAULT '' CHECK(length(provider_component_id) <= 128),
+    provider_component_version TEXT NOT NULL DEFAULT ''
+      CHECK(length(provider_component_version) <= 128),
+    provider_component_manifest_sha256 TEXT NOT NULL DEFAULT '' CHECK(
+      provider_component_manifest_sha256='' OR
+      (length(provider_component_manifest_sha256)=71 AND
+        provider_component_manifest_sha256 LIKE 'sha256:%')
+    ),
+    engine_component_id TEXT NOT NULL DEFAULT '' CHECK(length(engine_component_id) <= 128),
+    engine_component_version TEXT NOT NULL DEFAULT ''
+      CHECK(length(engine_component_version) <= 128),
+    engine_component_manifest_sha256 TEXT NOT NULL DEFAULT '' CHECK(
+      engine_component_manifest_sha256='' OR
+      (length(engine_component_manifest_sha256)=71 AND
+        engine_component_manifest_sha256 LIKE 'sha256:%')
+    ),
+    backfill_attempts INTEGER NOT NULL DEFAULT 0 CHECK(backfill_attempts >= 0),
+    backfill_last_attempted_at INTEGER NOT NULL DEFAULT 0 CHECK(backfill_last_attempted_at >= 0)
   );
   CREATE INDEX games_opponent_finished ON games(opponent, finished_at);
   CREATE INDEX challenges_opponent_created ON challenge_attempts(opponent, created_at);
@@ -360,6 +456,34 @@ const PROVIDER_INCIDENT_SQL = `
   CREATE INDEX provider_incidents_retention ON provider_incidents(active, last_occurrence, cursor);
 `;
 
+const GAME_ARCHIVE_SQL = `
+  CREATE TABLE game_archive_control(
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    next_archive_cursor INTEGER NOT NULL DEFAULT 1 CHECK(next_archive_cursor >= 1),
+    next_completion_cursor INTEGER NOT NULL DEFAULT 1 CHECK(next_completion_cursor >= 1),
+    updated_at INTEGER NOT NULL DEFAULT 0 CHECK(updated_at >= 0)
+  ) STRICT;
+  INSERT INTO game_archive_control(
+    id, next_archive_cursor, next_completion_cursor, updated_at
+  ) VALUES(1, 1, 1, 0);
+  CREATE TABLE game_plies(
+    game_id TEXT NOT NULL CHECK(length(game_id) BETWEEN 1 AND 64),
+    ply INTEGER NOT NULL CHECK(ply >= 0 AND ply < 2048),
+    uci_move TEXT NOT NULL CHECK(length(uci_move) BETWEEN 4 AND 5),
+    before_fen TEXT NOT NULL CHECK(length(before_fen) BETWEEN 1 AND 128),
+    after_fen TEXT NOT NULL CHECK(length(after_fen) BETWEEN 1 AND 128),
+    actor_color TEXT NOT NULL CHECK(actor_color IN ('white','black')),
+    clock_available INTEGER NOT NULL DEFAULT 0 CHECK(clock_available IN (0,1)),
+    clock_ms INTEGER NOT NULL DEFAULT 0 CHECK(clock_ms >= 0),
+    PRIMARY KEY(game_id, ply)
+  ) STRICT;
+  CREATE UNIQUE INDEX games_archive_cursor
+    ON games(archive_cursor) WHERE archive_cursor>0;
+  CREATE UNIQUE INDEX games_completion_cursor
+    ON games(completion_cursor) WHERE completion_cursor>0;
+  CREATE INDEX games_live_cursor ON games(finished_at, archive_cursor);
+`;
+
 const CURRENT_SCHEMA_SQL = `
   CREATE TABLE schema_meta(
     id INTEGER PRIMARY KEY CHECK(id=1),
@@ -390,6 +514,7 @@ const CURRENT_SCHEMA_SQL = `
   );
   ${PROVIDER_LIFECYCLE_SQL}
   ${PROVIDER_INCIDENT_SQL}
+  ${GAME_ARCHIVE_SQL}
 `;
 
 export class LichessStorageError extends Error {
@@ -626,7 +751,8 @@ function schemaVersion(database) {
 
 function expectedTables(version, legacyRateLimit, includeLifecycle = false, includeIncidents = false) {
   const tables = { ...CORE_TABLES, games: version >= 3
-    ? [...GAME_COLUMNS_V1, ...GAME_PROVENANCE_COLUMNS]
+    ? [...GAME_COLUMNS_V1, ...GAME_PROVENANCE_COLUMNS,
+        ...(version >= 6 ? GAME_ARCHIVE_COLUMNS : [])]
     : GAME_COLUMNS_V1 };
   if (version >= 2) {
     if (legacyRateLimit) tables.api_rate_limit = LEGACY_RATE_LIMIT_COLUMNS;
@@ -643,6 +769,10 @@ function expectedTables(version, legacyRateLimit, includeLifecycle = false, incl
   if (includeIncidents) {
     tables.provider_incident_control = PROVIDER_INCIDENT_CONTROL_COLUMNS;
     tables.provider_incidents = PROVIDER_INCIDENT_COLUMNS;
+  }
+  if (version >= 6) {
+    tables.game_archive_control = GAME_ARCHIVE_CONTROL_COLUMNS;
+    tables.game_plies = GAME_PLY_COLUMNS;
   }
   return tables;
 }
@@ -680,13 +810,14 @@ function verifyColumns(database, table, expected, version) {
 
 function expectedIndexes(table, columns) {
   const indexes = [];
-  const primary = columns.find((column) => column[2] === 1);
-  if (primary && primary[1] !== "INTEGER") {
+  const primary = columns.filter((column) => column[2] > 0)
+    .toSorted((left, right) => left[2] - right[2]);
+  if (primary.length > 1 || (primary.length === 1 && primary[0][1] !== "INTEGER")) {
     indexes.push({
       name: `sqlite_autoindex_${table}_1`,
       unique: 1,
       origin: "pk",
-      columns: [primary[0]],
+      columns: primary.map((column) => column[0]),
     });
   }
   if (table === "games") {
@@ -696,6 +827,29 @@ function expectedIndexes(table, columns) {
       origin: "c",
       columns: ["opponent", "finished_at"],
     });
+    if (columns.some(([name]) => name === "archive_cursor")) {
+      indexes.push({
+        name: "games_archive_cursor",
+        unique: 1,
+        origin: "c",
+        partial: 1,
+        columns: ["archive_cursor"],
+        where: "wherearchive_cursor>0",
+      }, {
+        name: "games_completion_cursor",
+        unique: 1,
+        origin: "c",
+        partial: 1,
+        columns: ["completion_cursor"],
+        where: "wherecompletion_cursor>0",
+      }, {
+        name: "games_live_cursor",
+        unique: 0,
+        origin: "c",
+        partial: 0,
+        columns: ["finished_at", "archive_cursor"],
+      });
+    }
   } else if (table === "challenge_attempts") {
     indexes.push({
       name: "challenges_opponent_created",
@@ -760,13 +914,17 @@ function verifyTableDefinitions(database, tables, { currentMeta }) {
     const normalized = String(database.prepare(
       "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
     ).get(table)?.sql ?? "").toLocaleLowerCase().replaceAll(/[\s"`\[\]]/gu, "");
+    const archivedGames = table === "games"
+      && database.prepare("PRAGMA table_info(games)").all()
+        .some((column) => column.name === "archive_cursor");
     const checks = table === "schema_meta" && currentMeta
       ? ["check(id=1)", "check(typeof(version)='integer'andversion>0)"]
-      : EXPECTED_CHECKS[table] ?? [];
+      : table === "games" && !archivedGames ? [] : EXPECTED_CHECKS[table] ?? [];
     const checkCount = normalized.match(/check\(/gu)?.length ?? 0;
     const strict = normalized.endsWith("strict");
     const expectedStrict = (table === "schema_meta" && currentMeta)
-      || table === "provider_incident_control" || table === "provider_incidents";
+      || table === "provider_incident_control" || table === "provider_incidents"
+      || table === "game_archive_control" || table === "game_plies";
     if (!normalized.startsWith(`createtable${table}(`)
         || checks.some((fragment) => !normalized.includes(fragment))
         || checkCount !== checks.length
@@ -788,6 +946,7 @@ function verifyStoredTypes(database, tables) {
     "api_safety_state.challenge_half_open", "api_rate_limit.half_open",
     "provider_lifecycle_control.admission_blocked",
     "provider_incidents.active",
+    "game_plies.clock_available",
   ]);
   for (const [table, columns] of Object.entries(tables)) {
     const invalidPredicates = columns.map(([column, type]) => {
@@ -807,6 +966,87 @@ function verifyStoredTypes(database, tables) {
         "LICHESS_STORAGE_ROW_INVALID",
         `${table} contains an invalid SQLite storage value`,
       );
+    }
+  }
+}
+
+function verifyGameArchiveRows(database) {
+  const controls = database.prepare("SELECT * FROM game_archive_control").all();
+  const games = database.prepare(`
+    SELECT game_id, archive_cursor, completion_cursor, finished_at, plies,
+      initial_fen, archive_completeness, archive_reason, archive_sha256,
+      provider_component_id, provider_component_version,
+      provider_component_manifest_sha256, engine_component_id,
+      engine_component_version, engine_component_manifest_sha256
+    FROM games ORDER BY archive_cursor
+  `).all();
+  const maxArchive = games.at(-1)?.archive_cursor ?? 0n;
+  const maxCompletion = games.reduce(
+    (maximum, game) => game.completion_cursor > maximum ? game.completion_cursor : maximum,
+    0n,
+  );
+  if (controls.length !== 1 || controls[0].id !== 1n
+      || controls[0].next_archive_cursor <= maxArchive
+      || controls[0].next_completion_cursor <= maxCompletion) {
+    throw storageError("LICHESS_STORAGE_ROW_INVALID", "game archive cursor authority is invalid");
+  }
+  const gameId = /^[A-Za-z0-9_-]{1,64}$/u;
+  const reason = /^(?:|[a-z][a-z0-9_]{0,63})$/u;
+  const digest = /^(?:|sha256:[a-f0-9]{64})$/u;
+  const completeness = new Set(["live", "summary_only", "complete", "reconciled"]);
+  for (const game of games) {
+    const providerFields = [
+      game.provider_component_id,
+      game.provider_component_version,
+      game.provider_component_manifest_sha256,
+    ];
+    const engineFields = [
+      game.engine_component_id,
+      game.engine_component_version,
+      game.engine_component_manifest_sha256,
+    ];
+    const terminal = game.finished_at > 0n;
+    const complete = game.archive_completeness === "complete"
+      || game.archive_completeness === "reconciled";
+    if (!gameId.test(game.game_id) || game.archive_cursor <= 0n
+        || !completeness.has(game.archive_completeness) || !reason.test(game.archive_reason)
+        || !digest.test(game.archive_sha256)
+        || !digest.test(game.provider_component_manifest_sha256)
+        || !digest.test(game.engine_component_manifest_sha256)
+        || providerFields.some(Boolean) && !providerFields.every(Boolean)
+        || engineFields.some(Boolean) && !engineFields.every(Boolean)
+        || (terminal && (game.completion_cursor <= 0n || game.archive_completeness === "live"))
+        || (!terminal && (game.completion_cursor !== 0n || game.archive_completeness !== "live"))
+        || (complete && (!game.initial_fen || !game.archive_sha256))) {
+      throw storageError("LICHESS_STORAGE_ROW_INVALID", "games contains invalid archive authority");
+    }
+  }
+  const plies = database.prepare("SELECT * FROM game_plies ORDER BY game_id, ply").all();
+  const byGame = new Map();
+  for (const ply of plies) {
+    if (!gameId.test(ply.game_id) || !/^[a-h][1-8][a-h][1-8][qrbn]?$/u.test(ply.uci_move)
+        || (ply.actor_color !== "white" && ply.actor_color !== "black")
+        || (ply.clock_available === 0n && ply.clock_ms !== 0n)) {
+      throw storageError("LICHESS_STORAGE_ROW_INVALID", "game_plies contains invalid archive data");
+    }
+    const list = byGame.get(ply.game_id) ?? [];
+    if (ply.ply !== BigInt(list.length)) {
+      throw storageError("LICHESS_STORAGE_ROW_INVALID", "game_plies is not contiguous");
+    }
+    list.push(ply);
+    byGame.set(ply.game_id, list);
+  }
+  for (const [id, rows] of byGame) {
+    const game = games.find((candidate) => candidate.game_id === id);
+    if (!game || BigInt(rows.length) !== game.plies) {
+      throw storageError("LICHESS_STORAGE_ROW_INVALID", "game replay cardinality is inconsistent");
+    }
+  }
+  for (const game of games) {
+    if (!byGame.has(game.game_id) && game.plies !== 0n
+        && (game.archive_completeness === "complete"
+          || game.archive_completeness === "reconciled")) {
+      throw storageError("LICHESS_STORAGE_ROW_INVALID", "complete game replay is unavailable");
     }
   }
 }
@@ -857,14 +1097,14 @@ function verifySchema(database, version, {
   if (version >= 3 && (!hasSafety || !hasLeases)) {
     throw storageError("LICHESS_STORAGE_SCHEMA_MALFORMED", "API safety tables are incomplete");
   }
-  if (hasLifecycle && version !== CURRENT_SCHEMA_VERSION) {
-    throw storageError("LICHESS_STORAGE_SCHEMA_MALFORMED", "Lifecycle authority belongs only to schema five");
+  if (hasLifecycle && version !== 5 && version !== 6) {
+    throw storageError("LICHESS_STORAGE_SCHEMA_MALFORMED", "Lifecycle authority is misplaced");
   }
   if (requireLifecycle && !hasLifecycle) {
     throw storageError("LICHESS_STORAGE_SCHEMA_MALFORMED", "Lifecycle authority is unavailable");
   }
   if (hasIncidentControl !== hasIncidents || (hasIncidents && (!hasLifecycle
-      || version !== CURRENT_SCHEMA_VERSION))) {
+      || (version !== 5 && version !== 6)))) {
     throw storageError("LICHESS_STORAGE_SCHEMA_MALFORMED", "Incident authority is incomplete or misplaced");
   }
   if (requireIncidents && !hasIncidents) {
@@ -886,6 +1126,11 @@ function verifySchema(database, version, {
     expectedObjects.add("provider_incidents_active_identity");
     expectedObjects.add("provider_incidents_active_cursor");
     expectedObjects.add("provider_incidents_retention");
+  }
+  if (version >= 6) {
+    expectedObjects.add("games_archive_cursor");
+    expectedObjects.add("games_completion_cursor");
+    expectedObjects.add("games_live_cursor");
   }
   if (version >= 3 && hasLegacyRate) expectedObjects.add("api_rate_limit");
   const objects = schemaObjects(database);
@@ -923,6 +1168,7 @@ function verifySchema(database, version, {
     });
     verifyIncidentRows(database);
   }
+  if (version >= 6) verifyGameArchiveRows(database);
   if (version >= 3 && hasLegacyRate) {
     verifyStoredTypes(database, { api_rate_limit: LEGACY_RATE_LIMIT_COLUMNS });
   }
@@ -952,7 +1198,7 @@ function verifySchema(database, version, {
       throw storageError("LICHESS_STORAGE_ROW_INVALID", "provider lifecycle singleton is invalid");
     }
   }
-  return { hasLegacyRate, hasLifecycle };
+  return { hasLegacyRate, hasLifecycle, hasIncidents };
 }
 
 function createApiV2(database) {
@@ -1023,11 +1269,78 @@ function migrateDatabase(database, initialVersion, { hasLegacyRate }) {
       DROP TABLE api_rate_limit;
     `);
   }
-  if (version === CURRENT_SCHEMA_VERSION && !tableExists(database, "provider_lifecycle_control")) {
-    database.exec(PROVIDER_LIFECYCLE_SQL);
-  }
-  if (version === CURRENT_SCHEMA_VERSION && !tableExists(database, "provider_incident_control")) {
-    database.exec(PROVIDER_INCIDENT_SQL);
+  if (version === 5) {
+    if (!tableExists(database, "provider_lifecycle_control")) {
+      database.exec(PROVIDER_LIFECYCLE_SQL);
+    }
+    if (!tableExists(database, "provider_incident_control")) {
+      database.exec(PROVIDER_INCIDENT_SQL);
+    }
+    database.exec(`
+      ALTER TABLE games ADD COLUMN archive_cursor INTEGER NOT NULL DEFAULT 0
+        CHECK(archive_cursor >= 0);
+      ALTER TABLE games ADD COLUMN completion_cursor INTEGER NOT NULL DEFAULT 0
+        CHECK(completion_cursor >= 0);
+      ALTER TABLE games ADD COLUMN initial_fen TEXT NOT NULL DEFAULT ''
+        CHECK(length(initial_fen) <= 128);
+      ALTER TABLE games ADD COLUMN variant TEXT NOT NULL DEFAULT 'standard'
+        CHECK(variant = 'standard');
+      ALTER TABLE games ADD COLUMN archive_completeness TEXT NOT NULL DEFAULT 'live'
+        CHECK(archive_completeness IN ('live','summary_only','complete','reconciled'));
+      ALTER TABLE games ADD COLUMN archive_reason TEXT NOT NULL DEFAULT ''
+        CHECK(length(archive_reason) <= 64);
+      ALTER TABLE games ADD COLUMN archive_sha256 TEXT NOT NULL DEFAULT '' CHECK(
+        archive_sha256='' OR (length(archive_sha256)=71 AND archive_sha256 LIKE 'sha256:%')
+      );
+      ALTER TABLE games ADD COLUMN provider_component_id TEXT NOT NULL DEFAULT ''
+        CHECK(length(provider_component_id) <= 128);
+      ALTER TABLE games ADD COLUMN provider_component_version TEXT NOT NULL DEFAULT ''
+        CHECK(length(provider_component_version) <= 128);
+      ALTER TABLE games ADD COLUMN provider_component_manifest_sha256 TEXT NOT NULL DEFAULT '' CHECK(
+        provider_component_manifest_sha256='' OR
+        (length(provider_component_manifest_sha256)=71 AND
+          provider_component_manifest_sha256 LIKE 'sha256:%')
+      );
+      ALTER TABLE games ADD COLUMN engine_component_id TEXT NOT NULL DEFAULT ''
+        CHECK(length(engine_component_id) <= 128);
+      ALTER TABLE games ADD COLUMN engine_component_version TEXT NOT NULL DEFAULT ''
+        CHECK(length(engine_component_version) <= 128);
+      ALTER TABLE games ADD COLUMN engine_component_manifest_sha256 TEXT NOT NULL DEFAULT '' CHECK(
+        engine_component_manifest_sha256='' OR
+        (length(engine_component_manifest_sha256)=71 AND
+          engine_component_manifest_sha256 LIKE 'sha256:%')
+      );
+      ALTER TABLE games ADD COLUMN backfill_attempts INTEGER NOT NULL DEFAULT 0
+        CHECK(backfill_attempts >= 0);
+      ALTER TABLE games ADD COLUMN backfill_last_attempted_at INTEGER NOT NULL DEFAULT 0
+        CHECK(backfill_last_attempted_at >= 0);
+      ${GAME_ARCHIVE_SQL}
+    `);
+    const archiveRows = database.prepare(
+      "SELECT game_id FROM games ORDER BY started_at, game_id",
+    ).all();
+    const assignArchiveCursor = database.prepare(
+      "UPDATE games SET archive_cursor=? WHERE game_id=?",
+    );
+    archiveRows.forEach((row, index) => {
+      assignArchiveCursor.run(index + 1, row.game_id);
+    });
+    const completedRows = database.prepare(`
+      SELECT game_id FROM games WHERE finished_at>0 ORDER BY finished_at, game_id
+    `).all();
+    const assignCompletionCursor = database.prepare(`
+      UPDATE games SET completion_cursor=?, archive_completeness='summary_only',
+        archive_reason='historical_moves_unavailable'
+      WHERE game_id=?
+    `);
+    completedRows.forEach((row, index) => {
+      assignCompletionCursor.run(index + 1, row.game_id);
+    });
+    database.prepare(`
+      UPDATE game_archive_control SET next_archive_cursor=?, next_completion_cursor=? WHERE id=1
+    `).run(archiveRows.length + 1, completedRows.length + 1);
+    updateVersion(database, 6);
+    version = 6;
   }
   return version;
 }

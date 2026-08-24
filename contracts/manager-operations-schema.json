@@ -91,7 +91,7 @@
       "arguments": ["status"],
       "mutates": false,
       "credential": "forbidden",
-      "response": "uci_arena_lichess_status_v4"
+      "response": "uci_arena_lichess_status_v5"
     },
     "incidents_list": {
       "arguments": ["incidents", "list"],
@@ -100,6 +100,23 @@
       "credential": "forbidden",
       "response": "uci_arena_provider_incident_page_v1",
       "response_schema": "contracts/incident-page-schema.json"
+    },
+    "games_list": {
+      "arguments": ["games", "list"],
+      "optional_arguments": ["--scope", "--before", "--limit", "--runtime-dir"],
+      "mutates": false,
+      "credential": "forbidden",
+      "response": "uci_arena_provider_game_page_v1",
+      "response_schema": "contracts/game-page-schema.json"
+    },
+    "game_get": {
+      "arguments": ["game", "get"],
+      "required_arguments": ["--game-id"],
+      "optional_arguments": ["--runtime-dir"],
+      "mutates": false,
+      "credential": "forbidden",
+      "response": "uci_arena_provider_game_v1",
+      "response_schema": "contracts/game-detail-schema.json"
     },
     "qualification_run": {
       "arguments": ["qualification", "run"],

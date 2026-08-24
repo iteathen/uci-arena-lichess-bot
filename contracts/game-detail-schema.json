@@ -1,0 +1,198 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "uci_arena_provider_game_v1",
+  "title": "UCI Arena Provider Game",
+  "type": "object",
+  "required": [
+    "schema", "cursor", "game_id", "state", "opponent", "color", "rated", "speed",
+    "variant", "clock_limit", "clock_increment", "status", "result", "winner", "plies",
+    "started_at", "finished_at", "archive_completeness", "incomplete_reason", "archive_sha256",
+    "provider_component", "engine_component", "initial_fen", "runtime_provenance", "replay"
+  ],
+  "properties": {
+    "schema": {"const": "uci_arena_provider_game_v1"},
+    "cursor": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+    "game_id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$"},
+    "state": {"enum": ["live", "history"]},
+    "opponent": {"type": "string", "maxLength": 32},
+    "color": {"oneOf": [{"enum": ["white", "black"]}, {"type": "null"}]},
+    "rated": {"type": "boolean"},
+    "speed": {"$ref": "#/$defs/nullable_token"},
+    "variant": {"const": "standard"},
+    "clock_limit": {"$ref": "#/$defs/nonnegative_integer"},
+    "clock_increment": {"$ref": "#/$defs/nonnegative_integer"},
+    "status": {"type": "string", "pattern": "^[A-Za-z0-9._:+-]{1,128}$"},
+    "result": {"$ref": "#/$defs/nullable_token"},
+    "winner": {"$ref": "#/$defs/nullable_token"},
+    "plies": {"type": "integer", "minimum": 0, "maximum": 2048},
+    "started_at": {"$ref": "#/$defs/nonnegative_integer"},
+    "finished_at": {"$ref": "#/$defs/nullable_nonnegative_integer"},
+    "archive_completeness": {"enum": ["live", "summary_only", "complete", "reconciled"]},
+    "incomplete_reason": {
+      "oneOf": [
+        {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"},
+        {"type": "null"}
+      ]
+    },
+    "archive_sha256": {"$ref": "#/$defs/nullable_sha256"},
+    "provider_component": {"$ref": "#/$defs/component"},
+    "engine_component": {"$ref": "#/$defs/component"},
+    "initial_fen": {
+      "oneOf": [
+        {"type": "string", "minLength": 1, "maxLength": 128},
+        {"type": "null"}
+      ]
+    },
+    "runtime_provenance": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/runtime_provenance"}
+      ]
+    },
+    "replay": {
+      "type": "array",
+      "maxItems": 2048,
+      "items": {"$ref": "#/$defs/ply"}
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "nonnegative_integer": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+    "nullable_nonnegative_integer": {
+      "oneOf": [
+        {"$ref": "#/$defs/nonnegative_integer"},
+        {"type": "null"}
+      ]
+    },
+    "nullable_sha256": {
+      "oneOf": [
+        {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+        {"type": "null"}
+      ]
+    },
+    "component": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "required": ["component_id", "version", "manifest_sha256"],
+          "properties": {
+            "component_id": {"type": "string", "pattern": "^[A-Za-z0-9._:+-]{1,128}$"},
+            "version": {"type": "string", "pattern": "^[A-Za-z0-9._:+-]{1,128}$"},
+            "manifest_sha256": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "nullable_token": {
+      "oneOf": [
+        {"type": "string", "pattern": "^[A-Za-z0-9._:+-]{1,128}$"},
+        {"type": "null"}
+      ]
+    },
+    "nullable_integer": {
+      "oneOf": [
+        {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        {"type": "null"}
+      ]
+    },
+    "runtime_provenance": {
+      "type": "object",
+      "required": ["sha256", "details_available"],
+      "properties": {
+        "sha256": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+        "details_available": {"type": "boolean"},
+        "engine": {"$ref": "#/$defs/engine"},
+        "model": {"$ref": "#/$defs/model"},
+        "evaluation_runtime": {"$ref": "#/$defs/evaluation_runtime"},
+        "search": {"$ref": "#/$defs/search"},
+        "timing": {"$ref": "#/$defs/timing"},
+        "knowledge": {"$ref": "#/$defs/knowledge"}
+      },
+      "additionalProperties": false
+    },
+    "engine": {
+      "type": "object",
+      "required": ["adapter", "build_fingerprint", "launch_identity_sha256", "uci_identity_sha256"],
+      "properties": {
+        "adapter": {"$ref": "#/$defs/nullable_token"},
+        "build_fingerprint": {"$ref": "#/$defs/nullable_token"},
+        "launch_identity_sha256": {"$ref": "#/$defs/nullable_token"},
+        "uci_identity_sha256": {"$ref": "#/$defs/nullable_token"}
+      },
+      "additionalProperties": false
+    },
+    "model": {
+      "type": "object",
+      "required": ["id", "fingerprint", "checkpoint_hash", "adapter_id"],
+      "properties": {
+        "id": {"$ref": "#/$defs/nullable_token"},
+        "fingerprint": {"$ref": "#/$defs/nullable_token"},
+        "checkpoint_hash": {"$ref": "#/$defs/nullable_token"},
+        "adapter_id": {"$ref": "#/$defs/nullable_token"}
+      },
+      "additionalProperties": false
+    },
+    "evaluation_runtime": {
+      "type": "object",
+      "required": ["name", "numeric_fingerprint", "hardware_driver_fingerprint", "version"],
+      "properties": {
+        "name": {"$ref": "#/$defs/nullable_token"},
+        "numeric_fingerprint": {"$ref": "#/$defs/nullable_token"},
+        "hardware_driver_fingerprint": {"$ref": "#/$defs/nullable_token"},
+        "version": {"$ref": "#/$defs/nullable_token"}
+      },
+      "additionalProperties": false
+    },
+    "search": {
+      "type": "object",
+      "required": ["core", "threads", "root_workers", "split_depth", "batch_size", "batch_wait_us"],
+      "properties": {
+        "core": {"$ref": "#/$defs/nullable_token"},
+        "threads": {"$ref": "#/$defs/nullable_integer"},
+        "root_workers": {"$ref": "#/$defs/nullable_integer"},
+        "split_depth": {"$ref": "#/$defs/nullable_integer"},
+        "batch_size": {"$ref": "#/$defs/nullable_integer"},
+        "batch_wait_us": {"$ref": "#/$defs/nullable_integer"}
+      },
+      "additionalProperties": false
+    },
+    "timing": {
+      "type": "object",
+      "required": ["profile_identity_sha256", "status", "accepted", "applied"],
+      "properties": {
+        "profile_identity_sha256": {"$ref": "#/$defs/nullable_token"},
+        "status": {"$ref": "#/$defs/nullable_token"},
+        "accepted": {"type": "boolean"},
+        "applied": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "knowledge": {
+      "type": "object",
+      "required": ["book_configuration_identity", "book_snapshot_identity", "book_manifest_sha256", "tablebase_identity", "tablebase_manifest_identity"],
+      "properties": {
+        "book_configuration_identity": {"$ref": "#/$defs/nullable_token"},
+        "book_snapshot_identity": {"$ref": "#/$defs/nullable_token"},
+        "book_manifest_sha256": {"$ref": "#/$defs/nullable_token"},
+        "tablebase_identity": {"$ref": "#/$defs/nullable_token"},
+        "tablebase_manifest_identity": {"$ref": "#/$defs/nullable_token"}
+      },
+      "additionalProperties": false
+    },
+    "ply": {
+      "type": "object",
+      "required": ["ply", "uci_move", "before_fen", "after_fen", "actor_color", "clock_ms"],
+      "properties": {
+        "ply": {"type": "integer", "minimum": 0, "maximum": 2047},
+        "uci_move": {"type": "string", "pattern": "^[a-h][1-8][a-h][1-8][qrbn]?$"},
+        "before_fen": {"type": "string", "minLength": 1, "maxLength": 128},
+        "after_fen": {"type": "string", "minLength": 1, "maxLength": 128},
+        "actor_color": {"enum": ["white", "black"]},
+        "clock_ms": {"$ref": "#/$defs/nullable_integer"}
+      },
+      "additionalProperties": false
+    }
+  }
+}

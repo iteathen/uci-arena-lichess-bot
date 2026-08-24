@@ -18,6 +18,8 @@ const configuration = readJson("contracts/configuration-schema.json");
 const configurationUpdate = readJson("contracts/configuration-update-schema.json");
 const status = readJson("contracts/status-schema.json");
 const incidentPage = readJson("contracts/incident-page-schema.json");
+const gamePage = readJson("contracts/game-page-schema.json");
+const gameDetail = readJson("contracts/game-detail-schema.json");
 const qualificationResult = readJson("contracts/qualification-result-schema.json");
 const template = readFileSync(path.join(root, "config.uci_arena.template.yml"), "utf8");
 const errors = [];
@@ -58,10 +60,20 @@ if (component.installation?.install_manifest_schema !== "arena_install_component
     || component.installation?.dependencies?.includes("uci_arena.engine")
     || !component.compatibility?.required_capabilities?.includes("uci.engine.process")
     || !component.compatibility?.compatible_default_components?.includes("uci_arena.engine")
-    || !service.required_capabilities?.includes("uci.engine.process")) {
+    || !service.required_capabilities?.includes("uci.engine.process")
+    || !service.provided_capabilities?.includes("lichess.provider_games")
+    || !component.installation?.capabilities?.includes("provider_games")) {
   errors.push("Installer component projection is incomplete or inconsistent");
 }
 const startupControl = component.installation?.installer_integration?.startup_control;
+const defaultEngineManifestBinding = component.installation?.installer_integration
+  ?.dependency_bindings?.find((binding) => binding.name === "default_engine_manifest");
+if (defaultEngineManifestBinding?.component_id !== "uci_arena.engine"
+    || defaultEngineManifestBinding.source !== "component_path"
+    || defaultEngineManifestBinding.path !== "arena-component.json"
+    || defaultEngineManifestBinding.required !== false) {
+  errors.push("optional Engine component-manifest binding is incomplete");
+}
 if (startupControl?.schema !== "arena_provider_startup_control_v2"
     || startupControl.schema_version !== 2
     || JSON.stringify(startupControl.actions?.install) !== JSON.stringify(["startup", "install"])
@@ -95,7 +107,7 @@ const requiredOperations = new Set([
   "owner_remove", "provider_status", "reservation_cancel", "reservation_create",
   "reservation_status", "scheduler_pause", "scheduler_resume", "scheduler_status",
   "startup_install", "startup_recover", "startup_status", "startup_uninstall",
-  "incidents_list",
+  "game_get", "games_list", "incidents_list",
 ]);
 if (operations.schema !== "uci_arena_lichess_manager_api_v1"
     || operations.version !== "1.1"
@@ -129,7 +141,7 @@ if (configurationUpdate.required?.[0] !== "settings"
     || configurationUpdate.properties?.settings?.additionalProperties !== false) {
   errors.push("configuration update schema is not a closed settings request");
 }
-if (status.properties?.schema?.const !== "uci_arena_lichess_status_v4") {
+if (status.properties?.schema?.const !== "uci_arena_lichess_status_v5") {
   errors.push("status projection schema is incompatible");
 }
 if (service.service?.contract_version !== "1.1"
@@ -145,6 +157,21 @@ if (service.incident_page_schema !== "contracts/incident-page-schema.json"
     || operations.operations?.incidents_list?.response !== incidentPage.$id
     || incidentPage.$id !== "uci_arena_provider_incident_page_v1") {
   errors.push("provider incident contract bindings differ");
+}
+if (service.game_page_schema !== "contracts/game-page-schema.json"
+    || service.game_detail_schema !== "contracts/game-detail-schema.json"
+    || component.contracts?.game_page !== service.game_page_schema
+    || component.contracts?.game_detail !== service.game_detail_schema
+    || operations.operations?.games_list?.response_schema !== service.game_page_schema
+    || operations.operations?.game_get?.response_schema !== service.game_detail_schema
+    || operations.operations?.games_list?.response !== gamePage.$id
+    || operations.operations?.game_get?.response !== gameDetail.$id
+    || gamePage.$id !== "uci_arena_provider_game_page_v1"
+    || gameDetail.$id !== "uci_arena_provider_game_v1"
+    || gamePage.additionalProperties !== false
+    || gameDetail.additionalProperties !== false
+    || gamePage.$defs?.game_summary?.additionalProperties !== false) {
+  errors.push("provider game contract bindings differ");
 }
 if (service.configuration_update_schema !== "contracts/configuration-update-schema.json"
     || component.contracts?.configuration_update !== service.configuration_update_schema
