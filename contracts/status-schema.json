@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://uci-arena.example/contracts/lichess-status-v3.json",
+  "$id": "https://uci-arena.example/contracts/lichess-status-v4.json",
   "title": "UCI Arena Lichess Bot Status",
   "type": "object",
   "required": [
@@ -17,10 +17,12 @@
     "games",
     "scheduler",
     "rate_limit",
+    "supervision",
+    "incidents",
     "blockers"
   ],
   "properties": {
-    "schema": {"const": "uci_arena_lichess_status_v3"},
+    "schema": {"const": "uci_arena_lichess_status_v4"},
     "installed": {"type": "boolean"},
     "registered": {"type": "boolean"},
     "active": {"type": "boolean"},
@@ -132,6 +134,54 @@
           },
           "additionalProperties": false
         }
+      },
+      "additionalProperties": false
+    },
+    "supervision": {
+      "type": "object",
+      "required": ["state", "restart_pending", "exit_receipt_state", "last_exit"],
+      "properties": {
+        "state": {"enum": ["unknown", "unregistered", "disabled", "active", "restart_pending", "clean_stopped", "inactive"]},
+        "restart_pending": {"type": "boolean"},
+        "exit_receipt_state": {"enum": ["unknown", "unavailable", "ready", "failed"]},
+        "last_exit": {
+          "oneOf": [
+            {"type": "null"},
+            {
+              "type": "object",
+              "required": ["disposition", "exited_at", "child_exit_code"],
+              "properties": {
+                "disposition": {"enum": ["clean_exit", "unexpected_exit"]},
+                "exited_at": {"type": "string", "format": "date-time", "maxLength": 64},
+                "child_exit_code": {"type": "integer", "minimum": 0, "maximum": 4294967295}
+              },
+              "additionalProperties": false
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "incidents": {
+      "type": "object",
+      "required": ["available", "active_count", "highest_severity", "latest_cursor", "truncated", "truncated_rows"],
+      "properties": {
+        "available": {"type": "boolean"},
+        "active_count": {"$ref": "#/$defs/nullable_nonnegative_integer"},
+        "highest_severity": {
+          "oneOf": [
+            {"enum": ["info", "warning", "error", "critical"]},
+            {"type": "null"}
+          ]
+        },
+        "latest_cursor": {"$ref": "#/$defs/nullable_nonnegative_integer"},
+        "truncated": {
+          "oneOf": [
+            {"type": "boolean"},
+            {"type": "null"}
+          ]
+        },
+        "truncated_rows": {"$ref": "#/$defs/nullable_nonnegative_integer"}
       },
       "additionalProperties": false
     },

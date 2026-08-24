@@ -13,11 +13,13 @@ function boundedFailure(error) {
 }
 
 export class SerializedStatusPublisher {
-  constructor({ write, close = async () => {}, now = Date.now } = {}) {
+  constructor({ write, close = async () => {}, now = Date.now, onOutcome = null } = {}) {
     if (typeof write !== "function") throw new Error("Status publisher write owner is required");
     this.write = write;
     this.closeWriter = close;
     this.now = now;
+    this.onOutcome = typeof onOutcome === "function" ? onOutcome : null;
+    this.failureActive = false;
     this.generation = 0;
     this.completedGeneration = 0;
     this.lastSuccessGeneration = 0;
@@ -93,6 +95,12 @@ export class SerializedStatusPublisher {
     this.waiters = retained;
   }
 
+  reportOutcome(outcome) {
+    try {
+      this.onOutcome?.(Object.freeze(outcome));
+    } catch {}
+  }
+
   async drain() {
     if (this.running || this.closed) return;
     this.running = true;
@@ -113,6 +121,10 @@ export class SerializedStatusPublisher {
             : null;
           this.lastFailure = null;
           this.settleSuccess(publication.generation);
+          if (this.failureActive) {
+            this.failureActive = false;
+            this.reportOutcome({ state: "recovered", generation: publication.generation });
+          }
         } catch (rawError) {
           const failure = boundedFailure(rawError);
           const error = new Error(failure.detail);
@@ -121,6 +133,8 @@ export class SerializedStatusPublisher {
           this.failures += 1;
           this.lastFailure = failure;
           this.settleFailure(publication.generation, error);
+          this.failureActive = true;
+          this.reportOutcome({ state: "failed", generation: publication.generation, failure });
         }
       }
     } finally {
@@ -213,7 +227,7 @@ class WorkerStatusWriter {
 }
 
 export class RuntimeStatusPublisher extends SerializedStatusPublisher {
-  constructor(runtimeDir, { now = Date.now } = {}) {
+  constructor(runtimeDir, { now = Date.now, onOutcome = null } = {}) {
     const writer = new WorkerStatusWriter({
       target: path.join(path.resolve(runtimeDir), "runtime.json"),
       maximumBytes: RUNTIME_STATUS_MAXIMUM_BYTES,
@@ -223,6 +237,7 @@ export class RuntimeStatusPublisher extends SerializedStatusPublisher {
       write: (snapshot, generation) => writer.write(snapshot, generation),
       close: () => writer.close(),
       now,
+      onOutcome,
     });
   }
 }
