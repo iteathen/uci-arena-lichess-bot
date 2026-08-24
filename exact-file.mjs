@@ -17,6 +17,7 @@ import path from "node:path";
 
 const MAX_PATH_BYTES = 32_768;
 const STREAM_BUFFER_BYTES = 64 * 1024;
+const PROGRESS_INTERVAL_BYTES = 1024 * 1024;
 const NO_FOLLOW = constants.O_NOFOLLOW ?? 0;
 const FILE_TYPE_MASK = constants.S_IFMT;
 
@@ -366,15 +367,21 @@ export function createExactFileAuthority(overrides = {}) {
     label = "File",
     hooks = {},
     capturePrefixBytes = 0,
+    onProgress,
   }) {
     if (!Number.isSafeInteger(capturePrefixBytes) || capturePrefixBytes < 0
         || capturePrefixBytes > STREAM_BUFFER_BYTES) {
       throw exactError("EXACT_FILE_LIMIT_INVALID", label, "prefix byte limit is invalid");
     }
+    if (onProgress !== undefined && typeof onProgress !== "function") {
+      throw exactError("EXACT_FILE_PROGRESS_INVALID", label, "progress observer is invalid");
+    }
     const state = openExact(io, filename, label, maximumBytes, hooks);
     const digest = createHash("sha256");
     const buffer = Buffer.allocUnsafe(STREAM_BUFFER_BYTES);
     const prefix = Buffer.allocUnsafe(Math.min(capturePrefixBytes, Number(state.opened.size)));
+    const totalBytes = Number(state.opened.size);
+    let nextProgressBytes = Math.min(PROGRESS_INTERVAL_BYTES, totalBytes);
     let offset = 0;
     let failure = null;
     try {
@@ -391,6 +398,16 @@ export function createExactFileAuthority(overrides = {}) {
           buffer.copy(prefix, start, 0, copied);
         }
         digest.update(buffer.subarray(0, count));
+        if (onProgress && (offset >= nextProgressBytes || offset === totalBytes)) {
+          try {
+            onProgress({ bytesRead: offset, totalBytes });
+          } catch {
+            throw exactError("EXACT_FILE_PROGRESS_FAILED", label, "progress observer failed");
+          }
+          while (nextProgressBytes <= offset && nextProgressBytes < totalBytes) {
+            nextProgressBytes = Math.min(nextProgressBytes + PROGRESS_INTERVAL_BYTES, totalBytes);
+          }
+        }
       }
       if (BigInt(offset) !== state.opened.size) {
         throw exactError("EXACT_FILE_SIZE_CHANGED", label, "changed size during hashing");
@@ -415,8 +432,14 @@ export function createExactFileAuthority(overrides = {}) {
     maximumBytes,
     label = "File",
     hooks = {},
+    onProgress,
   }) {
-    const result = hashExactFileSync(filename, { maximumBytes, label, hooks });
+    const result = hashExactFileSync(filename, {
+      maximumBytes,
+      label,
+      hooks,
+      onProgress,
+    });
     return Object.freeze({
       byteLength: result.byteLength,
       sha256: result.sha256,

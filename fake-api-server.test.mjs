@@ -217,6 +217,71 @@ test("supervised startup publishes restored cooldown before its account probe wa
   }
 });
 
+test("supervised startup is observable before slow engine qualification completes", async () => {
+  const token = await temporaryToken();
+  const root = await mkdtemp(path.join(os.tmpdir(), "uci-arena-startup-qualification-"));
+  const configPath = path.join(root, "config.json");
+  const runtimeDir = path.join(root, "runtime");
+  const runtimePath = path.join(runtimeDir, "runtime.json");
+  const config = JSON.parse(await readFile(DEFAULT_TEMPLATE, "utf8"));
+  config.engine = {
+    adapter: "standard_uci_v1",
+    executable: process.execPath,
+    arguments: [
+      path.join(HERE, "test-fixtures", "fake-standard-uci-engine.mjs"),
+      "--uci-delay-ms",
+      "2000",
+    ],
+    working_directory: HERE,
+    search_timeout_grace_ms: 1_000,
+    shutdown_grace_ms: 1_000,
+    uci_options: {},
+  };
+  config.timing.opponent_turn_search = false;
+  config.capacity = {
+    total_slots: 1,
+    capacity_profile: null,
+    startup_parallelism: 1,
+    human: { slots: 0, allow_borrowing: false, accept_public: false },
+    bot: { slots: 1, target_active: 0 },
+  };
+  config.scheduler.enabled = false;
+  await writeFile(configPath, JSON.stringify(config), "utf8");
+
+  const child = spawn(process.execPath, [
+    path.join(HERE, "lichess-adapter.mjs"),
+    "run",
+    "--config", configPath,
+    "--token-file", token.tokenFile,
+    "--expected-account", "fixturearenabot",
+    "--runtime-dir", runtimeDir,
+  ], {
+    cwd: root,
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  let output = "";
+  child.stdout.on("data", (chunk) => { output = `${output}${chunk}`.slice(-16_384); });
+  child.stderr.on("data", (chunk) => { output = `${output}${chunk}`.slice(-16_384); });
+  const exited = once(child, "exit");
+  try {
+    await waitFor(() => existsSync(runtimePath), {
+      timeoutMs: 1_000,
+      intervalMs: 10,
+      message: `starting status was not published before qualification; output=${output}`,
+    });
+    const runtime = JSON.parse(readFileSync(runtimePath, "utf8"));
+    assert.equal(runtime.pid, child.pid);
+    assert.equal(runtime.stream_lifecycle, "starting");
+    assert.equal(runtime.api_safety.client_lease.state, "authoritative");
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    await exited;
+    await rm(root, { recursive: true, force: true });
+    await token.close();
+  }
+});
+
 test("loopback API server rejects bad bearer values and non-BOT account fixtures", async () => {
   const rejectedApi = await startFakeLichessApi({ fixtureToken: FIXTURE_TOKEN });
   const rejectedToken = await temporaryToken("different-non-secret-test-token");

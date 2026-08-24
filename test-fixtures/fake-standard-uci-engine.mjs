@@ -3,6 +3,12 @@
 import readline from "node:readline";
 
 const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+const delayOption = process.argv.indexOf("--uci-delay-ms");
+const uciDelayMs = delayOption >= 0 ? Number(process.argv[delayOption + 1]) : 0;
+
+if (!Number.isSafeInteger(uciDelayMs) || uciDelayMs < 0 || uciDelayMs > 10_000) {
+  throw new Error("--uci-delay-ms must be an integer from 0 through 10000");
+}
 
 function reply(line) {
   process.stdout.write(`${line}\n`);
@@ -11,9 +17,11 @@ function reply(line) {
 input.on("line", (line) => {
   const command = line.trim();
   if (command === "uci") {
-    reply("id name UCI Arena Conforming Fixture");
-    reply("id author UCI Arena tests");
-    reply("uciok");
+    setTimeout(() => {
+      reply("id name UCI Arena Conforming Fixture");
+      reply("id author UCI Arena tests");
+      reply("uciok");
+    }, uciDelayMs);
   } else if (command === "isready") {
     reply("readyok");
   } else if (command.startsWith("go ")) {

@@ -920,6 +920,7 @@ telemetry:
     - "A live PID is insufficient authority for active or ready. Runtime evidence must bind the exact current process instance, and evidence older than the bounded heartbeat window is stale even if that PID has been reused by another process."
     - "Status distinguishes missing, invalid, stale, inactive, stream-transport-disconnected, startup-waiting-for-global-cooldown, challenge-create-quarantined, scheduler-faulted, and ready states without reading a credential."
     - "The run process publishes a fresh process-bound starting heartbeat immediately after acquiring the API-client lease and before account probing or reconciliation can wait. Restored cooldown and challenge quarantine are emitted once to the bounded runtime log and projected in typed status."
+    - "Potentially long exact engine, model, opening-book, tablebase, profile, or capacity validation keeps that lease and starting heartbeat fresh without weakening identity checks, reading credentials, contacting Lichess, or claiming readiness before validation completes."
     - "Status projects whether exactly one fresh local API-client lease belongs to the current provider process without returning its owner id, process identity, authority key, credential, or command line. A local lease cannot prove that no independently configured client exists on another host, so no cross-host exclusivity claim is made."
 
 transport_bounds:

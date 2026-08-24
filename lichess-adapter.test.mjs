@@ -1831,11 +1831,50 @@ test("profile application verifies and owns the complete Syzygy asset identity",
   fixture.config.engine.uci_options.SyzygyManifest =
     `${tablebasePath}${path.sep}.${path.sep}${path.basename(manifestPath)}`;
 
-  applySingleGameProfile(fixture.config);
+  const validationProgress = [];
+  applySingleGameProfile(fixture.config, {
+    onValidationProgress: (progress) => validationProgress.push(progress),
+  });
+  assert.deepEqual(validationProgress, [
+    {
+      phase: "tablebase_asset_validation",
+      completed: 0,
+      total: 2,
+      current_bytes_read: 3,
+      current_bytes_total: 3,
+    },
+    {
+      phase: "tablebase_asset_validation",
+      completed: 1,
+      total: 2,
+      current_bytes_read: null,
+      current_bytes_total: null,
+    },
+    {
+      phase: "tablebase_asset_validation",
+      completed: 1,
+      total: 2,
+      current_bytes_read: 3,
+      current_bytes_total: 3,
+    },
+    {
+      phase: "tablebase_asset_validation",
+      completed: 2,
+      total: 2,
+      current_bytes_read: null,
+      current_bytes_total: null,
+    },
+  ]);
   assert.equal(fixture.config.engine.uci_options.SyzygyPath, tablebasePath);
   assert.equal(fixture.config.engine.uci_options.SyzygyManifest, manifestPath);
   assert.equal(fixture.config.engine.uci_options.SyzygyProbeThreads, 4);
   assert.equal(fixture.config.engine.uci_options.SyzygyInternalProbe, true);
+  assert.throws(
+    () => applySingleGameProfile(fixture.config, {
+      onValidationProgress: () => { throw new Error("lifecycle failure"); },
+    }),
+    (error) => error?.code === "EXACT_FILE_PROGRESS_FAILED",
+  );
 
   fixture.config.engine.uci_options.SyzygyPath = path.dirname(tablebasePath);
   assert.throws(

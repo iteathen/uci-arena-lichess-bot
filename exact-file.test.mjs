@@ -56,6 +56,36 @@ test("exact reads and streaming hashes bind one unchanged regular file", (t) => 
   assert.equal(hashed.identity.ino, parsed.identity.ino);
 });
 
+test("streaming metadata reports bounded neutral progress without changing identity", (t) => {
+  const root = workspace(t);
+  const filename = path.join(root, "large-fixture.bin");
+  const bytes = Buffer.alloc(1024 * 1024 + 17, 0x5a);
+  writeFileSync(filename, bytes);
+  const progress = [];
+
+  const observed = exactFiles.exactFileMetadataSync(filename, {
+    maximumBytes: bytes.length,
+    label: "Large fixture",
+    onProgress: (value) => progress.push(value),
+  });
+
+  assert.equal(observed.byteLength, bytes.length);
+  assert.deepEqual(progress, [
+    { bytesRead: 1024 * 1024, totalBytes: bytes.length },
+    { bytesRead: bytes.length, totalBytes: bytes.length },
+  ]);
+  requireCode(() => exactFiles.exactFileMetadataSync(filename, {
+    maximumBytes: bytes.length,
+    label: "Large fixture",
+    onProgress: "invalid",
+  }), "EXACT_FILE_PROGRESS_INVALID");
+  requireCode(() => exactFiles.exactFileMetadataSync(filename, {
+    maximumBytes: bytes.length,
+    label: "Large fixture",
+    onProgress: () => { throw new Error("observer failure"); },
+  }), "EXACT_FILE_PROGRESS_FAILED");
+});
+
 test("sensitive reads verify bytes without producing a credential hash", (t) => {
   const root = workspace(t);
   const filename = path.join(root, "credential");
