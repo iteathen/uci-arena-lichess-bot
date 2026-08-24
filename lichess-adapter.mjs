@@ -6803,10 +6803,23 @@ export function replacementStartupReadiness(status) {
     && status?.rate_limit?.client_lease?.state === "authoritative"
     && blockers.length > 0
     && blockers.every((blocker) => allowedCooldownBlockers.has(blocker));
+  const allowedStartingBlockers = new Set([
+    "provider_starting",
+    "startup_reconciliation_pending",
+  ]);
+  const startupPending = !providerReady
+    && !apiCooldownDeferred
+    && status?.active === true
+    && status?.stream_state === "starting"
+    && status?.scheduler?.fault === null
+    && status?.rate_limit?.client_lease?.state === "authoritative"
+    && blockers.includes("provider_starting")
+    && blockers.every((blocker) => allowedStartingBlockers.has(blocker));
   return {
-    stable: providerReady || apiCooldownDeferred,
+    stable: providerReady || apiCooldownDeferred || startupPending,
     providerReady,
     apiCooldownDeferred,
+    startupPending,
   };
 }
 
@@ -7685,6 +7698,7 @@ export async function main(argv = process.argv.slice(2)) {
       stable: false,
       providerReady: false,
       apiCooldownDeferred: false,
+      startupPending: false,
     };
     const replacement = process.platform === "win32"
       ? await completeWindowsStartupReplacement({
@@ -7708,6 +7722,7 @@ export async function main(argv = process.argv.slice(2)) {
           ...replacement,
           providerReady: replacementReadiness.providerReady,
           apiCooldownDeferred: replacementReadiness.apiCooldownDeferred,
+          startupPending: replacementReadiness.startupPending,
         }
         : replacement,
     }));

@@ -352,6 +352,7 @@ test("post-replacement readiness preserves a durable global API cooldown", () =>
     stable: true,
     providerReady: false,
     apiCooldownDeferred: true,
+    startupPending: false,
   });
   assert.equal(replacementStartupReadiness({
     ...coolingDown,
@@ -368,7 +369,37 @@ test("post-replacement readiness preserves a durable global API cooldown", () =>
     stable: true,
     providerReady: true,
     apiCooldownDeferred: false,
+    startupPending: false,
   });
+});
+
+test("post-replacement readiness accepts only authoritative supervised startup pending", () => {
+  const starting = {
+    active: true,
+    ready: false,
+    stream_state: "starting",
+    scheduler: { fault: null },
+    rate_limit: { client_lease: { state: "authoritative" } },
+    blockers: ["provider_starting", "startup_reconciliation_pending"],
+  };
+  assert.deepEqual(replacementStartupReadiness(starting), {
+    stable: true,
+    providerReady: false,
+    apiCooldownDeferred: false,
+    startupPending: true,
+  });
+  assert.equal(replacementStartupReadiness({
+    ...starting,
+    blockers: [...starting.blockers, "runtime_status_stale"],
+  }).stable, false);
+  assert.equal(replacementStartupReadiness({
+    ...starting,
+    rate_limit: { client_lease: { state: "conflict" } },
+  }).stable, false);
+  assert.equal(replacementStartupReadiness({
+    ...starting,
+    scheduler: { fault: { kind: "startup" } },
+  }).stable, false);
 });
 
 test("Engine fingerprint drift cannot mask model or search-authority drift", () => {
