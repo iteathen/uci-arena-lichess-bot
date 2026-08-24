@@ -29,6 +29,37 @@ authority:
     - "Token contents never enter configuration, SQLite, logs, metadata, argv, or child environments."
     - "Every local installation supplies its own operator-owned token file outside the repository and immutable installed component roots. No release or test credential is bundled."
 
+provider_replacement_interlock_2026_08_23:
+  status: active
+  owner: provider_scheduler_and_durable_runtime_store
+  lifecycle_operation: pre_replace
+  purpose: >
+    Refuse component or dependency replacement while provider-owned game,
+    challenge-admission, or reconciliation work could be interrupted, without
+    transferring Lichess or scheduler semantics to Installer.
+  contract:
+    - "The existing neutral pre_replace lifecycle operation is the only replacement-quiescence port. No game-specific Installer operation, disposition, callback, or filesystem inspection is introduced."
+    - "The provider owns one durable admission gate in its existing matches.sqlite authority. Every preparing, pending, cancelling, or active slot holds provider-work authority from before its first external challenge mutation until exact generation-owned release; startup reconciliation holds the same authority until every observed remote game is either admitted or rejected."
+    - "Provider-work admission and gate closure serialize through one immediate store transaction. If admission wins, pre_replace observes active work and fails without closing the gate. If pre_replace wins, later work admission fails before engine startup or a Lichess challenge mutation."
+    - "Pre_replace may report replacement-ready only when the gate is closed, active provider work is zero, no unfinished durable game remains unresolved, and the running provider implements the exact interlock contract."
+    - "Active, unresolved, legacy-uncoordinated, malformed, or unavailable interlock evidence returns one bounded provider-owned failure reason. Installer treats that reason as opaque and performs no provider-specific branch."
+    - "A failed active-work check leaves the current process, engine children, games, startup registration, and open admission gate unchanged. It never disables supervision, stops a process, retargets a root, or aborts a game. A later safe retry is permitted."
+    - "After successful gate closure, startup control may disable restart, stop the now-idle exact owned process tree, and retarget the registration. Failure during that platform transition reopens admission before returning when the current provider remains authoritative."
+    - "Post-replacement resume reopens admission only through provider-owned lifecycle code. A blocked provider process cannot clear the gate merely by restarting, so a restart race cannot invalidate successful pre_replace evidence."
+    - "The gate, work count, lifecycle owner, and failure observations are credential-free. No lifecycle path reads, hashes, copies, validates, logs, or returns token contents."
+  migration:
+    store_schema_base: 5
+    compatible_extension: provider_lifecycle_control
+    rules:
+      - "Migration creates one additive closed-shape provider lifecycle control row while retaining base schema 5, so the prior provider version may ignore the extension and restart after an unsuccessful staged update. Every prior scheduler, game, challenge, cooldown, lease, and provenance row is preserved."
+      - "A pre-interlock provider is not assumed safe: missing exact lifecycle ownership fails closed unless platform authority already proves the registration explicitly disabled and inactive. An active or restart-enabled legacy registration cannot race staged replacement."
+      - "A newly claimed run authority may discard stale in-memory work counts only after the existing single-client lease proves exclusive process ownership; it never clears an outstanding replacement gate."
+  validation:
+    - "A live-session fixture invokes pre_replace, receives the active-work failure, observes no platform-control call, and proves the same game task, slot generation, and engine remain active until normal terminal completion."
+    - "Transaction tests prove both race orders: admitted work blocks replacement, while closed replacement admission blocks new work before external mutation."
+    - "Idle, repeated, legacy-uncoordinated, stale-owner, unfinished-game, platform-failure compensation, and post-replacement resume cases fail closed or converge as declared."
+    - "Windows and Linux startup tests prove no disable, stop, delete, retarget, or enable action occurs after an unsafe interlock result."
+
 local_api_simulator:
   implementation: fake-api-server.mjs
   network: loopback_only_ephemeral_port
@@ -273,15 +304,199 @@ storage:
     - "Reservation consumption is one SQLite transaction so a concurrent Manager cancellation or replacement cannot decrement or delete a different reservation."
     - "Persisting API safety state never shortens cooldown or replaces a newer strike observation with stale state."
 
-future_game_archive_and_training_export_2026_08_09:
-  status: architecture_reserved_not_runtime_implemented
-  purpose: >
-    Preserve completed Lichess games once as provider-owned canonical records
-    so future Manager history/replay and optional Restaurant training ingestion
-    can consume typed projections without reading matches.sqlite or inventing a
-    second game-capture path.
+transactional_game_activation_and_status_publication_2026_08_24:
+  status: active
+  owning_issue: https://github.com/iteathen/uci-arena-lichess-bot/issues/6
+  activation_owner:
+    owner: bot_controller_game_activation
+    rules:
+      - "The activation owner captures one exact slot generation before any transition and coordinates durable challenge acceptance, one-time reservation consumption, an activating game row, session construction, map publication, slot activation, execution, and cleanup."
+      - "A pending/preparing slot may be adopted only when its challenge id exactly matches the authoritative game/challenge correlation id. Opponent identity or pending-slot cardinality alone has no adoption authority."
+      - "The store transaction is idempotent by remote game id. Duplicate gameStart, reconnect, and startup reconciliation cannot consume a reservation twice or increment challenge acceptance twice."
+      - "The session object and its observed execution task are published coherently before execution may begin. Slot active authority is published only after durable activation succeeds."
+      - "A pre-publication failure removes only maps owned by that activation, marks the activating game with a bounded provider activation failure, releases only the captured slot generation, and closes its engine exactly once."
+      - "Session failure is persisted as provider_error without fabricating a Lichess result. Cleanup failures are bounded and attached to the primary diagnostic; they never replace or hide the session failure."
+      - "Cleanup is idempotent by activation generation and cannot release or close a later slot occupant."
+  durable_sequence:
+    transaction:
+      - challenge_acceptance_transition_if_present
+      - one_time_matching_reservation_consumption
+      - idempotent_activating_game_row
+    compensation:
+      - bounded_activation_failure_state_on_the_same_game_identity
+      - generation_owned_slot_and_engine_release
+    later_game_full:
+      - "Authoritative gameFull metadata and immutable runtime provenance fill only blank activating-row fields. Existing nonblank provenance is never replaced."
+  status_publisher:
+    owner: serialized_runtime_status_publisher
+    projection_source: bounded_in_memory_owner_snapshots
+    rules:
+      - "Heartbeat scheduling performs no SQLite query, opponent aggregation, transport-sample traversal, JSON serialization, synchronous file write, or rename on the Lichess/game-clock event loop."
+      - "The store maintains bounded cached control, opponent, and lease projections when their owning mutations commit. Transport sample/game counts and active game summaries are maintained incrementally."
+      - "One unrefed worker owns JSON serialization and exact atomic runtime.json publication. Publications are serialized and newer pending generations coalesce; a stale writer can never activate after a newer writer."
+      - "The worker uses the provider exact-file authority for a random private exclusive temporary file, bounded bytes, durable write, atomic same-directory activation, and identity-safe cleanup."
+      - "A status failure never changes gameplay authority. The next successfully published projection includes one bounded status-publication blocker and the last successful generation/time."
+      - "Initial and terminal status publication may be explicitly flushed; periodic and event-driven updates enqueue without delaying Lichess traffic. Shutdown drains the latest generation before terminating the worker."
+  performance:
+    - "Status scheduling records build time, activated write time, serialized byte count, coalesced generations, and failures without adding raw paths or output to runtime status."
+    - "The event-loop and move-submit acceptance compares status enabled and disabled under the same bounded workload and rejects a material p95 or p99 regression."
+  validation:
+    - "Fixtures cover failure at durable activation, session construction, map publication, immediate session completion, primary plus cleanup failure, duplicate events, and simultaneous same-opponent challenges."
+    - "Publisher fixtures cover overlap, coalescing, delayed completion, failure recovery, stale generation, temporary collision, write/activation failure, and shutdown drain."
+
+planned_provider_resilience_and_incidents_2026_08_23:
+  status: approved_plan_not_runtime_authoritative
+  suite_record: https://github.com/iteathen/uci-arena-installer/issues/166
+  owning_issues:
+    supervision: https://github.com/iteathen/uci-arena-lichess-bot/issues/40
+    incidents: https://github.com/iteathen/uci-arena-lichess-bot/issues/41
   activation:
-    - "This section reserves a compatibility contract only. It does not enable capture, export, retention, Manager operations, or training ingestion in the current provider."
+    - "This section records the approved target and test gates. It does not change the current launcher, startup definition, service/status contract, schemas, or release authority."
+    - "Runtime authority requires issue-owned spec-first implementation PRs, exact schemas, migrations where needed, cross-platform tests, and compatible component releases."
+  startup_authority:
+    rules:
+      - "Each platform retains exactly one provider-owned startup authority. Manager and Installer never add a second daemon supervisor."
+      - "Linux retains Restart=on-failure with a sixty-second restart delay."
+      - "Windows retains one hidden least-privilege logon task and IgnoreNew, and adds an indefinite one-minute repetition to the logon trigger so an unexpected exit is retried without admitting a concurrent duplicate."
+      - "A clean expected shutdown is not restart-eligible and never produces a crash incident or restart loop."
+  exit_receipt:
+    owner: provider_native_launcher
+    publication: bounded_exact_file_atomic_replacement
+    fields:
+      - process_instance_identity
+      - started_at
+      - exited_at
+      - child_exit_code
+      - expected_clean_or_unexpected_disposition
+      - restart_eligible
+    forbidden:
+      - command_lines
+      - executable_or_working_directory_paths
+      - arguments_or_environment
+      - credentials_or_headers
+      - raw_child_output
+    rules:
+      - "The receipt binds the exact supervised child instance and survives abrupt child termination so later status and incident reconciliation can explain the exit."
+      - "Publication is bounded and atomic; an invalid or stale receipt has no process-liveness authority."
+  incident_ledger:
+    prerequisite: "Provider issue 7 storage hardening and migration authority must land first."
+    owner: provider_runtime_store
+    retention: bounded_aggregated_ledger
+    stable_fields:
+      - provider_owned_code
+      - first_occurrence
+      - last_occurrence
+      - count
+      - severity
+      - active_or_resolved
+      - operation
+      - optional_http_status
+      - optional_retry_deadline
+      - optional_game_id
+      - sanitized_detail_maximum_512_characters
+    covered_failures:
+      - api
+      - scheduler
+      - stream
+      - startup
+      - engine_child
+      - storage
+      - status_publication
+    rules:
+      - "Repeated events aggregate by one stable provider-owned code without losing first/last occurrence, count, severity, and recovery state."
+      - "Sanitization rejects credentials, headers, command lines, paths, raw output, and arbitrary response documents before persistence or publication."
+      - "HTTP 429 and retry incidents expose the provider-owned cooldown deadline but recovery never clears, shortens, or bypasses it."
+  planned_contract:
+    service_contract_minor: "v1.1 additive incidents_list operation"
+    status_schema: "uci_arena_lichess_status_v4 adds supervision and active-incident summaries"
+    compatibility: "Manager continues accepting current status v3 and marks incident features unavailable when the declared operations are absent."
+    paging: "Stable provider-owned keyset cursor; bounded page and response schemas are defined by the implementation PR."
+  validation:
+    - "Unexpected Windows and Linux exits restart within two minutes, never produce duplicate authorities, and remain visible after recovery."
+    - "Clean shutdown neither produces a crash incident nor restarts."
+    - "HTTP 400 and 429, cooldown recovery, scheduler faults, stream failures, malformed error bodies, startup failures, engine-child failures, storage failures, and status-publication failures create bounded sanitized incidents."
+    - "Provider issue 31 remains closed; the new projection exposes its existing rate-limit authority and never reimplements or weakens cooldown behavior."
+    - "No fixture, receipt, incident, status, log, or diagnostic reads or exposes credential contents."
+
+planned_operational_game_archive_2026_08_23:
+  status: approved_plan_not_runtime_authoritative
+  suite_record: https://github.com/iteathen/uci-arena-installer/issues/166
+  owning_issue: https://github.com/iteathen/uci-arena-lichess-bot/issues/42
+  prerequisites:
+    - "Provider issue 6 lands atomic game activation and abnormal-termination behavior."
+    - "Provider issue 7 lands safe SQLite migration and storage authority."
+  activation:
+    - "This section activates architectural planning for the operational archive and Manager history/replay contract only. It does not change the current schema_version 5 store, operation catalog, schemas, retention behavior, or release authority."
+    - "Training export remains reserved by future_game_archive_and_training_export_2026_08_09 and receives no runtime authority from this section."
+  migration:
+    from_schema: 5
+    to_schema: 6
+    transaction: provider_owned_atomic_migration
+    games_additions:
+      - immutable_completion_cursor
+      - initial_position
+      - archive_completeness
+      - provider_release_identity
+      - optional_neutral_engine_component_identity
+    game_plies:
+      primary_key: [game_id, ply]
+      fields:
+        - uci_move
+        - before_fen
+        - after_fen
+        - actor
+        - available_clocks
+    provenance:
+      - "Every newly captured game binds provider component id, version, and manifest digest."
+      - "Engine component id, version, and manifest digest are bound only when explicitly supplied through the public component-manifest binding."
+      - "External UCI engines bind executable digest plus normalized UCI identities and explicitly omit component version rather than inventing it."
+      - "Historical component versions are never guessed. Unknown fields remain absent and visibly incomplete."
+  reconciliation:
+    - "Authoritative streamed plies append or reconcile idempotently by game id and ply. Reconnect, duplicate gameStart, duplicate stream records, and startup reconciliation cannot create a second logical game."
+    - "A takeback may rewrite only the nonterminal current line. Once authoritative terminal truth commits, the canonical replay and completion cursor are immutable."
+    - "Archive-complete replay is reconstructed from provider-authored before/after FEN snapshots; no downstream consumer fabricates positions."
+  historical_backfill:
+    source: provider_api_safety_coordinator
+    export_by_ids_maximum: 300
+    requested_evidence: [moves, clocks]
+    rules:
+      - "Attempt every known summary-only row in batches of at most 300 ids without blocking move submission, challenge readiness, or higher-priority API work."
+      - "Historical PGN and SAN pass through one bounded provider-owned parser and canonical legality reconstruction."
+      - "Conflict, unavailable remote data, invalid legality, or unsupported history remains summary_only with a bounded reason; the provider never invents moves, clocks, positions, or provenance."
+      - "Backfill obeys the existing global cooldown and request priority. It never shortens retry deadlines or competes with live move submission."
+  retention:
+    games: indefinite_in_v1
+    reporting: [total_games, incomplete_games, storage_bytes]
+    deferred: [automatic_pruning, training_export]
+  planned_operations:
+    games_list:
+      scopes: [live, history]
+      cursor: stable_keyset
+      maximum_page_size: 100
+    game_get:
+      maximum_plies: 2048
+      output: bounded_canonical_replay_and_provenance
+    rules:
+      - "Operations are credential-free, declared in the provider service contract, and return closed project-owned schemas."
+      - "Manager receives only bounded public records and never receives SQLite rows, paths, raw provider output, or credential material."
+  validation:
+    - "Crash, reconnect, takeback, duplicate-stream, and duplicate-start fixtures produce one canonical game and immutable terminal replay."
+    - "All known summary rows are attempted in bounded batches; unresolved rows and unknown historical versions remain visibly incomplete."
+    - "At 646 or more games, stable cursor pagination reaches every record without a full-store response or scan on the Manager request path."
+    - "Every archive-complete replay reconstructs from provider-authored FEN snapshots and never exceeds 2,048 plies."
+    - "Operational records are retained without automatic deletion in v1."
+    - "No archive, migration diagnostic, backfill request, or operation reads or exposes credential contents."
+
+future_game_archive_and_training_export_2026_08_09:
+  status: training_export_reserved_operational_archive_superseded_by_approved_plan_not_runtime_implemented
+  purpose: >
+    Reserve optional Restaurant training export derived from the provider-owned
+    canonical archive without reading matches.sqlite or inventing a second
+    game-capture path. The operational archive and Manager history/replay target
+    are now planned separately above; this section grants no training authority.
+  activation:
+    - "This section reserves a training-export compatibility contract only. It does not enable export or training ingestion in the current provider."
+    - "The approved operational archive plan above remains non-runtime-authoritative until its issue-owned implementation, migration, schemas, tests, and release land."
     - "Implementation requires a later explicit spec-first change, bounded storage policy, contract schemas, migration behavior, tests, and operator-visible controls."
   ownership:
     provider:
@@ -390,7 +605,7 @@ windows_supervision:
     - "Startup registration may persist only the token-file path, never token contents, and must validate engine/capacity evidence before registration."
     - "Uninstall first disables restart, then invokes the staged native supervisor to terminate and wait for every process in the exact receipt-owned launcher tree. It additionally polls Task Scheduler until the GUI launcher is no longer running. Only after both proofs may it delete the task and startup evidence."
     - "A missing task is idempotent success. Access denial, an unknown task state, or failure to reach stopped and deleted states within the bounded deadline fails closed and preserves the provider payload for retry."
-    - "Startup-control v2 exposes credential-free pre_replace and post_replace actions. Before any receipt-owned dependency root can change, the staged provider disables restart, terminates and waits for the exact prior launcher process tree, retargets the existing startup definition from the exact receipt-owned root to the exact replacement root without reading credential contents, and leaves it disabled until the installed replacement explicitly resumes it."
+    - "Startup-control v2 exposes credential-free pre_replace and post_replace actions. Before any receipt-owned dependency root can change, the staged provider first closes the provider-owned transactional admission gate and proves zero active or unresolved provider work; only then does it disable restart, terminate and wait for the exact prior launcher process tree, retarget the existing startup definition from the exact receipt-owned root to the exact replacement root without reading credential contents, and leave it disabled until the installed replacement explicitly resumes it."
     - "Pre-replacement rewrites only validated component-root references, preserves the external token-file path and other arguments, and requires a stopped disabled task before payload replacement. Linux applies the equivalent bounded rewrite to the user unit. Before explicit post-replacement resume, the provider validates current configuration and exact single-game, timing, temporal-curve, capacity, model, book, and tablebase authorities, then rebuilds every non-secret task or unit argument from those current bindings. Only the existing external token-file path and expected account are preserved from the disabled registration; an unknown action shape or any missing/current-evidence mismatch fails before enablement. Post-replacement normally proves the provider remains active and ready throughout a bounded stability window. When credential-free validation proves the selected single-game profile, model/checkpoint, search topology, tablebase, and temporal-curve authorities still match and only the exact Engine executable fingerprint differs, startup instead leaves the retargeted registration disabled and returns installed true, active false, and requalificationRequired true with a closed reason code. Installed requalification must then prove that the selected timing profile remains semantically compatible before it can publish exact replacement evidence or enable the provider. Other configuration, model, timing, book, tablebase, capacity, task-control, or readiness failures remain fatal."
     - "A fresh active replacement that owns the authoritative local API lease and is intentionally waiting for an unexpired durable global API cooldown is stable replacement authority even though providerReady remains false. Post-replacement reports the cooldown deferral explicitly, never clears or shortens the cooldown, and continues supervised startup; stale status, reconciliation, a lease conflict, scheduler failure, or an ordinary disconnected stream remains fatal."
     - "Installed qualification is permitted while that exact retargeted startup registration is explicitly disabled and inactive; an enabled, active, or ambiguously reported registration still blocks qualification. Successful qualification does not silently start the provider: the new exact single-game and capacity outputs must enter through Installer locators and configuration reconciliation before explicit post-replacement resume."
@@ -753,6 +968,40 @@ protected_live_acceptance_2026_07_26:
     - "Mock API tests cover correct identities, wrong/non-BOT/offline targets, and unrelated active games."
     - "Mock process/event tests prove the confirmation gate, attempt cap, wall-clock cap, target-only completion requirement, and fail-closed rerun result."
     - "Tests never read a token file or contact Lichess."
+
+provider_exit_supervision_contract_2026_08_23:
+  status: active
+  owner: lichess_provider_startup_and_native_launcher
+  purpose: >
+    Recover one provider authority after an unexpected exit while preserving
+    bounded durable evidence that remains useful after the replacement process
+    starts.
+  windows:
+    registration: per_user_task_scheduler
+    multiple_instances: IgnoreNew
+    retry_interval_seconds: 60
+    rules:
+      - "The one provider-owned logon trigger repeats every minute without a duration. IgnoreNew prevents a repetition from creating a concurrent launcher while the prior instance is active."
+      - "RestartOnFailure retains the same one-minute interval as immediate scheduler evidence; logon repetition supplies indefinite recovery after the bounded native restart count."
+      - "Install and post-requalification reconciliation upgrade legacy owned task XML idempotently. They reject duplicate trigger, settings, repetition, multiple-instance, or restart policy blocks rather than guessing ownership."
+      - "Replacement and uninstall disable the task before terminating the exact owned launcher tree, so an intentional operator shutdown cannot enter the repetition loop."
+      - "The native GUI launcher records the exact child PID plus Windows creation-time identity, child start/exit UTC timestamps, the full unsigned 32-bit exit code, disposition, and restart eligibility. Exit zero is clean and expected; every nonzero child exit is unexpected and restart-eligible."
+      - "The receipt is a closed JSON document atomically replaced through one private same-directory temporary file after exact non-reparse directory admission. Receipt publication failure returns launcher code 71 so Task Scheduler state cannot silently claim the child result was durably recorded."
+      - "The receipt never contains arguments, commands, paths, environment values, credentials, headers, or child output."
+      - "Startup status validates the bounded receipt before projection and distinguishes active, restart_pending, clean_stopped, disabled, inactive, and unregistered supervision. A malformed, unsafe, oversized, or unwritable receipt remains a closed error code."
+  linux:
+    service_restart: on-failure
+    restart_seconds: 60
+    rules:
+      - "The existing systemd user service remains the sole Linux startup authority and never introduces a second watchdog."
+      - "Startup status distinguishes active, restart_pending, disabled, inactive, and unregistered service state."
+  provider_status_v3_compatibility:
+    - "The credential-free provider status operation retains its closed v3 schema and maps failed receipt publication, pending recovery, abnormal last exit, and enabled inactive registration to bounded blocker codes."
+    - "Additive supervision and incident summaries in the main status document require the separately planned v4 contract; this contract does not add undeclared v3 fields."
+  validation:
+    - "Tests cover 0xC0000409 as unsigned 3221226505, signed and hexadecimal Task Scheduler result parsing, strict receipt shape and disposition checks, legacy task upgrade idempotence, receipt-write failure, clean stop, pending restart, and active recovery."
+    - "The Windows native launcher is compiled with warnings enabled; its probe declares atomic receipt support, and an actual nonzero child exit produces the expected atomically published receipt without sensitive fields."
+    - "No validation reads a credential or contacts Lichess."
 
 manager_account_and_options_contract_2026_07_31:
   status: active

@@ -8,7 +8,7 @@ endif()
 add_executable(lichess_adapter_launcher WIN32 lichess_adapter_launcher.cpp)
 target_compile_features(lichess_adapter_launcher PRIVATE cxx_std_20)
 target_compile_definitions(lichess_adapter_launcher PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
-target_link_libraries(lichess_adapter_launcher PRIVATE Shell32)
+target_link_libraries(lichess_adapter_launcher PRIVATE Bcrypt Shell32)
 
 if(MSVC)
     set_property(

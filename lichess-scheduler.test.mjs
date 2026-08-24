@@ -98,14 +98,45 @@ test("slot transitions require captured generations and stale releases cannot af
   await pool.release(second, second.generation);
 });
 
-test("pending lookup is deterministic by challenge id then opponent", () => {
+test("pending lookup requires an exact challenge id or one unique outbound correlation", () => {
   const pool = new SlotPool(capacity({ humans: 0, bots: 2 }));
   const first = pool.acquire("bot", { opponent: "one", createdAt: 1 });
   const second = pool.acquire("bot", { opponent: "two", createdAt: 2 });
   pool.pending(first, "challenge-one", first.generation);
   pool.pending(second, "challenge-two", second.generation);
   assert.equal(pool.findPending({ gameId: "challenge-two" }), second);
-  assert.equal(pool.findPending({ gameId: "new-id", opponent: { username: "one" } }), first);
+  assert.equal(pool.findPending({ gameId: "new-id", opponent: { username: "one" } }), null);
+
+  const outbound = new SlotPool(capacity({ humans: 0, bots: 1 }));
+  const correlated = outbound.acquire("bot", {
+    opponent: "one",
+    direction: "outbound",
+    correlationToken: "attempt-one",
+  });
+  assert.equal(outbound.findPending({ gameId: "new-id", opponent: { username: "one" } }), correlated);
+  assert.equal(outbound.correlatesGame(correlated, {
+    gameId: "new-id",
+    opponent: { username: "one" },
+  }), true);
+});
+
+test("same-opponent outbound attempts cannot be adopted by opponent alone", () => {
+  const pool = new SlotPool(capacity({ humans: 0, bots: 2 }));
+  const first = pool.acquire("bot", {
+    opponent: "same",
+    direction: "outbound",
+    correlationToken: "attempt-one",
+  });
+  const second = pool.acquire("bot", {
+    opponent: "same",
+    direction: "outbound",
+    correlationToken: "attempt-two",
+  });
+
+  const game = { gameId: "unrelated", opponent: { username: "same" } };
+  assert.equal(pool.findPending(game), null);
+  assert.equal(pool.correlatesGame(first, game), false);
+  assert.equal(pool.correlatesGame(second, game), false);
 });
 
 test("owner reservation protects only the next human slot", () => {

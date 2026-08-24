@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -11,7 +11,10 @@ import {
   STARTUP_TASK_NAME,
   buildTaskXml,
   completeWindowsStartupReplacement,
+  classifyWindowsStartup,
+  ensureWindowsSupervisionXml,
   parseWindowsArguments,
+  parseWindowsTaskResult,
   prepareWindowsStartupReplacement,
   quoteWindowsArgument,
   recoverWindowsStartup,
@@ -19,6 +22,7 @@ import {
   retargetWindowsTaskXml,
   stopAndDeleteWindowsTask,
   startupAction,
+  validateWindowsExitReceipt,
 } from "./windows-startup.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -76,11 +80,12 @@ test("startup task is hidden, supervised, and invokes the foreground adapter thr
   assert.match(xml, new RegExp(STARTUP_TASK_NAME));
   assert.match(xml, /<Hidden>true<\/Hidden>/);
   assert.match(xml, /<RestartOnFailure>/);
+  assert.match(xml, /<LogonTrigger><Repetition><Interval>PT1M<\/Interval><StopAtDurationEnd>false<\/StopAtDurationEnd><\/Repetition>/);
   assert.match(xml, /<MultipleInstancesPolicy>IgnoreNew<\/MultipleInstancesPolicy>/);
   assert.match(xml, /<ExecutionTimeLimit>PT0S<\/ExecutionTimeLimit>/);
 });
 
-test("native launcher is a Windows GUI process that creates a no-console child", async (t) => {
+test("native launcher creates a no-console child and publishes its exact exit receipt", async (t) => {
   if (process.platform !== "win32" || !existsSync(NATIVE_LAUNCHER)) {
     return t.skip("native Windows launcher is not built");
   }
@@ -92,7 +97,121 @@ test("native launcher is a Windows GUI process that creates a no-console child",
     schema: "uci_arena_lichess_launcher_probe_v1",
     windows_gui_subsystem: true,
     create_no_window: true,
+    atomic_exit_receipt: true,
+    exit_receipt_schema: "uci_arena_lichess_exit_receipt_v1",
   });
+  const runtimeDir = mkdtempSync(path.join(os.tmpdir(), "lichess-launcher-receipt-"));
+  try {
+    await assert.rejects(
+      execFileAsync(NATIVE_LAUNCHER, [
+        process.execPath,
+        "-e",
+        "process.exit(23)",
+        "--",
+        "--runtime-dir",
+        runtimeDir,
+      ], { windowsHide: true, timeout: 5_000 }),
+      (error) => Number(error.code) === 23,
+    );
+    const receipt = validateWindowsExitReceipt(JSON.parse(
+      readFileSync(path.join(runtimeDir, "launcher-exit.json"), "utf8"),
+    ));
+    assert.equal(receipt.child_exit_code, 23);
+    assert.equal(receipt.disposition, "unexpected_exit");
+    assert.equal(receipt.restart_eligible, true);
+    assert.doesNotMatch(
+      JSON.stringify(receipt),
+      /command|argument|environment|credential|authorization|bearer|output|path/iu,
+    );
+  } finally {
+    rmSync(runtimeDir, { recursive: true, force: true });
+  }
+});
+
+test("legacy Windows registration is upgraded to indefinite bounded retry without duplicates", () => {
+  const legacy = buildTaskXml(options(), "S-1-5-21-1")
+    .replace(/<Repetition>[\s\S]*?<\/Repetition>/u, "")
+    .replace(/<RestartOnFailure>[\s\S]*?<\/RestartOnFailure>/u, "")
+    .replace(/<MultipleInstancesPolicy>[\s\S]*?<\/MultipleInstancesPolicy>/u, "");
+  const upgraded = ensureWindowsSupervisionXml(legacy);
+  assert.equal((upgraded.match(/<Repetition>/gu) ?? []).length, 1);
+  assert.equal((upgraded.match(/<RestartOnFailure>/gu) ?? []).length, 1);
+  assert.equal((upgraded.match(/<MultipleInstancesPolicy>/gu) ?? []).length, 1);
+  assert.match(upgraded, /<Repetition><Interval>PT1M<\/Interval><StopAtDurationEnd>false<\/StopAtDurationEnd><\/Repetition>/u);
+  assert.match(upgraded, /<RestartOnFailure><Interval>PT1M<\/Interval><Count>999<\/Count><\/RestartOnFailure>/u);
+  assert.match(upgraded, /<MultipleInstancesPolicy>IgnoreNew<\/MultipleInstancesPolicy>/u);
+  assert.ok(upgraded.indexOf("<MultipleInstancesPolicy>") < upgraded.indexOf("<DisallowStartIfOnBatteries>"));
+  assert.ok(upgraded.indexOf("<RestartOnFailure>") > upgraded.indexOf("<Priority>"));
+  assert.equal(ensureWindowsSupervisionXml(upgraded), upgraded);
+});
+
+function exitReceipt(childExitCode = 0xc0000409) {
+  const clean = childExitCode === 0;
+  return {
+    schema: "uci_arena_lichess_exit_receipt_v1",
+    process_instance: {
+      schema: "uci_arena_process_instance_receipt_v1",
+      platform: "win32",
+      pid: 4242,
+      creation_time_100ns: "134157312000000000",
+    },
+    started_at: "2026-08-23T01:00:00.000Z",
+    exited_at: "2026-08-23T01:01:00.000Z",
+    child_exit_code: childExitCode,
+    clean,
+    expected: clean,
+    disposition: clean ? "clean_exit" : "unexpected_exit",
+    restart_eligible: !clean,
+  };
+}
+
+test("Windows exit receipt preserves high-bit exit evidence and rejects undeclared detail", () => {
+  const receipt = validateWindowsExitReceipt(exitReceipt());
+  assert.equal(receipt.child_exit_code, 3221226505);
+  assert.equal(receipt.restart_eligible, true);
+  assert.equal(parseWindowsTaskResult("0xC0000409"), 3221226505);
+  assert.equal(parseWindowsTaskResult("-1073740791"), 3221226505);
+  assert.equal(parseWindowsTaskResult("unknown"), null);
+  assert.throws(
+    () => validateWindowsExitReceipt({ ...exitReceipt(), command_line: "forbidden" }),
+    /invalid shape/,
+  );
+  assert.throws(
+    () => validateWindowsExitReceipt({ ...exitReceipt(), restart_eligible: false }),
+    /inconsistent/,
+  );
+});
+
+test("Windows startup projection distinguishes recovery, clean stop, and receipt failure", () => {
+  const unexpected = validateWindowsExitReceipt(exitReceipt());
+  const pending = classifyWindowsStartup(
+    { installed: true, enabled: true, active: false, lastResult: "0xC0000409" },
+    { state: "ready", receipt: unexpected, error: null },
+  );
+  assert.equal(pending.supervisionState, "restart_pending");
+  assert.equal(pending.restartPending, true);
+  assert.equal(pending.lastUnexpectedExit.child_exit_code, 3221226505);
+
+  const active = classifyWindowsStartup(
+    { installed: true, enabled: true, active: true, lastResult: "267009" },
+    { state: "ready", receipt: unexpected, error: null },
+  );
+  assert.equal(active.supervisionState, "active");
+  assert.equal(active.restartPending, false);
+  assert.equal(active.lastUnexpectedExit.child_exit_code, 3221226505);
+
+  const clean = validateWindowsExitReceipt(exitReceipt(0));
+  assert.equal(classifyWindowsStartup(
+    { installed: true, enabled: true, active: false, lastResult: "0" },
+    { state: "ready", receipt: clean, error: null },
+  ).supervisionState, "clean_stopped");
+
+  const failed = classifyWindowsStartup(
+    { installed: true, enabled: true, active: false, lastResult: "71" },
+  );
+  assert.equal(failed.exitReceiptState, "failed");
+  assert.equal(failed.exitReceiptError, "exit_receipt_write_failed");
+  assert.equal(failed.restartPending, true);
 });
 
 test("two-phase replacement stops, retargets, and resumes the existing task", async (t) => {
@@ -219,7 +338,7 @@ test("startup replacement retargets the owned task paths while preserving creden
   assert.match(updated, new RegExp(replacementRoot.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "iu"));
   assert.match(updated, new RegExp(tokenFile.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "iu"));
   assert.match(updated, /<Settings>[\s\S]*?<Enabled>false<\/Enabled>/u);
-  assert.match(updated, /<LogonTrigger><Enabled>true<\/Enabled>/u);
+  assert.match(updated, /<LogonTrigger>[\s\S]*?<Enabled>true<\/Enabled>/u);
 });
 
 test("startup replacement accepts the Task Scheduler default when task enablement is omitted", () => {
@@ -231,7 +350,7 @@ test("startup replacement accepts the Task Scheduler default when task enablemen
   assert.doesNotMatch(updated, new RegExp(previousRoot.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "iu"));
   assert.match(updated, new RegExp(replacementRoot.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "iu"));
   assert.doesNotMatch(updated, /<Settings>[\s\S]*?<Enabled>false<\/Enabled>/u);
-  assert.match(updated, /<LogonTrigger><Enabled>true<\/Enabled>/u);
+  assert.match(updated, /<LogonTrigger>[\s\S]*?<Enabled>true<\/Enabled>/u);
 });
 
 test("post-requalification reconciliation replaces stale runtime bindings and preserves credentials", () => {
