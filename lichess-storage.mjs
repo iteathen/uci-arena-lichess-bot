@@ -970,14 +970,36 @@ function verifyStoredTypes(database, tables) {
   }
 }
 
-function verifyGameArchiveRows(database) {
+function isLegacyArchiveDefaultRow(database, game) {
+  return game.completion_cursor === 0n
+    && game.initial_fen === ""
+    && game.variant === "standard"
+    && game.archive_completeness === "live"
+    && game.archive_reason === ""
+    && game.archive_sha256 === ""
+    && game.provider_component_id === ""
+    && game.provider_component_version === ""
+    && game.provider_component_manifest_sha256 === ""
+    && game.engine_component_id === ""
+    && game.engine_component_version === ""
+    && game.engine_component_manifest_sha256 === ""
+    && game.backfill_attempts === 0n
+    && game.backfill_last_attempted_at === 0n
+    && (game.archive_cursor === 0n || game.finished_at > 0n)
+    && !database.prepare(
+      "SELECT 1 AS present FROM game_plies WHERE game_id=? LIMIT 1",
+    ).get(game.game_id);
+}
+
+function verifyGameArchiveRows(database, { allowLegacyArchiveDefaults = false } = {}) {
   const controls = database.prepare("SELECT * FROM game_archive_control").all();
   const games = database.prepare(`
     SELECT game_id, archive_cursor, completion_cursor, finished_at, plies,
-      initial_fen, archive_completeness, archive_reason, archive_sha256,
+      initial_fen, variant, archive_completeness, archive_reason, archive_sha256,
       provider_component_id, provider_component_version,
       provider_component_manifest_sha256, engine_component_id,
-      engine_component_version, engine_component_manifest_sha256
+      engine_component_version, engine_component_manifest_sha256,
+      backfill_attempts, backfill_last_attempted_at
     FROM games ORDER BY archive_cursor
   `).all();
   const maxArchive = games.at(-1)?.archive_cursor ?? 0n;
@@ -1008,8 +1030,12 @@ function verifyGameArchiveRows(database) {
     const terminal = game.finished_at > 0n;
     const complete = game.archive_completeness === "complete"
       || game.archive_completeness === "reconciled";
-    if (!gameId.test(game.game_id) || game.archive_cursor <= 0n
-        || !completeness.has(game.archive_completeness) || !reason.test(game.archive_reason)
+    if (!gameId.test(game.game_id)) {
+      throw storageError("LICHESS_STORAGE_ROW_INVALID", "games contains invalid archive authority");
+    }
+    if (allowLegacyArchiveDefaults && isLegacyArchiveDefaultRow(database, game)) continue;
+    if (game.archive_cursor <= 0n || !completeness.has(game.archive_completeness)
+        || !reason.test(game.archive_reason)
         || !digest.test(game.archive_sha256)
         || !digest.test(game.provider_component_manifest_sha256)
         || !digest.test(game.engine_component_manifest_sha256)
@@ -1051,6 +1077,55 @@ function verifyGameArchiveRows(database) {
   }
 }
 
+function repairLegacyArchiveDefaults(database) {
+  const rows = database.prepare(`
+    SELECT game_id, archive_cursor, finished_at, started_at
+    FROM games
+    WHERE completion_cursor=0 AND initial_fen='' AND variant='standard'
+      AND archive_completeness='live' AND archive_reason='' AND archive_sha256=''
+      AND provider_component_id='' AND provider_component_version=''
+      AND provider_component_manifest_sha256='' AND engine_component_id=''
+      AND engine_component_version='' AND engine_component_manifest_sha256=''
+      AND backfill_attempts=0 AND backfill_last_attempted_at=0
+      AND (archive_cursor=0 OR finished_at>0)
+      AND NOT EXISTS(SELECT 1 FROM game_plies WHERE game_plies.game_id=games.game_id)
+    ORDER BY started_at, game_id
+  `).all();
+  if (rows.length === 0) return;
+  const control = database.prepare(`
+    SELECT next_archive_cursor, next_completion_cursor
+    FROM game_archive_control WHERE id=1
+  `).get();
+  let nextArchive = control.next_archive_cursor;
+  let nextCompletion = control.next_completion_cursor;
+  const assignArchive = database.prepare(
+    "UPDATE games SET archive_cursor=? WHERE game_id=? AND archive_cursor=0",
+  );
+  for (const row of rows) {
+    if (row.archive_cursor !== 0n) continue;
+    assignArchive.run(nextArchive, row.game_id);
+    nextArchive += 1n;
+  }
+  const assignCompletion = database.prepare(`
+    UPDATE games SET completion_cursor=?, archive_completeness='summary_only',
+      archive_reason='historical_moves_unavailable'
+    WHERE game_id=? AND finished_at>0 AND completion_cursor=0
+      AND archive_completeness='live'
+  `);
+  for (const row of rows
+    .filter((candidate) => candidate.finished_at > 0n)
+    .sort((left, right) => left.finished_at < right.finished_at ? -1
+      : left.finished_at > right.finished_at ? 1
+        : left.game_id.localeCompare(right.game_id))) {
+    assignCompletion.run(nextCompletion, row.game_id);
+    nextCompletion += 1n;
+  }
+  database.prepare(`
+    UPDATE game_archive_control
+    SET next_archive_cursor=?, next_completion_cursor=? WHERE id=1
+  `).run(nextArchive, nextCompletion);
+}
+
 function verifyIncidentRows(database) {
   const controls = database.prepare("SELECT * FROM provider_incident_control").all();
   const rows = database.prepare("SELECT * FROM provider_incidents ORDER BY cursor").all();
@@ -1081,6 +1156,7 @@ function verifyIncidentRows(database) {
 function verifySchema(database, version, {
   requireLifecycle = false,
   requireIncidents = false,
+  allowLegacyArchiveDefaults = false,
 } = {}) {
   const hasLegacyRate = tableExists(database, "api_rate_limit");
   const hasSafety = tableExists(database, "api_safety_state");
@@ -1168,7 +1244,7 @@ function verifySchema(database, version, {
     });
     verifyIncidentRows(database);
   }
-  if (version >= 6) verifyGameArchiveRows(database);
+  if (version >= 6) verifyGameArchiveRows(database, { allowLegacyArchiveDefaults });
   if (version >= 3 && hasLegacyRate) {
     verifyStoredTypes(database, { api_rate_limit: LEGACY_RATE_LIMIT_COLUMNS });
   }
@@ -1404,7 +1480,10 @@ function initializeOrMigrate(database, empty, failureInjector) {
         );
       }
       const version = schemaVersion(database);
-      const admitted = verifySchema(database, version);
+      const admitted = verifySchema(database, version, {
+        allowLegacyArchiveDefaults: version === CURRENT_SCHEMA_VERSION,
+      });
+      if (version === CURRENT_SCHEMA_VERSION) repairLegacyArchiveDefaults(database);
       const migrated = migrateDatabase(database, version, admitted);
       normalizeSchemaMeta(database, migrated);
     }
