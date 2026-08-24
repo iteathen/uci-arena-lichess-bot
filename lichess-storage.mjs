@@ -82,6 +82,83 @@ const LEGACY_RATE_LIMIT_COLUMNS = Object.freeze([
   ["half_open", "INTEGER", 0],
 ]);
 
+const PROVIDER_LIFECYCLE_COLUMNS = Object.freeze([
+  ["id", "INTEGER", 1], ["admission_blocked", "INTEGER", 0],
+  ["owner_id", "TEXT", 0], ["active_work", "INTEGER", 0],
+  ["updated_at", "INTEGER", 0],
+]);
+
+const EXPECTED_COLUMN_DEFAULTS = Object.freeze({
+  "scheduler_control.paused": "0",
+  "opponents.title": "''",
+  "opponents.rating": "0",
+  "opponents.online": "0",
+  "opponents.cooldown_until": "0",
+  "opponents.accepts": "0",
+  "opponents.declines": "0",
+  "opponents.timeouts": "0",
+  "challenge_attempts.color": "'random'",
+  "challenge_attempts.clock_limit": "0",
+  "challenge_attempts.clock_increment": "0",
+  "games.opponent": "''",
+  "games.color": "''",
+  "games.rated": "0",
+  "games.speed": "''",
+  "games.clock_limit": "0",
+  "games.clock_increment": "0",
+  "games.status": "'started'",
+  "games.result": "''",
+  "games.winner": "''",
+  "games.plies": "0",
+  "games.finished_at": "0",
+  "games.engine_build_fingerprint": "''",
+  "games.model_fingerprint": "''",
+  "games.provider_fingerprint": "''",
+  "games.book_identity": "''",
+  "games.model_id": "''",
+  "games.checkpoint_hash": "''",
+  "games.adapter_id": "''",
+  "games.provider": "''",
+  "games.hardware_driver_fingerprint": "''",
+  "games.onnx_runtime_version": "''",
+  "games.search_core": "''",
+  "games.threads": "0",
+  "games.root_workers": "0",
+  "games.split_depth": "0",
+  "games.batch_size": "0",
+  "games.batch_wait_us": "0",
+  "games.time_profile_identity": "''",
+  "games.runtime_provenance_sha256": "''",
+  "games.runtime_provenance_json": "'{}'",
+  "api_safety_state.cooldown_until": "0",
+  "api_safety_state.strike_count": "0",
+  "api_safety_state.last_429_at": "0",
+  "api_safety_state.last_retry_after_ms": "0",
+  "api_safety_state.challenge_blocked_until": "0",
+  "api_safety_state.challenge_strike_count": "0",
+  "api_safety_state.challenge_last_429_at": "0",
+  "api_safety_state.challenge_recovered_at": "0",
+  "api_safety_state.challenge_half_open": "0",
+  "api_client_leases.process_identity_json": "''",
+  "api_rate_limit.consecutive_429": "0",
+  "api_rate_limit.blocked_until": "0",
+  "api_rate_limit.last_429_at": "0",
+  "api_rate_limit.half_open": "0",
+  "provider_lifecycle_control.admission_blocked": "0",
+  "provider_lifecycle_control.owner_id": "''",
+  "provider_lifecycle_control.active_work": "0",
+  "provider_lifecycle_control.updated_at": "0",
+});
+
+const EXPECTED_CHECKS = Object.freeze({
+  reservations: ["check(id=1)", "check(games_remaining>0)"],
+  scheduler_control: ["check(id=1)"],
+  api_rate_limit: ["check(id=1)"],
+  provider_lifecycle_control: [
+    "check(id=1)", "check(admission_blockedin(0,1))", "check(active_work>=0)",
+  ],
+});
+
 const BASE_SCHEMA_SQL = `
   CREATE TABLE owners(
     username TEXT PRIMARY KEY,
@@ -184,6 +261,20 @@ const API_LEASE_V2_SQL = `
   );
 `;
 
+const PROVIDER_LIFECYCLE_SQL = `
+  CREATE TABLE provider_lifecycle_control(
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    admission_blocked INTEGER NOT NULL DEFAULT 0
+      CHECK(admission_blocked IN (0, 1)),
+    owner_id TEXT NOT NULL DEFAULT '',
+    active_work INTEGER NOT NULL DEFAULT 0 CHECK(active_work >= 0),
+    updated_at INTEGER NOT NULL DEFAULT 0
+  );
+  INSERT INTO provider_lifecycle_control(
+    id, admission_blocked, owner_id, active_work, updated_at
+  ) VALUES(1, 0, '', 0, 0);
+`;
+
 const CURRENT_SCHEMA_SQL = `
   CREATE TABLE schema_meta(
     id INTEGER PRIMARY KEY CHECK(id=1),
@@ -212,6 +303,7 @@ const CURRENT_SCHEMA_SQL = `
     heartbeat_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL
   );
+  ${PROVIDER_LIFECYCLE_SQL}
 `;
 
 export class LichessStorageError extends Error {
@@ -417,10 +509,18 @@ function schemaVersion(database) {
   }
   const columns = database.prepare("PRAGMA table_info(schema_meta)").all();
   const names = columns.map((column) => column.name);
-  if (names.length !== 1 && (names.length !== 2 || names[0] !== "id" || names[1] !== "version")) {
+  const historicalShape = names.length === 1 && names[0] === "version";
+  const currentShape = names.length === 2 && names[0] === "id" && names[1] === "version";
+  if (!historicalShape && !currentShape) {
     throw storageError("LICHESS_STORAGE_SCHEMA_AUTHORITY_INVALID", "schema_meta has an invalid shape");
   }
-  if (names.length === 1 && names[0] !== "version") {
+  const versionColumn = columns.at(-1);
+  const idColumn = currentShape ? columns[0] : null;
+  if (String(versionColumn.type).toUpperCase() !== "INTEGER"
+      || Number(versionColumn.notnull) !== 1 || Number(versionColumn.pk) !== 0
+      || versionColumn.dflt_value !== null
+      || (idColumn && (String(idColumn.type).toUpperCase() !== "INTEGER"
+        || Number(idColumn.pk) !== 1 || idColumn.dflt_value !== null))) {
     throw storageError("LICHESS_STORAGE_SCHEMA_AUTHORITY_INVALID", "schema_meta has an invalid shape");
   }
   const rows = database.prepare(
@@ -438,7 +538,7 @@ function schemaVersion(database) {
   return rawInteger(rows[0].version, "schema_meta.version");
 }
 
-function expectedTables(version, legacyRateLimit) {
+function expectedTables(version, legacyRateLimit, includeLifecycle = false) {
   const tables = { ...CORE_TABLES, games: version >= 3
     ? [...GAME_COLUMNS_V1, ...GAME_PROVENANCE_COLUMNS]
     : GAME_COLUMNS_V1 };
@@ -453,53 +553,113 @@ function expectedTables(version, legacyRateLimit) {
         : API_LEASE_COLUMNS_V2;
     }
   }
+  if (includeLifecycle) tables.provider_lifecycle_control = PROVIDER_LIFECYCLE_COLUMNS;
   return tables;
 }
 
-function verifyColumns(database, table, expected) {
+function admittedColumnOrders(table, expected, version) {
+  const orders = [expected];
+  if (table === "api_client_leases" && version >= 4) {
+    orders.push([...API_LEASE_COLUMNS_V2, ["process_identity_json", "TEXT", 0]]);
+  } else if (table === "api_safety_state" && version >= 5) {
+    orders.push([...API_SAFETY_COLUMNS_V2, ...API_SAFETY_CHALLENGE_COLUMNS]);
+  }
+  return orders;
+}
+
+function columnsMatch(actual, expected, table) {
+  return actual.length === expected.length && expected.every(
+    ([name, type, primaryKey], position) => {
+      const column = actual[position];
+      const expectedDefault = EXPECTED_COLUMN_DEFAULTS[`${table}.${name}`] ?? null;
+      return column?.name === name && String(column.type).toUpperCase() === type
+        && Number(column.pk) === primaryKey
+        && (primaryKey || Number(column.notnull) === 1)
+        && column.dflt_value === expectedDefault;
+    },
+  );
+}
+
+function verifyColumns(database, table, expected, version) {
   const actual = database.prepare(`PRAGMA table_info("${table}")`).all();
-  if (actual.length !== expected.length) {
-    throw storageError("LICHESS_STORAGE_SCHEMA_MALFORMED", `${table} has unexpected columns`);
-  }
-  const byName = new Map(actual.map((column) => [column.name, column]));
-  expected.forEach(([name, type, primaryKey]) => {
-    const column = byName.get(name);
-    if (!column || column.name !== name || String(column.type).toUpperCase() !== type
-        || Number(column.pk) !== primaryKey
-        || (!primaryKey && Number(column.notnull) !== 1)) {
-      throw storageError("LICHESS_STORAGE_SCHEMA_MALFORMED", `${table}.${name} is malformed`);
-    }
-  });
-}
-
-function verifyIndexes(database) {
-  for (const [name, table, columns] of [
-    ["games_opponent_finished", "games", ["opponent", "finished_at"]],
-    ["challenges_opponent_created", "challenge_attempts", ["opponent", "created_at"]],
-  ]) {
-    const index = database.prepare(
-      "SELECT type, tbl_name FROM sqlite_master WHERE name=?",
-    ).get(name);
-    const actualColumns = database.prepare(`PRAGMA index_info("${name}")`).all()
-      .map((column) => column.name);
-    if (index?.type !== "index" || index.tbl_name !== table
-        || actualColumns.length !== columns.length
-        || actualColumns.some((column, position) => column !== columns[position])) {
-      throw storageError("LICHESS_STORAGE_SCHEMA_MALFORMED", `${name} is malformed`);
-    }
+  if (!admittedColumnOrders(table, expected, version)
+    .some((order) => columnsMatch(actual, order, table))) {
+    throw storageError("LICHESS_STORAGE_SCHEMA_MALFORMED", `${table} has malformed columns`);
   }
 }
 
-function verifyConstraints(database) {
-  for (const [table, fragments] of [
-    ["schema_meta", ["check(id=1)", "check(typeof(version)='integer'andversion>0)", "strict"]],
-    ["reservations", ["check(id=1)", "check(games_remaining>0)"]],
-    ["scheduler_control", ["check(id=1)"]],
-  ]) {
-    const sql = String(database.prepare(
+function expectedIndexes(table, columns) {
+  const indexes = [];
+  const primary = columns.find((column) => column[2] === 1);
+  if (primary && primary[1] !== "INTEGER") {
+    indexes.push({
+      name: `sqlite_autoindex_${table}_1`,
+      unique: 1,
+      origin: "pk",
+      columns: [primary[0]],
+    });
+  }
+  if (table === "games") {
+    indexes.push({
+      name: "games_opponent_finished",
+      unique: 0,
+      origin: "c",
+      columns: ["opponent", "finished_at"],
+    });
+  } else if (table === "challenge_attempts") {
+    indexes.push({
+      name: "challenges_opponent_created",
+      unique: 0,
+      origin: "c",
+      columns: ["opponent", "created_at"],
+    });
+  }
+  return indexes;
+}
+
+function verifyIndexes(database, tables) {
+  for (const [table, columns] of Object.entries(tables)) {
+    const expected = expectedIndexes(table, columns);
+    const actual = database.prepare(`PRAGMA index_list("${table}")`).all();
+    if (actual.length !== expected.length) {
+      throw storageError("LICHESS_STORAGE_SCHEMA_MALFORMED", `${table} has unexpected indexes`);
+    }
+    const byName = new Map(actual.map((index) => [index.name, index]));
+    for (const index of expected) {
+      const admitted = byName.get(index.name);
+      const actualColumns = database.prepare(`PRAGMA index_xinfo("${index.name}")`).all()
+        .filter((column) => Number(column.key) === 1);
+      if (!admitted || Number(admitted.unique) !== index.unique
+          || admitted.origin !== index.origin || Number(admitted.partial) !== 0
+          || actualColumns.length !== index.columns.length
+          || actualColumns.some((column, position) => column.name !== index.columns[position]
+            || Number(column.desc) !== 0 || column.coll !== "BINARY")) {
+        throw storageError("LICHESS_STORAGE_SCHEMA_MALFORMED", `${index.name} is malformed`);
+      }
+    }
+  }
+}
+
+function verifyTableDefinitions(database, tables, { currentMeta }) {
+  for (const table of tables) {
+    const normalized = String(database.prepare(
       "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
     ).get(table)?.sql ?? "").toLocaleLowerCase().replaceAll(/[\s"`\[\]]/gu, "");
-    if (fragments.some((fragment) => !sql.includes(fragment))) {
+    const checks = table === "schema_meta" && currentMeta
+      ? ["check(id=1)", "check(typeof(version)='integer'andversion>0)"]
+      : EXPECTED_CHECKS[table] ?? [];
+    const checkCount = normalized.match(/check\(/gu)?.length ?? 0;
+    const strict = normalized.endsWith("strict");
+    if (!normalized.startsWith(`createtable${table}(`)
+        || checks.some((fragment) => !normalized.includes(fragment))
+        || checkCount !== checks.length
+        || strict !== (table === "schema_meta" && currentMeta)
+        || [
+          "asselect", "autoincrement", "collate", "foreignkey", "generated",
+          "onconflict", "primarykeyasc", "primarykeydesc", "references", "withoutrowid",
+        ]
+          .some((fragment) => normalized.includes(fragment))
+        || database.prepare(`PRAGMA foreign_key_list("${table}")`).all().length !== 0) {
       throw storageError("LICHESS_STORAGE_SCHEMA_MALFORMED", `${table} constraints are malformed`);
     }
   }
@@ -509,32 +669,35 @@ function verifyStoredTypes(database, tables) {
   const booleanColumns = new Set([
     "scheduler_control.paused", "opponents.online", "games.rated",
     "api_safety_state.challenge_half_open", "api_rate_limit.half_open",
+    "provider_lifecycle_control.admission_blocked",
   ]);
   for (const [table, columns] of Object.entries(tables)) {
-    for (const [column, type] of columns) {
+    const invalidPredicates = columns.map(([column, type]) => {
       const quoted = `"${column}"`;
       let predicate = `typeof(${quoted})<>'${type.toLocaleLowerCase()}'`;
       if (type === "INTEGER") {
         predicate += ` OR ${quoted}<0 OR ${quoted}>${Number.MAX_SAFE_INTEGER}`;
         if (booleanColumns.has(`${table}.${column}`)) predicate += ` OR ${quoted} NOT IN (0,1)`;
       }
-      const invalid = database.prepare(
-        `SELECT 1 AS invalid FROM "${table}" WHERE ${predicate} LIMIT 1`,
-      ).get();
-      if (invalid) {
-        throw storageError(
-          "LICHESS_STORAGE_ROW_INVALID",
-          `${table}.${column} contains an invalid SQLite storage value`,
-        );
-      }
+      return `(${predicate})`;
+    });
+    const invalid = database.prepare(
+      `SELECT 1 AS invalid FROM "${table}" WHERE ${invalidPredicates.join(" OR ")} LIMIT 1`,
+    ).get();
+    if (invalid) {
+      throw storageError(
+        "LICHESS_STORAGE_ROW_INVALID",
+        `${table} contains an invalid SQLite storage value`,
+      );
     }
   }
 }
 
-function verifySchema(database, version) {
+function verifySchema(database, version, { requireLifecycle = false } = {}) {
   const hasLegacyRate = tableExists(database, "api_rate_limit");
   const hasSafety = tableExists(database, "api_safety_state");
   const hasLeases = tableExists(database, "api_client_leases");
+  const hasLifecycle = tableExists(database, "provider_lifecycle_control");
   if (version === 2 && hasLegacyRate === hasSafety) {
     throw storageError(
       "LICHESS_STORAGE_SCHEMA_MALFORMED",
@@ -544,7 +707,17 @@ function verifySchema(database, version) {
   if (version >= 3 && (!hasSafety || !hasLeases)) {
     throw storageError("LICHESS_STORAGE_SCHEMA_MALFORMED", "API safety tables are incomplete");
   }
-  const tables = expectedTables(version, version === 2 && hasLegacyRate);
+  if (hasLifecycle && version !== CURRENT_SCHEMA_VERSION) {
+    throw storageError("LICHESS_STORAGE_SCHEMA_MALFORMED", "Lifecycle authority belongs only to schema five");
+  }
+  if (requireLifecycle && !hasLifecycle) {
+    throw storageError("LICHESS_STORAGE_SCHEMA_MALFORMED", "Lifecycle authority is unavailable");
+  }
+  const tables = expectedTables(
+    version,
+    version === 2 && hasLegacyRate,
+    hasLifecycle,
+  );
   const expectedObjects = new Set([
     "schema_meta",
     ...Object.keys(tables),
@@ -557,25 +730,25 @@ function verifySchema(database, version) {
       || [...expectedObjects].some((name) => !objects.some((object) => object.name === name))) {
     throw storageError("LICHESS_STORAGE_SCHEMA_MALFORMED", "SQLite objects do not match the admitted version");
   }
-  for (const [table, columns] of Object.entries(tables)) verifyColumns(database, table, columns);
-  if (version >= 3 && hasLegacyRate) verifyColumns(database, "api_rate_limit", LEGACY_RATE_LIMIT_COLUMNS);
-  verifyIndexes(database);
+  for (const [table, columns] of Object.entries(tables)) {
+    verifyColumns(database, table, columns, version);
+  }
+  if (version >= 3 && hasLegacyRate) {
+    verifyColumns(database, "api_rate_limit", LEGACY_RATE_LIMIT_COLUMNS, version);
+  }
   const metaColumns = database.prepare("PRAGMA table_info(schema_meta)").all()
     .map((column) => column.name);
-  if (metaColumns.length === 2) verifyConstraints(database);
-  else {
-    for (const table of ["reservations", "scheduler_control"]) {
-      const sql = String(database.prepare(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
-      ).get(table)?.sql ?? "").toLocaleLowerCase().replaceAll(/[\s"`\[\]]/gu, "");
-      const required = table === "reservations"
-        ? ["check(id=1)", "check(games_remaining>0)"]
-        : ["check(id=1)"];
-      if (required.some((fragment) => !sql.includes(fragment))) {
-        throw storageError("LICHESS_STORAGE_SCHEMA_MALFORMED", `${table} constraints are malformed`);
-      }
-    }
-  }
+  const admittedTables = {
+    schema_meta: metaColumns.length === 2
+      ? [["id", "INTEGER", 1], ["version", "INTEGER", 0]]
+      : [["version", "INTEGER", 0]],
+    ...tables,
+  };
+  if (version >= 3 && hasLegacyRate) admittedTables.api_rate_limit = LEGACY_RATE_LIMIT_COLUMNS;
+  verifyIndexes(database, admittedTables);
+  verifyTableDefinitions(database, Object.keys(admittedTables), {
+    currentMeta: metaColumns.length === 2,
+  });
   verifyStoredTypes(database, tables);
   if (version >= 3 && hasLegacyRate) {
     verifyStoredTypes(database, { api_rate_limit: LEGACY_RATE_LIMIT_COLUMNS });
@@ -596,7 +769,17 @@ function verifySchema(database, version) {
   if (controlRows.length !== 1 || controlRows[0].id !== 1n) {
     throw storageError("LICHESS_STORAGE_ROW_INVALID", "scheduler_control singleton is invalid");
   }
-  return { hasLegacyRate };
+  if (hasLifecycle) {
+    const lifecycleRows = database.prepare(
+      "SELECT id, owner_id FROM provider_lifecycle_control",
+    ).all();
+    if (lifecycleRows.length !== 1 || lifecycleRows[0].id !== 1n
+        || (lifecycleRows[0].owner_id !== ""
+          && !/^[A-Za-z0-9-]{1,128}$/u.test(lifecycleRows[0].owner_id))) {
+      throw storageError("LICHESS_STORAGE_ROW_INVALID", "provider lifecycle singleton is invalid");
+    }
+  }
+  return { hasLegacyRate, hasLifecycle };
 }
 
 function createApiV2(database) {
@@ -666,6 +849,9 @@ function migrateDatabase(database, initialVersion, { hasLegacyRate }) {
         updated_at=MAX(api_safety_state.updated_at, excluded.updated_at);
       DROP TABLE api_rate_limit;
     `);
+  }
+  if (version === CURRENT_SCHEMA_VERSION && !tableExists(database, "provider_lifecycle_control")) {
+    database.exec(PROVIDER_LIFECYCLE_SQL);
   }
   return version;
 }
@@ -738,7 +924,7 @@ function initializeOrMigrate(database, empty, failureInjector) {
     if (finalVersion !== CURRENT_SCHEMA_VERSION) {
       throw storageError("LICHESS_STORAGE_SCHEMA_UNSUPPORTED", "SQLite migration did not reach the current schema");
     }
-    verifySchema(database, finalVersion);
+    verifySchema(database, finalVersion, { requireLifecycle: true });
     const quickCheck = database.prepare("PRAGMA quick_check").get()?.quick_check;
     if (quickCheck !== "ok") {
       throw storageError("LICHESS_STORAGE_INTEGRITY_FAILED", "SQLite quick_check rejected the database");
@@ -756,8 +942,8 @@ function initializeOrMigrate(database, empty, failureInjector) {
     }
     if (rollbackError) {
       throw storageError(
-        "LICHESS_STORAGE_OPERATION_AND_ROLLBACK_FAILED",
-        "SQLite initialization and rollback both failed",
+        "LICHESS_STORAGE_OPERATION_AND_RECOVERY_FAILED",
+        "SQLite initialization and transaction recovery both failed",
         error,
       );
     }

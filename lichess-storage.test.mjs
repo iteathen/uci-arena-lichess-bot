@@ -29,7 +29,7 @@ function initializedDatabase(prefix) {
 
 function replaceSchemaMeta(file, values) {
   const database = new DatabaseSync(file);
-  database.exec("DROP TABLE schema_meta; CREATE TABLE schema_meta(version);");
+  database.exec("DROP TABLE schema_meta; CREATE TABLE schema_meta(version INTEGER NOT NULL);");
   const insert = database.prepare("INSERT INTO schema_meta(version) VALUES(?)");
   for (const value of values) insert.run(value);
   database.close();
@@ -107,6 +107,99 @@ test("unversioned nonempty and malformed migration authorities are rejected", ()
       (error) => error.code === "LICHESS_STORAGE_SCHEMA_AUTHORITY_INVALID",
     );
   }
+
+  const wrongDeclaration = initializedDatabase("uci-arena-storage-meta-declaration-");
+  const declared = new DatabaseSync(wrongDeclaration);
+  declared.exec(`
+    DROP TABLE schema_meta;
+    CREATE TABLE schema_meta(version TEXT NOT NULL);
+    INSERT INTO schema_meta(version) VALUES('5');
+  `);
+  declared.close();
+  assert.throws(
+    () => new LichessStore(wrongDeclaration),
+    (error) => error.code === "LICHESS_STORAGE_SCHEMA_AUTHORITY_INVALID",
+  );
+});
+
+test("schema-five lifecycle extension migrates exactly and preserves admitted authority", () => {
+  const legacyFile = initializedDatabase("uci-arena-storage-lifecycle-legacy-");
+  const legacy = new DatabaseSync(legacyFile);
+  legacy.exec("DROP TABLE provider_lifecycle_control");
+  legacy.close();
+  const migrated = new LichessStore(legacyFile);
+  try {
+    assert.deepEqual(migrated.providerLifecycleSnapshot(), {
+      admissionBlocked: false,
+      owned: false,
+      activeWork: 0,
+      updatedAt: 0,
+    });
+  } finally {
+    migrated.close();
+  }
+
+  const retainedFile = initializedDatabase("uci-arena-storage-lifecycle-retained-");
+  const retained = new DatabaseSync(retainedFile);
+  retained.exec(`
+    UPDATE provider_lifecycle_control
+    SET admission_blocked=1, owner_id='retained-owner', active_work=2, updated_at=99
+    WHERE id=1
+  `);
+  retained.close();
+  const reopened = new LichessStore(retainedFile);
+  try {
+    assert.deepEqual(reopened.providerLifecycleSnapshot(), {
+      admissionBlocked: true,
+      owned: true,
+      activeWork: 2,
+      updatedAt: 99,
+    });
+  } finally {
+    reopened.close();
+  }
+});
+
+test("malformed schema-five lifecycle extensions fail closed", () => {
+  const file = initializedDatabase("uci-arena-storage-lifecycle-malformed-");
+  const database = new DatabaseSync(file);
+  database.exec(`
+    DROP TABLE provider_lifecycle_control;
+    CREATE TABLE provider_lifecycle_control(
+      id INTEGER PRIMARY KEY,
+      admission_blocked INTEGER NOT NULL,
+      owner_id TEXT NOT NULL,
+      active_work INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    INSERT INTO provider_lifecycle_control VALUES(1, 0, '', 0, 0);
+  `);
+  database.close();
+  assert.throws(
+    () => new LichessStore(file),
+    (error) => error.code === "LICHESS_STORAGE_SCHEMA_MALFORMED",
+  );
+
+  const reorderedFile = initializedDatabase("uci-arena-storage-lifecycle-reordered-");
+  const reordered = new DatabaseSync(reorderedFile);
+  reordered.exec(`
+    DROP TABLE provider_lifecycle_control;
+    CREATE TABLE provider_lifecycle_control(
+      id INTEGER PRIMARY KEY CHECK(id=1),
+      owner_id TEXT NOT NULL DEFAULT '',
+      admission_blocked INTEGER NOT NULL DEFAULT 0 CHECK(admission_blocked IN (0, 1)),
+      active_work INTEGER NOT NULL DEFAULT 0 CHECK(active_work >= 0),
+      updated_at INTEGER NOT NULL DEFAULT 0
+    );
+    INSERT INTO provider_lifecycle_control(
+      id, owner_id, admission_blocked, active_work, updated_at
+    ) VALUES(1, '', 0, 0, 0);
+  `);
+  reordered.close();
+  assert.throws(
+    () => new LichessStore(reorderedFile),
+    (error) => error.code === "LICHESS_STORAGE_SCHEMA_MALFORMED",
+  );
 });
 
 test("wrong SQLite storage classes and unsafe integer rows fail before projection", () => {
@@ -140,6 +233,10 @@ test("caller integers are exact and never accept strings or reals", () => {
     );
     assert.throws(
       () => store.reserve("owner", 2.5, 15),
+      (error) => error.code === "LICHESS_STORAGE_INTEGER_INVALID",
+    );
+    assert.throws(
+      () => store.requestProviderReplacement("1", { allowUnowned: true }),
       (error) => error.code === "LICHESS_STORAGE_INTEGER_INVALID",
     );
     assert.equal(store.getReservation(), null);

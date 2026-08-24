@@ -229,18 +229,35 @@ export async function queryLinuxStartup(options = {}) {
   requireLinux();
   const unitPath = startupUnitPath(options);
   if (!exactRegularFileExistsSync(unitPath, "Lichess systemd unit")) {
-    return { installed: false, unitName: SYSTEMD_UNIT_NAME, unitPath };
+    return classifyLinuxStartup({ installed: false, unitName: SYSTEMD_UNIT_NAME, unitPath });
   }
   const [enabled, active] = await Promise.all([
     systemctlState("is-enabled"),
     systemctlState("is-active"),
   ]);
-  return {
+  return classifyLinuxStartup({
     installed: true,
     unitName: SYSTEMD_UNIT_NAME,
     unitPath,
     enabled,
     active,
+  });
+}
+
+export function classifyLinuxStartup(startup) {
+  const supervisionState = !startup.installed
+    ? "unregistered"
+    : startup.enabled !== "enabled"
+      ? "disabled"
+      : startup.active === "active"
+        ? "active"
+        : new Set(["activating", "reloading"]).has(startup.active)
+          ? "restart_pending"
+          : "inactive";
+  return {
+    ...startup,
+    supervisionState,
+    restartPending: supervisionState === "restart_pending",
   };
 }
 

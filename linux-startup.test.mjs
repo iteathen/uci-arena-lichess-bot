@@ -5,6 +5,7 @@ import test from "node:test";
 import {
   SYSTEMD_UNIT_NAME,
   buildSystemdUnit,
+  classifyLinuxStartup,
   parseSystemdArguments,
   recoverLinuxStartup,
   reconcileSystemdUnit,
@@ -48,6 +49,21 @@ test("Linux startup recovery starts only the existing enabled user unit", async 
     systemctlImpl: async () => calls.push("unexpected"),
   }), /disabled/);
   assert.equal(calls.length, 1);
+});
+
+test("Linux startup projection distinguishes active, pending, disabled, and absent supervision", () => {
+  assert.equal(classifyLinuxStartup({ installed: false }).supervisionState, "unregistered");
+  assert.equal(classifyLinuxStartup({
+    installed: true, enabled: "enabled", active: "active",
+  }).supervisionState, "active");
+  const pending = classifyLinuxStartup({
+    installed: true, enabled: "enabled", active: "activating",
+  });
+  assert.equal(pending.supervisionState, "restart_pending");
+  assert.equal(pending.restartPending, true);
+  assert.equal(classifyLinuxStartup({
+    installed: true, enabled: "disabled", active: "inactive",
+  }).supervisionState, "disabled");
 });
 
 test("Linux startup action runs the foreground adapter with path-only credential input", () => {

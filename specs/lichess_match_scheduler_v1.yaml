@@ -29,6 +29,37 @@ authority:
     - "Token contents never enter configuration, SQLite, logs, metadata, argv, or child environments."
     - "Every local installation supplies its own operator-owned token file outside the repository and immutable installed component roots. No release or test credential is bundled."
 
+provider_replacement_interlock_2026_08_23:
+  status: active
+  owner: provider_scheduler_and_durable_runtime_store
+  lifecycle_operation: pre_replace
+  purpose: >
+    Refuse component or dependency replacement while provider-owned game,
+    challenge-admission, or reconciliation work could be interrupted, without
+    transferring Lichess or scheduler semantics to Installer.
+  contract:
+    - "The existing neutral pre_replace lifecycle operation is the only replacement-quiescence port. No game-specific Installer operation, disposition, callback, or filesystem inspection is introduced."
+    - "The provider owns one durable admission gate in its existing matches.sqlite authority. Every preparing, pending, cancelling, or active slot holds provider-work authority from before its first external challenge mutation until exact generation-owned release; startup reconciliation holds the same authority until every observed remote game is either admitted or rejected."
+    - "Provider-work admission and gate closure serialize through one immediate store transaction. If admission wins, pre_replace observes active work and fails without closing the gate. If pre_replace wins, later work admission fails before engine startup or a Lichess challenge mutation."
+    - "Pre_replace may report replacement-ready only when the gate is closed, active provider work is zero, no unfinished durable game remains unresolved, and the running provider implements the exact interlock contract."
+    - "Active, unresolved, legacy-uncoordinated, malformed, or unavailable interlock evidence returns one bounded provider-owned failure reason. Installer treats that reason as opaque and performs no provider-specific branch."
+    - "A failed active-work check leaves the current process, engine children, games, startup registration, and open admission gate unchanged. It never disables supervision, stops a process, retargets a root, or aborts a game. A later safe retry is permitted."
+    - "After successful gate closure, startup control may disable restart, stop the now-idle exact owned process tree, and retarget the registration. Failure during that platform transition reopens admission before returning when the current provider remains authoritative."
+    - "Post-replacement resume reopens admission only through provider-owned lifecycle code. A blocked provider process cannot clear the gate merely by restarting, so a restart race cannot invalidate successful pre_replace evidence."
+    - "The gate, work count, lifecycle owner, and failure observations are credential-free. No lifecycle path reads, hashes, copies, validates, logs, or returns token contents."
+  migration:
+    store_schema_base: 5
+    compatible_extension: provider_lifecycle_control
+    rules:
+      - "Migration creates one additive closed-shape provider lifecycle control row while retaining base schema 5, so the prior provider version may ignore the extension and restart after an unsuccessful staged update. Every prior scheduler, game, challenge, cooldown, lease, and provenance row is preserved."
+      - "A pre-interlock provider is not assumed safe: missing exact lifecycle ownership fails closed unless platform authority already proves the registration explicitly disabled and inactive. An active or restart-enabled legacy registration cannot race staged replacement."
+      - "A newly claimed run authority may discard stale in-memory work counts only after the existing single-client lease proves exclusive process ownership; it never clears an outstanding replacement gate."
+  validation:
+    - "A live-session fixture invokes pre_replace, receives the active-work failure, observes no platform-control call, and proves the same game task, slot generation, and engine remain active until normal terminal completion."
+    - "Transaction tests prove both race orders: admitted work blocks replacement, while closed replacement admission blocks new work before external mutation."
+    - "Idle, repeated, legacy-uncoordinated, stale-owner, unfinished-game, platform-failure compensation, and post-replacement resume cases fail closed or converge as declared."
+    - "Windows and Linux startup tests prove no disable, stop, delete, retarget, or enable action occurs after an unsafe interlock result."
+
 local_api_simulator:
   implementation: fake-api-server.mjs
   network: loopback_only_ephemeral_port
@@ -344,6 +375,8 @@ sqlite_storage_foundation_2026_08_24:
     rules:
       - "A valid empty SQLite database initializes in one exclusive transaction. A nonempty database must contain exactly one typed supported schema authority before any table creation or repair."
       - "Versions one through five are admitted only after exact table, column, primary-key, constraint, named-index, object-set, SQLite storage-class, boolean-domain, nonnegative-domain, and JavaScript-safe-integer verification for that historical version."
+      - "Schema five admits exactly two known object sets: the base schema used before the provider lifecycle interlock and that same base plus the exact provider_lifecycle_control extension. Initialization adds the extension transactionally when absent, preserves an admitted existing singleton when present, and requires the extended object set at final verification without changing the base schema version."
+      - "The prior ALTER migrations' append-order layouts for the schema-four lease identity column and schema-five challenge-safety columns, plus the corresponding fresh-create layouts, are the only admitted column-order variants. Arbitrary column reordering remains malformed."
       - "Known version-two legacy rate-limit authority is a named migration variant. Unknown, missing, duplicate, partial, malformed, or ambiguous authority is rejected rather than repaired."
       - "Every migration step and final quick_check executes inside the same exclusive transaction. Failure rolls back all DDL and data changes, closes the connection, and leaves deterministic retry authority."
       - "The final schema_meta table is one STRICT singleton keyed by id=1 with one positive INTEGER version. Historical loose metadata is rebuilt only after its exact single row has been admitted."
@@ -353,10 +386,11 @@ sqlite_storage_foundation_2026_08_24:
       - "The connection reads integers as BigInt. One typed projection owner converts only safe BigInt values to Number; strings, reals, negative values, overflow, unsafe BigInt values, and fallback coercion never become domain authority."
       - "Caller-supplied counts, durations, timestamps, PIDs, clocks, topology values, limits, and plies require exact finite safe integers with explicit bounds. Numeric strings and reals are rejected."
   transactions:
-    - "Reservation consumption, challenge state plus counters/cooldown, API lease acquisition, online-opponent replacement, and game activation use the provider immediate-transaction owner with exact pre/post path authority and rollback that preserves the primary error."
+    - "Reservation consumption, challenge state plus counters/cooldown, API lease acquisition, online-opponent replacement, game activation, and provider lifecycle gate/work mutations use the provider immediate-transaction owner with exact pre/post path authority and rollback that preserves the primary error."
+    - "If rollback or the required post-rollback path revalidation also fails, the boundary returns LICHESS_STORAGE_OPERATION_AND_RECOVERY_FAILED with a bounded path-free detail and retains the primary operation error as its cause."
     - "Historical backfill uses the same exact pre/post authority while retaining its intentional dry-run rollback contract."
   validation:
-    - "Fixtures cover database/ancestor/WAL/SHM link and type failures where the host exposes them, orphan sidecars, valid empty initialization, unversioned nonempty storage, duplicate/unknown/wrong-type authority, partial schema, wrong storage classes, negative and unsafe integers, pragma refusal, injected migration failure and retry, abrupt process exit rollback, and WAL reopening."
+    - "Fixtures cover database/ancestor/WAL/SHM link and type failures where the host exposes them, orphan sidecars, valid empty initialization, unversioned nonempty storage, duplicate/unknown/wrong-type authority, partial schema, exact lifecycle-extension migration and rejection, wrong storage classes, negative and unsafe integers, pragma refusal, injected migration failure and retry, abrupt process exit rollback, and WAL reopening."
 
 planned_provider_resilience_and_incidents_2026_08_23:
   status: approved_plan_not_runtime_authoritative
@@ -619,7 +653,7 @@ windows_supervision:
     - "Startup registration may persist only the token-file path, never token contents, and must validate engine/capacity evidence before registration."
     - "Uninstall first disables restart, then invokes the staged native supervisor to terminate and wait for every process in the exact receipt-owned launcher tree. It additionally polls Task Scheduler until the GUI launcher is no longer running. Only after both proofs may it delete the task and startup evidence."
     - "A missing task is idempotent success. Access denial, an unknown task state, or failure to reach stopped and deleted states within the bounded deadline fails closed and preserves the provider payload for retry."
-    - "Startup-control v2 exposes credential-free pre_replace and post_replace actions. Before any receipt-owned dependency root can change, the staged provider disables restart, terminates and waits for the exact prior launcher process tree, retargets the existing startup definition from the exact receipt-owned root to the exact replacement root without reading credential contents, and leaves it disabled until the installed replacement explicitly resumes it."
+    - "Startup-control v2 exposes credential-free pre_replace and post_replace actions. Before any receipt-owned dependency root can change, the staged provider first closes the provider-owned transactional admission gate and proves zero active or unresolved provider work; only then does it disable restart, terminate and wait for the exact prior launcher process tree, retarget the existing startup definition from the exact receipt-owned root to the exact replacement root without reading credential contents, and leave it disabled until the installed replacement explicitly resumes it."
     - "Pre-replacement rewrites only validated component-root references, preserves the external token-file path and other arguments, and requires a stopped disabled task before payload replacement. Linux applies the equivalent bounded rewrite to the user unit. Before explicit post-replacement resume, the provider validates current configuration and exact single-game, timing, temporal-curve, capacity, model, book, and tablebase authorities, then rebuilds every non-secret task or unit argument from those current bindings. Only the existing external token-file path and expected account are preserved from the disabled registration; an unknown action shape or any missing/current-evidence mismatch fails before enablement. Post-replacement normally proves the provider remains active and ready throughout a bounded stability window. When credential-free validation proves the selected single-game profile, model/checkpoint, search topology, tablebase, and temporal-curve authorities still match and only the exact Engine executable fingerprint differs, startup instead leaves the retargeted registration disabled and returns installed true, active false, and requalificationRequired true with a closed reason code. Installed requalification must then prove that the selected timing profile remains semantically compatible before it can publish exact replacement evidence or enable the provider. Other configuration, model, timing, book, tablebase, capacity, task-control, or readiness failures remain fatal."
     - "A fresh active replacement that owns the authoritative local API lease and is intentionally waiting for an unexpired durable global API cooldown is stable replacement authority even though providerReady remains false. Post-replacement reports the cooldown deferral explicitly, never clears or shortens the cooldown, and continues supervised startup; stale status, reconciliation, a lease conflict, scheduler failure, or an ordinary disconnected stream remains fatal."
     - "Installed qualification is permitted while that exact retargeted startup registration is explicitly disabled and inactive; an enabled, active, or ambiguously reported registration still blocks qualification. Successful qualification does not silently start the provider: the new exact single-game and capacity outputs must enter through Installer locators and configuration reconciliation before explicit post-replacement resume."
@@ -982,6 +1016,40 @@ protected_live_acceptance_2026_07_26:
     - "Mock API tests cover correct identities, wrong/non-BOT/offline targets, and unrelated active games."
     - "Mock process/event tests prove the confirmation gate, attempt cap, wall-clock cap, target-only completion requirement, and fail-closed rerun result."
     - "Tests never read a token file or contact Lichess."
+
+provider_exit_supervision_contract_2026_08_23:
+  status: active
+  owner: lichess_provider_startup_and_native_launcher
+  purpose: >
+    Recover one provider authority after an unexpected exit while preserving
+    bounded durable evidence that remains useful after the replacement process
+    starts.
+  windows:
+    registration: per_user_task_scheduler
+    multiple_instances: IgnoreNew
+    retry_interval_seconds: 60
+    rules:
+      - "The one provider-owned logon trigger repeats every minute without a duration. IgnoreNew prevents a repetition from creating a concurrent launcher while the prior instance is active."
+      - "RestartOnFailure retains the same one-minute interval as immediate scheduler evidence; logon repetition supplies indefinite recovery after the bounded native restart count."
+      - "Install and post-requalification reconciliation upgrade legacy owned task XML idempotently. They reject duplicate trigger, settings, repetition, multiple-instance, or restart policy blocks rather than guessing ownership."
+      - "Replacement and uninstall disable the task before terminating the exact owned launcher tree, so an intentional operator shutdown cannot enter the repetition loop."
+      - "The native GUI launcher records the exact child PID plus Windows creation-time identity, child start/exit UTC timestamps, the full unsigned 32-bit exit code, disposition, and restart eligibility. Exit zero is clean and expected; every nonzero child exit is unexpected and restart-eligible."
+      - "The receipt is a closed JSON document atomically replaced through one private same-directory temporary file after exact non-reparse directory admission. Receipt publication failure returns launcher code 71 so Task Scheduler state cannot silently claim the child result was durably recorded."
+      - "The receipt never contains arguments, commands, paths, environment values, credentials, headers, or child output."
+      - "Startup status validates the bounded receipt before projection and distinguishes active, restart_pending, clean_stopped, disabled, inactive, and unregistered supervision. A malformed, unsafe, oversized, or unwritable receipt remains a closed error code."
+  linux:
+    service_restart: on-failure
+    restart_seconds: 60
+    rules:
+      - "The existing systemd user service remains the sole Linux startup authority and never introduces a second watchdog."
+      - "Startup status distinguishes active, restart_pending, disabled, inactive, and unregistered service state."
+  provider_status_v3_compatibility:
+    - "The credential-free provider status operation retains its closed v3 schema and maps failed receipt publication, pending recovery, abnormal last exit, and enabled inactive registration to bounded blocker codes."
+    - "Additive supervision and incident summaries in the main status document require the separately planned v4 contract; this contract does not add undeclared v3 fields."
+  validation:
+    - "Tests cover 0xC0000409 as unsigned 3221226505, signed and hexadecimal Task Scheduler result parsing, strict receipt shape and disposition checks, legacy task upgrade idempotence, receipt-write failure, clean stop, pending restart, and active recovery."
+    - "The Windows native launcher is compiled with warnings enabled; its probe declares atomic receipt support, and an actual nonzero child exit produces the expected atomically published receipt without sensitive fields."
+    - "No validation reads a credential or contacts Lichess."
 
 manager_account_and_options_contract_2026_07_31:
   status: active

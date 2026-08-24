@@ -72,6 +72,30 @@ export class LichessStore {
     this.storage.close();
   }
 
+  failOwnedTransaction(primaryError) {
+    let recoveryFailed = false;
+    if (this.db.isTransaction) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        recoveryFailed = true;
+      }
+    }
+    try {
+      this.storage.assertPaths();
+    } catch {
+      recoveryFailed = true;
+    }
+    if (recoveryFailed) {
+      throw new LichessStorageError(
+        "LICHESS_STORAGE_OPERATION_AND_RECOVERY_FAILED",
+        "Lichess storage operation and transaction recovery both failed",
+        primaryError,
+      );
+    }
+    throw primaryError;
+  }
+
   withImmediateTransaction(operation) {
     this.storage.assertPaths();
     this.db.exec("BEGIN IMMEDIATE");
@@ -81,18 +105,7 @@ export class LichessStore {
       this.storage.assertPaths();
       return result;
     } catch (error) {
-      if (this.db.isTransaction) {
-        try {
-          this.db.exec("ROLLBACK");
-        } catch {
-          throw new LichessStorageError(
-            "LICHESS_STORAGE_OPERATION_AND_ROLLBACK_FAILED",
-            "Lichess storage operation and rollback both failed",
-            error,
-          );
-        }
-      }
-      throw error;
+      this.failOwnedTransaction(error);
     }
   }
 
@@ -264,6 +277,200 @@ export class LichessStore {
       paused: control.paused,
       reservation: control.reservation ? { ...control.reservation } : null,
     };
+  }
+
+  claimProviderLifecycle(ownerId, now = Date.now()) {
+    const owner = String(ownerId ?? "");
+    if (!/^[A-Za-z0-9-]{1,128}$/u.test(owner)) {
+      throw new Error("Provider lifecycle owner id is invalid");
+    }
+    now = safeInteger(now, "provider lifecycle claim timestamp");
+    return this.withImmediateTransaction(() => {
+      const control = this.db.prepare(`
+        SELECT admission_blocked, owner_id, active_work
+        FROM provider_lifecycle_control WHERE id=1
+      `).get();
+      if (!control || control.admission_blocked) {
+        const error = new Error("Provider admission is blocked for replacement");
+        error.code = "LICHESS_PROVIDER_REPLACEMENT_BLOCKED";
+        throw error;
+      }
+      const exactLease = this.db.prepare(`
+        SELECT 1 AS present FROM api_client_leases
+        WHERE owner_id=? AND expires_at>?
+      `).get(owner, now);
+      const conflictingLease = this.db.prepare(`
+        SELECT 1 AS present FROM api_client_leases
+        WHERE owner_id<>? AND expires_at>? LIMIT 1
+      `).get(owner, now);
+      if (!exactLease || conflictingLease) {
+        const error = new Error("Provider lifecycle claim lacks exclusive API authority");
+        error.code = "LICHESS_PROVIDER_LIFECYCLE_AUTHORITY_INVALID";
+        throw error;
+      }
+      if (control.owner_id && control.owner_id !== owner) {
+        const priorLease = this.db.prepare(`
+          SELECT 1 AS present FROM api_client_leases
+          WHERE owner_id=? AND expires_at>?
+        `).get(control.owner_id, now);
+        if (priorLease) {
+          const error = new Error("Provider lifecycle authority is already active");
+          error.code = "LICHESS_PROVIDER_LIFECYCLE_HELD";
+          throw error;
+        }
+      }
+      this.db.prepare(`
+        UPDATE provider_lifecycle_control
+        SET owner_id=?, active_work=0, updated_at=? WHERE id=1
+      `).run(owner, now);
+      return Object.freeze({ admissionBlocked: false, activeWork: 0 });
+    });
+  }
+
+  releaseProviderLifecycle(ownerId, now = Date.now()) {
+    const owner = String(ownerId ?? "");
+    now = safeInteger(now, "provider lifecycle release timestamp");
+    return this.withImmediateTransaction(() => {
+      const result = this.db.prepare(`
+        UPDATE provider_lifecycle_control SET owner_id='', updated_at=?
+        WHERE id=1 AND owner_id=? AND active_work=0
+      `).run(now, owner);
+      return result.changes > 0;
+    });
+  }
+
+  beginProviderWork(ownerId, now = Date.now()) {
+    const owner = String(ownerId ?? "");
+    now = safeInteger(now, "provider work admission timestamp");
+    return this.withImmediateTransaction(() => {
+      const control = this.db.prepare(`
+        SELECT admission_blocked, owner_id, active_work
+        FROM provider_lifecycle_control WHERE id=1
+      `).get();
+      if (!control || control.admission_blocked || control.owner_id !== owner) {
+        const error = new Error("Provider work admission is blocked or unowned");
+        error.code = control?.admission_blocked
+          ? "LICHESS_PROVIDER_REPLACEMENT_BLOCKED"
+          : "LICHESS_PROVIDER_LIFECYCLE_AUTHORITY_INVALID";
+        throw error;
+      }
+      const activeWork = safeInteger(
+        control.active_work + 1,
+        "provider active work count",
+        { minimum: 1 },
+      );
+      this.db.prepare(`
+        UPDATE provider_lifecycle_control SET active_work=?, updated_at=? WHERE id=1
+      `).run(activeWork, now);
+      return Object.freeze({ ownerId: owner, activeWork });
+    });
+  }
+
+  finishProviderWork(ownerId, now = Date.now()) {
+    const owner = String(ownerId ?? "");
+    now = safeInteger(now, "provider work release timestamp");
+    return this.withImmediateTransaction(() => {
+      const control = this.db.prepare(`
+        SELECT owner_id, active_work FROM provider_lifecycle_control WHERE id=1
+      `).get();
+      if (!control || control.owner_id !== owner || control.active_work < 1) {
+        const error = new Error("Provider work release does not own active authority");
+        error.code = "LICHESS_PROVIDER_WORK_RELEASE_INVALID";
+        throw error;
+      }
+      const activeWork = control.active_work - 1;
+      this.db.prepare(`
+        UPDATE provider_lifecycle_control SET active_work=?, updated_at=? WHERE id=1
+      `).run(activeWork, now);
+      return activeWork;
+    });
+  }
+
+  requestProviderReplacement(now = Date.now(), { allowUnowned = false } = {}) {
+    now = safeInteger(now, "provider replacement timestamp");
+    return this.withImmediateTransaction(() => {
+      const control = this.db.prepare(`
+        SELECT admission_blocked, owner_id, active_work
+        FROM provider_lifecycle_control WHERE id=1
+      `).get();
+      const unfinishedGames = this.db.prepare(`
+        SELECT COUNT(*) AS count FROM games WHERE finished_at=0
+      `).get().count;
+      const activeWork = control?.active_work ?? 0;
+      const activeLeases = this.db.prepare(`
+        SELECT COUNT(*) AS count FROM api_client_leases WHERE expires_at>?
+      `).get(now).count;
+      const ownerLease = control?.owner_id
+        ? this.db.prepare(`
+            SELECT 1 AS present FROM api_client_leases
+            WHERE owner_id=? AND expires_at>?
+          `).get(control.owner_id, now)
+        : null;
+      let reason = null;
+      if (!control) reason = "provider_lifecycle_interlock_unavailable";
+      else if (activeWork > 0 || unfinishedGames > 0) reason = "provider_owned_work_active";
+      else if ((activeLeases > 0 && !ownerLease)
+          || (!control.owner_id && !control.admission_blocked && !allowUnowned)) {
+        reason = "provider_lifecycle_interlock_unavailable";
+      }
+      if (reason) {
+        return Object.freeze({
+          safe: false,
+          reason,
+          activeWork,
+          unfinishedGames,
+          admissionBlocked: Boolean(control?.admission_blocked),
+        });
+      }
+      if (!control.admission_blocked) {
+        this.db.prepare(`
+          UPDATE provider_lifecycle_control
+          SET admission_blocked=1, updated_at=? WHERE id=1
+        `).run(now);
+      }
+      return Object.freeze({
+        safe: true,
+        reason: null,
+        activeWork: 0,
+        unfinishedGames: 0,
+        admissionBlocked: true,
+      });
+    });
+  }
+
+  resumeProviderAdmissions(now = Date.now()) {
+    now = safeInteger(now, "provider admission resume timestamp");
+    return this.withImmediateTransaction(() => {
+      const control = this.db.prepare(`
+        SELECT active_work FROM provider_lifecycle_control WHERE id=1
+      `).get();
+      const unfinishedGames = this.db.prepare(`
+        SELECT COUNT(*) AS count FROM games WHERE finished_at=0
+      `).get().count;
+      if (!control || control.active_work !== 0 || unfinishedGames !== 0) {
+        const error = new Error("Provider admission cannot resume with unresolved work");
+        error.code = "LICHESS_PROVIDER_WORK_UNRESOLVED";
+        throw error;
+      }
+      this.db.prepare(`
+        UPDATE provider_lifecycle_control
+        SET admission_blocked=0, owner_id='', updated_at=? WHERE id=1
+      `).run(now);
+      return Object.freeze({ admissionBlocked: false, activeWork: 0 });
+    });
+  }
+
+  providerLifecycleSnapshot() {
+    const row = this.db.prepare(`
+      SELECT admission_blocked, owner_id, active_work, updated_at
+      FROM provider_lifecycle_control WHERE id=1
+    `).get();
+    return Object.freeze({
+      admissionBlocked: Boolean(row?.admission_blocked),
+      owned: Boolean(row?.owner_id),
+      activeWork: row?.active_work ?? 0,
+      updatedAt: row?.updated_at ?? 0,
+    });
   }
 
   apiSafetyState(key) {
@@ -931,8 +1138,7 @@ export class LichessStore {
       this.storage.assertPaths();
       return reports;
     } catch (error) {
-      if (this.db.isTransaction) this.db.exec("ROLLBACK");
-      throw error;
+      this.failOwnedTransaction(error);
     }
   }
 

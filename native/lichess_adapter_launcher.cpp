@@ -1,9 +1,13 @@
 #include <windows.h>
+#include <bcrypt.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
 
 #include <algorithm>
+#include <array>
+#include <iomanip>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -12,12 +16,16 @@
 namespace {
 
 constexpr DWORD launcher_error = 70;
+constexpr DWORD receipt_error = 71;
 constexpr DWORD owned_tree_exit = ERROR_CANCELLED;
 
 struct process_record {
     DWORD process_id;
     DWORD parent_process_id;
 };
+
+std::optional<std::wstring> normalized_path(std::wstring_view value);
+bool same_path(std::wstring_view left, std::wstring_view right);
 
 std::vector<std::wstring> command_line_arguments() {
     int count = 0;
@@ -64,11 +72,144 @@ std::wstring child_command_line(const std::vector<std::wstring>& arguments) {
 void write_probe() {
     constexpr std::string_view message =
         "{\"schema\":\"uci_arena_lichess_launcher_probe_v1\","
-        "\"windows_gui_subsystem\":true,\"create_no_window\":true}\n";
+        "\"windows_gui_subsystem\":true,\"create_no_window\":true,"
+        "\"atomic_exit_receipt\":true,"
+        "\"exit_receipt_schema\":\"uci_arena_lichess_exit_receipt_v1\"}\n";
     const auto output = GetStdHandle(STD_OUTPUT_HANDLE);
     if (output == nullptr || output == INVALID_HANDLE_VALUE) return;
     DWORD written = 0;
     WriteFile(output, message.data(), static_cast<DWORD>(message.size()), &written, nullptr);
+}
+
+std::optional<std::wstring> runtime_directory(const std::vector<std::wstring>& arguments) {
+    std::optional<std::wstring> result;
+    for (std::size_t index = 1; index < arguments.size(); ++index) {
+        if (arguments[index] != L"--runtime-dir") continue;
+        if (result.has_value() || index + 1 >= arguments.size()) return std::nullopt;
+        result = normalized_path(arguments[index + 1]);
+        ++index;
+    }
+    return result;
+}
+
+bool exact_directory(std::wstring_view directory) {
+    if (directory.empty()) return false;
+    std::wstring volume(MAX_PATH + 1, L'\0');
+    if (GetVolumePathNameW(std::wstring(directory).c_str(), volume.data(),
+                           static_cast<DWORD>(volume.size())) == FALSE) {
+        return false;
+    }
+    volume.resize(wcslen(volume.c_str()));
+    if (volume.empty() || directory.size() < volume.size()
+        || !same_path(directory.substr(0, volume.size()), volume)) {
+        return false;
+    }
+    auto safe_directory = [](const std::wstring& candidate) {
+        const DWORD attributes = GetFileAttributesW(candidate.c_str());
+        return attributes != INVALID_FILE_ATTRIBUTES
+            && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+            && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0;
+    };
+    if (!safe_directory(volume)) return false;
+    for (std::size_t index = volume.size(); index <= directory.size(); ++index) {
+        if (index != directory.size() && directory[index] != L'\\') continue;
+        const auto candidate = std::wstring(directory.substr(0, index));
+        if (!candidate.empty() && !safe_directory(candidate)) return false;
+    }
+    return true;
+}
+
+std::string utc_timestamp(const FILETIME& timestamp) {
+    SYSTEMTIME value{};
+    if (FileTimeToSystemTime(&timestamp, &value) == FALSE) return {};
+    std::ostringstream stream;
+    stream << std::setfill('0') << std::setw(4) << value.wYear << '-'
+           << std::setw(2) << value.wMonth << '-' << std::setw(2) << value.wDay << 'T'
+           << std::setw(2) << value.wHour << ':' << std::setw(2) << value.wMinute << ':'
+           << std::setw(2) << value.wSecond << '.' << std::setw(3) << value.wMilliseconds << 'Z';
+    return stream.str();
+}
+
+std::string filetime_ticks(const FILETIME& timestamp) {
+    ULARGE_INTEGER value{};
+    value.LowPart = timestamp.dwLowDateTime;
+    value.HighPart = timestamp.dwHighDateTime;
+    return std::to_string(value.QuadPart);
+}
+
+bool safe_receipt_target(std::wstring_view target) {
+    const DWORD attributes = GetFileAttributesW(std::wstring(target).c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) return GetLastError() == ERROR_FILE_NOT_FOUND;
+    return (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0;
+}
+
+std::optional<std::wstring> private_temporary_path(std::wstring_view directory) {
+    std::array<unsigned char, 16> random{};
+    if (BCryptGenRandom(nullptr, random.data(), static_cast<ULONG>(random.size()),
+                        BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
+        return std::nullopt;
+    }
+    constexpr wchar_t hex[] = L"0123456789abcdef";
+    std::wstring result(directory);
+    result.append(L"\\.launcher-exit.json.");
+    for (const auto byte : random) {
+        result.push_back(hex[byte >> 4]);
+        result.push_back(hex[byte & 0x0f]);
+    }
+    result.append(L".tmp");
+    return result;
+}
+
+bool publish_exit_receipt(std::wstring_view directory, std::string_view payload) {
+    if (payload.empty() || payload.size() > 4096 || !exact_directory(directory)) return false;
+    const std::wstring target = std::wstring(directory) + L"\\launcher-exit.json";
+    if (!safe_receipt_target(target)) return false;
+    const auto temporary = private_temporary_path(directory);
+    if (!temporary.has_value()) return false;
+    const HANDLE file = CreateFileW(
+        temporary->c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+        FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_WRITE_THROUGH, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    bool success = true;
+    std::size_t offset = 0;
+    while (offset < payload.size()) {
+        DWORD written = 0;
+        const DWORD count = static_cast<DWORD>(payload.size() - offset);
+        if (WriteFile(file, payload.data() + offset, count, &written, nullptr) == FALSE
+            || written == 0) {
+            success = false;
+            break;
+        }
+        offset += written;
+    }
+    if (success && FlushFileBuffers(file) == FALSE) success = false;
+    if (CloseHandle(file) == FALSE) success = false;
+    if (success && (!exact_directory(directory) || !safe_receipt_target(target))) success = false;
+    if (success && MoveFileExW(temporary->c_str(), target.c_str(),
+                              MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == FALSE) {
+        success = false;
+    }
+    if (!success) DeleteFileW(temporary->c_str());
+    return success;
+}
+
+std::string exit_receipt(DWORD process_id, const FILETIME& creation_time,
+                         const FILETIME& started_at, const FILETIME& exited_at,
+                         DWORD exit_code) {
+    const bool clean = exit_code == 0;
+    std::ostringstream json;
+    json << "{\"schema\":\"uci_arena_lichess_exit_receipt_v1\","
+         << "\"process_instance\":{\"schema\":\"uci_arena_process_instance_receipt_v1\","
+         << "\"platform\":\"win32\",\"pid\":" << process_id
+         << ",\"creation_time_100ns\":\"" << filetime_ticks(creation_time) << "\"},"
+         << "\"started_at\":\"" << utc_timestamp(started_at) << "\","
+         << "\"exited_at\":\"" << utc_timestamp(exited_at) << "\","
+         << "\"child_exit_code\":" << exit_code << ','
+         << "\"clean\":" << (clean ? "true" : "false") << ','
+         << "\"expected\":" << (clean ? "true" : "false") << ','
+         << "\"disposition\":\"" << (clean ? "clean_exit" : "unexpected_exit") << "\","
+         << "\"restart_eligible\":" << (clean ? "false" : "true") << '}';
+    return json.str();
 }
 
 std::optional<std::wstring> normalized_path(std::wstring_view value) {
@@ -218,6 +359,10 @@ HANDLE open_null(DWORD access, SECURITY_ATTRIBUTES* security) {
 
 int launch_hidden(const std::vector<std::wstring>& arguments) {
     if (arguments.size() < 3 || arguments[1].empty()) return ERROR_INVALID_PARAMETER;
+    const auto receipt_directory = runtime_directory(arguments);
+    if (!receipt_directory.has_value() || !exact_directory(*receipt_directory)) {
+        return ERROR_INVALID_PARAMETER;
+    }
     SECURITY_ATTRIBUTES security{};
     security.nLength = sizeof(security);
     security.bInheritHandle = TRUE;
@@ -245,6 +390,18 @@ int launch_hidden(const std::vector<std::wstring>& arguments) {
     CloseHandle(null_output);
     if (created == FALSE) return static_cast<int>(GetLastError());
 
+    FILETIME creation_time{};
+    FILETIME exit_time_unused{};
+    FILETIME kernel_time{};
+    FILETIME user_time{};
+    if (GetProcessTimes(process.hProcess, &creation_time, &exit_time_unused,
+                        &kernel_time, &user_time) == FALSE) {
+        TerminateProcess(process.hProcess, launcher_error);
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        return launcher_error;
+    }
+
     const auto job = CreateJobObjectW(nullptr, nullptr);
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -266,8 +423,14 @@ int launch_hidden(const std::vector<std::wstring>& arguments) {
         TerminateJobObject(job, launcher_error);
         exit_code = launcher_error;
     }
+    FILETIME exited_at{};
+    GetSystemTimeAsFileTime(&exited_at);
+    const DWORD child_process_id = process.dwProcessId;
     CloseHandle(process.hProcess);
     CloseHandle(job);
+    const auto receipt = exit_receipt(
+        child_process_id, creation_time, creation_time, exited_at, exit_code);
+    if (!publish_exit_receipt(*receipt_directory, receipt)) return receipt_error;
     return static_cast<int>(exit_code);
 }
 

@@ -9,5 +9,6 @@ process.stdout.write(`${JSON.stringify({
     "specs/00_READ_FIRST.yaml",
     "specs/suite_lego_boundaries_v1.yaml",
     "specs/lichess_match_scheduler_v1.yaml",
+    "specs/move_submission_timing_boundary_v1.yaml",
   ],
 }, null, 2)}\n`);

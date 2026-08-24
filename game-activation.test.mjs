@@ -4,7 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { BotController } from "./lichess-adapter.mjs";
+import {
+  BotController,
+  prepareProviderReplacementInterlock,
+} from "./lichess-adapter.mjs";
 import { LichessStore } from "./lichess-store.mjs";
 
 function config() {
@@ -30,6 +33,126 @@ function statusPublisher() {
     health: () => ({ state: "ready", last_success_generation: generation || null }),
   };
 }
+
+function processIdentity(pid) {
+  return {
+    schema: "uci_arena_process_instance_identity_v1",
+    platform: "win32",
+    pid,
+    start_token: String(pid),
+    executable_path: "C:\\UCI Arena\\node.exe",
+    boot_id: "",
+  };
+}
+
+test("pre-replacement leaves an active game and startup control untouched", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-game-interlock-"));
+  const storeFile = path.join(directory, "matches.sqlite");
+  const store = new LichessStore(storeFile);
+  const owner = "live-provider-owner";
+  const authority = "https://lichess.org|arena-bot";
+  const now = Date.now();
+  let finishSession;
+  let sessionStarted;
+  const sessionStartedPromise = new Promise((resolve) => { sessionStarted = resolve; });
+  const sessionFinishPromise = new Promise((resolve) => { finishSession = resolve; });
+  let closes = 0;
+  let prepareCalls = 0;
+  store.acquireApiLease(
+    authority,
+    owner,
+    101,
+    now,
+    60_000,
+    null,
+    processIdentity(101),
+  );
+  store.claimProviderLifecycle(owner, now);
+  const controller = new BotController({
+    client: {},
+    config: config(),
+    account: "self",
+    runtimeDir: directory,
+    signal: new AbortController().signal,
+    store,
+    lifecycleOwner: owner,
+    statusPublisher: statusPublisher(),
+    sessionFactory: ({ gameId }) => ({
+      finished: true,
+      run: async () => {
+        sessionStarted();
+        await sessionFinishPromise;
+        store.finishGame({
+          id: gameId,
+          status: "mate",
+          result: "win",
+          winner: "white",
+          plies: 1,
+        });
+      },
+    }),
+  });
+  controller.prepareSlot = async (slot) => {
+    controller.slots.attachEngine(slot, { close: async () => { closes += 1; } }, slot.generation);
+    return slot;
+  };
+  let activeTask = null;
+  try {
+    await controller.startGame({
+      gameId: "interlock-game",
+      opponent: { id: "fixture-bot", title: "BOT" },
+    });
+    await sessionStartedPromise;
+    activeTask = controller.activeGames.get("interlock-game");
+    await assert.rejects(prepareProviderReplacementInterlock({
+      runtimeDir: directory,
+      storeFile,
+      prepare: async () => { prepareCalls += 1; },
+    }), (error) => (
+      error.code === "provider_owned_work_active"
+      && error.observed.activeWork === 1
+      && error.observed.unfinishedGames === 1
+    ));
+    assert.equal(prepareCalls, 0);
+    assert.equal(controller.activeGames.get("interlock-game"), activeTask);
+    assert.equal(controller.slots.findGame("interlock-game").state, "active");
+    assert.equal(store.providerLifecycleSnapshot().admissionBlocked, false);
+    assert.equal(closes, 0);
+
+    finishSession();
+    await activeTask;
+    activeTask = null;
+    assert.equal(controller.activeGames.size, 0);
+    assert.equal(store.providerLifecycleSnapshot().activeWork, 0);
+    assert.equal(closes, 1);
+  } finally {
+    finishSession();
+    await activeTask;
+    await controller.drainProviderSlots();
+    store.releaseProviderLifecycle(owner);
+    store.releaseApiLease(authority, owner);
+    store.close();
+  }
+});
+
+test("failed platform preparation compensates an idle replacement gate", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-interlock-compensation-"));
+  const storeFile = path.join(directory, "matches.sqlite");
+  const seed = new LichessStore(storeFile);
+  seed.close();
+  await assert.rejects(prepareProviderReplacementInterlock({
+    runtimeDir: directory,
+    storeFile,
+    allowUnowned: true,
+    prepare: async () => { throw new Error("platform preparation failed"); },
+  }), /platform preparation failed/u);
+  const observed = new LichessStore(storeFile);
+  try {
+    assert.equal(observed.providerLifecycleSnapshot().admissionBlocked, false);
+  } finally {
+    observed.close();
+  }
+});
 
 test("activation publishes maps and active slot before immediate session execution", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-game-activation-"));
