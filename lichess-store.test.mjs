@@ -261,7 +261,6 @@ test("replacement admission and provider work serialize without a status race", 
       safe: false,
       reason: "provider_owned_work_active",
       activeWork: 1,
-      unfinishedGames: 0,
       admissionBlocked: false,
     });
     assert.equal(runtime.providerLifecycleSnapshot().admissionBlocked, false);
@@ -271,7 +270,6 @@ test("replacement admission and provider work serialize without a status race", 
       safe: true,
       reason: null,
       activeWork: 0,
-      unfinishedGames: 0,
       admissionBlocked: true,
     });
     assert.throws(
@@ -291,7 +289,7 @@ test("replacement admission and provider work serialize without a status race", 
   }
 });
 
-test("replacement fails closed for legacy live authority and unfinished games", () => {
+test("replacement fails closed for legacy live authority but not stale archive history", () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-lifecycle-legacy-"));
   const file = path.join(directory, "matches.sqlite");
   const runtime = new LichessStore(file);
@@ -311,7 +309,6 @@ test("replacement fails closed for legacy live authority and unfinished games", 
       safe: false,
       reason: "provider_lifecycle_interlock_unavailable",
       activeWork: 0,
-      unfinishedGames: 0,
       admissionBlocked: false,
     });
     runtime.releaseApiLease(authority, "legacy-owner");
@@ -329,11 +326,12 @@ test("replacement fails closed for legacy live authority and unfinished games", 
       opponent: "fixture-bot",
       audience: "bot",
     }, 1_005);
-    const unfinished = lifecycle.requestProviderReplacement(1_006, { allowUnowned: true });
-    assert.equal(unfinished.safe, false);
-    assert.equal(unfinished.reason, "provider_owned_work_active");
-    assert.equal(unfinished.unfinishedGames, 1);
-    assert.equal(unfinished.admissionBlocked, false);
+    const staleArchive = lifecycle.requestProviderReplacement(1_006, { allowUnowned: true });
+    assert.equal(staleArchive.safe, true);
+    assert.equal(staleArchive.reason, null);
+    assert.equal(staleArchive.activeWork, 0);
+    assert.equal(staleArchive.admissionBlocked, true);
+    lifecycle.resumeProviderAdmissions(1_007);
   } finally {
     runtime.close();
     lifecycle.close();

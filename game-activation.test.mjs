@@ -128,7 +128,6 @@ test("pre-replacement leaves an active game and startup control untouched", asyn
     }), (error) => (
       error.code === "provider_owned_work_active"
       && error.observed.activeWork === 1
-      && error.observed.unfinishedGames === 1
     ));
     assert.equal(prepareCalls, 0);
     assert.equal(controller.activeGames.get("interlock-game"), activeTask);

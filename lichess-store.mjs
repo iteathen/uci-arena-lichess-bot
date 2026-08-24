@@ -647,9 +647,6 @@ export class LichessStore {
         SELECT admission_blocked, owner_id, active_work
         FROM provider_lifecycle_control WHERE id=1
       `).get();
-      const unfinishedGames = this.db.prepare(`
-        SELECT COUNT(*) AS count FROM games WHERE finished_at=0
-      `).get().count;
       const activeWork = control?.active_work ?? 0;
       const activeLeases = this.db.prepare(`
         SELECT COUNT(*) AS count FROM api_client_leases WHERE expires_at>?
@@ -662,7 +659,7 @@ export class LichessStore {
         : null;
       let reason = null;
       if (!control) reason = "provider_lifecycle_interlock_unavailable";
-      else if (activeWork > 0 || unfinishedGames > 0) reason = "provider_owned_work_active";
+      else if (activeWork > 0) reason = "provider_owned_work_active";
       else if ((activeLeases > 0 && !ownerLease)
           || (!control.owner_id && !control.admission_blocked && !allowUnowned)) {
         reason = "provider_lifecycle_interlock_unavailable";
@@ -672,7 +669,6 @@ export class LichessStore {
           safe: false,
           reason,
           activeWork,
-          unfinishedGames,
           admissionBlocked: Boolean(control?.admission_blocked),
         });
       }
@@ -686,7 +682,6 @@ export class LichessStore {
         safe: true,
         reason: null,
         activeWork: 0,
-        unfinishedGames: 0,
         admissionBlocked: true,
       });
     });
@@ -698,11 +693,8 @@ export class LichessStore {
       const control = this.db.prepare(`
         SELECT active_work FROM provider_lifecycle_control WHERE id=1
       `).get();
-      const unfinishedGames = this.db.prepare(`
-        SELECT COUNT(*) AS count FROM games WHERE finished_at=0
-      `).get().count;
-      if (!control || control.active_work !== 0 || unfinishedGames !== 0) {
-        const error = new Error("Provider admission cannot resume with unresolved work");
+      if (!control || control.active_work !== 0) {
+        const error = new Error("Provider admission cannot resume with active work");
         error.code = "LICHESS_PROVIDER_WORK_UNRESOLVED";
         throw error;
       }

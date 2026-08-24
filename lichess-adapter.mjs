@@ -7490,12 +7490,11 @@ export async function prepareProviderReplacementInterlock({
     if (!observation.safe) {
       const error = new Error(
         `Provider replacement is unsafe: ${observation.reason} `
-        + `(active_work=${observation.activeWork}, unfinished_games=${observation.unfinishedGames})`,
+        + `(active_work=${observation.activeWork})`,
       );
       error.code = observation.reason;
       error.observed = Object.freeze({
         activeWork: observation.activeWork,
-        unfinishedGames: observation.unfinishedGames,
         admissionBlocked: observation.admissionBlocked,
       });
       throw error;
