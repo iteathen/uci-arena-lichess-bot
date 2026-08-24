@@ -4985,6 +4985,7 @@ export class BotController {
     now = Date.now,
     reconnectDelay = delay,
     apiLeaseStatus = null,
+    lifecycleOwner = null,
     sessionFactory = null,
     statusPublisher = null,
   }) {
@@ -5006,6 +5007,8 @@ export class BotController {
         heartbeat_at: null,
         expires_at: null,
       });
+    this.lifecycleOwner = lifecycleOwner ? String(lifecycleOwner) : null;
+    this.providerSlotWork = new Map();
     this.sessionFactory = typeof sessionFactory === "function"
       ? sessionFactory
       : (options) => new GameSession(options);
@@ -5044,6 +5047,52 @@ export class BotController {
       this.statusPublisher = new RuntimeStatusPublisher(this.runtimeDir, { now: this.now });
     }
     return this.statusPublisher;
+  }
+
+  beginProviderWork() {
+    const work = { released: false, tracked: Boolean(this.lifecycleOwner) };
+    if (work.tracked) this.store.beginProviderWork(this.lifecycleOwner, this.now());
+    return work;
+  }
+
+  finishProviderWork(work) {
+    if (!work || work.released) return;
+    work.released = true;
+    if (work.tracked) this.store.finishProviderWork(this.lifecycleOwner, this.now());
+  }
+
+  acquireProviderSlot(acquire) {
+    const work = this.beginProviderWork();
+    try {
+      const slot = acquire();
+      if (!slot) {
+        this.finishProviderWork(work);
+        return null;
+      }
+      this.providerSlotWork.set(slot, { generation: slot.generation, work });
+      return slot;
+    } catch (error) {
+      this.finishProviderWork(work);
+      throw error;
+    }
+  }
+
+  async releaseProviderSlot(slot, expectedGeneration) {
+    const released = await this.slots.release(slot, expectedGeneration);
+    if (!released) return false;
+    const owned = this.providerSlotWork.get(slot);
+    if (owned?.generation === expectedGeneration) {
+      this.providerSlotWork.delete(slot);
+      this.finishProviderWork(owned.work);
+    }
+    return true;
+  }
+
+  async drainProviderSlots() {
+    await this.slots.drainAll();
+    const ownedWork = Array.from(this.providerSlotWork.values(), ({ work }) => work);
+    this.providerSlotWork.clear();
+    for (const work of ownedWork) this.finishProviderWork(work);
   }
 
   async run(opponent) {
@@ -5107,7 +5156,7 @@ export class BotController {
     } finally {
       clearInterval(statusHeartbeat);
       await Promise.allSettled(this.activeGames.values());
-      await this.slots.drainAll();
+      await this.drainProviderSlots();
       await schedulerTask;
       try {
         await this.writeStatus({ flush: true });
@@ -5138,31 +5187,36 @@ export class BotController {
       return slot;
     } catch (error) {
       if (engine && slot.engine !== engine) await engine.close();
-      await this.slots.release(slot, slotGeneration);
+      await this.releaseProviderSlot(slot, slotGeneration);
       throw error;
     }
   }
 
   async recoverPlayingGames() {
-    const playing = await this.client.json("api/account/playing?nb=50", { signal: this.signal });
-    const games = playing.nowPlaying ?? [];
-    let recovered = 0;
-    await Promise.all(games.map(async (game) => {
-      const gameId = String(game.gameId ?? game.id ?? "");
-      if (!gameId || this.activeGames.has(gameId) || this.slots.findGame(gameId)) return;
-      const pending = this.slots.findPending(game);
-      if (pending) {
-        await this.startGame(game, pending);
+    const reconciliationWork = this.beginProviderWork();
+    try {
+      const playing = await this.client.json("api/account/playing?nb=50", { signal: this.signal });
+      const games = playing.nowPlaying ?? [];
+      let recovered = 0;
+      await Promise.all(games.map(async (game) => {
+        const gameId = String(game.gameId ?? game.id ?? "");
+        if (!gameId || this.activeGames.has(gameId) || this.slots.findGame(gameId)) return;
+        const pending = this.slots.findPending(game);
+        if (pending) {
+          await this.startGame(game, pending);
+          recovered += 1;
+          return;
+        }
+        await this.startGame(game);
         recovered += 1;
-        return;
-      }
-      await this.startGame(game);
-      recovered += 1;
-    }));
-    this.lastReconciliationAt = Date.now();
-    this.needsReconciliation = false;
-    if (recovered) log("games_recovered", { count: recovered });
-    return recovered;
+      }));
+      this.lastReconciliationAt = Date.now();
+      this.needsReconciliation = false;
+      if (recovered) log("games_recovered", { count: recovered });
+      return recovered;
+    } finally {
+      this.finishProviderWork(reconciliationWork);
+    }
   }
 
   async recoverTimedOutSlot(slot, expectedGeneration = slot?.generation) {
@@ -5232,11 +5286,11 @@ export class BotController {
     })) reason = "later";
     let slot = null;
     if (!reason) {
-      slot = this.slots.acquire(audience, {
+      slot = this.acquireProviderSlot(() => this.slots.acquire(audience, {
         opponent,
         direction: "inbound",
         challengeId: challenge.id,
-      });
+      }));
       if (!slot) reason = "later";
     }
     const endpoint = `api/challenge/${encodeURIComponent(challenge.id)}`;
@@ -5287,7 +5341,7 @@ export class BotController {
       log("challenge_accepted", { challenge_id: challenge.id, opponent, audience, slot_id: slot.id });
     } catch (error) {
       if (slot.generation === slotGeneration && slot.state !== "active") {
-        await this.slots.release(slot, slotGeneration);
+        await this.releaseProviderSlot(slot, slotGeneration);
       }
       if (error instanceof StaleApiOperationError) {
         log("stale_challenge_response_skipped", {
@@ -5312,7 +5366,7 @@ export class BotController {
         : 0,
     });
     if (["pending", "cancelling", "preparing"].includes(slot?.state)) {
-      await this.slots.release(slot, slot.generation);
+      await this.releaseProviderSlot(slot, slot.generation);
     }
     log("challenge_terminal", { challenge_id: challengeId, status: declined ? "declined" : "canceled" });
   }
@@ -5338,7 +5392,10 @@ export class BotController {
     if (!slot) {
       const opponent = normalizedUsername(game?.opponent?.id ?? game?.opponent?.username ?? game?.opponent?.name);
       const audience = await this.resolveAudience(opponent, game?.opponent?.title);
-      slot = this.slots.acquireStarted(audience, { opponent, direction: "event-recovery" });
+      slot = this.acquireProviderSlot(() => this.slots.acquireStarted(
+        audience,
+        { opponent, direction: "event-recovery" },
+      ));
       if (!slot) throw new Error(`No ${audience} slot is available for started game ${gameId}`);
       await this.prepareSlot(slot);
     }
@@ -5422,7 +5479,7 @@ export class BotController {
         }
       }
       try {
-        await this.slots.release(slot, slotGeneration);
+        await this.releaseProviderSlot(slot, slotGeneration);
       } catch (error) {
         cleanupDiagnostics.push(`slot:${String(error?.message ?? "failure").slice(0, 256)}`);
       }
@@ -5449,7 +5506,7 @@ export class BotController {
     if (this.activeGames.get(gameId) === task()) this.activeGames.delete(gameId);
     if (this.gameSessions.get(gameId) === session) this.gameSessions.delete(gameId);
     try {
-      await this.slots.release(slot, slotGeneration);
+      await this.releaseProviderSlot(slot, slotGeneration);
     } catch (error) {
       cleanupDiagnostics.push(`slot:${String(error?.message ?? "failure").slice(0, 256)}`);
     }
@@ -5492,11 +5549,11 @@ export class BotController {
     const normalized = normalizedUsername(opponent);
     if (normalized === this.account || this.slots.hasOpponent(normalized)
         || this.client.isRequestClassBlocked?.("challenge_create")) return false;
-    const slot = this.slots.acquire(audience, {
+    const slot = this.acquireProviderSlot(() => this.slots.acquire(audience, {
       opponent: normalized,
       direction: "outbound",
       correlationToken: randomUUID(),
-    });
+    }));
     if (!slot) return false;
     const slotGeneration = slot.generation;
     try {
@@ -5545,7 +5602,7 @@ export class BotController {
       return true;
     } catch (error) {
       if (slot.generation === slotGeneration && slot.state !== "active") {
-        await this.slots.release(slot, slotGeneration);
+        await this.releaseProviderSlot(slot, slotGeneration);
       }
       if (error instanceof StaleApiOperationError) return false;
       if (!(error instanceof LichessHttpError && error.status === 429) && audience === "bot") {
@@ -5647,7 +5704,7 @@ export class BotController {
         audience: slot.audience,
         grace_ms: 2_000,
       });
-      await this.slots.release(slot, generation);
+      await this.releaseProviderSlot(slot, generation);
     }
     for (const slot of this.slots.slots.filter((candidate) => ["pending", "cancelling"].includes(candidate.state)
       && candidate.direction === "outbound"
@@ -5751,7 +5808,7 @@ export class BotController {
         audience: slot.audience,
         canceled: true,
       });
-      await this.slots.release(slot, generation);
+      await this.releaseProviderSlot(slot, generation);
     }
   }
 
@@ -6746,6 +6803,60 @@ function runStoreCommand(options) {
   }
 }
 
+export async function prepareProviderReplacementInterlock({
+  runtimeDir,
+  storeFile = path.join(path.resolve(runtimeDir), "matches.sqlite"),
+  prepare,
+  allowUnowned = false,
+  now = Date.now,
+} = {}) {
+  if (!runtimeDir || typeof prepare !== "function" || typeof now !== "function") {
+    throw new Error("Provider replacement interlock requires runtime authority and prepare action");
+  }
+  const store = new LichessStore(path.resolve(storeFile));
+  let interlockClosed = false;
+  try {
+    const observation = store.requestProviderReplacement(now(), { allowUnowned });
+    if (!observation.safe) {
+      const error = new Error(
+        `Provider replacement is unsafe: ${observation.reason} `
+        + `(active_work=${observation.activeWork}, unfinished_games=${observation.unfinishedGames})`,
+      );
+      error.code = observation.reason;
+      error.observed = Object.freeze({
+        activeWork: observation.activeWork,
+        unfinishedGames: observation.unfinishedGames,
+        admissionBlocked: observation.admissionBlocked,
+      });
+      throw error;
+    }
+    interlockClosed = true;
+    return await prepare();
+  } catch (error) {
+    if (interlockClosed) {
+      try {
+        store.resumeProviderAdmissions(now());
+      } catch (compensationError) {
+        error.cleanupDiagnostics = [
+          `provider_admission:${String(compensationError?.message ?? "failure").slice(0, 256)}`,
+        ];
+      }
+    }
+    throw error;
+  } finally {
+    store.close();
+  }
+}
+
+function resumeProviderReplacementAdmissions(runtimeDir, now = Date.now()) {
+  const store = new LichessStore(path.join(path.resolve(runtimeDir), "matches.sqlite"));
+  try {
+    return store.resumeProviderAdmissions(now);
+  } finally {
+    store.close();
+  }
+}
+
 export async function main(argv = process.argv.slice(2)) {
   assertSupportedNode();
   const options = parseArguments(argv);
@@ -6808,18 +6919,34 @@ export async function main(argv = process.argv.slice(2)) {
     if (!options.previous_root || !options.replacement_root) {
       throw new Error("startup prepare_replace requires exact previous and replacement roots");
     }
-    const replacement = process.platform === "win32"
-      ? await prepareWindowsStartupReplacement({
-        previousRoot: options.previous_root,
-        replacementRoot: options.replacement_root,
-        runtimeDir,
-      })
+    const existingStartup = process.platform === "win32"
+      ? await queryWindowsStartup({ runtimeDir })
       : process.platform === "linux"
-        ? await prepareLinuxStartupReplacement({
+        ? await queryLinuxStartup()
+        : (() => { throw new Error(`Unsupported startup platform: ${process.platform}`); })();
+    const allowUnowned = process.platform === "win32"
+      ? existingStartup.installed === true
+        && existingStartup.active === false
+        && existingStartup.enabled === false
+      : existingStartup.installed === true
+        && existingStartup.active === "inactive"
+        && existingStartup.enabled === "disabled";
+    const replacement = await prepareProviderReplacementInterlock({
+      runtimeDir,
+      allowUnowned,
+      prepare: () => (process.platform === "win32"
+        ? prepareWindowsStartupReplacement({
           previousRoot: options.previous_root,
           replacementRoot: options.replacement_root,
+          runtimeDir,
         })
-        : (() => { throw new Error(`Unsupported startup platform: ${process.platform}`); })();
+        : process.platform === "linux"
+          ? prepareLinuxStartupReplacement({
+            previousRoot: options.previous_root,
+            replacementRoot: options.replacement_root,
+          })
+          : (() => { throw new Error(`Unsupported startup platform: ${process.platform}`); })()),
+    });
     console.log(JSON.stringify({ status: "ready", startup: replacement }));
     return 0;
   }
@@ -6879,6 +7006,7 @@ export async function main(argv = process.argv.slice(2)) {
     } else {
       throw new Error(`Unsupported startup platform: ${process.platform}`);
     }
+    resumeProviderReplacementAdmissions(runtimeDir);
     let replacementReadiness = {
       stable: false,
       providerReady: false,
@@ -7108,6 +7236,7 @@ export async function main(argv = process.argv.slice(2)) {
   const processIdentity = currentProcessIdentity();
   let leaseHeartbeat = null;
   let startupStatusHeartbeat = null;
+  let lifecycleClaimed = false;
   try {
     store.acquireApiLease(
       authority,
@@ -7118,6 +7247,10 @@ export async function main(argv = process.argv.slice(2)) {
       probeProcessInstance,
       processIdentity,
     );
+    if (options.command === "run") {
+      store.claimProviderLifecycle(leaseOwner);
+      lifecycleClaimed = true;
+    }
     const safetyCoordinator = new ApiSafetyCoordinator({
       initialState: store.apiSafetyState(authority),
       persistSafetyState: (state) => store.saveApiSafetyState(authority, state),
@@ -7224,6 +7357,7 @@ export async function main(argv = process.argv.slice(2)) {
       signal: controller.signal,
       store,
       apiLeaseStatus,
+      lifecycleOwner: leaseOwner,
     });
     await botController.writeStatus();
     if (startupStatusHeartbeat) {
@@ -7236,6 +7370,7 @@ export async function main(argv = process.argv.slice(2)) {
     for (const [signal, handler] of signalHandlers) process.off(signal, handler);
     if (leaseHeartbeat) clearInterval(leaseHeartbeat);
     if (startupStatusHeartbeat) clearInterval(startupStatusHeartbeat);
+    if (lifecycleClaimed) store.releaseProviderLifecycle(leaseOwner);
     store.releaseApiLease(authority, leaseOwner);
     store.close();
   }

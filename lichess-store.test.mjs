@@ -31,12 +31,18 @@ const EMPTY_CHALLENGE_SAFETY = Object.freeze({
   challengeHalfOpen: false,
 });
 
-test("store migrates to schema five and uses WAL", () => {
+test("store keeps schema five and adds the compatible lifecycle extension", () => {
   const store = storeFixture();
   try {
     assert.equal(store.status().schemaVersion, 5);
     assert.equal(store.db.prepare("PRAGMA journal_mode").get().journal_mode, "wal");
     assert.equal(store.db.prepare("SELECT version FROM schema_meta").get().version, 5);
+    assert.deepEqual(store.providerLifecycleSnapshot(), {
+      admissionBlocked: false,
+      owned: false,
+      activeWork: 0,
+      updatedAt: 0,
+    });
   } finally {
     store.close();
   }
@@ -129,6 +135,109 @@ test("schema-three stores repair API safety tables without shortening legacy coo
     assert.equal(store.status().schemaVersion, 5);
   } finally {
     store.close();
+  }
+});
+
+test("replacement admission and provider work serialize without a status race", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-lifecycle-interlock-"));
+  const file = path.join(directory, "matches.sqlite");
+  const runtime = new LichessStore(file);
+  const lifecycle = new LichessStore(file);
+  const authority = "https://lichess.org|arena-bot";
+  const owner = "provider-owner";
+  try {
+    runtime.acquireApiLease(
+      authority,
+      owner,
+      101,
+      1_000,
+      60_000,
+      null,
+      processIdentity(101),
+    );
+    runtime.claimProviderLifecycle(owner, 1_000);
+    runtime.beginProviderWork(owner, 1_001);
+
+    assert.deepEqual(lifecycle.requestProviderReplacement(1_002), {
+      safe: false,
+      reason: "provider_owned_work_active",
+      activeWork: 1,
+      unfinishedGames: 0,
+      admissionBlocked: false,
+    });
+    assert.equal(runtime.providerLifecycleSnapshot().admissionBlocked, false);
+
+    runtime.finishProviderWork(owner, 1_003);
+    assert.deepEqual(lifecycle.requestProviderReplacement(1_004), {
+      safe: true,
+      reason: null,
+      activeWork: 0,
+      unfinishedGames: 0,
+      admissionBlocked: true,
+    });
+    assert.throws(
+      () => runtime.beginProviderWork(owner, 1_005),
+      (error) => error.code === "LICHESS_PROVIDER_REPLACEMENT_BLOCKED",
+    );
+    assert.equal(lifecycle.requestProviderReplacement(1_006).safe, true);
+    lifecycle.resumeProviderAdmissions(1_007);
+    runtime.claimProviderLifecycle(owner, 1_008);
+    assert.equal(runtime.beginProviderWork(owner, 1_009).activeWork, 1);
+    runtime.finishProviderWork(owner, 1_010);
+  } finally {
+    runtime.releaseProviderLifecycle(owner, 1_011);
+    runtime.releaseApiLease(authority, owner);
+    runtime.close();
+    lifecycle.close();
+  }
+});
+
+test("replacement fails closed for legacy live authority and unfinished games", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-lifecycle-legacy-"));
+  const file = path.join(directory, "matches.sqlite");
+  const runtime = new LichessStore(file);
+  const lifecycle = new LichessStore(file);
+  const authority = "https://lichess.org|arena-bot";
+  try {
+    runtime.acquireApiLease(
+      authority,
+      "legacy-owner",
+      101,
+      1_000,
+      60_000,
+      null,
+      processIdentity(101),
+    );
+    assert.deepEqual(lifecycle.requestProviderReplacement(1_001), {
+      safe: false,
+      reason: "provider_lifecycle_interlock_unavailable",
+      activeWork: 0,
+      unfinishedGames: 0,
+      admissionBlocked: false,
+    });
+    runtime.releaseApiLease(authority, "legacy-owner");
+    assert.equal(
+      lifecycle.requestProviderReplacement(1_002).reason,
+      "provider_lifecycle_interlock_unavailable",
+    );
+    assert.equal(
+      lifecycle.requestProviderReplacement(1_003, { allowUnowned: true }).safe,
+      true,
+    );
+    lifecycle.resumeProviderAdmissions(1_004);
+    runtime.beginGameActivation({
+      id: "unfinished-game",
+      opponent: "fixture-bot",
+      audience: "bot",
+    }, 1_005);
+    const unfinished = lifecycle.requestProviderReplacement(1_006, { allowUnowned: true });
+    assert.equal(unfinished.safe, false);
+    assert.equal(unfinished.reason, "provider_owned_work_active");
+    assert.equal(unfinished.unfinishedGames, 1);
+    assert.equal(unfinished.admissionBlocked, false);
+  } finally {
+    runtime.close();
+    lifecycle.close();
   }
 });
 

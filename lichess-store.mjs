@@ -293,6 +293,19 @@ export class LichessStore {
       version = 5;
     }
     if (version !== 5) throw new Error(`Unsupported Lichess store schema version: ${version}`);
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS provider_lifecycle_control(
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        admission_blocked INTEGER NOT NULL DEFAULT 0
+          CHECK(admission_blocked IN (0, 1)),
+        owner_id TEXT NOT NULL DEFAULT '',
+        active_work INTEGER NOT NULL DEFAULT 0 CHECK(active_work >= 0),
+        updated_at INTEGER NOT NULL DEFAULT 0
+      );
+      INSERT OR IGNORE INTO provider_lifecycle_control(
+        id, admission_blocked, owner_id, active_work, updated_at
+      ) VALUES(1, 0, '', 0, 0);
+    `);
   }
 
   close() {
@@ -465,6 +478,214 @@ export class LichessStore {
       paused: control.paused,
       reservation: control.reservation ? { ...control.reservation } : null,
     };
+  }
+
+  claimProviderLifecycle(ownerId, now = Date.now()) {
+    const owner = String(ownerId ?? "");
+    if (!/^[A-Za-z0-9-]{1,128}$/u.test(owner)) {
+      throw new Error("Provider lifecycle owner id is invalid");
+    }
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const control = this.db.prepare(`
+        SELECT admission_blocked, owner_id, active_work
+        FROM provider_lifecycle_control WHERE id=1
+      `).get();
+      if (!control || control.admission_blocked) {
+        const error = new Error("Provider admission is blocked for replacement");
+        error.code = "LICHESS_PROVIDER_REPLACEMENT_BLOCKED";
+        throw error;
+      }
+      const exactLease = this.db.prepare(`
+        SELECT 1 AS present FROM api_client_leases
+        WHERE owner_id=? AND expires_at>?
+      `).get(owner, now);
+      const conflictingLease = this.db.prepare(`
+        SELECT 1 AS present FROM api_client_leases
+        WHERE owner_id<>? AND expires_at>? LIMIT 1
+      `).get(owner, now);
+      if (!exactLease || conflictingLease) {
+        const error = new Error("Provider lifecycle claim lacks exclusive API authority");
+        error.code = "LICHESS_PROVIDER_LIFECYCLE_AUTHORITY_INVALID";
+        throw error;
+      }
+      if (control.owner_id && control.owner_id !== owner) {
+        const priorLease = this.db.prepare(`
+          SELECT 1 AS present FROM api_client_leases
+          WHERE owner_id=? AND expires_at>?
+        `).get(control.owner_id, now);
+        if (priorLease) {
+          const error = new Error("Provider lifecycle authority is already active");
+          error.code = "LICHESS_PROVIDER_LIFECYCLE_HELD";
+          throw error;
+        }
+      }
+      this.db.prepare(`
+        UPDATE provider_lifecycle_control
+        SET owner_id=?, active_work=0, updated_at=? WHERE id=1
+      `).run(owner, now);
+      this.db.exec("COMMIT");
+      return Object.freeze({ admissionBlocked: false, activeWork: 0 });
+    } catch (error) {
+      if (this.db.isTransaction) this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  releaseProviderLifecycle(ownerId, now = Date.now()) {
+    const owner = String(ownerId ?? "");
+    const result = this.db.prepare(`
+      UPDATE provider_lifecycle_control SET owner_id='', updated_at=?
+      WHERE id=1 AND owner_id=? AND active_work=0
+    `).run(now, owner);
+    return result.changes > 0;
+  }
+
+  beginProviderWork(ownerId, now = Date.now()) {
+    const owner = String(ownerId ?? "");
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const control = this.db.prepare(`
+        SELECT admission_blocked, owner_id, active_work
+        FROM provider_lifecycle_control WHERE id=1
+      `).get();
+      if (!control || control.admission_blocked || control.owner_id !== owner) {
+        const error = new Error("Provider work admission is blocked or unowned");
+        error.code = control?.admission_blocked
+          ? "LICHESS_PROVIDER_REPLACEMENT_BLOCKED"
+          : "LICHESS_PROVIDER_LIFECYCLE_AUTHORITY_INVALID";
+        throw error;
+      }
+      const activeWork = Number(control.active_work) + 1;
+      this.db.prepare(`
+        UPDATE provider_lifecycle_control SET active_work=?, updated_at=? WHERE id=1
+      `).run(activeWork, now);
+      this.db.exec("COMMIT");
+      return Object.freeze({ ownerId: owner, activeWork });
+    } catch (error) {
+      if (this.db.isTransaction) this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  finishProviderWork(ownerId, now = Date.now()) {
+    const owner = String(ownerId ?? "");
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const control = this.db.prepare(`
+        SELECT owner_id, active_work FROM provider_lifecycle_control WHERE id=1
+      `).get();
+      if (!control || control.owner_id !== owner || Number(control.active_work) < 1) {
+        const error = new Error("Provider work release does not own active authority");
+        error.code = "LICHESS_PROVIDER_WORK_RELEASE_INVALID";
+        throw error;
+      }
+      const activeWork = Number(control.active_work) - 1;
+      this.db.prepare(`
+        UPDATE provider_lifecycle_control SET active_work=?, updated_at=? WHERE id=1
+      `).run(activeWork, now);
+      this.db.exec("COMMIT");
+      return activeWork;
+    } catch (error) {
+      if (this.db.isTransaction) this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  requestProviderReplacement(now = Date.now(), { allowUnowned = false } = {}) {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const control = this.db.prepare(`
+        SELECT admission_blocked, owner_id, active_work
+        FROM provider_lifecycle_control WHERE id=1
+      `).get();
+      const unfinishedGames = Number(this.db.prepare(`
+        SELECT COUNT(*) AS count FROM games WHERE finished_at=0
+      `).get().count);
+      const activeWork = Number(control?.active_work ?? 0);
+      const activeLeases = Number(this.db.prepare(`
+        SELECT COUNT(*) AS count FROM api_client_leases WHERE expires_at>?
+      `).get(now).count);
+      const ownerLease = control?.owner_id
+        ? this.db.prepare(`
+            SELECT 1 AS present FROM api_client_leases
+            WHERE owner_id=? AND expires_at>?
+          `).get(control.owner_id, now)
+        : null;
+      let reason = null;
+      if (!control) reason = "provider_lifecycle_interlock_unavailable";
+      else if (activeWork > 0 || unfinishedGames > 0) reason = "provider_owned_work_active";
+      else if ((activeLeases > 0 && !ownerLease)
+          || (!control.owner_id && !control.admission_blocked && !allowUnowned)) {
+        reason = "provider_lifecycle_interlock_unavailable";
+      }
+      if (reason) {
+        this.db.exec("ROLLBACK");
+        return Object.freeze({
+          safe: false,
+          reason,
+          activeWork,
+          unfinishedGames,
+          admissionBlocked: Boolean(control?.admission_blocked),
+        });
+      }
+      if (!control.admission_blocked) {
+        this.db.prepare(`
+          UPDATE provider_lifecycle_control
+          SET admission_blocked=1, updated_at=? WHERE id=1
+        `).run(now);
+      }
+      this.db.exec("COMMIT");
+      return Object.freeze({
+        safe: true,
+        reason: null,
+        activeWork: 0,
+        unfinishedGames: 0,
+        admissionBlocked: true,
+      });
+    } catch (error) {
+      if (this.db.isTransaction) this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  resumeProviderAdmissions(now = Date.now()) {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const control = this.db.prepare(`
+        SELECT active_work FROM provider_lifecycle_control WHERE id=1
+      `).get();
+      const unfinishedGames = Number(this.db.prepare(`
+        SELECT COUNT(*) AS count FROM games WHERE finished_at=0
+      `).get().count);
+      if (!control || Number(control.active_work) !== 0 || unfinishedGames !== 0) {
+        const error = new Error("Provider admission cannot resume with unresolved work");
+        error.code = "LICHESS_PROVIDER_WORK_UNRESOLVED";
+        throw error;
+      }
+      this.db.prepare(`
+        UPDATE provider_lifecycle_control
+        SET admission_blocked=0, owner_id='', updated_at=? WHERE id=1
+      `).run(now);
+      this.db.exec("COMMIT");
+      return Object.freeze({ admissionBlocked: false, activeWork: 0 });
+    } catch (error) {
+      if (this.db.isTransaction) this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  providerLifecycleSnapshot() {
+    const row = this.db.prepare(`
+      SELECT admission_blocked, owner_id, active_work, updated_at
+      FROM provider_lifecycle_control WHERE id=1
+    `).get();
+    return Object.freeze({
+      admissionBlocked: Boolean(row?.admission_blocked),
+      owned: Boolean(row?.owner_id),
+      activeWork: Number(row?.active_work ?? 0),
+      updatedAt: Number(row?.updated_at ?? 0),
+    });
   }
 
   apiSafetyState(key) {
