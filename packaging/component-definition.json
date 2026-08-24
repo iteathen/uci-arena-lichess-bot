@@ -19,6 +19,7 @@
     {"source": "exact-file.mjs", "target": "exact-file.mjs"},
     {"source": "lichess-adapter.mjs", "target": "lichess-adapter.mjs"},
     {"source": "lichess-scheduler.mjs", "target": "lichess-scheduler.mjs"},
+    {"source": "lichess-storage.mjs", "target": "lichess-storage.mjs"},
     {"source": "lichess-store.mjs", "target": "lichess-store.mjs"},
     {"source": "process-instance-identity.mjs", "target": "process-instance-identity.mjs"},
     {"source": "runtime-status-publisher.mjs", "target": "runtime-status-publisher.mjs"},

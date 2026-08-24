@@ -23,6 +23,55 @@ function processIdentity(pid, startToken = String(pid)) {
   };
 }
 
+const PROVENANCE_COLUMNS = Object.freeze([
+  "runtime_provenance_json",
+  "runtime_provenance_sha256",
+  "time_profile_identity",
+  "batch_wait_us",
+  "batch_size",
+  "split_depth",
+  "root_workers",
+  "threads",
+  "search_core",
+  "onnx_runtime_version",
+  "hardware_driver_fingerprint",
+  "provider",
+  "adapter_id",
+  "checkpoint_hash",
+  "model_id",
+]);
+
+function downgradeToLegacyV1(file, { version = 1, legacyRateLimit = false } = {}) {
+  const database = new DatabaseSync(file);
+  database.exec(`
+    DROP TABLE api_safety_state;
+    DROP TABLE api_client_leases;
+    DROP TABLE provider_lifecycle_control;
+  `);
+  for (const column of PROVENANCE_COLUMNS) {
+    database.exec(`ALTER TABLE games DROP COLUMN ${column}`);
+  }
+  database.exec(`
+    DROP TABLE schema_meta;
+    CREATE TABLE schema_meta(version INTEGER NOT NULL);
+    INSERT INTO schema_meta(version) VALUES(${version});
+  `);
+  if (legacyRateLimit) {
+    database.exec(`
+      CREATE TABLE api_rate_limit(
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        consecutive_429 INTEGER NOT NULL DEFAULT 0,
+        blocked_until INTEGER NOT NULL DEFAULT 0,
+        last_429_at INTEGER NOT NULL DEFAULT 0,
+        half_open INTEGER NOT NULL DEFAULT 0
+      );
+      INSERT INTO api_rate_limit(id, consecutive_429, blocked_until, last_429_at, half_open)
+      VALUES(1, 3, 100000, 40000, 0);
+    `);
+  }
+  database.close();
+}
+
 const EMPTY_CHALLENGE_SAFETY = Object.freeze({
   challengeBlockedUntil: 0,
   challengeStrikeCount: 0,
@@ -51,18 +100,10 @@ test("store keeps schema five and adds the compatible lifecycle extension", () =
 test("schema-one stores migrate without losing existing control state", () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-lichess-store-v1-"));
   const file = path.join(directory, "matches.sqlite");
-  const legacy = new DatabaseSync(file);
-  legacy.exec(`
-    CREATE TABLE schema_meta(version INTEGER NOT NULL);
-    INSERT INTO schema_meta(version) VALUES(1);
-    CREATE TABLE scheduler_control(
-      id INTEGER PRIMARY KEY CHECK(id=1),
-      paused INTEGER NOT NULL DEFAULT 0,
-      updated_at INTEGER NOT NULL
-    );
-    INSERT INTO scheduler_control(id, paused, updated_at) VALUES(1, 1, 123);
-  `);
-  legacy.close();
+  const initialized = new LichessStore(file);
+  initialized.setPaused(true, 123);
+  initialized.close();
+  downgradeToLegacyV1(file);
   const store = new LichessStore(file);
   try {
     assert.equal(store.status().schemaVersion, 5);
@@ -79,24 +120,12 @@ test("schema-one stores migrate without losing existing control state", () => {
   }
 });
 
-test("schema-three stores repair API safety tables without shortening legacy cooldown", () => {
-  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-lichess-store-v3-repair-"));
+test("legacy schema-two rate-limit state migrates without shortening cooldown", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-lichess-store-v2-"));
   const file = path.join(directory, "matches.sqlite");
   const seed = new LichessStore(file);
-  seed.db.exec(`
-    DROP TABLE api_safety_state;
-    DROP TABLE api_client_leases;
-    CREATE TABLE api_rate_limit(
-      id INTEGER PRIMARY KEY,
-      consecutive_429 INTEGER NOT NULL DEFAULT 0,
-      blocked_until INTEGER NOT NULL DEFAULT 0,
-      last_429_at INTEGER NOT NULL DEFAULT 0,
-      half_open INTEGER NOT NULL DEFAULT 0
-    );
-    INSERT INTO api_rate_limit(id, consecutive_429, blocked_until, last_429_at, half_open)
-    VALUES(1, 3, 100000, 40000, 0);
-  `);
   seed.close();
+  downgradeToLegacyV1(file, { version: 2, legacyRateLimit: true });
 
   const store = new LichessStore(file);
   const key = "https://lichess.org|arena-bot";
@@ -135,6 +164,24 @@ test("schema-three stores repair API safety tables without shortening legacy coo
     assert.equal(store.status().schemaVersion, 5);
   } finally {
     store.close();
+  }
+});
+
+test("partial schema is rejected instead of being repaired", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-lichess-store-partial-"));
+  const file = path.join(directory, "matches.sqlite");
+  const seed = new LichessStore(file);
+  seed.db.exec("DROP TABLE api_client_leases; UPDATE schema_meta SET version=3");
+  seed.close();
+  assert.throws(
+    () => new LichessStore(file),
+    (error) => error.code === "LICHESS_STORAGE_SCHEMA_MALFORMED",
+  );
+  const reopened = new DatabaseSync(file);
+  try {
+    assert.equal(reopened.prepare("SELECT version FROM schema_meta").get().version, 3);
+  } finally {
+    reopened.close();
   }
 });
 

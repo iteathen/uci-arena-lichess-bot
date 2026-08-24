@@ -344,6 +344,54 @@ transactional_game_activation_and_status_publication_2026_08_24:
     - "Fixtures cover failure at durable activation, session construction, map publication, immediate session completion, primary plus cleanup failure, duplicate events, and simultaneous same-opponent challenges."
     - "Publisher fixtures cover overlap, coalescing, delayed completion, failure recovery, stale generation, temporary collision, write/activation failure, and shutdown drain."
 
+sqlite_storage_foundation_2026_08_24:
+  status: active
+  owning_issue: https://github.com/iteathen/uci-arena-lichess-bot/issues/7
+  owner: provider_lichess_storage_adapter
+  path_authority:
+    rules:
+      - "The absolute UTF-8 database path is bounded before filesystem use. Every existing ancestor, the database, and any WAL or SHM sidecar is admitted through the provider exact-file authority and must be a regular non-link expected type."
+      - "A missing database is activated from one random private exclusive empty file only when WAL and SHM are also absent. Orphan sidecars fail closed."
+      - "Exact no-follow descriptor admission binds the database identity before SQLite open; the same database object and safe sidecar types are revalidated immediately after open, after migration, and around provider-owned multi-statement transactions."
+      - "Node's built-in SQLite binding does not expose sqlite3_open_v2 flags and therefore cannot request SQLITE_OPEN_NOFOLLOW on SQLite's separate internal open. The exact-file no-follow admission plus immediate identity revalidation is the cross-platform authority; replacing it with a native binding is a separately reviewed packaging decision."
+  connection:
+    options:
+      read_bigints: true
+      timeout_ms: 5000
+      foreign_keys: true
+      double_quoted_string_literals: false
+      extension_loading: false
+      defensive: true
+    effective_pragmas:
+      journal_mode: wal
+      synchronous: normal
+      foreign_keys: 1
+      busy_timeout_ms: 5000
+      trusted_schema: false
+    rules:
+      - "Refusal of any required effective pragma is a typed initialization failure. The connection and any transaction are closed or rolled back before the failure escapes."
+  migration:
+    current_schema: 5
+    rules:
+      - "A valid empty SQLite database initializes in one exclusive transaction. A nonempty database must contain exactly one typed supported schema authority before any table creation or repair."
+      - "Versions one through five are admitted only after exact table, column, primary-key, constraint, named-index, object-set, SQLite storage-class, boolean-domain, nonnegative-domain, and JavaScript-safe-integer verification for that historical version."
+      - "Schema five admits exactly two known object sets: the base schema used before the provider lifecycle interlock and that same base plus the exact provider_lifecycle_control extension. Initialization adds the extension transactionally when absent, preserves an admitted existing singleton when present, and requires the extended object set at final verification without changing the base schema version."
+      - "The prior ALTER migrations' append-order layouts for the schema-four lease identity column and schema-five challenge-safety columns, plus the corresponding fresh-create layouts, are the only admitted column-order variants. Arbitrary column reordering remains malformed."
+      - "Known version-two legacy rate-limit authority is a named migration variant. Unknown, missing, duplicate, partial, malformed, or ambiguous authority is rejected rather than repaired."
+      - "Every migration step and final quick_check executes inside the same exclusive transaction. Failure rolls back all DDL and data changes, closes the connection, and leaves deterministic retry authority."
+      - "The final schema_meta table is one STRICT singleton keyed by id=1 with one positive INTEGER version. Historical loose metadata is rebuilt only after its exact single row has been admitted."
+  typed_values:
+    rules:
+      - "Every persisted integer column must use SQLite INTEGER storage, remain nonnegative and within the JavaScript safe-integer domain, and satisfy any narrower boolean or domain bound before migration or projection."
+      - "The connection reads integers as BigInt. One typed projection owner converts only safe BigInt values to Number; strings, reals, negative values, overflow, unsafe BigInt values, and fallback coercion never become domain authority."
+      - "Caller-supplied counts, durations, timestamps, PIDs, clocks, topology values, limits, and plies require exact finite safe integers with explicit bounds. Numeric strings and reals are rejected."
+  transactions:
+    - "Reservation consumption, challenge state plus counters/cooldown, API lease acquisition, online-opponent replacement, game activation, and provider lifecycle gate/work mutations use the provider immediate-transaction owner with exact pre/post path authority and rollback that preserves the primary error."
+    - "If rollback or the required post-rollback path revalidation also fails, the boundary returns LICHESS_STORAGE_OPERATION_AND_RECOVERY_FAILED with a bounded path-free detail and retains the primary operation error as its cause."
+    - "Historical backfill uses the same exact pre/post authority while retaining its intentional dry-run rollback contract."
+  validation:
+    - "Fixtures cover database/ancestor/WAL/SHM link and type failures where the host exposes them, orphan sidecars, valid empty initialization, unversioned nonempty storage, duplicate/unknown/wrong-type authority, partial schema, exact lifecycle-extension migration and rejection, wrong storage classes, negative and unsafe integers, pragma refusal, injected migration failure and retry, abrupt process exit rollback, and WAL reopening."
+
 planned_provider_resilience_and_incidents_2026_08_23:
   status: approved_plan_not_runtime_authoritative
   suite_record: https://github.com/iteathen/uci-arena-installer/issues/166
