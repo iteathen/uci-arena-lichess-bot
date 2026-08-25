@@ -365,11 +365,24 @@ export async function prepareLinuxStartupReplacement({
     maximumBytes: STARTUP_FILE_LIMIT,
     label: "Lichess systemd unit",
   });
-  const updated = retargetSystemdUnit(
-    admittedUnit.text,
-    previousRoot,
-    replacementRoot,
-  );
+  let updated;
+  try {
+    updated = retargetSystemdUnit(
+      admittedUnit.text,
+      previousRoot,
+      replacementRoot,
+    );
+  } catch (error) {
+    try {
+      updated = retargetSystemdUnit(
+        admittedUnit.text,
+        replacementRoot,
+        replacementRoot,
+      );
+    } catch {
+      throw error;
+    }
+  }
   await systemctl(["disable", "--now", SYSTEMD_UNIT_NAME]);
   if (await systemctlState("is-active") === "active") {
     throw new Error(`${SYSTEMD_UNIT_NAME} did not stop for replacement`);

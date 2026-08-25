@@ -3,7 +3,7 @@
   "component": {
     "id": "lichess.adapter",
     "product_id": "uci_arena.lichess_bot",
-    "version": "1.0.26",
+    "version": "1.0.27",
     "repository": "iteathen/uci-arena-lichess-bot"
   },
   "runtime": {
@@ -80,28 +80,33 @@
         {"name": "syzygy", "kind": "syzygy", "required": false, "accepted_sources": ["saved_locator", "install_receipt"]}
       ],
       "startup_control": {
-        "schema": "arena_provider_startup_control_v2",
-        "schema_version": 2,
+        "schema": "arena_provider_startup_control_v3",
+        "schema_version": 3,
         "entrypoint": "startup",
-        "actions": {
-          "install": ["startup", "install"],
-          "uninstall": ["startup", "uninstall"],
-          "pre_replace": ["startup", "prepare_replace"],
-          "post_replace": ["startup", "complete_replace"]
+        "operations": {
+          "install": {
+            "arguments": ["startup", "install", "--lifecycle-result", "typed_v1"],
+            "success_dispositions": ["ready"]
+          },
+          "uninstall": {
+            "arguments": ["startup", "uninstall", "--lifecycle-result", "typed_v1"],
+            "success_dispositions": ["ready"]
+          },
+          "pre_replace": {
+            "arguments": ["startup", "prepare_replace", "--lifecycle-result", "typed_v1"],
+            "success_dispositions": ["ready"]
+          },
+          "post_replace": {
+            "arguments": ["startup", "complete_replace", "--lifecycle-result", "typed_v1"],
+            "success_dispositions": ["ready", "safe_inactive"]
+          }
         },
         "replacement_arguments": {
           "previous_root": "--previous-root",
           "replacement_root": "--replacement-root"
         },
         "workspace_argument": {"flag": "--runtime-dir", "relative_path": "."},
-        "configuration_argument": "--config",
-        "result": {
-          "envelope": "startup",
-          "require_configuration_match_on_install": false,
-          "require_live_on_install": false,
-          "require_live_on_post_replace": false,
-          "allow_deferred_requalification_on_post_replace": true
-        }
+        "configuration_argument": "--config"
       }
     },
     "configuration_template": "config.uci_arena.template.yml",

@@ -612,7 +612,16 @@ export async function prepareWindowsStartupReplacement({
     "schtasks.exe", ["/Query", "/TN", STARTUP_TASK_NAME, "/XML"],
     { windowsHide: true, timeout: 10_000, maxBuffer: 1024 * 1024 },
   );
-  const updatedXml = retargetWindowsTaskXml(stdout, previousRoot, replacementRoot);
+  let updatedXml;
+  try {
+    updatedXml = retargetWindowsTaskXml(stdout, previousRoot, replacementRoot);
+  } catch (error) {
+    try {
+      updatedXml = retargetWindowsTaskXml(stdout, replacementRoot, replacementRoot);
+    } catch {
+      throw error;
+    }
+  }
   await stopWindowsTask({
     execute,
     query,

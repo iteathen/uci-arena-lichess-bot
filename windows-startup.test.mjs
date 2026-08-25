@@ -339,6 +339,10 @@ test("startup replacement retargets the owned task paths while preserving creden
   assert.match(updated, new RegExp(tokenFile.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "iu"));
   assert.match(updated, /<Settings>[\s\S]*?<Enabled>false<\/Enabled>/u);
   assert.match(updated, /<LogonTrigger>[\s\S]*?<Enabled>true<\/Enabled>/u);
+  assert.equal(
+    retargetWindowsTaskXml(updated, replacementRoot, replacementRoot),
+    updated,
+  );
 });
 
 test("startup replacement accepts the Task Scheduler default when task enablement is omitted", () => {

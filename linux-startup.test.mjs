@@ -87,6 +87,10 @@ test("systemd replacement retargets only the receipt-owned component root", () =
   assert.equal(updated.includes(previousRoot), false);
   assert.equal(updated.includes(replacementRoot), true);
   assert.equal(updated.includes(tokenFile), true);
+  assert.equal(
+    retargetSystemdUnit(updated, replacementRoot, replacementRoot),
+    updated,
+  );
 });
 
 test("systemd user unit is network ordered, restartable, and non-root", () => {

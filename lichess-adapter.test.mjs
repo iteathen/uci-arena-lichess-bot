@@ -37,6 +37,7 @@ import {
   parseArguments,
   parseRuntimeStatus,
   probeAccount,
+  providerLifecycleResult,
   providerComponentIdentity,
   providerStatusProjection,
   replacementStartupReadiness,
@@ -77,6 +78,32 @@ function temporaryToken() {
 function sha256(content) {
   return `sha256:${createHash("sha256").update(content).digest("hex")}`;
 }
+
+test("typed provider lifecycle results preserve neutral inactive replacement truth", () => {
+  assert.deepEqual(
+    providerLifecycleResult("pre_replace", "ready").observed,
+    {
+      installation: "installed",
+      activity: "inactive",
+      configuration: "matches",
+      replacement: "safe",
+    },
+  );
+  const inactive = providerLifecycleResult("post_replace", "safe_inactive", {
+    id: "startup.explicitly_inactive",
+    message: "Operator startup state remained inactive during replacement",
+  });
+  assert.equal(inactive.schema, "arena_provider_lifecycle_result_v1");
+  assert.equal(inactive.component_id, "lichess.adapter");
+  assert.equal(inactive.component_version, "1.0.27");
+  assert.equal(inactive.disposition, "safe_inactive");
+  assert.equal(inactive.observed.activity, "inactive");
+  assert.equal(inactive.reason.id, "startup.explicitly_inactive");
+  assert.throws(
+    () => providerLifecycleResult("pre_replace", "safe_inactive", { id: "invalid" }),
+    /invalid/,
+  );
+});
 
 test("provider status distinguishes inactive, disconnected, and ready states", () => {
   const missing = providerStatusProjection();
@@ -1120,7 +1147,7 @@ test("component identity is explicit, inventory-bound, and null for external UCI
   const provider = providerComponentIdentity();
   assert.deepEqual(provider, {
     componentId: "lichess.adapter",
-    version: "1.0.26",
+    version: "1.0.27",
     manifestSha256: sha256(readFileSync(path.join(ROOT, "contracts", "component-manifest.json"))),
   });
 
