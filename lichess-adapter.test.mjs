@@ -95,7 +95,7 @@ test("typed provider lifecycle results preserve neutral inactive replacement tru
   });
   assert.equal(inactive.schema, "arena_provider_lifecycle_result_v1");
   assert.equal(inactive.component_id, "lichess.adapter");
-  assert.equal(inactive.component_version, "1.0.27");
+  assert.equal(inactive.component_version, "1.0.28");
   assert.equal(inactive.disposition, "safe_inactive");
   assert.equal(inactive.observed.activity, "inactive");
   assert.equal(inactive.reason.id, "startup.explicitly_inactive");
@@ -1147,7 +1147,7 @@ test("component identity is explicit, inventory-bound, and null for external UCI
   const provider = providerComponentIdentity();
   assert.deepEqual(provider, {
     componentId: "lichess.adapter",
-    version: "1.0.27",
+    version: "1.0.28",
     manifestSha256: sha256(readFileSync(path.join(ROOT, "contracts", "component-manifest.json"))),
   });
 

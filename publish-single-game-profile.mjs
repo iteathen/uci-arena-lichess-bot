@@ -163,9 +163,12 @@ function validateMcgsCompleteGame(runtime) {
     [runtime.mcgs_graph_nodes, "graph nodes"],
     [runtime.mcgs_graph_edges, "graph edges"],
     [runtime.mcgs_completed_simulations, "completed simulations"],
-    [runtime.mcgs_async_admissions, "asynchronous admissions"],
-    [runtime.mcgs_outstanding_peak, "outstanding peak"],
+    [runtime.async_admissions_delta, "evaluation asynchronous admissions"],
   ]) requireValue(Number(value) > 0, `Complete-game MCGS ${label} is not positive`);
+  for (const [value, label] of [
+    [runtime.mcgs_async_admissions, "move-scoped asynchronous admissions"],
+    [runtime.mcgs_outstanding_peak, "move-scoped outstanding peak"],
+  ]) requireInteger(value, `Complete-game MCGS ${label}`);
   requireValue(Number(runtime.mcgs_root_legal_moves) > 0
     && runtime.mcgs_root_seeded_moves === runtime.mcgs_root_legal_moves,
   "Complete-game MCGS legal-root coverage is incomplete");
@@ -193,8 +196,6 @@ function validateCompleteGamePublicationBoundary(runtime, searchCore) {
     requireValue(Number.isSafeInteger(value) && value >= 0,
       `Complete-game ${label} telemetry is invalid`);
   }
-  requireValue(runtime.bestmove_active_async_leases <= runtime.bestmove_active_tickets,
-    "Complete-game bestmove asynchronous leases exceed active tickets");
   requireValue(Number.isFinite(runtime.post_bestmove_observation_ms)
     && runtime.post_bestmove_observation_ms >= 0
     && runtime.post_bestmove_observation_ms <= 2_000,
@@ -245,8 +246,13 @@ function validateCompleteGamePublicationBoundary(runtime, searchCore) {
   requireInteger(runtime.ticket_capacity, "Complete-game evaluation ticket capacity", 1);
   requireInteger(runtime.active_tickets, "Complete-game active evaluation tickets",
     0, runtime.ticket_capacity);
+  requireInteger(runtime.peak_async_leases, "Complete-game peak asynchronous leases");
   requireInteger(runtime.active_async_leases, "Complete-game active asynchronous leases",
-    0, runtime.active_tickets);
+    0, runtime.peak_async_leases);
+  requireInteger(runtime.bestmove_active_tickets,
+    "Complete-game bestmove active tickets", 0, runtime.ticket_capacity);
+  requireInteger(runtime.bestmove_active_async_leases,
+    "Complete-game bestmove active asynchronous leases", 0, runtime.peak_async_leases);
   requireInteger(runtime.pending_tickets, "Complete-game pending evaluation tickets",
     0, runtime.active_tickets);
   requireInteger(runtime.oldest_pending_age_us,

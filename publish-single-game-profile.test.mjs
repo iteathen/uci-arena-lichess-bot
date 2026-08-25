@@ -184,8 +184,8 @@ function fixture(searchCore = "v2") {
             mcgs_graph_nodes: 64,
             mcgs_graph_edges: 128,
             mcgs_completed_simulations: 96,
-            mcgs_async_admissions: 32,
-            mcgs_outstanding_peak: 2,
+            mcgs_async_admissions: 0,
+            mcgs_outstanding_peak: 0,
             mcgs_root_legal_moves: 20,
             mcgs_root_seeded_moves: 20,
             mcgs_stale_backups_discarded: 0,
@@ -201,6 +201,7 @@ function fixture(searchCore = "v2") {
           }),
           provider_batches_delta: 3,
           provider_rows_delta: 8,
+          async_admissions_delta: searchCore === "mcgs" ? 32 : 0,
           stale_publications_delta: 0,
           stale_publications: 0,
           bestmove_active_tickets: 4,
@@ -208,6 +209,7 @@ function fixture(searchCore = "v2") {
           post_bestmove_observation_ms: 15.25,
           post_bestmove_status_samples: 2,
           ticket_capacity: 64,
+          peak_async_leases: searchCore === "mcgs" ? 96 : 0,
           blocked_submitters: 0,
           ...(searchCore === "mcgs" ? {
             post_bestmove_observation_kind: "persistent_search_continuity",
@@ -394,6 +396,38 @@ test("accepts bounded persistent MCGS work and rejects lost continuity or overca
     /active evaluation tickets must be an integer in 0\.\.64/,
   );
 
+  const sharedTickets = fixture("mcgs");
+  const sharedTicketEvidence = JSON.parse(
+    readFileSync(sharedTickets.complete_game_evidence, "utf8"),
+  );
+  Object.assign(sharedTicketEvidence.runtime_contract.activation_probe.runtime, {
+    bestmove_active_tickets: 2,
+    bestmove_active_async_leases: 5,
+    active_tickets: 2,
+    active_async_leases: 5,
+    peak_async_leases: 8,
+    pending_tickets: 1,
+  });
+  writeFileSync(sharedTickets.complete_game_evidence, JSON.stringify(sharedTicketEvidence));
+  assert.equal(publishSingleGameProfile({
+    ...sharedTickets,
+    qualification_scope: "local_live_safety",
+  }).qualified, true);
+
+  const leaseOverPeak = fixture("mcgs");
+  const leaseOverPeakEvidence = JSON.parse(
+    readFileSync(leaseOverPeak.complete_game_evidence, "utf8"),
+  );
+  leaseOverPeakEvidence.runtime_contract.activation_probe.runtime.active_async_leases = 97;
+  writeFileSync(leaseOverPeak.complete_game_evidence, JSON.stringify(leaseOverPeakEvidence));
+  assert.throws(
+    () => publishSingleGameProfile({
+      ...leaseOverPeak,
+      qualification_scope: "local_live_safety",
+    }),
+    /active asynchronous leases must be an integer in 0\.\.96/,
+  );
+
   const slowObservation = fixture("mcgs");
   const slowEvidence = JSON.parse(
     readFileSync(slowObservation.complete_game_evidence, "utf8"),
@@ -517,7 +551,7 @@ test("rejects tablebase runtime identity drift without replacing prior authority
 test("rejects V2 cursor evidence presented as MCGS authority", () => {
   const options = fixture("mcgs");
   const completeGame = JSON.parse(readFileSync(options.complete_game_evidence, "utf8"));
-  delete completeGame.runtime_contract.activation_probe.runtime.mcgs_async_admissions;
+  completeGame.runtime_contract.activation_probe.runtime.async_admissions_delta = 0;
   Object.assign(completeGame.runtime_contract.activation_probe.runtime, {
     v2_cursor_admissions: 4,
     v2_cursor_async_pending: 2,
@@ -529,7 +563,7 @@ test("rejects V2 cursor evidence presented as MCGS authority", () => {
       ...options,
       qualification_scope: "local_live_safety",
     }),
-    /MCGS asynchronous admissions/,
+    /MCGS evaluation asynchronous admissions/,
   );
 });
 
