@@ -56,6 +56,10 @@ import {
   BOOTSTRAP_COEFFICIENTS,
   coefficientOptions,
 } from "./test-fixtures/adaptive-temporal-curve.mjs";
+import {
+  sha256Object,
+  TIME_POLICY_VERSION,
+} from "@uci-arena/time-profile-contract";
 import { ApiSafetyCoordinator, LichessHttpError } from "./lichess-scheduler.mjs";
 import { LichessStore } from "./lichess-store.mjs";
 import {
@@ -1443,6 +1447,128 @@ test("Manager options remain usable while live-engine onboarding is incomplete",
   assert.equal(updateResponse.schema, MANAGER_OPTIONS_SCHEMA);
   assert.equal(updateResponse.scheduler.discovery_interval_seconds, 80);
   assert.equal(Object.hasOwn(updateResponse, "editable"), false);
+});
+
+test("Manager capacity projection does not revalidate large runtime assets", () => {
+  const fixture = qualifiedFixture();
+  const directory = path.dirname(fixture.profilePath);
+  const missingManifest = path.join(directory, "missing-syzygy-manifest.json");
+  fixture.profile.tablebase = {
+    path: path.join(directory, "missing-syzygy"),
+    manifest: missingManifest,
+    manifest_identity: `sha256:${"c".repeat(64)}`,
+    manifest_file_sha256: `sha256:${"d".repeat(64)}`,
+    loaded_cardinality: 6,
+    probe_limit: 6,
+    probe_threads: 2,
+    rule50: true,
+    root_probe: true,
+    internal_probe: true,
+  };
+  writeFileSync(fixture.profilePath, JSON.stringify(fixture.profile));
+
+  const timeProfilePath = path.join(directory, "time-v3.json");
+  const identity = {
+    time_policy_version: TIME_POLICY_VERSION,
+    model: {
+      model_id: fixture.profile.model_id,
+      model_fingerprint: fixture.profile.model_fingerprint,
+      adapter_id: fixture.profile.adapter_id,
+    },
+    provider: {
+      provider_numeric_fingerprint: fixture.profile.provider_numeric_fingerprint,
+      hardware_driver_fingerprint: fixture.profile.hardware_driver_fingerprint,
+      onnx_runtime_version: fixture.profile.onnx_runtime_version,
+    },
+    search: {
+      search_core: "mcgs",
+      mcgs: { time_policy: "RelativeClockTemporalV1" },
+    },
+  };
+  const gates = Object.fromEntries([
+    "legal_moves",
+    "nonterminal_null_moves",
+    "controller_disabled",
+    "provider_timing_captured",
+    "provider_service_reserve_valid",
+    "applied_provider_service_reserve_covered",
+    "applied_backup_emit_reserve_covered",
+    "p99_deadline_overshoot_passed",
+    "maximum_deadline_overshoot_passed",
+    "passed",
+    "mcgs_root_coverage_passed",
+    "mcgs_policy_only_fallback_passed",
+    "mcgs_graph_population_passed",
+    "mcgs_async_overlap_passed",
+    "mcgs_single_owner_passed",
+    "mcgs_low_budget_fallback_passed",
+    "mcgs_deterministic_fallback_passed",
+    "mcgs_completion_integrity_passed",
+    "mcgs_temporal_policy_passed",
+    "mcgs_deadline_tail_telemetry_passed",
+  ].map((gate) => [gate, true]));
+  const timeProfile = {
+    schema: "uci_time_profile_v3",
+    qualified: true,
+    identity,
+    identity_sha256: sha256Object(identity),
+    applicability: {
+      move_overhead_ms: {
+        minimum: 250,
+        maximum: 1500,
+        tested_values: [250, 650, 700, 1500],
+      },
+    },
+    predictive_controller: { default_enabled: false, enabled_by_profile: false },
+    calibration: {
+      provider_batch_reserve_us: 2000,
+      backup_emit_reserve_us: 1000,
+      iteration_forecast_scale_permille: 1000,
+    },
+    gates,
+  };
+  writeFileSync(timeProfilePath, JSON.stringify(timeProfile));
+
+  const capacityPath = path.join(directory, "capacity-v2.json");
+  const capacity = {
+    schema: "uci_arena_lichess_capacity_profile_v2",
+    qualified: true,
+    published_at: "2026-08-24T00:00:00Z",
+    maximum_concurrency: 2,
+    engine_build_fingerprint: fixture.profile.engine_build_fingerprint,
+    single_game_profile_sha256: sha256(readFileSync(fixture.profilePath)),
+    model_fingerprint: fixture.profile.model_fingerprint,
+    provider_numeric_fingerprint: fixture.profile.provider_numeric_fingerprint,
+    hardware_driver_fingerprint: fixture.profile.hardware_driver_fingerprint,
+    time_profile_sha256: sha256(readFileSync(timeProfilePath)),
+    time_profile_identity_sha256: timeProfile.identity_sha256,
+    search_core: "mcgs",
+    evidence: [
+      { child: 1, qualified: true },
+      { child: 2, qualified: true },
+    ],
+  };
+  writeFileSync(capacityPath, JSON.stringify(capacity));
+
+  const raw = JSON.parse(readFileSync(DEFAULT_TEMPLATE, "utf8"));
+  raw.engine.executable = fixture.config.engine.executable;
+  raw.engine.working_directory = fixture.config.engine.working_directory;
+  raw.engine.single_game_profile = fixture.profilePath;
+  raw.engine.time_profile = timeProfilePath;
+  raw.capacity.capacity_profile = capacityPath;
+  const configPath = path.join(directory, "manager-config.json");
+  writeFileSync(configPath, JSON.stringify(raw));
+
+  const config = loadManagerConfig({ templatePath: configPath, engineRoot: directory });
+  assert.deepEqual(managerOptionsProjection(config).capacity.evidence, {
+    status: "runtime_revalidation_required",
+    qualified: true,
+    maximum_concurrency: 2,
+  });
+  assert.throws(
+    () => applySingleGameProfile(config),
+    /Syzygy manifest is missing/,
+  );
 });
 
 test("Manager capacity projection publishes the standard-UCI startup evidence state", () => {

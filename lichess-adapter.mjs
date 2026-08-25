@@ -944,7 +944,7 @@ function requireOnlyKeys(value, label, allowed) {
   return value;
 }
 
-function capacityEvidenceSummary(config) {
+function capacityEvidenceSummary(config, { validateRuntimeAssets = true } = {}) {
   if (config.capacity.legacy_shared) {
     return { status: "legacy_shared", qualified: true, maximum_concurrency: 1 };
   }
@@ -983,21 +983,29 @@ function capacityEvidenceSummary(config) {
     ? configured
     : path.resolve(config.engine.working_directory, configured);
   try {
-    const singleGameProfile = applySingleGameProfile(config);
+    const evidenceConfig = validateRuntimeAssets
+      ? config
+      : { ...config, engine: { ...config.engine } };
+    const singleGameProfile = validateRuntimeAssets
+      ? applySingleGameProfile(evidenceConfig)
+      : loadSingleGameProfile(evidenceConfig.engine.single_game_profile);
+    if (singleGameProfile.search_core !== "mcgs") {
+      throw new Error("Live deployment requires a qualified MCGS single-game profile");
+    }
     if (singleGameProfile.search_core === "mcgs") {
       const timingProfile = loadExactTimeProfile(
-        config.engine.time_profile,
-        config.engine.working_directory,
+        evidenceConfig.engine.time_profile,
+        evidenceConfig.engine.working_directory,
       );
-      config.engine.time_profile_status = {
+      evidenceConfig.engine.time_profile_status = {
         accepted: true,
         profile_path: timingProfile.profile_path,
         identity_sha256: timingProfile.identity_sha256,
       };
     }
-    const profile = loadCapacityProfile(resolved, config, singleGameProfile);
+    const profile = loadCapacityProfile(resolved, evidenceConfig, singleGameProfile);
     return {
-      status: "qualified",
+      status: validateRuntimeAssets ? "qualified" : "runtime_revalidation_required",
       qualified: true,
       maximum_concurrency: profile.maximum_concurrency,
     };
@@ -1047,7 +1055,7 @@ export function managerOptionsProjection(config) {
     schema: MANAGER_OPTIONS_SCHEMA,
     capacity: {
       ...editable.capacity,
-      evidence: capacityEvidenceSummary(config),
+      evidence: capacityEvidenceSummary(config, { validateRuntimeAssets: false }),
     },
     inbound_challenges: editable.inbound_challenges,
     outbound_challenge: editable.outbound_challenge,
