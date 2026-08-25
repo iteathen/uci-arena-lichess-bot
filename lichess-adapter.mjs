@@ -3059,8 +3059,59 @@ export function validateRuntimeStatus(profile, status) {
     requireRuntimeStatus(status.mcgs_graph_nodes > 0, "MCGS graph contains no nodes");
     requireRuntimeStatus(status.mcgs_graph_edges > 0, "MCGS graph contains no edges");
     requireRuntimeStatus(status.mcgs_completed_simulations > 0, "MCGS completed no simulations");
-    requireRuntimeStatus(status.mcgs_async_admissions > 0, "MCGS admitted no asynchronous leaves");
-    requireRuntimeStatus(status.mcgs_outstanding_peak > 0, "MCGS observed no inference overlap");
+    for (const field of ["mcgs_async_admissions", "mcgs_outstanding_peak"]) {
+      requireRuntimeStatus(
+        Number.isSafeInteger(status[field]) && status[field] >= 0,
+        `MCGS move-scoped telemetry ${field} is missing`,
+      );
+    }
+    requireRuntimeStatus(
+      status.continuous_search_active === true
+        && status.continuous_search_failed === false
+        && status.continuous_focus_valid === true,
+      "MCGS continuous search is not active on a valid focus",
+    );
+    for (const field of [
+      "continuous_search_lineage",
+      "continuous_worker_set_identity",
+      "continuous_search_activations",
+      "continuous_focus_transition_sequence",
+    ]) {
+      requireRuntimeStatus(
+        Number.isSafeInteger(status[field]) && status[field] >= 1,
+        `MCGS continuous identity ${field} is missing`,
+      );
+    }
+    for (const field of [
+      "continuous_focus_position_key",
+      "continuous_focus_graph_epoch",
+      "continuous_focus_subject_identity",
+      "continuous_graph_focus_position_key",
+    ]) {
+      requireRuntimeStatus(
+        typeof status[field] === "string" && /^\d+$/u.test(status[field]),
+        `MCGS continuous focus identity ${field} is missing`,
+      );
+    }
+    requireRuntimeStatus(
+      status.continuous_focus_position_key === status.continuous_graph_focus_position_key,
+      "MCGS continuous focus identity mismatch",
+    );
+    requireRuntimeStatus(
+      Number.isSafeInteger(status.continuous_focus_completed_visits)
+        && status.continuous_focus_completed_visits > 0,
+      "MCGS current focus has no completed visits",
+    );
+    for (const [field, label] of [
+      ["evaluation_service_async_admissions", "asynchronous admissions"],
+      ["evaluation_service_provider_batches", "provider batches"],
+      ["evaluation_service_provider_rows", "provider rows"],
+    ]) {
+      requireRuntimeStatus(
+        Number.isSafeInteger(status[field]) && status[field] > 0,
+        `MCGS EvaluationService ${label} is not positive`,
+      );
+    }
     requireRuntimeStatus(
       status.mcgs_root_seeded_moves === status.mcgs_root_legal_moves,
       "MCGS did not seed every legal root move",
@@ -3096,11 +3147,27 @@ export function validateRuntimeStatus(profile, status) {
     status.evaluation_service_stale_publications_discarded === 0,
     "stale evaluation publication",
   );
-  requireRuntimeStatus(
-    status.evaluation_service_active_async_leases === 0,
-    "terminal async leases remain active",
-  );
-  requireRuntimeStatus(status.evaluation_service_active_tickets === 0, "terminal tickets remain active");
+  if (profile.search_core === "mcgs") {
+    requireRuntimeStatus(
+      Number.isSafeInteger(status.evaluation_service_active_async_leases)
+        && status.evaluation_service_active_async_leases >= 0,
+      "active asynchronous lease telemetry is invalid",
+    );
+    requireRuntimeStatus(
+      Number.isSafeInteger(status.evaluation_service_active_tickets)
+        && status.evaluation_service_active_tickets >= 0,
+      "active ticket telemetry is invalid",
+    );
+  } else {
+    requireRuntimeStatus(
+      status.evaluation_service_active_async_leases === 0,
+      "terminal async leases remain active",
+    );
+    requireRuntimeStatus(
+      status.evaluation_service_active_tickets === 0,
+      "terminal tickets remain active",
+    );
+  }
   requireRuntimeStatus(status.model_cache_eviction_deferrals === 0, "model cache pin deferral");
   requireRuntimeStatus(status.repetition_unbalanced_workers === 0, "repetition state imbalance");
   return status;
@@ -3519,7 +3586,9 @@ export class UciEngine {
       this.qualificationStatus = {
         ...validateRuntimeStatus(
           profile,
-          await this.runtimeStatusAfterInferenceDrain(),
+          profile.search_core === "mcgs"
+            ? await this.runtimeStatus()
+            : await this.runtimeStatusAfterInferenceDrain(),
         ),
         bestmove,
       };

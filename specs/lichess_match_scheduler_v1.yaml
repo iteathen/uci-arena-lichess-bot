@@ -1150,9 +1150,9 @@ mixed_mcgs_capacity_canary_2026_07_20:
   status: active
   profile_schema: uci_arena_lichess_capacity_profile_v2
   rules:
-    - "A two-slot profile binds exact single-game and timing-profile hashes and qualifies one timed foreground child beside one opponent-root child, then swaps roles."
+    - "A two-slot profile binds exact single-game and timing-profile hashes and qualifies two independently active continuous-search children while their current-focus publication responsibilities vary."
     - "Each independently selectable engine-adapter configuration carries its own capacity evidence. Changing adapter, executable, model, timing, or options requires a newly validated composition before token contents are read; there is no hidden runtime fallback bundle."
-    - "Both children remain GPU-backed and satisfy deadline, stop/drain, handoff, stale-publication, and reservation-integrity gates in every evidence round."
+    - "Both children remain GPU-backed and satisfy publication deadlines, current-focus continuity, late-bound publication fencing, stale-publication, and reservation-integrity gates in every evidence round. Continuous MCGS capacity qualification uses positive EvaluationService asynchronous-admission and provider activity with bounded active work; it does not demand terminal inference drain or positive publication-local admission counters."
     - "The initial live canary is one casual public-human slot plus one casual bot slot at rapid/classical controls with outbound 600+2 and at most one game per opponent per day."
 
 persistent_mcgs_worker_scaling_2026_07_21:

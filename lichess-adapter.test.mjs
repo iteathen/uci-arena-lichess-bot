@@ -95,7 +95,7 @@ test("typed provider lifecycle results preserve neutral inactive replacement tru
   });
   assert.equal(inactive.schema, "arena_provider_lifecycle_result_v1");
   assert.equal(inactive.component_id, "lichess.adapter");
-  assert.equal(inactive.component_version, "1.0.28");
+  assert.equal(inactive.component_version, "1.0.29");
   assert.equal(inactive.disposition, "safe_inactive");
   assert.equal(inactive.observed.activity, "inactive");
   assert.equal(inactive.reason.id, "startup.explicitly_inactive");
@@ -624,8 +624,8 @@ function qualifiedRuntimeStatus(profile) {
     mcgs_graph_nodes: 73,
     mcgs_graph_edges: 411,
     mcgs_completed_simulations: 96,
-    mcgs_async_admissions: 88,
-    mcgs_outstanding_peak: 16,
+    mcgs_async_admissions: 0,
+    mcgs_outstanding_peak: 0,
     mcgs_root_seeded_moves: 20,
     mcgs_root_legal_moves: 20,
     mcgs_neural_admission_closed: false,
@@ -634,10 +634,25 @@ function qualifiedRuntimeStatus(profile) {
     mcgs_nonprovider_backups_after_admission_close: 0,
     mcgs_stale_backups_discarded: 0,
     mcgs_reservation_leaks: 0,
+    continuous_search_active: true,
+    continuous_search_failed: false,
+    continuous_search_lineage: 7,
+    continuous_worker_set_identity: 11,
+    continuous_search_activations: 1,
+    continuous_focus_valid: true,
+    continuous_focus_position_key: "123",
+    continuous_focus_graph_epoch: "4",
+    continuous_focus_subject_identity: "5",
+    continuous_graph_focus_position_key: "123",
+    continuous_focus_transition_sequence: 1,
+    continuous_focus_completed_visits: 96,
+    evaluation_service_async_admissions: 88,
     evaluation_service_async_lease_completions: 8,
+    evaluation_service_provider_batches: 4,
+    evaluation_service_provider_rows: 48,
     evaluation_service_stale_publications_discarded: 0,
-    evaluation_service_active_async_leases: 0,
-    evaluation_service_active_tickets: 0,
+    evaluation_service_active_async_leases: 5,
+    evaluation_service_active_tickets: 2,
     model_cache_eviction_deferrals: 0,
     repetition_unbalanced_workers: 0,
     opening_book_enabled: true,
@@ -1147,7 +1162,7 @@ test("component identity is explicit, inventory-bound, and null for external UCI
   const provider = providerComponentIdentity();
   assert.deepEqual(provider, {
     componentId: "lichess.adapter",
-    version: "1.0.28",
+    version: "1.0.29",
     manifestSha256: sha256(readFileSync(path.join(ROOT, "contracts", "component-manifest.json"))),
   });
 
@@ -2293,7 +2308,7 @@ test("MCGS capacity profile v2 binds the accepted timing profile", () => {
   );
 });
 
-test("runtime status gate accepts qualified batched MCGS and rejects incomplete root coverage", () => {
+test("runtime status gate accepts continuous MCGS and rejects incomplete authority", () => {
   const { profile } = qualifiedFixture();
   Object.assign(profile, {
     search_core: "mcgs",
@@ -2311,8 +2326,8 @@ test("runtime status gate accepts qualified batched MCGS and rejects incomplete 
     mcgs_graph_nodes: 73,
     mcgs_graph_edges: 411,
     mcgs_completed_simulations: 96,
-    mcgs_async_admissions: 88,
-    mcgs_outstanding_peak: 16,
+    mcgs_async_admissions: 0,
+    mcgs_outstanding_peak: 0,
     mcgs_root_seeded_moves: 20,
     mcgs_root_legal_moves: 20,
     mcgs_stale_backups_discarded: 0,
@@ -2322,6 +2337,17 @@ test("runtime status gate accepts qualified batched MCGS and rejects incomplete 
   assert.throws(
     () => validateRuntimeStatus(profile, { ...status, mcgs_root_seeded_moves: 19 }),
     /did not seed every legal root move/,
+  );
+  assert.throws(
+    () => validateRuntimeStatus(profile, {
+      ...status,
+      evaluation_service_async_admissions: 0,
+    }),
+    /EvaluationService asynchronous admissions/,
+  );
+  assert.throws(
+    () => validateRuntimeStatus(profile, { ...status, continuous_focus_valid: false }),
+    /continuous search is not active on a valid focus/,
   );
 });
 
@@ -2341,6 +2367,9 @@ test("runtime qualification bypasses the book probe and restores live book play"
     throw new Error(`Unexpected command: ${command}`);
   };
   engine.runtimeStatus = async () => ({ ...qualifiedRuntimeStatus(profile), ...bookStatus });
+  engine.runtimeStatusAfterInferenceDrain = async () => {
+    throw new Error("continuous MCGS must not wait for terminal inference drain");
+  };
 
   await engine.qualifyRuntime();
 
