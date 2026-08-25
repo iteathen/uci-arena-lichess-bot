@@ -185,6 +185,76 @@ function validateMcgsCompleteGame(runtime) {
   "Complete-game MCGS deadline-tail work lacks an admission-close observation");
 }
 
+function validateCompleteGamePublicationBoundary(runtime, searchCore) {
+  for (const [value, label] of [
+    [runtime.bestmove_active_tickets, "bestmove active tickets"],
+    [runtime.bestmove_active_async_leases, "bestmove active asynchronous leases"],
+  ]) {
+    requireValue(Number.isSafeInteger(value) && value >= 0,
+      `Complete-game ${label} telemetry is invalid`);
+  }
+  requireValue(runtime.bestmove_active_async_leases <= runtime.bestmove_active_tickets,
+    "Complete-game bestmove asynchronous leases exceed active tickets");
+  requireValue(Number.isFinite(runtime.post_bestmove_observation_ms)
+    && runtime.post_bestmove_observation_ms >= 0
+    && runtime.post_bestmove_observation_ms <= 2_000,
+  "Complete-game post-bestmove observation was not bounded");
+  requireValue(Number.isSafeInteger(runtime.post_bestmove_status_samples)
+    && runtime.post_bestmove_status_samples >= 1,
+  "Complete-game post-bestmove observation sampling is invalid");
+  requireValue(runtime.stale_publications_delta === 0
+    && runtime.stale_publications === 0,
+  "Complete-game activation reported stale evaluation publications");
+
+  if (searchCore !== "mcgs") {
+    requireValue(runtime.post_bestmove_observation_kind === "terminal_drain",
+      "Complete-game V2 post-bestmove observation is not a terminal drain");
+    requireValue(runtime.active_tickets === 0
+      && runtime.active_async_leases === 0
+      && runtime.pending_tickets === 0
+      && runtime.oldest_pending_age_us === 0,
+    "Complete-game V2 activation did not drain cleanly");
+    return;
+  }
+
+  requireValue(runtime.post_bestmove_observation_kind === "persistent_search_continuity",
+    "Complete-game MCGS post-bestmove observation is not persistent-search continuity");
+  requireValue(runtime.continuous_search_active === true
+    && runtime.continuous_search_failed === false
+    && runtime.continuous_focus_valid === true,
+  "Complete-game MCGS search was not continuously active on a valid focus");
+  for (const [value, label] of [
+    [runtime.continuous_search_lineage, "search lineage"],
+    [runtime.continuous_worker_set_identity, "worker-set identity"],
+    [runtime.continuous_search_activations, "search activations"],
+    [runtime.continuous_focus_transition_sequence, "focus transition sequence"],
+  ]) requireInteger(value, `Complete-game MCGS ${label}`, 1);
+  for (const [value, label] of [
+    [runtime.continuous_focus_position_key, "focus position key"],
+    [runtime.continuous_focus_graph_epoch, "focus graph epoch"],
+    [runtime.continuous_focus_subject_identity, "focus subject identity"],
+    [runtime.continuous_graph_focus_position_key, "graph focus position key"],
+  ]) {
+    requireValue(typeof value === "string" && /^\d+$/u.test(value),
+      `Complete-game MCGS ${label} is invalid`);
+  }
+  same(runtime.continuous_graph_focus_position_key,
+    runtime.continuous_focus_position_key, "Complete-game MCGS focus position identity");
+  requireInteger(runtime.continuous_focus_completed_visits,
+    "Complete-game MCGS focus completed visits");
+  requireInteger(runtime.ticket_capacity, "Complete-game evaluation ticket capacity", 1);
+  requireInteger(runtime.active_tickets, "Complete-game active evaluation tickets",
+    0, runtime.ticket_capacity);
+  requireInteger(runtime.active_async_leases, "Complete-game active asynchronous leases",
+    0, runtime.active_tickets);
+  requireInteger(runtime.pending_tickets, "Complete-game pending evaluation tickets",
+    0, runtime.active_tickets);
+  requireInteger(runtime.oldest_pending_age_us,
+    "Complete-game oldest pending evaluation age");
+  requireValue(runtime.blocked_submitters === 0,
+    "Complete-game MCGS evaluation service has blocked submitters");
+}
+
 function validateCompleteGameTablebase(tablebase, runtime) {
   if (tablebase === null || tablebase === undefined) return null;
   requireValue(tablebase && typeof tablebase === "object",
@@ -282,8 +352,8 @@ function validateCompleteGame(
   timeProfile,
   timeProfileSha,
 ) {
-  requireValue(completeGame.schema === "uci_arena_complete_game_matrix_v3",
-    "Complete-game evidence schema is not uci_arena_complete_game_matrix_v3");
+  requireValue(completeGame.schema === "uci_arena_complete_game_matrix_v4",
+    "Complete-game evidence schema is not uci_arena_complete_game_matrix_v4");
   requireValue(completeGame.completed === true
     && completeGame.summary?.all_games_complete === true
     && completeGame.summary?.runtime_qualification?.passed === true,
@@ -355,25 +425,7 @@ function validateCompleteGame(
       [runtime.v2_cursor_ready_resumes, "cursor ready resumes"],
     ]) requireValue(Number(value) > 0, `Complete-game ${label} is not positive`);
   }
-  for (const [value, label] of [
-    [runtime.bestmove_active_tickets, "bestmove active tickets"],
-    [runtime.bestmove_active_async_leases, "bestmove active asynchronous leases"],
-  ]) {
-    requireValue(Number.isSafeInteger(value) && value >= 0,
-      `Complete-game ${label} telemetry is invalid`);
-  }
-  requireValue(Number.isFinite(runtime.post_bestmove_drain_ms)
-    && runtime.post_bestmove_drain_ms >= 0
-    && runtime.post_bestmove_drain_ms <= 2_000,
-  "Complete-game post-bestmove drain was not bounded");
-  requireValue(Number.isSafeInteger(runtime.post_bestmove_status_samples)
-    && runtime.post_bestmove_status_samples >= 1,
-  "Complete-game post-bestmove drain sampling is invalid");
-  requireValue(runtime.stale_publications_delta === 0
-    && runtime.stale_publications === 0
-    && runtime.active_tickets === 0
-    && runtime.active_async_leases === 0,
-  "Complete-game activation did not drain cleanly");
+  validateCompleteGamePublicationBoundary(runtime, identity.search.search_core);
   return validateCompleteGameTablebase(topology.tablebase, runtime);
 }
 

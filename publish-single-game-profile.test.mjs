@@ -126,7 +126,7 @@ function fixture(searchCore = "v2") {
   writeFileSync(timeProfilePath, JSON.stringify(timeProfile));
   const timeProfileSha = sha256(readFileSync(timeProfilePath));
   writeFileSync(completeGamePath, JSON.stringify({
-    schema: "uci_arena_complete_game_matrix_v3",
+    schema: "uci_arena_complete_game_matrix_v4",
     completed: true,
     config: {
       executable_sha256: { model_engine: engineSha.slice("sha256:".length) },
@@ -205,10 +205,35 @@ function fixture(searchCore = "v2") {
           stale_publications: 0,
           bestmove_active_tickets: 4,
           bestmove_active_async_leases: 0,
-          post_bestmove_drain_ms: 15.25,
+          post_bestmove_observation_ms: 15.25,
           post_bestmove_status_samples: 2,
-          active_tickets: 0,
-          active_async_leases: 0,
+          ticket_capacity: 64,
+          blocked_submitters: 0,
+          ...(searchCore === "mcgs" ? {
+            post_bestmove_observation_kind: "persistent_search_continuity",
+            continuous_search_active: true,
+            continuous_search_failed: false,
+            continuous_search_lineage: 7,
+            continuous_worker_set_identity: 11,
+            continuous_search_activations: 1,
+            continuous_focus_valid: true,
+            continuous_focus_position_key: "123",
+            continuous_focus_graph_epoch: "4",
+            continuous_focus_subject_identity: "5",
+            continuous_graph_focus_position_key: "123",
+            continuous_focus_transition_sequence: 1,
+            continuous_focus_completed_visits: 96,
+            active_tickets: 64,
+            active_async_leases: 64,
+            pending_tickets: 32,
+            oldest_pending_age_us: 100,
+          } : {
+            post_bestmove_observation_kind: "terminal_drain",
+            active_tickets: 0,
+            active_async_leases: 0,
+            pending_tickets: 0,
+            oldest_pending_age_us: 0,
+          }),
         },
       },
     },
@@ -335,7 +360,7 @@ test("publishes a self-contained exact local-live-safety profile", () => {
   );
 });
 
-test("accepts bestmove-boundary work only after a clean bounded drain", () => {
+test("accepts bounded persistent MCGS work and rejects lost continuity or overcapacity", () => {
   const accepted = fixture("mcgs");
   const result = publishSingleGameProfile({
     ...accepted,
@@ -343,7 +368,55 @@ test("accepts bestmove-boundary work only after a clean bounded drain", () => {
   });
   assert.equal(result.qualified, true);
 
-  const leaked = fixture("mcgs");
+  const inactive = fixture("mcgs");
+  const inactiveEvidence = JSON.parse(readFileSync(inactive.complete_game_evidence, "utf8"));
+  inactiveEvidence.runtime_contract.activation_probe.runtime.continuous_search_active = false;
+  writeFileSync(inactive.complete_game_evidence, JSON.stringify(inactiveEvidence));
+  assert.throws(
+    () => publishSingleGameProfile({
+      ...inactive,
+      qualification_scope: "local_live_safety",
+    }),
+    /not continuously active/,
+  );
+
+  const overcapacity = fixture("mcgs");
+  const overcapacityEvidence = JSON.parse(
+    readFileSync(overcapacity.complete_game_evidence, "utf8"),
+  );
+  overcapacityEvidence.runtime_contract.activation_probe.runtime.active_tickets = 65;
+  writeFileSync(overcapacity.complete_game_evidence, JSON.stringify(overcapacityEvidence));
+  assert.throws(
+    () => publishSingleGameProfile({
+      ...overcapacity,
+      qualification_scope: "local_live_safety",
+    }),
+    /active evaluation tickets must be an integer in 0\.\.64/,
+  );
+
+  const slowObservation = fixture("mcgs");
+  const slowEvidence = JSON.parse(
+    readFileSync(slowObservation.complete_game_evidence, "utf8"),
+  );
+  slowEvidence.runtime_contract.activation_probe.runtime.post_bestmove_observation_ms = 2_001;
+  writeFileSync(slowObservation.complete_game_evidence, JSON.stringify(slowEvidence));
+  assert.throws(
+    () => publishSingleGameProfile({
+      ...slowObservation,
+      qualification_scope: "local_live_safety",
+    }),
+    /observation was not bounded/,
+  );
+});
+
+test("retains terminal evaluation drain for V2 compatibility", () => {
+  const accepted = fixture("v2");
+  assert.equal(publishSingleGameProfile({
+    ...accepted,
+    qualification_scope: "local_live_safety",
+  }).qualified, true);
+
+  const leaked = fixture("v2");
   const leakedEvidence = JSON.parse(readFileSync(leaked.complete_game_evidence, "utf8"));
   leakedEvidence.runtime_contract.activation_probe.runtime.active_tickets = 1;
   writeFileSync(leaked.complete_game_evidence, JSON.stringify(leakedEvidence));
@@ -352,19 +425,7 @@ test("accepts bestmove-boundary work only after a clean bounded drain", () => {
       ...leaked,
       qualification_scope: "local_live_safety",
     }),
-    /did not drain cleanly/,
-  );
-
-  const unbounded = fixture("mcgs");
-  const unboundedEvidence = JSON.parse(readFileSync(unbounded.complete_game_evidence, "utf8"));
-  unboundedEvidence.runtime_contract.activation_probe.runtime.post_bestmove_drain_ms = 2_001;
-  writeFileSync(unbounded.complete_game_evidence, JSON.stringify(unboundedEvidence));
-  assert.throws(
-    () => publishSingleGameProfile({
-      ...unbounded,
-      qualification_scope: "local_live_safety",
-    }),
-    /drain was not bounded/,
+    /V2 activation did not drain cleanly/,
   );
 });
 
