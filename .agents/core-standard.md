@@ -1,6 +1,6 @@
 # Shared Agent Operating Standard
 
-Version: `2026-08-20.v3`
+Version: `2026-09-06.v4`
 
 This is the reusable operating core for AI coding agents. Project-local `AGENTS.md` files add product identity, authority order, commands, and non-negotiable constraints. A project may strengthen this standard but should not casually fork its language or duplicate it elsewhere.
 
@@ -65,20 +65,40 @@ Every important fact, state transition, schema, threshold, identifier, mapping, 
 
 ## 4. Shared architecture rule
 
-Use LEGO boundaries: **universally replaceable outside; purpose-built inside**.
+Use LEGO boundaries: **universally replaceable outside; purpose-built inside; recursively attention-bounded throughout**.
 
-A meaningful component owns one coherent problem, lifecycle, state, replacement, or failure boundary. A file, class, function, or helper is not automatically a component.
+LEGO is the outer architecture discipline. It governs ownership, universality, replaceability, scope containment, damage-limiting encapsulation, supported connection surfaces, and the amount of context required to reason correctly about one brick.
 
-At a component boundary:
+**The application or system itself is the outermost LEGO.** Its supported external inputs, outputs, commands, events, data contracts, and lifecycle entry/exit points are its public **studs/surfaces**. Large application sections, subsystems, services, components, and large objects should preferably be compositions of smaller child LEGOs when that preserves cohesion and keeps each reasoning unit inside full attention. A parent owns its externally visible responsibility and hides child topology; callers connect through deliberate studs/surfaces rather than drilling through a parent to reach private children.
+
+A meaningful LEGO owns one coherent problem, invariant, lifecycle, state, replacement, resource, or failure boundary. A file, class, function, or helper is not automatically a LEGO.
+
+A LEGO must fit one agent's **full-attention envelope**. The complete authoritative working set—public contract/studs/surfaces, implementation, invariants, lifecycle/resource/failure rules, tests/conformance, and the immediate dependency and consumer interfaces needed to understand consequences—must fit comfortably in focused attention with substantial headroom for reasoning, evidence, diff inspection, and review. Merely fitting inside a model's maximum context window is not sufficient.
+
+Choose boundaries using both cohesion and attention fit. Strong real seams include semantic/ontological ownership, lifecycle cohesion, functional cohesion, stable dependency/substitution boundaries, independently owned failure/resource behavior, volatility/change boundaries, and execution locality. When a brick exceeds the full-attention envelope, recursively split at the strongest real seam or narrow its scope. Context pressure is a first-class boundary criterion, but it does not justify arbitrary file splitting, duplicated truth, multiple writers, shared mutable ownership, constant cross-boundary chatter, or neighbors that must understand each other's internals.
+
+At a LEGO boundary:
 
 - inject replaceable external capabilities;
-- expose the smallest complete role contract;
+- expose the smallest complete role contract as deliberate studs/surfaces;
 - use project-owned, owner-neutral types and schemas;
 - declare inputs, outputs, errors, state changes, ordering, cancellation, capacity, precision, compatibility, and performance assumptions when material;
-- keep framework, SDK, storage, subprocess, transport, and provider-private types inside adapters;
-- make substitution possible through contract and composition rather than caller branches.
+- keep framework, SDK, storage, subprocess, transport, provider-private, and private-child types inside adapters or the owning brick;
+- make substitution possible through contract and composition rather than caller branches;
+- keep failures, resource pressure, cleanup, and redesign blast radius inside the smallest responsible boundary.
 
-Inside a valid boundary, prefer simple idiomatic code, SOLID/CUPID responsibilities, concrete private helpers, and direct hot-path implementation. Do not add abstraction without real variation, ownership, testing, lifecycle, or clarity value.
+The target is the **smallest coherent, independently comprehensible and replaceable unit**, not the smallest possible module. Very large objects or application sections should preferentially become parent LEGOs composed from smaller private child LEGOs when that preserves one external responsibility while restoring full attention internally.
+
+Inside a valid LEGO, apply the hierarchy in order:
+
+```text
+LEGO: choose and contain boundaries, scope, and studs/surfaces
+  -> SOLID: structure responsibilities and dependency direction inside the brick
+    -> CUPID: make the implementation composable, predictable, idiomatic, and domain-based
+      -> KISS: remove remaining unjustified complexity
+```
+
+A lower level may not defeat a higher one. A locally simpler implementation is not KISS if it breaks LEGO containment; CUPID does not justify violating SOLID dependency direction; SOLID does not justify putting a responsibility in the wrong LEGO.
 
 Foundational ranges, precision, schemas, IDs, persistence formats, and boundaries must fit the real domain rather than accidental limits from the first example. Future-proof foundations; do not invent speculative features.
 
@@ -86,11 +106,13 @@ Foundational ranges, precision, schemas, IDs, persistence formats, and boundarie
 
 These are architecture gates, not style preferences. They apply to names and local logic as strongly as to imports and dependency injection.
 
-- **Complete module isolation:** every LEGO brick is self-contained. Internal logic, types, state, and names describe only the brick's own domain and contract. Never reference an external module/repository/product/provider name, foreign object type, or neighbor-specific context merely because that neighbor is connected today. External identity belongs in composition or in the adapter that intrinsically owns that integration.
+- **Complete module isolation:** every LEGO brick is self-contained. Internal logic, types, state, and names describe only the brick's own domain and contract. Never reference an external module/repository/product/provider name, foreign object type, private child, or neighbor-specific context merely because that neighbor is connected today. External identity belongs in composition or in the adapter that intrinsically owns that integration.
 - **Agnostic interface naming:** inputs, outputs, ports, events, properties, commands, queries, DTOs, callbacks, and public types describe local data, intent, or action. They never encode the identity of the current upstream source or downstream target. A domain identity is valid inside the component that actually owns that domain; it is a leak when copied into another generic brick.
 - **Transient topology:** architect every external connection as temporary. Replacing, removing, isolating, or rewiring a neighbor must not require changes to the component's internal logic or vocabulary. The composition root owns relationships, selection, and lifecycle wiring; bricks do not discover neighbors or branch on product/repository/provider identity.
+- **Stud/surface integrity:** public connection surfaces expose owned contracts, not mutable internals or private child topology. Consumers never drill through one brick's surface to couple directly to an encapsulated child.
 - **Rewiring test:** before accepting a boundary, mentally replace the current neighbor with another conforming implementation or remove it entirely. If internal names become false, foreign types surface, or local logic needs topology-specific branches, the boundary leaks and must be redesigned.
-- **No abstraction theater:** do not create a port, interface, event bus, registry, or generic wrapper merely to appear modular. A port exists only for a real ownership, substitution, lifecycle, failure, or testing boundary. Direct private calls inside one brick are preferred when there is no genuine boundary.
+- **Full-attention test:** an entering agent must be able to identify what the brick owns and excludes, its studs/surfaces, invariants, lifecycle/resources/failures, immediate dependencies, replacement contract, and decisive tests without repository archaeology across unrelated internals.
+- **No abstraction theater:** do not create a port, interface, event bus, registry, generic wrapper, or child LEGO merely to appear modular. A boundary exists only for real ownership, substitution, lifecycle, failure/resource, testing/change, damage-containment, or attention-containment value. Direct private calls inside one attention-bounded brick are preferred when there is no genuine boundary.
 - **One owner remains one owner:** neutral naming must never blur semantic authority. Do not replace explicit ownership with `common`, `shared`, `generic`, `manager`, or callback-based dumping grounds.
 
 A violation of these rules is an architecture defect and a stop condition before implementation or acceptance, not a naming nit to defer for cleanup.
