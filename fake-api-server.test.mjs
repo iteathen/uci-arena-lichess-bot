@@ -217,20 +217,22 @@ test("supervised startup publishes restored cooldown before its account probe wa
   }
 });
 
-test("supervised startup is observable before slow engine qualification completes", async () => {
+test("supervised startup is observable before slow engine qualification completes", { timeout: 25_000 }, async () => {
+  const api = await startFakeLichessApi({ fixtureToken: FIXTURE_TOKEN });
   const token = await temporaryToken();
   const root = await mkdtemp(path.join(os.tmpdir(), "uci-arena-startup-qualification-"));
   const configPath = path.join(root, "config.json");
   const runtimeDir = path.join(root, "runtime");
   const runtimePath = path.join(runtimeDir, "runtime.json");
   const config = JSON.parse(await readFile(DEFAULT_TEMPLATE, "utf8"));
+  config.url = api.origin;
   config.engine = {
     adapter: "standard_uci_v1",
     executable: process.execPath,
     arguments: [
       path.join(HERE, "test-fixtures", "fake-standard-uci-engine.mjs"),
       "--uci-delay-ms",
-      "2000",
+      "10000",
     ],
     working_directory: HERE,
     search_timeout_grace_ms: 1_000,
@@ -266,7 +268,7 @@ test("supervised startup is observable before slow engine qualification complete
   const exited = once(child, "exit");
   try {
     await waitFor(() => existsSync(runtimePath), {
-      timeoutMs: 1_000,
+      timeoutMs: 5_000,
       intervalMs: 10,
       message: `starting status was not published before qualification; output=${output}`,
     });
@@ -275,10 +277,16 @@ test("supervised startup is observable before slow engine qualification complete
     assert.equal(runtime.stream_lifecycle, "starting");
     assert.equal(runtime.api_safety.client_lease.state, "authoritative");
   } finally {
-    if (child.exitCode === null && child.signalCode === null) child.kill();
-    await exited;
-    await rm(root, { recursive: true, force: true });
-    await token.close();
+    if (child.exitCode === null && child.signalCode === null) child.stdin.end("shutdown\n");
+    const forceExit = setTimeout(() => child.kill("SIGKILL"), 5_000);
+    try {
+      await exited;
+    } finally {
+      clearTimeout(forceExit);
+      await rm(root, { recursive: true, force: true });
+      await token.close();
+      await api.close();
+    }
   }
 });
 

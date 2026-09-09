@@ -99,7 +99,9 @@ test("component release accepts safe declarative workspace mappings", () => {
   assert.equal(safeWorkspaceRelative("runtime"), "runtime");
   assert.equal(safeWorkspaceRelative("provider/runtime"), "provider/runtime");
   assert.throws(() => safeWorkspaceRelative(".."), /unsafe component path/);
-  assert.throws(() => safeWorkspaceRelative("C:\\provider"), /unsafe component path/);
+  for (const value of ["C:\\provider", "C:provider", "/provider", "\\provider", "\\\\server\\share"]) {
+    assert.throws(() => safeWorkspaceRelative(value), /unsafe component path/);
+  }
 });
 
 test("Manager configuration and status contracts are closed and separate requests from responses", () => {
