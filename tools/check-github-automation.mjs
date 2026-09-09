@@ -23,6 +23,15 @@ for (const name of readdirSync(workflowRoot).filter((value) => /\.ya?ml$/u.test(
     const match = /^ {2}([A-Za-z_][A-Za-z0-9_-]*):/u.exec(lines[index]);
     if (match) triggers.push(match[1]);
   }
+  if (name === "ci.yml") {
+    if (!triggers.includes("pull_request") || triggers.some(trigger => !["pull_request", "push", "workflow_dispatch"].includes(trigger))) {
+      errors.push(`${name}: only pull request, branch push and manual CI are allowed`);
+    }
+    if (!/^permissions:\s*\n  contents: read\s*$/m.test(source) || /:\s*write\b|secrets\.|self-hosted|^\s*environment:/m.test(source)) {
+      errors.push(`${name}: CI must be read-only, secret-free and GitHub-hosted`);
+    }
+    continue;
+  }
   if (!triggers.includes("workflow_dispatch")) errors.push(`${name}: manual dispatch is required`);
   for (const trigger of triggers.filter((value) => forbidden.has(value))) {
     errors.push(`${name}: automatic trigger is forbidden: ${trigger}`);
@@ -39,4 +48,4 @@ if (errors.length) {
   process.stderr.write(`${errors.join("\n")}\n`);
   process.exit(1);
 }
-process.stdout.write("github automation: manual-only, free OIDC provenance path\n");
+process.stdout.write("github automation: read-only CI; manual releases with free OIDC provenance\n");
