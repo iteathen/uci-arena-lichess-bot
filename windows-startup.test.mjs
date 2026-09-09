@@ -370,10 +370,10 @@ test("post-requalification reconciliation replaces stale runtime bindings and pr
   delete current.expectedAccount;
   const tokenFile = path.resolve(stale.tokenFile);
   const reconciled = reconcileWindowsTaskXml(buildTaskXml(stale, "S-1-5-21-1"), current);
-  assert.doesNotMatch(reconciled, /stale-(single|capacity)|models\\stale/iu);
+  assert.doesNotMatch(reconciled, /stale-(single|capacity)|models[\\/]stale/iu);
   assert.match(reconciled, /current-single\.json/iu);
   assert.match(reconciled, /current-capacity\.json/iu);
-  assert.match(reconciled, /models\\current\\engine/iu);
+  assert.match(reconciled, /models[\\/]current[\\/]engine/iu);
   assert.match(
     reconciled,
     new RegExp(tokenFile.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "iu"),

@@ -47,7 +47,8 @@ function sha256File(filename) {
 function safeRelative(value) {
   const normalized = String(value).replaceAll("\\", "/").replace(/^\.\/+/, "");
   const parts = normalized.split("/");
-  if (!normalized || path.isAbsolute(value)
+  if (!normalized || path.posix.isAbsolute(normalized) || path.win32.isAbsolute(String(value))
+      || /^[A-Za-z]:/.test(normalized)
       || parts.some((part) => !part || part === "." || part === ".." || forbiddenParts.has(part))) {
     throw new Error(`unsafe component path: ${value}`);
   }
