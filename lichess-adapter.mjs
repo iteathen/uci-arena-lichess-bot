@@ -480,6 +480,14 @@ export class TransportProfileTracker {
   }
 }
 
+class GameEngineError extends Error {
+  constructor(code, operation, cause) {
+    super(cause.message, { cause });
+    this.code = code;
+    this.operation = operation;
+  }
+}
+
 class StaleAuthoritativeSearchError extends Error {
   constructor(gameId, reason) {
     super(`Authoritative Lichess state changed during search for ${gameId}: ${reason}`);
@@ -2749,9 +2757,23 @@ function requireQualifiedSearchIdentity(profile, telemetry) {
   }
 }
 
-function requireQualifiedMcgsTimeTelemetry(profile, telemetry) {
+function requireQualifiedMcgsTimeTelemetry(profile, telemetry, legalityState) {
   if (profile.search_core !== "mcgs") {
     throw new Error("Live move authority is not MCGS");
+  }
+  if (telemetry.time_completion_kind === "opening_book") {
+    if (!bookMoveWasUsed(telemetry)) throw new Error("UCI book resolution did not supply the move");
+    return telemetry;
+  }
+  if (telemetry.time_completion_kind === "exact_tablebase") {
+    if (!profile.tablebase) throw new Error("UCI exact tablebase resolution has no qualified tablebase authority");
+    return telemetry;
+  }
+  if (telemetry.time_completion_kind === "objective_no_choice") {
+    if (legalityState.legalMoveCount() !== 1) {
+      throw new Error("UCI objective no-choice resolution has multiple legal candidates");
+    }
+    return telemetry;
   }
   if (telemetry.time_policy !== "RelativeClockTemporalV1") {
     throw new Error(
@@ -2771,8 +2793,8 @@ function requireQualifiedMcgsTimeTelemetry(profile, telemetry) {
       throw new Error(`UCI move timing telemetry is missing ${field}`);
     }
   }
-  if (typeof telemetry.time_completion_kind !== "string") {
-    throw new Error("UCI move timing telemetry is missing completion authority");
+  if (!["searched_decision", "useful_ponder", "deadline_fallback"].includes(telemetry.time_completion_kind)) {
+    throw new Error("UCI move timing telemetry has missing or unsupported completion authority");
   }
   return telemetry;
 }
@@ -4285,6 +4307,7 @@ export class GameSession {
     this.firstMoveAbortAttempts = 0;
     this.finishRecorded = false;
     this.gameStreamRecoveryPending = true;
+    this.engineIncident = null;
   }
 
   gameStreamIncidentIdentity() {
@@ -4296,6 +4319,38 @@ export class GameSession {
     };
   }
 
+  async engineOperation(operation, run) {
+    try {
+      return await run();
+    } catch (error) {
+      if (error instanceof StaleAuthoritativeSearchError || error instanceof GameEngineError) {
+        throw error;
+      }
+      throw new GameEngineError("engine_process_failure", operation, error);
+    }
+  }
+
+  async recordEngineIncident(error) {
+    if (this.engineIncident) return;
+    this.engineIncident = { code: error.code, operation: error.operation };
+    safeRecordProviderIncident(this.store, {
+      ...this.engineIncident,
+      source: "engine_child",
+      gameId: this.gameId,
+      severity: "error",
+      detail: error.code === "engine_contract_failure"
+        ? "Engine move contract validation failed; publication remains blocked until authoritative game completion"
+        : "Engine process operation failed; publication remains blocked until authoritative game completion",
+    });
+    log("game_engine_incident", {
+      game_id: this.gameId,
+      ...this.engineIncident,
+      message: String(error.message).replace(/[\r\n]/gu, " ").slice(0, 512),
+      publication: "quarantined",
+    });
+    await this.invalidateOpponentSearch("local_engine_failure").catch(() => {});
+  }
+
   async run() {
     const engine = this.slot.engine;
     if (!engine) throw new Error(`Game ${this.gameId} has no prepared engine`);
@@ -4303,15 +4358,25 @@ export class GameSession {
     let consecutiveFailures = 0;
     try {
       while (!this.finished && !this.signal.aborted) {
-        const generationBeforeConnection = this.observedGeneration;
+        const stateBeforeConnection = this.latestObservedState;
         try {
           await this.consumeGameStream(engine);
           if (!this.finished) throw new Error("Lichess game stream closed before the game finished");
         } catch (error) {
           if (this.signal.aborted) break;
-          await this.invalidateOpponentSearch("reconnect");
+          await this.invalidateOpponentSearch("reconnect").catch(async (engineError) => {
+            if (!(engineError instanceof GameEngineError)) throw engineError;
+            await this.recordEngineIncident(engineError);
+          });
           this.reconnecting = true;
-          if (this.observedGeneration > generationBeforeConnection) {
+          const stateAfterConnection = this.latestObservedState;
+          const madeProgress = stateAfterConnection && (!stateBeforeConnection
+            || stateAfterConnection.rootKey !== stateBeforeConnection.rootKey
+            || stateAfterConnection.status !== stateBeforeConnection.status
+            || ["wtime", "btime", "winc", "binc"].some((field) => (
+              stateAfterConnection.clock[field] !== stateBeforeConnection.clock[field]
+            )));
+          if (madeProgress) {
             consecutiveFailures = 0;
             reconnectDelay = 1_000;
           }
@@ -4402,15 +4467,20 @@ export class GameSession {
           continue;
         }
         const { event, observation } = queue.shift();
-        if (event.type === "gameFull") {
-          await this.initialize(event, engine);
-          await this.onState(event.state, engine, { observation });
-          this.reconnecting = false;
-        } else {
-          if (!this.initialized) {
-            throw new Error(`Game state arrived before metadata for ${this.gameId}`);
+        try {
+          if (event.type === "gameFull") {
+            await this.initialize(event, engine);
+            await this.onState(event.state, engine, { observation });
+            this.reconnecting = false;
+          } else {
+            if (!this.initialized && !this.engineIncident) {
+              throw new Error(`Game state arrived before metadata for ${this.gameId}`);
+            }
+            await this.onState(event, engine, { observation });
           }
-          await this.onState(event, engine, { observation });
+        } catch (error) {
+          if (!(error instanceof GameEngineError)) throw error;
+          await this.recordEngineIncident(error);
         }
         if (this.gameStreamRecoveryPending) {
           this.gameStreamRecoveryPending = false;
@@ -4455,11 +4525,8 @@ export class GameSession {
     this.opponent = this.color === "white" ? black : white;
     this.slot.opponent = this.opponent;
     this.defaultIncrementMs = clockMilliseconds(event.clock?.increment);
-    await engine.newGame();
-    const profile = this.config.engine.qualification_profile ?? {};
-    const qualification = engine.qualificationStatus ?? {};
-    const runtimeProvenance = gameRuntimeProvenance(this.config, engine);
-    this.store.beginGame({
+    if (this.engineIncident) return;
+    const gameMetadata = {
       id: this.gameId,
       opponent: this.opponent,
       audience: this.slot.audience,
@@ -4468,6 +4535,24 @@ export class GameSession {
       speed: event.speed,
       clockLimit: event.clock?.initial,
       clockIncrement: event.clock?.increment,
+      initialFen: this.legalityState.canonicalInitialFen,
+      variant: "standard",
+      providerComponent: providerComponentIdentity(),
+      engineComponent: this.config.engine.component_identity ?? null,
+    };
+    try {
+      await this.engineOperation("new_game", () => engine.newGame());
+    } catch (error) {
+      if (!(error instanceof GameEngineError)) throw error;
+      this.store.beginGame(gameMetadata);
+      this.initialized = true;
+      throw error;
+    }
+    const profile = this.config.engine.qualification_profile ?? {};
+    const qualification = engine.qualificationStatus ?? {};
+    const runtimeProvenance = gameRuntimeProvenance(this.config, engine);
+    this.store.beginGame({
+      ...gameMetadata,
       engineBuildFingerprint: profile.engine_build_fingerprint
         ?? qualification.engine_build_fingerprint
         ?? "",
@@ -4489,10 +4574,6 @@ export class GameSession {
       bookIdentity: bookConfigurationIdentity(this.config),
       runtimeProvenanceSha256: runtimeProvenance.sha256,
       runtimeProvenance: runtimeProvenance.provenance,
-      initialFen: this.legalityState.canonicalInitialFen,
-      variant: "standard",
-      providerComponent: providerComponentIdentity(),
-      engineComponent: this.config.engine.component_identity ?? null,
     });
     this.initialized = true;
     log("game_ready", {
@@ -4559,6 +4640,13 @@ export class GameSession {
       winner,
       plies,
     });
+    if (this.engineIncident) {
+      safeResolveProviderIncident(this.store, {
+        ...this.engineIncident,
+        source: "engine_child",
+        gameId: this.gameId,
+      });
+    }
     log("game_finished", {
       game_id: this.gameId,
       opponent: this.opponent,
@@ -4651,7 +4739,7 @@ export class GameSession {
       if (reason === "foreground_preempted" && !engine.isOpponentTurnSearchActive()) {
         return { drained: false, reason };
       }
-      const drained = await engine.stopAndDrain(reason);
+      const drained = await this.engineOperation("stop_and_drain", () => engine.stopAndDrain(reason));
       this.staleBestmoveDrained ||= drained.drained;
       this.opponentSearchDrainMs += Number(drained.elapsedMs ?? 0);
       if (reason === "foreground_preempted") this.lastPonderMissReason = reason;
@@ -4669,7 +4757,7 @@ export class GameSession {
   resumeOpponentSearch() {
     return this.serializeOpponentOperation(async () => {
       const engine = this.slot.engine;
-      if (!engine || this.finished || !this.initialized
+      if (!engine || this.engineIncident || this.finished || !this.initialized
           || !this.config.timing.opponent_turn_search
           || engine.mode !== "idle"
           || this.authoritativeGeneration !== this.observedGeneration
@@ -4689,7 +4777,9 @@ export class GameSession {
       } else {
         return null;
       }
-      const active = await engine.startOpponentTurnSearch({ moves, predictedMove, ...clocks });
+      const active = await this.engineOperation("opponent_search", () => (
+        engine.startOpponentTurnSearch({ moves, predictedMove, ...clocks })
+      ));
       if (!active) return null;
       if (this.pendingOwnMove) {
         this.pendingOwnMove.ponderSearchGeneration = active.generation;
@@ -4877,6 +4967,18 @@ export class GameSession {
     observation.authorityValidationMs = observation.authorityValidatedAt - receivedAt;
     this.lastClock = observation.clock;
 
+    if (this.engineIncident) {
+      this.authoritativeMoves = moves;
+      this.authoritativeGeneration = observation.generation;
+      if (status !== "started" && this.observationIsLatest(observation)) {
+        const winner = String(state.winner ?? "");
+        const result = winner ? winner === this.color ? "win" : "loss"
+          : new Set(["draw", "stalemate"]).has(status) ? "draw" : "";
+        this.recordGameFinished({ status, result, winner, plies: moves.length });
+      }
+      return;
+    }
+
     if (transition.kind === "duplicate" && status === "started") {
       if (!this.observationIsLatest(observation)) return;
       this.authoritativeMoves = moves;
@@ -4982,6 +5084,7 @@ export class GameSession {
     let bestmoveToLegalityMs = 0;
     let moveQueueWaitMs = 0;
     let goClock = null;
+    let bestmoveAt = null;
     let projectedSearchRequested = false;
     try {
       if (!this.observationIsCurrent(observation)) {
@@ -4993,13 +5096,13 @@ export class GameSession {
       if (controller.signal.aborted) throw searchCancellationError(controller.signal);
       if (ponderHit) {
         const ownTime = this.color === "white" ? this.lastClock.wtime : this.lastClock.btime;
-        result = await engine.ponderHit({
+        result = await this.engineOperation("ponder_hit", () => engine.ponderHit({
           timeoutMs: Math.max(
             10_000,
             ownTime + Number(this.config.engine.search_timeout_grace_ms ?? 10_000),
           ),
           signal: controller.signal,
-        });
+        }));
       } else {
         const clocks = subtractLocalClockDelay(
           this.lastClock,
@@ -5007,38 +5110,43 @@ export class GameSession {
           performance.now() - receivedAt,
         );
         goClock = clocks;
-        result = await engine.search({
+        result = await this.engineOperation("search", () => engine.search({
           moves,
           ...clocks,
           color: this.color,
           signal: controller.signal,
-        });
+        }));
       }
 
       if (!this.observationIsCurrent(observation)
           || this.authoritativeGeneration !== stateGeneration) {
         throw new StaleAuthoritativeSearchError(this.gameId, "superseded_before_submission");
       }
-      if (result.rootKey !== rootKey || result.runtimeGeneration !== engine.runtimeGeneration) {
-        throw new Error(`UCI bestmove belongs to a stale root or runtime generation for ${this.gameId}`);
-      }
-      if (usesExtendedEngineAdapter(this.config)) {
-        requireQualifiedSearchIdentity(this.config.engine.qualification_profile, result.telemetry ?? {});
-        requireQualifiedMcgsTimeTelemetry(
-          this.config.engine.qualification_profile,
-          result.telemetry ?? {},
-        );
-      }
-      if (!UCI_MOVE_PATTERN.test(result.bestmove)) {
-        throw new Error(`UCI bestmove failed legal-root syntax validation: ${result.bestmove ?? "missing"}`);
-      }
-      legality = this.legalityState.validateCandidate(moves, result.bestmove);
-      const bestmoveAt = Number.isFinite(result.bestmoveAt) ? result.bestmoveAt : performance.now();
-      bestmoveToLegalityMs = performance.now() - bestmoveAt;
-      if (!legality.legal) {
-        throw new Error(
-          `UCI bestmove is illegal at the exact authoritative root: ${result.bestmove}`,
-        );
+      try {
+        if (result.rootKey !== rootKey || result.runtimeGeneration !== engine.runtimeGeneration) {
+          throw new Error(`UCI bestmove belongs to a stale root or runtime generation for ${this.gameId}`);
+        }
+        if (!UCI_MOVE_PATTERN.test(result.bestmove)) {
+          throw new Error(`UCI bestmove failed legal-root syntax validation: ${result.bestmove ?? "missing"}`);
+        }
+        legality = this.legalityState.validateCandidate(moves, result.bestmove);
+        bestmoveAt = Number.isFinite(result.bestmoveAt) ? result.bestmoveAt : performance.now();
+        bestmoveToLegalityMs = performance.now() - bestmoveAt;
+        if (!legality.legal) {
+          throw new Error(
+            `UCI bestmove is illegal at the exact authoritative root: ${result.bestmove}`,
+          );
+        }
+        if (usesExtendedEngineAdapter(this.config)) {
+          requireQualifiedSearchIdentity(this.config.engine.qualification_profile, result.telemetry ?? {});
+          requireQualifiedMcgsTimeTelemetry(
+            this.config.engine.qualification_profile,
+            result.telemetry ?? {},
+            this.legalityState,
+          );
+        }
+      } catch (error) {
+        throw new GameEngineError("engine_contract_failure", "move_validation", error);
       }
       if (!this.observationIsCurrent(observation)) {
         throw new StaleAuthoritativeSearchError(this.gameId, "superseded_during_legality_replay");
@@ -5071,7 +5179,8 @@ export class GameSession {
         this.lastPonderMissReason = null;
         this.staleBestmoveDrained = false;
         projectedSearchRequested = true;
-        void this.resumeOpponentSearch().catch((error) => {
+        void this.resumeOpponentSearch().catch(async (error) => {
+          if (error instanceof GameEngineError) await this.recordEngineIncident(error);
           log("projected_opponent_search_failed", {
             game_id: this.gameId,
             message: error.message,
@@ -6264,6 +6373,9 @@ export class BotController {
       configured_capacity: this.config.capacity.total_slots,
       qualified_capacity: this.config.capacity_profile?.maximum_concurrency ?? 1,
       slots: this.slots.snapshot(),
+      game_engine_incidents: Array.from(this.gameSessions.values())
+        .filter((session) => session.engineIncident)
+        .map((session) => ({ game_id: session.gameId, ...session.engineIncident })),
       scheduler: {
         enabled: this.config.scheduler.enabled,
         target_active_bots: this.config.capacity.bot.target_active,
@@ -6614,6 +6726,10 @@ export function providerStatusProjection({
   const schedulerFault = effectiveActive ? runtime?.scheduler?.fault ?? null : null;
   const reconciliationPending = effectiveActive
     && runtime?.scheduler?.reconciliation_pending === true;
+  const engineIncidentCodes = effectiveActive && Array.isArray(runtime?.game_engine_incidents)
+    ? new Set(runtime.game_engine_incidents.map((incident) => incident?.code)
+      .filter((code) => ["engine_process_failure", "engine_contract_failure"].includes(code)))
+    : new Set();
   const blockers = [];
   if (effectiveRuntimeError) blockers.push(effectiveRuntimeError);
   if (!effectiveActive) blockers.push("provider_process_inactive");
@@ -6637,6 +6753,7 @@ export function providerStatusProjection({
     blockers.push("api_client_lease_unhealthy");
   }
   if (schedulerFault) blockers.push("scheduler_fault");
+  for (const code of engineIncidentCodes) blockers.push(`game_${code}`);
   if (startupError) blockers.push("startup_status_unavailable");
   if (startup?.exitReceiptState === "failed") blockers.push("startup_exit_receipt_unavailable");
   if (startup?.restartPending === true) blockers.push("provider_restart_pending");
@@ -6695,6 +6812,7 @@ export function providerStatusProjection({
     registered: startup?.installed === true,
     active: effectiveActive,
     ready: effectiveActive && streamConnected && !schedulerFault && !reconciliationPending
+      && engineIncidentCodes.size === 0
       && apiLeaseState === "authoritative",
     stream_connected: streamConnected,
     stream_state: streamLifecycle,

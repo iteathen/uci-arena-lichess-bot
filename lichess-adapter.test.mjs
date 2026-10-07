@@ -58,6 +58,7 @@ import {
 } from "./test-fixtures/adaptive-temporal-curve.mjs";
 import { ApiSafetyCoordinator, LichessHttpError } from "./lichess-scheduler.mjs";
 import { LichessStore } from "./lichess-store.mjs";
+import { startFakeLichessApi } from "./fake-api-server.mjs";
 import {
   AuthoritativeChessState,
   validateLegalMoveAtAuthoritativeRoot,
@@ -255,6 +256,22 @@ test("provider status distinguishes inactive, disconnected, and ready states", (
     truncated: true,
     truncated_rows: 3,
   });
+
+  const engineFaulted = providerStatusProjection({
+    runtime: {
+      ...runtime,
+      stream_connected: true,
+      stream_lifecycle: "connected",
+      game_engine_incidents: [{ game_id: "retained-game", code: "engine_contract_failure", operation: "move_validation" }],
+    },
+    active: true,
+    now: Date.parse(runtime.updated_at),
+  });
+  assert.equal(engineFaulted.active, true);
+  assert.equal(engineFaulted.stream_connected, true);
+  assert.equal(engineFaulted.games.active, 1);
+  assert.equal(engineFaulted.ready, false);
+  assert.deepEqual(engineFaulted.blockers, ["game_engine_contract_failure"]);
 
   const stale = providerStatusProjection({
     runtime: { ...runtime, stream_connected: true, stream_lifecycle: "connected" },
@@ -2823,6 +2840,165 @@ test("active game stream retries beyond the former failure threshold", async () 
   assert.notEqual(session.finished, true);
 });
 
+test("replayed gameFull does not reset transport backoff and HTTP 429 keeps its full cooldown", async () => {
+  const stop = new AbortController();
+  const waits = [];
+  let connections = 0;
+  const full = gameFull(startedState("e2e4"));
+  const engine = new MockGameEngine();
+  const config = gameConfig();
+  config.timing.opponent_turn_search = false;
+  const session = new GameSession({
+    client: {
+      async *stream() {
+        connections += 1;
+        yield full;
+        if (connections === 4) throw new LichessHttpError("GET", "game-stream", 429, 3_600_000);
+        throw new Error("fabricated stream transport disconnect");
+      },
+    },
+    config,
+    account: "arena-bot",
+    gameId: "game-transport-replay",
+    signal: stop.signal,
+    slot: { engine },
+    store: mockStore(),
+    waitForReconnect: async (milliseconds) => {
+      waits.push(milliseconds);
+      if (waits.length === 4) stop.abort();
+    },
+  });
+  await session.run();
+  assert.deepEqual(waits, [1_000, 2_000, 4_000, 3_600_000]);
+  assert.equal(session.engineIncident, null);
+  assert.notEqual(session.finished, true);
+});
+
+test("engine new-game failure preserves canonical game completion without inventing qualified provenance", async () => {
+  const stop = new AbortController();
+  const engine = new MockGameEngine();
+  let newGames = 0;
+  engine.newGame = async () => { newGames += 1; throw new Error("fabricated child exited"); };
+  const starts = [];
+  const finishes = [];
+  const session = new GameSession({
+    client: {
+      async *stream() {
+        yield gameFull(startedState(""));
+        await new Promise((resolve) => setImmediate(resolve));
+        yield startedState("", { status: "timeout", winner: "black" });
+      },
+    },
+    config: gameConfig(),
+    account: "arena-bot",
+    gameId: "game-new-game-failure",
+    signal: stop.signal,
+    slot: { engine, audience: "human" },
+    store: { beginGame(value) { starts.push(value); }, reconcileGameLine() {}, finishGame(value) { finishes.push(value); } },
+    waitForReconnect: async () => { throw new Error("local failure attempted reconnect"); },
+  });
+  await session.run();
+  assert.equal(newGames, 1);
+  assert.equal(starts.length, 1);
+  assert.equal(starts[0].runtimeProvenance, undefined);
+  assert.equal(finishes.length, 1);
+  assert.equal(finishes[0].status, "timeout");
+  assert.equal(session.engineIncident.code, "engine_process_failure");
+});
+
+test("local engine telemetry failure retains the loopback game stream and active slot until terminal authority", async () => {
+  const stop = new AbortController();
+  const fixtureToken = "fabricated-game-failure-token";
+  const initial = startedState("");
+  let searches = 0;
+  let reconnects = 0;
+  let session;
+  const events = [];
+  const originalLog = console.log;
+  console.log = (line) => events.push(JSON.parse(line));
+  const engine = new UciEngine({
+    adapter: "standard_uci_v1",
+    executable: process.execPath,
+    arguments: [path.join(ROOT, "test-fixtures", "fake-standard-uci-engine.mjs")],
+    working_directory: ROOT,
+    uci_options: {},
+    timing: { opponent_turn_search: false },
+    shutdown_grace_ms: 1_000,
+  });
+  const send = engine.send.bind(engine);
+  engine.send = (command) => {
+    if (command.startsWith("go ")) searches += 1;
+    send(command);
+  };
+  const api = await startFakeLichessApi({
+    fixtureToken,
+    state: { gameStreams: {
+      "game-local-failure": async function* records() {
+        yield gameFull(initial);
+        const deadline = Date.now() + 5_000;
+        while (!session?.engineIncident && reconnects === 0 && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        yield initial;
+        yield startedState("", { status: "timeout", winner: "black" });
+      },
+    } },
+  });
+  const config = gameConfig();
+  config.timing.opponent_turn_search = false;
+  const slot = { id: "human-1", state: "active", audience: "human", engine };
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-local-engine-failure-"));
+  const store = new LichessStore(path.join(directory, "matches.sqlite"));
+  session = new GameSession({
+    client: new LichessClient({
+      token: fixtureToken,
+      baseUrl: api.origin,
+      fetchImpl: (url, options) => {
+        assert.equal(new URL(url).origin, new URL(api.origin).origin);
+        return fetch(url, options);
+      },
+    }),
+    config,
+    account: "arena-bot",
+    gameId: "game-local-failure",
+    signal: stop.signal,
+    slot,
+    store,
+    waitForReconnect: async () => {
+      reconnects += 1;
+      if (reconnects === 2) stop.abort();
+    },
+  });
+  try {
+    await engine.start();
+    searches = 0;
+    await session.run();
+    assert.equal(api.requests.filter((row) => row.path.includes("/stream/")).length, 1);
+    assert.equal(reconnects, 0);
+    assert.equal(searches, 1);
+    assert.equal(slot.state, "active");
+    assert.equal(session.finished, true);
+    assert.equal(store.status().games, 1);
+    assert.equal(api.state.moves.length, 0);
+    assert.equal(api.state.aborts.length, 0);
+    assert.equal(events.filter((row) => row.event === "game_engine_incident").length, 1);
+    assert.equal(events.some((row) => row.event === "game_stream_error"), false);
+    assert.equal(session.engineIncident.code, "engine_contract_failure");
+    const incidents = store.listProviderIncidents({ filter: "all", after_cursor: 0, limit: 10 });
+    assert.equal(incidents.incidents.length, 1);
+    assert.equal(incidents.incidents[0].code, "engine_contract_failure");
+    assert.equal(incidents.incidents[0].state, "resolved");
+    assert.equal(incidents.incidents[0].occurrence_count, 1);
+  } finally {
+    stop.abort();
+    console.log = originalLog;
+    await engine.close();
+    await api.close();
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("qualified v1 transport profiles remain readable with legacy coverage", (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-transport-v1-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
@@ -3336,6 +3512,172 @@ test("search identity change rejects a move before submission", async () => {
   );
   assert.equal(posts.length, 0);
   assert.equal(session.pendingOwnMove, null);
+});
+
+test("explicit legal book and exact-tablebase resolutions do not require searched timing fields", async () => {
+  for (const [kind, extra] of [
+    ["opening_book", { book_move_used: 1 }],
+    ["exact_tablebase", {}],
+  ]) {
+    const posts = [];
+    const config = gameConfig();
+    config.timing.opponent_turn_search = false;
+    if (kind === "exact_tablebase") config.engine.qualification_profile.tablebase = { loaded_cardinality: 6 };
+    const move = kind === "exact_tablebase" ? "a1a2" : "e2e4";
+    const engine = new MockGameEngine([{ bestmove: move, telemetry: {
+      time_policy: undefined,
+      time_completion_kind: kind,
+      time_opponent_remaining_ms: undefined,
+      time_completion_applied: undefined,
+      ...extra,
+    } }]);
+    const session = createGameSession(engine, { post: async (endpoint) => posts.push(endpoint) }, config);
+    const initial = startedState("");
+    if (kind === "exact_tablebase") {
+      session.initialized = true;
+      session.color = "white";
+      session.initialFen = "7k/8/8/8/8/2R5/8/K7 w - - 0 1";
+      session.legalityState = new AuthoritativeChessState(session.initialFen);
+    } else {
+      await session.initialize(gameFull(initial), engine);
+    }
+    await session.onState(initial, engine);
+    assert.deepEqual(posts, [`api/bot/game/game-1/move/${move}`]);
+  }
+});
+
+test("objective no-choice resolution requires the independently replayed root to have one legal move", async () => {
+  const posts = [];
+  const engine = new MockGameEngine([{ bestmove: "a1b2", telemetry: {
+    time_policy: undefined, time_completion_kind: "objective_no_choice",
+  } }]);
+  const config = gameConfig();
+  config.timing.opponent_turn_search = false;
+  const session = createGameSession(engine, { post: async (endpoint) => posts.push(endpoint) }, config);
+  session.initialized = true;
+  session.color = "white";
+  session.initialFen = "k7/8/8/8/8/8/1r6/K7 w - - 0 1";
+  session.legalityState = new AuthoritativeChessState(session.initialFen);
+  await session.onState(startedState(""), engine);
+  assert.deepEqual(posts, ["api/bot/game/game-1/move/a1b2"]);
+});
+
+test("book hints, tablebase availability, and false no-choice claims cannot bypass searched timing validation", async () => {
+  for (const [kind, extra, tablebase] of [
+    ["searched_decision", { book_probe_hit: 1, book_move_used: 0 }, true],
+    ["opening_book", { book_probe_hit: 1, book_move_used: 0 }, false],
+    ["objective_no_choice", {}, false],
+    ["exact_tablebase", {}, false],
+    ["nonsearch_selection", {}, true],
+    ["deadline_fallback", {}, false],
+  ]) {
+    const posts = [];
+    const config = gameConfig();
+    config.timing.opponent_turn_search = false;
+    if (tablebase) config.engine.qualification_profile.tablebase = { loaded_cardinality: 6 };
+    const engine = new MockGameEngine([{ bestmove: "e2e4", telemetry: {
+      time_policy: undefined, time_completion_kind: kind, ...extra,
+    } }]);
+    const session = createGameSession(engine, { post: async (endpoint) => posts.push(endpoint) }, config);
+    const initial = startedState("");
+    await session.initialize(gameFull(initial), engine);
+    await assert.rejects(session.onState(initial, engine));
+    assert.equal(posts.length, 0);
+  }
+});
+
+test("loopback book resolution submits the legal move without fabricated searched timing telemetry", async () => {
+  const lifetime = new AbortController();
+  const fixtureToken = "fabricated-book-resolution-token";
+  let session;
+  let api;
+  const engine = new UciEngine({
+    adapter: "standard_uci_v1",
+    executable: process.execPath,
+    arguments: [path.join(ROOT, "test-fixtures", "fake-standard-uci-engine.mjs"), "--book-resolution"],
+    working_directory: ROOT,
+    uci_options: {},
+    timing: { opponent_turn_search: false },
+    shutdown_grace_ms: 1_000,
+  });
+  api = await startFakeLichessApi({
+    fixtureToken,
+    state: { gameStreams: {
+      "game-book-resolution": async function* records() {
+        yield gameFull(startedState(""));
+        const deadline = Date.now() + 5_000;
+        while (api.state.moves.length === 0 && !session.engineIncident && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        yield startedState(api.state.moves.length ? "e2e4" : "", { status: "timeout", winner: "black" });
+      },
+    } },
+  });
+  const config = gameConfig();
+  config.timing.opponent_turn_search = false;
+  session = new GameSession({
+    client: new LichessClient({
+      token: fixtureToken,
+      baseUrl: api.origin,
+      fetchImpl: (url, options) => {
+        assert.equal(new URL(url).origin, new URL(api.origin).origin);
+        return fetch(url, options);
+      },
+    }),
+    config,
+    account: "arena-bot",
+    gameId: "game-book-resolution",
+    signal: lifetime.signal,
+    slot: { id: "book-game", engine, audience: "human" },
+    store: mockStore(),
+    waitForReconnect: async () => { throw new Error("book resolution attempted a stream reconnect"); },
+  });
+  try {
+    await engine.start();
+    await session.run();
+    assert.deepEqual(api.state.moves.map((row) => row.move), ["e2e4"]);
+    assert.equal(api.requests.filter((row) => row.path.includes("/stream/")).length, 1);
+    assert.equal(session.engineIncident, null);
+    assert.equal(engine.latestInfo.time_policy, undefined);
+    assert.equal(engine.latestInfo.time_completion_kind, "opening_book");
+    assert.equal(session.finished, true);
+  } finally {
+    lifetime.abort();
+    await engine.close();
+    await api.close();
+  }
+});
+
+test("unknown and unpublished completions fail closed even with otherwise complete timing fields", async () => {
+  for (const kind of ["unknown_completion", "unpublished", "nonsearch_selection"]) {
+    const posts = [];
+    const engine = new MockGameEngine([{ bestmove: "e2e4", telemetry: { time_completion_kind: kind } }]);
+    const session = createGameSession(engine, { post: async (endpoint) => posts.push(endpoint) });
+    const initial = startedState("");
+    await session.initialize(gameFull(initial), engine);
+    await assert.rejects(session.onState(initial, engine), /completion authority/);
+    assert.equal(posts.length, 0);
+  }
+});
+
+test("explicit nonsearch completion cannot bypass exact root, runtime, or move legality fences", async () => {
+  for (const [change, expected] of [
+    [{ bestmove: "e2e5" }, /illegal at the exact authoritative root/],
+    [{ rootKey: "e2e4" }, /stale root or runtime generation/],
+    [{ runtimeGeneration: 999 }, /stale root or runtime generation/],
+  ]) {
+    const posts = [];
+    const engine = new MockGameEngine([{ bestmove: "e2e4", telemetry: {
+      time_policy: undefined, time_completion_kind: "opening_book", book_move_used: 1,
+    } }]);
+    const originalResult = engine.nextResult.bind(engine);
+    engine.nextResult = (moves) => ({ ...originalResult(moves), ...change });
+    const session = createGameSession(engine, { post: async (endpoint) => posts.push(endpoint) });
+    const initial = startedState("");
+    await session.initialize(gameFull(initial), engine);
+    await assert.rejects(session.onState(initial, engine), expected);
+    assert.equal(posts.length, 0);
+  }
 });
 
 test("syntactically valid illegal bestmove is rejected at the exact authoritative root", async () => {
