@@ -24,7 +24,7 @@ jobs:
       - name: Reproduce two startup failures with original operation bounds
         shell: pwsh
         run: |
-          node --test --test-reporter=tap --test-timeout=60000 `
+          node --test --test-isolation=none --test-reporter=tap --test-timeout=60000 `
             --test-name-pattern='provider probe reaches the account API without a configured engine|supervised startup publishes restored cooldown before its account probe waits' `
             fake-api-server.test.mjs
           exit $LASTEXITCODE
