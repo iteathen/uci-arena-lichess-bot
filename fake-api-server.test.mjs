@@ -125,7 +125,7 @@ test("provider probe reaches the account API without a configured engine", async
   }
 });
 
-test("supervised startup publishes restored cooldown before its account probe waits", async () => {
+test("supervised startup publishes restored cooldown before its account probe waits", async (t) => {
   const api = await startFakeLichessApi({ fixtureToken: FIXTURE_TOKEN });
   const token = await temporaryToken();
   const root = await mkdtemp(path.join(os.tmpdir(), "uci-arena-startup-cooldown-"));
@@ -210,6 +210,16 @@ test("supervised startup publishes restored cooldown before its account probe wa
       .map((line) => JSON.parse(line));
     assert.ok(rows.some((row) => row.event === "api_rate_limit_restored"));
   } finally {
+    // Diagnostic branch only: retain evidence before the existing cleanup
+    // ordering runs. No operation limit or assertion is changed.
+    t.diagnostic(JSON.stringify({
+      phase: "restored_cooldown_fixture_cleanup",
+      child_pid: child.pid,
+      child_exit_code: child.exitCode,
+      child_signal_code: child.signalCode,
+      child_output_tail: output.replaceAll(FIXTURE_TOKEN, "[fixture-token]").slice(-4096),
+      active_resources: process.getActiveResourcesInfo(),
+    }));
     if (child.exitCode === null && child.signalCode === null) child.kill();
     await rm(root, { recursive: true, force: true });
     await token.close();
