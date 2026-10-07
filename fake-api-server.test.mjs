@@ -17,6 +17,7 @@ import {
 import { startFakeLichessApi } from "./fake-api-server.mjs";
 import { renderInstallerConfiguration } from "./installer-integration.mjs";
 import { LichessStore } from "./lichess-store.mjs";
+import { registerProviderFixtureCleanup } from "./test-fixtures/provider-fixture-cleanup.mjs";
 
 const FIXTURE_TOKEN = "uci-arena-non-secret-test-token";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -87,7 +88,7 @@ test("loopback API server exercises the real account probe without a Lichess cre
   }
 });
 
-test("provider probe reaches the account API without a configured engine", async () => {
+test("provider probe reaches the account API without a configured engine", async (t) => {
   const api = await startFakeLichessApi({ fixtureToken: FIXTURE_TOKEN });
   const token = await temporaryToken();
   const root = await mkdtemp(path.join(os.tmpdir(), "uci-arena-provider-probe-"));
@@ -101,6 +102,7 @@ test("provider probe reaches the account API without a configured engine", async
   const output = [];
   const originalLog = console.log;
   console.log = (line) => output.push(String(line));
+  registerProviderFixtureCleanup(t, { api, token, root });
   try {
     assert.equal(await main([
       "probe",
@@ -119,13 +121,10 @@ test("provider probe reaches the account API without a configured engine", async
     ]);
   } finally {
     console.log = originalLog;
-    await rm(root, { recursive: true, force: true });
-    await token.close();
-    await api.close();
   }
 });
 
-test("supervised startup publishes restored cooldown before its account probe waits", async () => {
+test("supervised startup publishes restored cooldown before its account probe waits", async (t) => {
   const api = await startFakeLichessApi({ fixtureToken: FIXTURE_TOKEN });
   const token = await temporaryToken();
   const root = await mkdtemp(path.join(os.tmpdir(), "uci-arena-startup-cooldown-"));
@@ -188,36 +187,30 @@ test("supervised startup publishes restored cooldown before its account probe wa
   child.stdout.on("data", (chunk) => { output = `${output}${chunk}`.slice(-16_384); });
   child.stderr.on("data", (chunk) => { output = `${output}${chunk}`.slice(-16_384); });
   const exited = once(child, "exit");
-  try {
-    await waitFor(() => existsSync(runtimePath), {
-      message: `startup runtime status was not published; output=${output}`,
-    });
-    const runtime = JSON.parse(readFileSync(runtimePath, "utf8"));
-    assert.equal(runtime.pid, child.pid);
-    assert.equal(runtime.stream_lifecycle, "waiting_for_api_cooldown");
-    assert.equal(runtime.api_safety.state, "cooldown");
-    assert.equal(runtime.api_safety.challenge_state, "quarantined");
-    assert.equal(runtime.api_safety.client_lease.state, "authoritative");
-    assert.deepEqual(api.requests, []);
+  registerProviderFixtureCleanup(t, { api, token, root, child, exited });
+  await waitFor(() => existsSync(runtimePath), {
+    message: `startup runtime status was not published; output=${output}`,
+  });
+  const runtime = JSON.parse(readFileSync(runtimePath, "utf8"));
+  assert.equal(runtime.pid, child.pid);
+  assert.equal(runtime.stream_lifecycle, "waiting_for_api_cooldown");
+  assert.equal(runtime.api_safety.state, "cooldown");
+  assert.equal(runtime.api_safety.challenge_state, "quarantined");
+  assert.equal(runtime.api_safety.client_lease.state, "authoritative");
+  assert.deepEqual(api.requests, []);
 
-    child.stdin.end("shutdown\n");
-    const [code, signal] = await exited;
-    assert.equal(signal, null, output);
-    assert.equal(code, 1, output);
-    const rows = readFileSync(path.join(runtimeDir, "adapter.ndjson"), "utf8")
-      .split("\n")
-      .filter(Boolean)
-      .map((line) => JSON.parse(line));
-    assert.ok(rows.some((row) => row.event === "api_rate_limit_restored"));
-  } finally {
-    if (child.exitCode === null && child.signalCode === null) child.kill();
-    await rm(root, { recursive: true, force: true });
-    await token.close();
-    await api.close();
-  }
+  child.stdin.end("shutdown\n");
+  const [code, signal] = await exited;
+  assert.equal(signal, null, output);
+  assert.equal(code, 1, output);
+  const rows = readFileSync(path.join(runtimeDir, "adapter.ndjson"), "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  assert.ok(rows.some((row) => row.event === "api_rate_limit_restored"));
 });
 
-test("supervised startup is observable before slow engine qualification completes", { timeout: 25_000 }, async () => {
+test("supervised startup is observable before slow engine qualification completes", { timeout: 25_000 }, async (t) => {
   const api = await startFakeLichessApi({ fixtureToken: FIXTURE_TOKEN });
   const token = await temporaryToken();
   const root = await mkdtemp(path.join(os.tmpdir(), "uci-arena-startup-qualification-"));
@@ -266,6 +259,7 @@ test("supervised startup is observable before slow engine qualification complete
   child.stdout.on("data", (chunk) => { output = `${output}${chunk}`.slice(-16_384); });
   child.stderr.on("data", (chunk) => { output = `${output}${chunk}`.slice(-16_384); });
   const exited = once(child, "exit");
+  registerProviderFixtureCleanup(t, { api, token, root, child, exited });
   try {
     await waitFor(() => existsSync(runtimePath), {
       timeoutMs: 5_000,
@@ -283,9 +277,6 @@ test("supervised startup is observable before slow engine qualification complete
       await exited;
     } finally {
       clearTimeout(forceExit);
-      await rm(root, { recursive: true, force: true });
-      await token.close();
-      await api.close();
     }
   }
 });
@@ -413,7 +404,7 @@ test("loopback API server simulates NDJSON, challenges, and move submission", as
 
 test("loopback API drives the complete adapter through a spawned UCI child and legal move POST", {
   timeout: 30_000,
-}, async () => {
+}, async (t) => {
   const gameId = "fixture-complete-game";
   const api = await startFakeLichessApi({
     fixtureToken: FIXTURE_TOKEN,
@@ -494,60 +485,53 @@ test("loopback API drives the complete adapter through a spawned UCI child and l
   child.stdout.on("data", (chunk) => { output = `${output}${chunk}`.slice(-32_768); });
   child.stderr.on("data", (chunk) => { output = `${output}${chunk}`.slice(-32_768); });
   const exited = once(child, "exit");
-  try {
-    await Promise.race([
-      waitFor(() => api.state.moves.length === 1, {
-        message: `complete adapter did not submit a move; output=${output}`,
-      }),
-      exited.then(([code, signal]) => {
-        throw new Error(`complete adapter exited before move submission: ${code}/${signal}; ${output}`);
-      }),
-    ]);
-    assert.deepEqual(api.state.moves, [{
-      gameId,
-      move: "e2e4",
-      form: {},
-    }]);
-    assert.ok(api.requests.some((request) => (
-      request.method === "GET" && request.path === "/api/account/playing"
-    )));
-    assert.ok(api.requests.some((request) => (
-      request.method === "GET" && request.path === `/api/bot/game/stream/${gameId}`
-    )));
-    assert.ok(api.requests.some((request) => (
-      request.method === "POST" && request.path === `/api/bot/game/${gameId}/move/e2e4`
-    )));
-    assert.equal(JSON.stringify(api.requests).includes(FIXTURE_TOKEN), false);
-    child.stdin.end("shutdown\n");
-    const [code, signal] = await exited;
-    assert.equal(signal, null, output);
-    assert.equal(code, 0, output);
-    const move = (await readFile(path.join(runtimeDir, "adapter.ndjson"), "utf8"))
-      .split("\n").filter(Boolean).map((line) => JSON.parse(line))
-      .find((row) => row.event === "move_played" && row.game_id === gameId);
-    assert.ok(move, "the real provider must persist its move diagnostics");
-    assert.deepEqual(Object.fromEntries(Object.entries(move).filter(([key]) => (
-      key.startsWith("mcgs_graph_") || key === "mcgs_explicit_reroots"
-    ))), {
-      mcgs_graph_node_capacity: 96,
-      mcgs_graph_edge_capacity: 2048,
-      mcgs_graph_evictions: 17,
-      mcgs_graph_reclaimed_edges: 153,
-      mcgs_graph_reclaimed_spans: 11,
-      mcgs_graph_span_coalesces: 5,
-      mcgs_graph_capacity_deferrals: 2,
-      mcgs_graph_stale_handles: 3,
-      mcgs_graph_focus_admissions: 9,
-      mcgs_graph_focus_fallbacks: 1,
-      mcgs_explicit_reroots: 0,
-    });
-  } finally {
-    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-    await Promise.allSettled([exited]);
-    await rm(root, { recursive: true, force: true });
-    await token.close();
-    await api.close();
-  }
+  registerProviderFixtureCleanup(t, { api, token, root, child, exited });
+  await Promise.race([
+    waitFor(() => api.state.moves.length === 1, {
+      message: `complete adapter did not submit a move; output=${output}`,
+    }),
+    exited.then(([code, signal]) => {
+      throw new Error(`complete adapter exited before move submission: ${code}/${signal}; ${output}`);
+    }),
+  ]);
+  assert.deepEqual(api.state.moves, [{
+    gameId,
+    move: "e2e4",
+    form: {},
+  }]);
+  assert.ok(api.requests.some((request) => (
+    request.method === "GET" && request.path === "/api/account/playing"
+  )));
+  assert.ok(api.requests.some((request) => (
+    request.method === "GET" && request.path === `/api/bot/game/stream/${gameId}`
+  )));
+  assert.ok(api.requests.some((request) => (
+    request.method === "POST" && request.path === `/api/bot/game/${gameId}/move/e2e4`
+  )));
+  assert.equal(JSON.stringify(api.requests).includes(FIXTURE_TOKEN), false);
+  child.stdin.end("shutdown\n");
+  const [code, signal] = await exited;
+  assert.equal(signal, null, output);
+  assert.equal(code, 0, output);
+  const move = (await readFile(path.join(runtimeDir, "adapter.ndjson"), "utf8"))
+    .split("\n").filter(Boolean).map((line) => JSON.parse(line))
+    .find((row) => row.event === "move_played" && row.game_id === gameId);
+  assert.ok(move, "the real provider must persist its move diagnostics");
+  assert.deepEqual(Object.fromEntries(Object.entries(move).filter(([key]) => (
+    key.startsWith("mcgs_graph_") || key === "mcgs_explicit_reroots"
+  ))), {
+    mcgs_graph_node_capacity: 96,
+    mcgs_graph_edge_capacity: 2048,
+    mcgs_graph_evictions: 17,
+    mcgs_graph_reclaimed_edges: 153,
+    mcgs_graph_reclaimed_spans: 11,
+    mcgs_graph_span_coalesces: 5,
+    mcgs_graph_capacity_deferrals: 2,
+    mcgs_graph_stale_handles: 3,
+    mcgs_graph_focus_admissions: 9,
+    mcgs_graph_focus_fallbacks: 1,
+    mcgs_explicit_reroots: 0,
+  });
 });
 
 test("loopback API drives the current extended bundle with exact mature asset provenance", {
@@ -555,7 +539,7 @@ test("loopback API drives the current extended bundle with exact mature asset pr
   skip: LOCAL_EXTENDED_BUNDLE_MISSING.length > 0
     ? `local extended bundle inputs are missing: ${LOCAL_EXTENDED_BUNDLE_MISSING.join(", ")}`
     : false,
-}, async () => {
+}, async (t) => {
   const gameId = "fixture-current-bundle";
   const api = await startFakeLichessApi({
     fixtureToken: FIXTURE_TOKEN,
@@ -644,77 +628,70 @@ test("loopback API drives the current extended bundle with exact mature asset pr
   child.stdout.on("data", (chunk) => { output = `${output}${chunk}`.slice(-65_536); });
   child.stderr.on("data", (chunk) => { output = `${output}${chunk}`.slice(-65_536); });
   const exited = once(child, "exit");
-  try {
-    const moveDeadline = Date.now() + 90_000;
-    while (api.state.moves.length === 0
-        && child.exitCode === null
-        && child.signalCode === null
-        && Date.now() < moveDeadline) {
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-    if (api.state.moves.length === 0) {
-      const disposition = child.exitCode === null && child.signalCode === null
-        ? "timed out"
-        : `exited ${child.exitCode}/${child.signalCode}`;
-      throw new Error(`current extended bundle ${disposition} before move submission; output=${output}`);
-    }
-    assert.match(api.state.moves[0].move, /^[a-h][1-8][a-h][1-8][qrbn]?$/u);
-    assert.equal(api.state.moves[0].gameId, gameId);
-    child.stdin.end("shutdown\n");
-    const [code, signal] = await exited;
-    assert.equal(signal, null, output);
-    assert.equal(code, 0, output);
-
-    const logRows = (await readFile(path.join(runtimeDir, "adapter.ndjson"), "utf8"))
-      .split("\n")
-      .filter(Boolean)
-      .map((line) => JSON.parse(line));
-    const started = logRows.find((row) => row.event === "adapter_started");
-    assert.equal(started.engine_adapter, "uci_arena_extended_v1");
-    assert.equal(started.provider, "directml");
-    assert.equal(started.time_profile.accepted, true);
-    assert.equal(started.time_profile.applied, true);
-    assert.equal(started.time_profile.timing_authority_match, true);
-    const move = logRows.find((row) => row.event === "move_played" && row.game_id === gameId);
-    assert.equal(move.move, api.state.moves[0].move);
-    assert.equal(move.book_hit, true);
-
-    const evidenceStore = new LichessStore(storePath);
-    try {
-      const row = evidenceStore.db.prepare(
-        "SELECT runtime_provenance_json FROM games WHERE game_id=?",
-      ).get(gameId);
-      assert.ok(row);
-      const provenance = JSON.parse(row.runtime_provenance_json);
-      assert.equal(provenance.engine.adapter, "uci_arena_extended_v1");
-      assert.equal(provenance.model.id, "compact_chessformer_gab_v1");
-      assert.equal(provenance.search.core, "mcgs");
-      assert.equal(provenance.timing.accepted, true);
-      assert.equal(provenance.timing.applied, true);
-      assert.equal(provenance.timing.timing_authority_match, true);
-      assert.equal(provenance.timing.predictive_controller_enabled, false);
-      assert.equal(provenance.book.configured_enabled, true);
-      assert.equal(provenance.book.observed_active, true);
-      assert.equal(provenance.book.observed_statistics_available, true);
-      assert.ok(provenance.book.observed_entries > 0);
-      assert.match(provenance.book.observed_identity, /^[0-9]+$/u);
-      assert.equal(provenance.tablebase.observed_active, true);
-      assert.equal(provenance.tablebase.observed_loaded_cardinality, 6);
-      assert.match(provenance.tablebase.observed_manifest_identity, /^sha256:[0-9a-f]{64}$/u);
-      assert.match(provenance.profiles.single_game_sha256, /^sha256:[0-9a-f]{64}$/u);
-      assert.match(provenance.profiles.capacity_sha256, /^sha256:[0-9a-f]{64}$/u);
-    } finally {
-      evidenceStore.close();
-    }
-    assert.equal(output.includes(FIXTURE_TOKEN), false);
-    assert.equal(JSON.stringify(api.requests).includes(FIXTURE_TOKEN), false);
-  } finally {
-    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-    await Promise.allSettled([exited]);
-    await rm(root, { recursive: true, force: true });
-    await token.close();
-    await api.close();
+  registerProviderFixtureCleanup(t, { api, token, root, child, exited });
+  const moveDeadline = Date.now() + 90_000;
+  while (api.state.moves.length === 0
+      && child.exitCode === null
+      && child.signalCode === null
+      && Date.now() < moveDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
   }
+  if (api.state.moves.length === 0) {
+    const disposition = child.exitCode === null && child.signalCode === null
+      ? "timed out"
+      : `exited ${child.exitCode}/${child.signalCode}`;
+    throw new Error(`current extended bundle ${disposition} before move submission; output=${output}`);
+  }
+  assert.match(api.state.moves[0].move, /^[a-h][1-8][a-h][1-8][qrbn]?$/u);
+  assert.equal(api.state.moves[0].gameId, gameId);
+  child.stdin.end("shutdown\n");
+  const [code, signal] = await exited;
+  assert.equal(signal, null, output);
+  assert.equal(code, 0, output);
+
+  const logRows = (await readFile(path.join(runtimeDir, "adapter.ndjson"), "utf8"))
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  const started = logRows.find((row) => row.event === "adapter_started");
+  assert.equal(started.engine_adapter, "uci_arena_extended_v1");
+  assert.equal(started.provider, "directml");
+  assert.equal(started.time_profile.accepted, true);
+  assert.equal(started.time_profile.applied, true);
+  assert.equal(started.time_profile.timing_authority_match, true);
+  const move = logRows.find((row) => row.event === "move_played" && row.game_id === gameId);
+  assert.equal(move.move, api.state.moves[0].move);
+  assert.equal(move.book_hit, true);
+
+  const evidenceStore = new LichessStore(storePath);
+  try {
+    const row = evidenceStore.db.prepare(
+      "SELECT runtime_provenance_json FROM games WHERE game_id=?",
+    ).get(gameId);
+    assert.ok(row);
+    const provenance = JSON.parse(row.runtime_provenance_json);
+    assert.equal(provenance.engine.adapter, "uci_arena_extended_v1");
+    assert.equal(provenance.model.id, "compact_chessformer_gab_v1");
+    assert.equal(provenance.search.core, "mcgs");
+    assert.equal(provenance.timing.accepted, true);
+    assert.equal(provenance.timing.applied, true);
+    assert.equal(provenance.timing.timing_authority_match, true);
+    assert.equal(provenance.timing.predictive_controller_enabled, false);
+    assert.equal(provenance.book.configured_enabled, true);
+    assert.equal(provenance.book.observed_active, true);
+    assert.equal(provenance.book.observed_statistics_available, true);
+    assert.ok(provenance.book.observed_entries > 0);
+    assert.match(provenance.book.observed_identity, /^[0-9]+$/u);
+    assert.equal(provenance.tablebase.observed_active, true);
+    assert.equal(provenance.tablebase.observed_loaded_cardinality, 6);
+    assert.match(provenance.tablebase.observed_manifest_identity, /^sha256:[0-9a-f]{64}$/u);
+    assert.match(provenance.profiles.single_game_sha256, /^sha256:[0-9a-f]{64}$/u);
+    assert.match(provenance.profiles.capacity_sha256, /^sha256:[0-9a-f]{64}$/u);
+  } finally {
+    evidenceStore.close();
+  }
+  assert.equal(output.includes(FIXTURE_TOKEN), false);
+  assert.equal(JSON.stringify(api.requests).includes(FIXTURE_TOKEN), false);
 });
 
 test("fake Lichess API refuses non-loopback binding", async () => {
