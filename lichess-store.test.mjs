@@ -37,7 +37,7 @@ function processIdentity(pid, startToken = String(pid)) {
     schema: "uci_arena_process_instance_identity_v1",
     platform: "win32",
     pid,
-    start_token: startToken,
+    start_token: (504911232000000000n + BigInt(startToken)).toString(),
     executable_path: "C:\\UCI Arena\\node.exe",
     boot_id: "",
   };
@@ -532,6 +532,30 @@ test("API client lease permits fresh takeover only when the exact owner is absen
     first.close();
     second.close();
   }
+});
+
+test("malformed present owner observations cannot replace an unexpired exact API lease", () => {
+  const store = storeFixture();
+  try {
+    const authority = "https://127.0.0.1|identity-fixture";
+    const current = processIdentity(101, "100");
+    const contender = processIdentity(202, "200");
+    store.acquireApiLease(authority, "current-owner", current.pid, 1000, 60000, null, current);
+    const original = store.db.prepare("SELECT * FROM api_client_leases WHERE authority_key=?").get(authority);
+    for (const observed of [
+      { state: "present", identity: null },
+      { state: "present" },
+      { state: "present", identity: { ...current, pid: contender.pid } },
+      { state: "present", identity: { ...current, start_token: Number(current.start_token) } },
+      { state: "present", identity: { ...current, executable_path: "relative.exe" } },
+    ]) {
+      assert.throws(() => store.acquireApiLease(authority, "contender", contender.pid, 1001, 60000,
+        () => observed, contender), (error) => error.code === "LICHESS_API_LEASE_HELD");
+      assert.deepEqual(store.db.prepare("SELECT * FROM api_client_leases WHERE authority_key=?").get(authority), original);
+    }
+    assert.equal(store.acquireApiLease(authority, "contender", contender.pid, 61000, 60000,
+      () => ({ state: "present", identity: null }), contender).owner_id, "contender");
+  } finally { store.close(); }
 });
 
 test("owners and expiring reservations are durable control state", () => {

@@ -79,17 +79,25 @@ jobs:
           foreach ($buildRoot in @('native/build', 'native/build-repro')) {
             cmake -S native -B $buildRoot -A x64
             if ($LASTEXITCODE -ne 0) { throw "CMake configuration failed: $buildRoot" }
-            cmake --build $buildRoot --config Release
+            cmake --build $buildRoot --config Release --target lichess_adapter_launcher uci_arena_background_guard
             if ($LASTEXITCODE -ne 0) { throw "native launcher build failed: $buildRoot" }
             & "$buildRoot/Release/lichess_adapter_launcher.exe" --probe
             if ($LASTEXITCODE -ne 0) { throw "native launcher probe failed: $buildRoot" }
           }
           Copy-Item -LiteralPath native/build/Release/lichess_adapter_launcher.exe `
             -Destination native/lichess_adapter_launcher.exe
+          Copy-Item -LiteralPath native/build/Release/uci_arena_background_guard.exe `
+            -Destination native/uci_arena_background_guard.exe
+          node --test --test-name-pattern='^native provider current-instance' process-instance-native.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'First native provider identity query failed' }
 
       - name: Test exact component source
         shell: pwsh
         run: |
+          if ('${{ inputs.target }}' -eq 'windows-x86_64') {
+            $env:UCI_ARENA_NATIVE_HELPER = (Resolve-Path native/uci_arena_background_guard.exe).Path
+            $env:UCI_ARENA_PROCESS_IDENTITY_TEST_ORACLE = Join-Path $PSHOME 'pwsh.exe'
+          }
           node tools/write-test-receipt.mjs `
             --output "release-receipts/${{ inputs.target }}.json" `
             --target "${{ inputs.target }}"
@@ -130,9 +138,11 @@ jobs:
           if ('${{ inputs.target }}' -eq 'windows-x86_64') {
             $primaryArguments += @(
               '--native-launcher', 'native/build/Release/lichess_adapter_launcher.exe'
+              '--native-process-query', 'native/build/Release/uci_arena_background_guard.exe'
             )
             $reproArguments += @(
               '--native-launcher', 'native/build-repro/Release/lichess_adapter_launcher.exe'
+              '--native-process-query', 'native/build-repro/Release/uci_arena_background_guard.exe'
             )
           }
           & node @primaryArguments

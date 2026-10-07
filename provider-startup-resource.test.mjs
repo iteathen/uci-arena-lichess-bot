@@ -43,7 +43,7 @@ for (const [command, failure] of [["probe", "identity"], ["run", "identity"], ["
     });
     const originalExec = childProcess.execFileSync;
     t.mock.method(childProcess, "execFileSync", function (executable, args, options) {
-      if (failure === "identity" && executable === "powershell.exe" && options?.env?.UCI_ARENA_PROCESS_PROBE_PID) {
+      if (failure === "identity" && args?.[0] === "--query-process-instance") {
         throw Object.assign(new Error("injected exact-process probe timeout"), { code: "ETIMEDOUT" });
       }
       return originalExec(executable, args, options);

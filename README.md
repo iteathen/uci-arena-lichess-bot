@@ -378,6 +378,19 @@ operator-controlled data.
 
 ## Release and provenance
 
+Windows process-instance observations use the component's explicitly packaged
+native helper through the public `@uci-arena/background-service-runtime` contract.
+The identity deadline remains at most 2000 ms; lifecycle callers can supply a
+smaller remaining budget. Access denial and unknown observations remain
+unverifiable. There is no PowerShell identity fallback or helper prewarm.
+The immutable 1.2.0 snapshot is pinned to Engine source
+`a535772f818eba76473e4f931dcfc7b764f0c6c5`; `vendor/upstream.lock.json` binds every
+source file. Runtime packages contain the public JavaScript closure and the
+Windows helper, while source tests and vendor provenance history remain outside
+the payload. Windows builds produce the helper and provider launcher in two
+independent roots with the application-local static C++ runtime, then verify
+exact native output and packaged current-instance query behavior.
+
 Component release automation is manual-only. Official artifacts require:
 
 - a clean exact commit;

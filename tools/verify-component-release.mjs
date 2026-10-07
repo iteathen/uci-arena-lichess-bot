@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import { pathToFileURL } from "node:url";
 
 import { readAndValidateNativeToolchainReceipt } from "./native-toolchain-receipt.mjs";
 
@@ -171,6 +172,14 @@ function verify(args) {
   const licensesSha256 = sha256(Buffer.concat(
     licenseFiles.map((relative) => readFileSync(path.join(root, relative))),
   ));
+  const dependencyHashes = {
+    package_lock_sha256: sha256File(path.join(root, "package-lock.json")),
+    time_profile_contract_sha256: sha256File(path.join(root, "vendor", "time-profile-contract", "package.json")),
+    background_service_runtime_sha256: sha256File(path.join(root, "vendor", "background-service-runtime", "package.json")),
+  };
+  if (Object.entries(dependencyHashes).some(([name, value]) => result.dependency_lock_identities?.[name] !== value)) {
+    throw new Error("release result does not bind its exact runtime dependency snapshots");
+  }
   if (licenseFiles.length === 0
       || result.licenses_sha256 !== licensesSha256
       || result.sbom_sha256 !== sha256File(path.join(root, "release", "sbom.spdx.json"))) {
@@ -188,6 +197,23 @@ function verify(args) {
   if (result.target_triple === "windows-x86_64"
       && !existsSync(path.join(root, "native", "lichess_adapter_launcher.exe"))) {
     throw new Error("Windows component lacks its windowless native launcher");
+  }
+  if (result.target_triple === "windows-x86_64") {
+    const processQuery = path.join(root, "native", "uci_arena_background_guard.exe");
+    if (!existsSync(processQuery)) throw new Error("Windows component lacks its native process query helper");
+    const queryModule = pathToFileURL(path.join(root, "process-instance-identity.mjs")).href;
+    const querySmoke = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "-e",
+      `const {currentProcessIdentity}=await import(${JSON.stringify(queryModule)}); const identity=currentProcessIdentity(); console.log(JSON.stringify({schema:identity.schema,platform:identity.platform,exact:identity.pid===process.pid}));`,
+    ], { cwd: path.parse(root).root, encoding: "utf8", windowsHide: true, timeout: 15_000, maxBuffer: 4096 }));
+    if (querySmoke.schema !== "uci_arena_process_instance_identity_v1" || querySmoke.platform !== "win32" || querySmoke.exact !== true) {
+      throw new Error("packaged native current-process query failed");
+    }
+    const helperProbe = JSON.parse(execFileSync(processQuery, ["--probe"], {
+      encoding: "utf8", windowsHide: true, timeout: 2_000, maxBuffer: 16_384,
+    }));
+    if (!helperProbe.capabilities?.includes("process_instance_query_v1")) throw new Error("packaged native query capability is missing");
+  } else if (existsSync(path.join(root, "native", "uci_arena_background_guard.exe"))) {
+    throw new Error("non-Windows component contains a native Windows query helper");
   }
   const runtimeDir = path.join(root, "release", "verification-runtime-missing");
   const output = execFileSync(process.execPath, [

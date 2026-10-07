@@ -1,33 +1,15 @@
-import { execFileSync } from "node:child_process";
 import { readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { NativeResourceHelper } from "@uci-arena/background-service-runtime/native-resource-helper";
+import processContract from "@uci-arena/background-service-runtime/process-instance-query-contract" with { type: "json" };
 
-export const PROCESS_INSTANCE_IDENTITY_SCHEMA = "uci_arena_process_instance_identity_v1";
+export const PROCESS_INSTANCE_IDENTITY_SCHEMA = processContract.identity_schema;
 let cachedCurrentIdentity = null;
-
-const WINDOWS_PROBE = String.raw`
-$ErrorActionPreference = 'Stop'
-try {
-  $process = [System.Diagnostics.Process]::GetProcessById(
-    [int]$env:UCI_ARENA_PROCESS_PROBE_PID)
-} catch [System.ArgumentException] {
-  [Console]::Out.Write('{"state":"absent"}')
-  exit 0
-}
-$payload = [ordered]@{
-  state = 'present'
-  identity = [ordered]@{
-    schema = 'uci_arena_process_instance_identity_v1'
-    platform = 'win32'
-    pid = [int]$process.Id
-    start_token = $process.StartTime.ToUniversalTime().Ticks.ToString(
-      [System.Globalization.CultureInfo]::InvariantCulture)
-    executable_path = $process.MainModule.FileName
-    boot_id = ''
-  }
-}
-[Console]::Out.Write(($payload | ConvertTo-Json -Compress -Depth 3))
-`;
+const nativeProcessQuery = new NativeResourceHelper({
+  nativeHelperAvailable: true,
+  nativeHelper: fileURLToPath(new URL("./native/uci_arena_background_guard.exe", import.meta.url)),
+});
 
 function normalizedExecutable(identity) {
   const value = String(identity?.executable_path ?? "");
@@ -37,17 +19,31 @@ function normalizedExecutable(identity) {
 }
 
 export function validProcessIdentity(value, expectedPid = null) {
-  return value?.schema === PROCESS_INSTANCE_IDENTITY_SCHEMA
+  const common = value !== null && typeof value === "object" && !Array.isArray(value)
+    && value.schema === PROCESS_INSTANCE_IDENTITY_SCHEMA
+    && Object.keys(value).length === processContract.identity_fields.length
+    && processContract.identity_fields.every((field) => Object.hasOwn(value, field))
     && (value.platform === "win32" || value.platform === "linux")
     && Number.isSafeInteger(value.pid)
     && value.pid > 0
+    && value.pid <= processContract.pid_maximum
     && (expectedPid === null || value.pid === expectedPid)
-    && /^[0-9]{1,32}$/.test(String(value.start_token ?? ""))
+    && typeof value.start_token === "string"
+    && /^[0-9]{1,32}$/.test(value.start_token)
     && typeof value.executable_path === "string"
     && value.executable_path.length > 0
-    && value.executable_path.length <= 4096
+    && value.executable_path.length <= (value.platform === "win32" ? processContract.maximum_executable_path_utf16_units : 4096)
+    && value.executable_path.isWellFormed()
+    && !/[\u0000\r\n]/u.test(value.executable_path)
     && typeof value.boot_id === "string"
     && value.boot_id.length <= 128;
+  if (!common || value.platform !== "win32") return common;
+  const root = path.win32.parse(value.executable_path).root;
+  return (root.startsWith("\\\\") || /^[a-z]:[\\/]/iu.test(root))
+    && value.boot_id === ""
+    && value.start_token.length <= 19
+    && BigInt(value.start_token) >= BigInt(processContract.creation_tick_minimum)
+    && BigInt(value.start_token) <= BigInt(processContract.creation_tick_maximum);
 }
 
 export function sameProcessInstance(left, right) {
@@ -84,35 +80,18 @@ function linuxProcessIdentity(pid) {
   }
 }
 
-function windowsProcessIdentity(pid) {
-  try {
-    const stdout = execFileSync(
-      "powershell.exe",
-      ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_PROBE],
-      {
-        encoding: "utf8",
-        windowsHide: true,
-        timeout: 2_000,
-        maxBuffer: 16_384,
-        env: { ...process.env, UCI_ARENA_PROCESS_PROBE_PID: String(pid) },
-      },
-    );
-    const result = JSON.parse(stdout);
-    if (result?.state === "absent") return { state: "absent" };
-    return result?.state === "present" && validProcessIdentity(result.identity, pid)
-      ? result
-      : { state: "unverifiable" };
-  } catch {
-    return { state: "unverifiable" };
-  }
+function windowsProcessIdentity(pid, timeoutMs) {
+  const result = nativeProcessQuery.queryProcessInstanceSync(pid, { timeoutMs });
+  if (result.state === "present") return { state: "present", identity: result.identity };
+  return { state: result.state === "absent" ? "absent" : "unverifiable" };
 }
 
-export function probeProcessInstance(pid) {
+export function probeProcessInstance(pid, { timeoutMs = processContract.timeout_ms } = {}) {
   if (!Number.isSafeInteger(pid) || pid <= 0 || pid > 0xffff_ffff) {
     return { state: "absent" };
   }
   if (process.platform === "linux") return linuxProcessIdentity(pid);
-  if (process.platform === "win32") return windowsProcessIdentity(pid);
+  if (process.platform === "win32") return windowsProcessIdentity(pid, timeoutMs);
   return { state: "unverifiable" };
 }
 
@@ -128,6 +107,7 @@ export function currentProcessIdentity() {
 
 export function processIdentityFromJson(value, expectedPid = null) {
   try {
+    if (typeof value === "string" && Buffer.byteLength(value, "utf8") > processContract.maximum_response_bytes) return null;
     const parsed = typeof value === "string" ? JSON.parse(value) : value;
     return validProcessIdentity(parsed, expectedPid) ? parsed : null;
   } catch {

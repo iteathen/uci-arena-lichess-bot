@@ -1,13 +1,13 @@
 {
   "name": "@uci-arena/lichess-adapter",
-  "version": "1.0.30",
+  "version": "1.0.31",
   "private": true,
   "type": "module",
   "engines": {
     "node": ">=24.15.0"
   },
   "scripts": {
-    "test": "node --test *.test.mjs vendor/time-profile-contract/test/*.test.mjs",
+    "test": "node --test *.test.mjs vendor/time-profile-contract/test/*.test.mjs vendor/background-service-runtime/test/*.test.mjs",
     "check:contracts": "node tools/contract-check.mjs",
     "check:github": "node tools/check-github-automation.mjs",
     "check:vendor": "node tools/verify-vendor-lock.mjs",
@@ -17,6 +17,7 @@
     "acceptance:live": "node live-acceptance.mjs"
   },
   "dependencies": {
+    "@uci-arena/background-service-runtime": "file:vendor/background-service-runtime",
     "@uci-arena/time-profile-contract": "file:vendor/time-profile-contract",
     "chess.js": "1.4.0"
   }
