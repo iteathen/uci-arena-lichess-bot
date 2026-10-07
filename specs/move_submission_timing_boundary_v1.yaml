@@ -151,6 +151,13 @@ extended_timing_validation:
     Existing timing-profile/temporal-curve schemas keep their historical meaning.
     A new timing-policy/applicability contract requires explicit versioned adapter
     support rather than silently changing old validation semantics.
+  existing_extended_completion_contract:
+    field: time_completion_kind
+    rules:
+      - "The existing opening_book completion is timing-not-applicable only when typed book_move_used equals one. A probe hit, hint, prior, or search handoff is insufficient."
+      - "The existing exact_tablebase completion attests actual Engine-owned current-root resolution; configured qualified tablebase authority and an independently legal current-generation move are additionally required. Availability alone never selects this completion."
+      - "The existing objective_no_choice completion requires the independent authoritative legality state to contain exactly one legal candidate."
+      - "These explicit existing completion authorities do not require searched timing-policy or clock-allocation fields. Search-derived and deadline_fallback decisions retain the existing RelativeClockTemporalV1 checks; missing, unknown, or generic nonsearch_selection evidence never invents applicability or conservative fallback authority."
 
 transport_evidence:
   rules:

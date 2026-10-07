@@ -460,7 +460,7 @@ test("loopback API drives the complete adapter through a spawned UCI child and l
   config.engine = {
     adapter: "standard_uci_v1",
     executable: process.execPath,
-    arguments: [path.join(HERE, "test-fixtures", "fake-standard-uci-engine.mjs")],
+    arguments: [path.join(HERE, "test-fixtures", "fake-standard-uci-engine.mjs"), "--retention-telemetry"],
     working_directory: HERE,
     search_timeout_grace_ms: 1_000,
     shutdown_grace_ms: 1_000,
@@ -522,6 +522,25 @@ test("loopback API drives the complete adapter through a spawned UCI child and l
     const [code, signal] = await exited;
     assert.equal(signal, null, output);
     assert.equal(code, 0, output);
+    const move = (await readFile(path.join(runtimeDir, "adapter.ndjson"), "utf8"))
+      .split("\n").filter(Boolean).map((line) => JSON.parse(line))
+      .find((row) => row.event === "move_played" && row.game_id === gameId);
+    assert.ok(move, "the real provider must persist its move diagnostics");
+    assert.deepEqual(Object.fromEntries(Object.entries(move).filter(([key]) => (
+      key.startsWith("mcgs_graph_") || key === "mcgs_explicit_reroots"
+    ))), {
+      mcgs_graph_node_capacity: 96,
+      mcgs_graph_edge_capacity: 2048,
+      mcgs_graph_evictions: 17,
+      mcgs_graph_reclaimed_edges: 153,
+      mcgs_graph_reclaimed_spans: 11,
+      mcgs_graph_span_coalesces: 5,
+      mcgs_graph_capacity_deferrals: 2,
+      mcgs_graph_stale_handles: 3,
+      mcgs_graph_focus_admissions: 9,
+      mcgs_graph_focus_fallbacks: 1,
+      mcgs_explicit_reroots: 0,
+    });
   } finally {
     if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     await Promise.allSettled([exited]);

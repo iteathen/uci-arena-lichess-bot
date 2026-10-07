@@ -96,6 +96,10 @@ export class AuthoritativeChessState {
       rootFen: this.chess.fen(),
     };
   }
+
+  legalMoveCount() {
+    return this.chess.moves().length;
+  }
 }
 
 /** Standalone exact-root helper used by focused tests and diagnostics. */

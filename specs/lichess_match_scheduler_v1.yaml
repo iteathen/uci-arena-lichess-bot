@@ -258,6 +258,9 @@ slots:
     - "An outbound gameStart that races the challenge-create response adopts the already preparing opponent slot. The late create response may attach its challenge id but cannot move an active slot backward to pending or release its engine."
     - "A disconnected per-game stream reconnects and reconstructs position from authoritative gameFull/gameState moves without releasing its active slot."
     - "Repeated per-game stream failures retain the active slot and qualified child while retrying with bounded backoff. A retry-count threshold never converts an unfinished remote game into a local terminal session; only authoritative terminal state, a successful provider-requested zero-ply abort, or explicit whole-provider shutdown ends it."
+    - "A typed local engine operation or move-contract failure is not a stream-transport failure. Quarantine publication for that game, record one bounded engine-child incident through the existing ledger, retain the active slot and current game stream, and continue canonical observations until authoritative completion or whole-provider shutdown. Duplicate states never retry the failed engine operation. Terminal authority resolves the game-scoped incident without claiming that the engine itself recovered."
+    - "Quarantine preserves the exact canonical observation whose engine operation failed, including terminal gameFull initialization or gameState drain failure. Cross-game foreground coordination attributes a typed pause or resume failure only to the session owning that child; a healthy requesting session keeps its publication authority."
+    - "An identical reconnect gameFull replay may refresh publication identity but is not transport-recovery progress. Only a changed authoritative root, status, or clock observation may reset exponential stream backoff; HTTP 429 retains the full effective cooldown."
     - "For a standard game where the bot is Black, the first authoritative started state with zero plies arms one first-move deadline. Reconnects do not extend that deadline; process recovery may start one fresh bounded deadline. Any authoritative move, terminal state, or provider shutdown cancels the pending request before dispatch."
     - "At expiry the provider revalidates zero plies immediately before dispatch and invokes the Bot API abort operation. HTTP 200 is authoritative aborted completion; HTTP 400 is a terminal abort refusal left for stream reconciliation; 429, transport, and 5xx failures use bounded cooldown-aware retry without concurrent abort requests. The provider never invokes this watchdog after one move or while playing White."
 
@@ -906,6 +909,22 @@ local_ephemeral_release:
 
 telemetry:
   runtime_schema: uci_arena_lichess_runtime_v3
+  optional_graph_retention_diagnostics:
+    fields:
+      - mcgs_graph_node_capacity
+      - mcgs_graph_edge_capacity
+      - mcgs_graph_evictions
+      - mcgs_graph_reclaimed_edges
+      - mcgs_graph_reclaimed_spans
+      - mcgs_graph_span_coalesces
+      - mcgs_graph_capacity_deferrals
+      - mcgs_graph_stale_handles
+      - mcgs_graph_focus_admissions
+      - mcgs_graph_focus_fallbacks
+      - mcgs_explicit_reroots
+    rules:
+      - "These optional Engine-owned UCI info counters are admitted only as exact nonnegative JavaScript-safe integers. Missing or malformed optional diagnostics stay absent and do not change timing, legality, move selection, qualification, or search control."
+      - "The existing bounded provider-owned move_played log preserves admitted counters with game_id and ply. The canonical game archive retains exact immutable Engine/runtime provenance; diagnostic collection joins those identities and must retain canary evidence before runtime-log rotation. This adds no search-evidence table, alternate game archive, or mandatory standard-UCI field."
   fields:
     - configured_and_qualified_capacity
     - active_pending_preparing_by_audience

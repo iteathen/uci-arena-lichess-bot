@@ -1,6 +1,6 @@
 {
   "name": "@uci-arena/lichess-adapter",
-  "version": "1.0.24",
+  "version": "1.0.30",
   "private": true,
   "type": "module",
   "engines": {

@@ -29,6 +29,15 @@ function ndjsonResponse(response, values) {
   response.end(terminated);
 }
 
+async function timedNdjsonResponse(response, records) {
+  response.writeHead(200, { "Content-Type": "application/x-ndjson; charset=utf-8" });
+  for await (const value of records()) {
+    if (response.destroyed) break;
+    response.write(`${JSON.stringify(value)}\n`);
+  }
+  if (!response.destroyed) response.end();
+}
+
 async function boundedBody(request) {
   const chunks = [];
   let size = 0;
@@ -149,9 +158,14 @@ export async function startFakeLichessApi({
       const gameStreamMatch =
         /^\/api\/bot\/game\/stream\/([^/]+)$/.exec(url.pathname);
       if (request.method === "GET" && gameStreamMatch) {
+        const records = state.gameStreams[decodeURIComponent(gameStreamMatch[1])] ?? [];
+        if (typeof records === "function") {
+          await timedNdjsonResponse(response, records);
+          return;
+        }
         ndjsonResponse(
           response,
-          state.gameStreams[decodeURIComponent(gameStreamMatch[1])] ?? [],
+          records,
         );
         return;
       }
