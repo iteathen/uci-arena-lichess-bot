@@ -7027,6 +7027,7 @@ export function resolveExternalTokenFile(options, componentRoot = ROOT) {
 }
 
 export function bindShutdownInput(controller, input = process.stdin) {
+  const wasFlowing = input.readableFlowing === true;
   let buffered = "";
   const onData = (chunk) => {
     buffered += String(chunk);
@@ -7042,7 +7043,10 @@ export function bindShutdownInput(controller, input = process.stdin) {
     }
   };
   input.on("data", onData);
-  return () => input.off("data", onData);
+  return () => {
+    input.off("data", onData);
+    if (!wasFlowing && input.listenerCount("data") === 0) input.pause();
+  };
 }
 
 async function preflightQualifiedEngine(config) {
@@ -8056,24 +8060,24 @@ export async function main(argv = process.argv.slice(2)) {
   }
   const controller = new AbortController();
   const signalHandlers = new Map();
-  for (const signal of ["SIGINT", "SIGTERM"]) {
-    const handler = () => controller.abort(new Error(`Received ${signal}`));
-    signalHandlers.set(signal, handler);
-    process.once(signal, handler);
-  }
-  const unbindShutdownInput = options.command === "run"
-    ? bindShutdownInput(controller)
-    : () => {};
-  const store = new LichessStore(path.resolve(options.store ?? path.join(runtimeDir, "matches.sqlite")));
+  let unbindShutdownInput = () => {};
+  let store = null;
   const authority = apiAuthorityKey(config.url, expectedAccount ?? "account-probe");
   const leaseOwner = randomUUID();
-  const processIdentity = currentProcessIdentity();
   let leaseHeartbeat = null;
   let startupStatusHeartbeat = null;
   let startupStatusPublicationFailed = true;
   let lifecycleClaimed = false;
   let startupIncidentIdentity = null;
   try {
+    store = new LichessStore(path.resolve(options.store ?? path.join(runtimeDir, "matches.sqlite")));
+    for (const signal of ["SIGINT", "SIGTERM"]) {
+      const handler = () => controller.abort(new Error(`Received ${signal}`));
+      signalHandlers.set(signal, handler);
+      process.once(signal, handler);
+    }
+    if (options.command === "run") unbindShutdownInput = bindShutdownInput(controller);
+    const processIdentity = currentProcessIdentity();
     store.acquireApiLease(
       authority,
       leaseOwner,
@@ -8286,9 +8290,14 @@ export async function main(argv = process.argv.slice(2)) {
     for (const [signal, handler] of signalHandlers) process.off(signal, handler);
     if (leaseHeartbeat) clearInterval(leaseHeartbeat);
     if (startupStatusHeartbeat) clearInterval(startupStatusHeartbeat);
-    if (lifecycleClaimed) store.releaseProviderLifecycle(leaseOwner);
-    store.releaseApiLease(authority, leaseOwner);
-    store.close();
+    if (store) {
+      try {
+        if (lifecycleClaimed) store.releaseProviderLifecycle(leaseOwner);
+        store.releaseApiLease(authority, leaseOwner);
+      } finally {
+        store.close();
+      }
+    }
   }
   return 0;
 }
