@@ -916,6 +916,7 @@ export class LichessStore {
         const recordedIdentity = processIdentityFromJson(active.process_identity_json, activePid);
         ownerProvenReplaced = observed.state === "absent"
           || (recordedIdentity && observed.state === "present"
+            && validProcessIdentity(observed.identity, activePid)
             && !sameProcessInstance(recordedIdentity, observed.identity));
       }
       if (active && active.owner_id !== owner && active.expires_at > now

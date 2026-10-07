@@ -46,7 +46,7 @@ const files = Object.fromEntries(walk(vendor).map((name) => [
 if (process.argv.includes("--write")) {
   writeFileSync(lockPath, `${JSON.stringify({
     schema: "uci_arena_upstream_vendor_lock_v1",
-    source_repository: "iteathen/UCI_Arena",
+    source_repository: "iteathen/uci-arena-engine",
     source_commit: sourceCommit,
     packages: packageVersions,
     files,
@@ -57,7 +57,7 @@ if (process.argv.includes("--write")) {
 
 const lock = JSON.parse(readFileSync(lockPath, "utf8"));
 if (lock.schema !== "uci_arena_upstream_vendor_lock_v1"
-    || lock.source_repository !== "iteathen/UCI_Arena"
+    || lock.source_repository !== "iteathen/uci-arena-engine"
     || lock.source_commit !== sourceCommit
     || JSON.stringify(lock.packages) !== JSON.stringify(packageVersions)
     || JSON.stringify(lock.files) !== JSON.stringify(files)) {

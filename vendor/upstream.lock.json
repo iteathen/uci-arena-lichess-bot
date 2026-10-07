@@ -1,6 +1,6 @@
 {
   "schema": "uci_arena_upstream_vendor_lock_v1",
-  "source_repository": "iteathen/UCI_Arena",
+  "source_repository": "iteathen/uci-arena-engine",
   "source_commit": "a535772f818eba76473e4f931dcfc7b764f0c6c5",
   "packages": {
     "@uci-arena/background-service-runtime": "1.2.0",
