@@ -4749,6 +4749,9 @@ export class GameSession {
   pauseOpponentSearch(reason = "foreground_preempted") {
     return this.serializeOpponentOperation(async () => {
       const engine = this.slot.engine;
+      // Only the incident owner's one containment attempt may drain a
+      // quarantined child; ordinary coordination/reconnect work stays inert.
+      if (this.engineIncident && reason !== "local_engine_failure") return { drained: false, reason };
       if (!engine || engine.mode === "idle") return { drained: false, reason };
       if (reason === "foreground_preempted" && !engine.isOpponentTurnSearchActive()) {
         return { drained: false, reason };

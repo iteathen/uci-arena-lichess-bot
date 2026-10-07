@@ -3064,14 +3064,15 @@ for (const failedOperation of ["new_game", "stop_and_drain"]) {
   });
 }
 
-for (const peerOperation of ["pause", "resume"]) {
-  test(`foreground loopback game quarantines the peer whose ${peerOperation} operation fails`, async (t) => {
+for (const [peerOperation, foregroundMoves] of [["pause", 1], ["resume", 1], ["pause", 2], ["resume", 2]]) {
+  test(`foreground loopback game quarantines the peer whose ${peerOperation} operation fails across ${foregroundMoves} acquisitions`, async (t) => {
     const stop = new AbortController();
     const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-peer-engine-failure-"));
     const store = new LichessStore(path.join(directory, "matches.sqlite"));
     const fixtureToken = "fabricated-peer-failure-token";
     let requestingSession;
     let reconnects = 0;
+    let failedOperationCalls = 0;
     const api = await startFakeLichessApi({
       fixtureToken,
       state: { gameStreams: { "game-a": async function* records() {
@@ -3080,7 +3081,15 @@ for (const peerOperation of ["pause", "resume"]) {
         while (!api.state.moves.length && !requestingSession.engineIncident && Date.now() < deadline) {
           await new Promise((resolve) => setTimeout(resolve, 10));
         }
-        yield startedState(api.state.moves.length ? "e2e4" : "", { status: "resign", winner: "black" });
+        if (foregroundMoves === 2 && api.state.moves.length) {
+          yield startedState("e2e4 e7e5");
+          while (api.state.moves.length < 2 && !requestingSession.engineIncident && Date.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+        }
+        const moves = api.state.moves.length === 2 ? "e2e4 e7e5 g1f3"
+          : api.state.moves.length ? "e2e4" : "";
+        yield startedState(moves, { status: "resign", winner: "black" });
       } } },
     });
     t.after(async () => {
@@ -3096,7 +3105,7 @@ for (const peerOperation of ["pause", "resume"]) {
         return fetch(url, options);
       },
     });
-    const requestingEngine = new MockGameEngine([{ bestmove: "e2e4" }]);
+    const requestingEngine = new MockGameEngine([{ bestmove: "e2e4" }, { bestmove: "g1f3" }]);
     const peerEngine = new MockGameEngine();
     const config = gameConfig();
     config.timing.opponent_turn_search = false;
@@ -3116,12 +3125,12 @@ for (const peerOperation of ["pause", "resume"]) {
     peerSession.config.timing.opponent_turn_search = true;
     if (peerOperation === "pause") {
       await peerSession.resumeOpponentSearch();
-      peerEngine.stopAndDrain = async () => { throw new Error("fixture peer drain failed"); };
+      peerEngine.stopAndDrain = async () => { failedOperationCalls += 1; throw new Error("fixture peer drain failed"); };
     } else {
-      peerEngine.startOpponentTurnSearch = async () => { throw new Error("fixture peer resume failed"); };
+      peerEngine.startOpponentTurnSearch = async () => { failedOperationCalls += 1; throw new Error("fixture peer resume failed"); };
     }
     await requestingSession.run();
-    assert.equal(api.state.moves.length, 1, "the healthy requesting game must submit its legal move");
+    assert.equal(api.state.moves.length, foregroundMoves, "the healthy requesting game must submit its legal moves");
     assert.equal(requestingSession.engineIncident, null);
     assert.equal(peerSession.engineIncident?.code, "engine_process_failure");
     assert.equal(peerSession.engineIncident.operation, peerOperation === "pause" ? "stop_and_drain" : "opponent_search");
@@ -3129,6 +3138,14 @@ for (const peerOperation of ["pause", "resume"]) {
     const incidents = store.listProviderIncidents({ filter: "active", after_cursor: 0, limit: 10 });
     assert.equal(incidents.incidents.length, 1);
     assert.equal(incidents.incidents[0].game_id, "game-b");
+    if (foregroundMoves === 2) {
+      assert.equal(failedOperationCalls, peerOperation === "pause" ? 2 : 1,
+        "reacquiring healthy foreground work must not retry the quarantined child's failed operation");
+      await assert.doesNotReject(peerSession.pauseOpponentSearch("reconnect"));
+      await peerSession.resumeOpponentSearch();
+      assert.equal(failedOperationCalls, peerOperation === "pause" ? 2 : 1,
+        "only the initial failure and one containment drain may touch the quarantined child");
+    }
     await peerSession.onState(startedState("e2e4", { status: "resign", winner: "black" }), peerEngine);
     assert.equal(peerSession.finished, true);
     assert.equal(store.listProviderIncidents({ filter: "active", after_cursor: 0, limit: 10 }).incidents.length, 0);
