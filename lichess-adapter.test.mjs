@@ -1133,7 +1133,7 @@ test("component identity is explicit, inventory-bound, and null for external UCI
   const provider = providerComponentIdentity();
   assert.deepEqual(provider, {
     componentId: "lichess.adapter",
-    version: "1.0.24",
+    version: "1.0.30",
     manifestSha256: sha256(readFileSync(path.join(ROOT, "contracts", "component-manifest.json"))),
   });
 
@@ -2998,6 +2998,142 @@ test("local engine telemetry failure retains the loopback game stream and active
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+for (const failedOperation of ["new_game", "stop_and_drain"]) {
+  test(`terminal loopback observation survives ${failedOperation} failure`, async (t) => {
+    const stop = new AbortController();
+    const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-terminal-engine-failure-"));
+    const store = new LichessStore(path.join(directory, "matches.sqlite"));
+    const engine = new MockGameEngine();
+    const terminal = startedState("e2e4", { status: "resign", winner: "black" });
+    let operationCalls = 0;
+    let reconnects = 0;
+    if (failedOperation === "new_game") {
+      engine.newGame = async () => { operationCalls += 1; throw new Error("fixture startup failed"); };
+    } else {
+      engine.stopAndDrain = async () => { operationCalls += 1; throw new Error("fixture drain failed"); };
+    }
+    const fixtureToken = "fabricated-terminal-failure-token";
+    const api = await startFakeLichessApi({
+      fixtureToken,
+      state: { gameStreams: { "game-1": failedOperation === "new_game"
+        ? [gameFull(terminal)]
+        : async function* records() {
+          yield gameFull(startedState("e2e4"));
+          const deadline = Date.now() + 5_000;
+          while (!engine.active && Date.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+          yield terminal;
+        } } },
+    });
+    t.after(async () => {
+      stop.abort();
+      await api.close();
+      store.close();
+      rmSync(directory, { recursive: true, force: true });
+    });
+    const client = new LichessClient({
+      token: fixtureToken,
+      baseUrl: api.origin,
+      fetchImpl: (url, options) => {
+        assert.equal(new URL(url).origin, new URL(api.origin).origin);
+        return fetch(url, options);
+      },
+    });
+    const session = new GameSession({
+      client, config: gameConfig(), account: "arena-bot", gameId: "game-1",
+      signal: stop.signal, slot: { id: "human-1", audience: "human", state: "active", engine },
+      store,
+      waitForReconnect: async () => { reconnects += 1; stop.abort(); },
+    });
+    await session.run();
+    assert.equal(session.finished, true, "the consumed terminal observation must finish the game");
+    assert.equal(reconnects, 0);
+    assert.equal(operationCalls > 0, true);
+    assert.equal(api.requests.filter((row) => row.path.includes("/stream/")).length, 1);
+    assert.equal(api.state.moves.length, 0);
+    const archive = store.getProviderGame("game-1");
+    assert.equal(archive.status, "resign");
+    assert.equal(archive.archive_completeness, "complete");
+    assert.deepEqual(archive.replay.map((ply) => ply.uci_move), ["e2e4"]);
+    const incidents = store.listProviderIncidents({ filter: "all", after_cursor: 0, limit: 10 });
+    assert.equal(incidents.incidents.length, 1);
+    assert.equal(incidents.incidents[0].operation, failedOperation);
+    assert.equal(incidents.incidents[0].state, "resolved");
+  });
+}
+
+for (const peerOperation of ["pause", "resume"]) {
+  test(`foreground loopback game quarantines the peer whose ${peerOperation} operation fails`, async (t) => {
+    const stop = new AbortController();
+    const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-peer-engine-failure-"));
+    const store = new LichessStore(path.join(directory, "matches.sqlite"));
+    const fixtureToken = "fabricated-peer-failure-token";
+    let requestingSession;
+    let reconnects = 0;
+    const api = await startFakeLichessApi({
+      fixtureToken,
+      state: { gameStreams: { "game-a": async function* records() {
+        yield { ...gameFull(startedState("")), id: "game-a" };
+        const deadline = Date.now() + 5_000;
+        while (!api.state.moves.length && !requestingSession.engineIncident && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        yield startedState(api.state.moves.length ? "e2e4" : "", { status: "resign", winner: "black" });
+      } } },
+    });
+    t.after(async () => {
+      stop.abort();
+      await api.close();
+      store.close();
+      rmSync(directory, { recursive: true, force: true });
+    });
+    const client = new LichessClient({
+      token: fixtureToken, baseUrl: api.origin,
+      fetchImpl: (url, options) => {
+        assert.equal(new URL(url).origin, new URL(api.origin).origin);
+        return fetch(url, options);
+      },
+    });
+    const requestingEngine = new MockGameEngine([{ bestmove: "e2e4" }]);
+    const peerEngine = new MockGameEngine();
+    const config = gameConfig();
+    config.timing.opponent_turn_search = false;
+    const sessions = [];
+    const coordinator = new ForegroundSearchCoordinator({ sessions: () => sessions });
+    const makeSession = (gameId, engine) => new GameSession({
+      client, config, account: "arena-bot", gameId, signal: stop.signal,
+      slot: { id: gameId, audience: "human", state: "active", engine }, store,
+      foregroundCoordinator: coordinator,
+      waitForReconnect: async () => { reconnects += 1; stop.abort(); },
+    });
+    requestingSession = makeSession("game-a", requestingEngine);
+    const peerSession = makeSession("game-b", peerEngine);
+    sessions.push(requestingSession, peerSession);
+    await peerSession.initialize({ ...gameFull(startedState("e2e4")), id: "game-b" }, peerEngine);
+    await peerSession.onState(startedState("e2e4"), peerEngine);
+    peerSession.config.timing.opponent_turn_search = true;
+    if (peerOperation === "pause") {
+      await peerSession.resumeOpponentSearch();
+      peerEngine.stopAndDrain = async () => { throw new Error("fixture peer drain failed"); };
+    } else {
+      peerEngine.startOpponentTurnSearch = async () => { throw new Error("fixture peer resume failed"); };
+    }
+    await requestingSession.run();
+    assert.equal(api.state.moves.length, 1, "the healthy requesting game must submit its legal move");
+    assert.equal(requestingSession.engineIncident, null);
+    assert.equal(peerSession.engineIncident?.code, "engine_process_failure");
+    assert.equal(peerSession.engineIncident.operation, peerOperation === "pause" ? "stop_and_drain" : "opponent_search");
+    assert.equal(reconnects, 0);
+    const incidents = store.listProviderIncidents({ filter: "active", after_cursor: 0, limit: 10 });
+    assert.equal(incidents.incidents.length, 1);
+    assert.equal(incidents.incidents[0].game_id, "game-b");
+    await peerSession.onState(startedState("e2e4", { status: "resign", winner: "black" }), peerEngine);
+    assert.equal(peerSession.finished, true);
+    assert.equal(store.listProviderIncidents({ filter: "active", after_cursor: 0, limit: 10 }).incidents.length, 0);
+  });
+}
 
 test("qualified v1 transport profiles remain readable with legacy coverage", (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-transport-v1-"));

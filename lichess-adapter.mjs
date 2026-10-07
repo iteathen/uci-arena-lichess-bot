@@ -4218,11 +4218,15 @@ export class ForegroundSearchCoordinator {
     this.activeGames.add(id);
     try {
       if (this.enabled) {
-        await Promise.all(Array.from(this.sessions(), (session) => (
-          session.gameId === id
-            ? Promise.resolve()
-            : session.pauseOpponentSearch("foreground_preempted")
-        )));
+        await Promise.all(Array.from(this.sessions(), async (session) => {
+          if (session.gameId === id) return;
+          try {
+            await session.pauseOpponentSearch("foreground_preempted");
+          } catch (error) {
+            if (!(error instanceof GameEngineError)) throw error;
+            await session.recordEngineIncident(error);
+          }
+        }));
       }
     } catch (error) {
       this.activeGames.delete(id);
@@ -4237,7 +4241,14 @@ export class ForegroundSearchCoordinator {
         if (!this.enabled || this.activeGames.size !== 0) return;
         const sessions = Array.from(this.sessions());
         const outcomes = await Promise.allSettled(
-          sessions.map((session) => session.resumeOpponentSearch()),
+          sessions.map(async (session) => {
+            try {
+              await session.resumeOpponentSearch();
+            } catch (error) {
+              if (error instanceof GameEngineError) await session.recordEngineIncident(error);
+              throw error;
+            }
+          }),
         );
         outcomes.forEach((outcome, index) => {
           if (outcome.status === "rejected") {
@@ -4481,6 +4492,9 @@ export class GameSession {
         } catch (error) {
           if (!(error instanceof GameEngineError)) throw error;
           await this.recordEngineIncident(error);
+          // Quarantine suppresses engine work, not the canonical observation
+          // already consumed from this healthy stream (including terminal truth).
+          await this.onState(event.type === "gameFull" ? event.state : event, engine, { observation });
         }
         if (this.gameStreamRecoveryPending) {
           this.gameStreamRecoveryPending = false;
