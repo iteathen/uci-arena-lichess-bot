@@ -2660,6 +2660,35 @@ test("UCI search telemetry retains identity across later info string lines", () 
   });
 });
 
+test("UCI graph retention diagnostics admit only exact nonnegative safe integers", () => {
+  const expected = {
+    mcgs_graph_node_capacity: 96,
+    mcgs_graph_edge_capacity: 2048,
+    mcgs_graph_evictions: 17,
+    mcgs_graph_reclaimed_edges: 153,
+    mcgs_graph_reclaimed_spans: 11,
+    mcgs_graph_span_coalesces: 5,
+    mcgs_graph_capacity_deferrals: 2,
+    mcgs_graph_stale_handles: 3,
+    mcgs_graph_focus_admissions: 9,
+    mcgs_graph_focus_fallbacks: 1,
+    mcgs_explicit_reroots: 0,
+  };
+  const engine = new UciEngine({ uci_options: {} });
+  engine.onLine("info string mcgs_graph_node_capacity 96 mcgs_graph_edge_capacity 2048 mcgs_graph_evictions 17 mcgs_graph_reclaimed_edges 153 mcgs_graph_reclaimed_spans 11 mcgs_graph_span_coalesces 5 mcgs_graph_capacity_deferrals 2 mcgs_graph_stale_handles 3 mcgs_graph_focus_admissions 9 mcgs_graph_focus_fallbacks 1 mcgs_explicit_reroots 0");
+  assert.deepEqual(engine.latestInfo, expected);
+  for (const field of Object.keys(expected)) {
+    for (const invalid of ["-1", "1.5", "2suffix", "9007199254740992", "NaN", "Infinity"]) {
+      const malformed = new UciEngine({ uci_options: {} });
+      malformed.onLine(`info string ${field} ${invalid}`);
+      assert.equal(Object.hasOwn(malformed.latestInfo, field), false, `${field}: ${invalid}`);
+    }
+    const maximum = new UciEngine({ uci_options: {} });
+    maximum.onLine(`info string ${field} 9007199254740991`);
+    assert.equal(maximum.latestInfo[field], Number.MAX_SAFE_INTEGER);
+  }
+});
+
 test("UCI book telemetry is structured without losing later search identity", () => {
   const engine = new UciEngine({ uci_options: {} });
   engine.onLine("info string book_decision_v1 book_probe_result hit book_probe_hit 1 book_move_used 0 book_exit 1 book_phase_latched 1 book_completion_kind search_handoff book_miss_reason none book_lookup_us 9 book_evaluation_source completed_evaluation book_evaluation_cp -23 book_evaluation_us 4 book_decision_us 11 book_emit_us 0 book_candidate_count 4 book_candidate_games 81 book_selected_lcb 0.42 book_best_lcb 0.57 book_exit_probability 0.73 book_snapshot_identity sha256:12345 book_snapshot_generation integration-0123456789abcdefabcd book_snapshot_manifest_sha256 abc123 book_snapshot_validation manifest_verified book_record_count 363 book_evaluation_model_fingerprint 18446744073709551615");

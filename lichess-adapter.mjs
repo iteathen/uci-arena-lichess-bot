@@ -2622,6 +2622,22 @@ export function apiAuthorityKey(url, expectedAccount) {
 function parseInfo(line) {
   const telemetry = {};
   for (const key of [
+    "mcgs_graph_node_capacity",
+    "mcgs_graph_edge_capacity",
+    "mcgs_graph_evictions",
+    "mcgs_graph_reclaimed_edges",
+    "mcgs_graph_reclaimed_spans",
+    "mcgs_graph_span_coalesces",
+    "mcgs_graph_capacity_deferrals",
+    "mcgs_graph_stale_handles",
+    "mcgs_graph_focus_admissions",
+    "mcgs_graph_focus_fallbacks",
+    "mcgs_explicit_reroots",
+  ]) {
+    const match = line.match(new RegExp(`(?:^| )${key} (\\d+)(?= |$)`));
+    if (match && Number.isSafeInteger(Number(match[1]))) telemetry[key] = Number(match[1]);
+  }
+  for (const key of [
     "depth",
     "seldepth",
     "nodes",

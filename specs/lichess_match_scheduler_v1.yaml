@@ -909,6 +909,22 @@ local_ephemeral_release:
 
 telemetry:
   runtime_schema: uci_arena_lichess_runtime_v3
+  optional_graph_retention_diagnostics:
+    fields:
+      - mcgs_graph_node_capacity
+      - mcgs_graph_edge_capacity
+      - mcgs_graph_evictions
+      - mcgs_graph_reclaimed_edges
+      - mcgs_graph_reclaimed_spans
+      - mcgs_graph_span_coalesces
+      - mcgs_graph_capacity_deferrals
+      - mcgs_graph_stale_handles
+      - mcgs_graph_focus_admissions
+      - mcgs_graph_focus_fallbacks
+      - mcgs_explicit_reroots
+    rules:
+      - "These optional Engine-owned UCI info counters are admitted only as exact nonnegative JavaScript-safe integers. Missing or malformed optional diagnostics stay absent and do not change timing, legality, move selection, qualification, or search control."
+      - "The existing bounded provider-owned move_played log preserves admitted counters with game_id and ply. The canonical game archive retains exact immutable Engine/runtime provenance; diagnostic collection joins those identities and must retain canary evidence before runtime-log rotation. This adds no search-evidence table, alternate game archive, or mandatory standard-UCI field."
   fields:
     - configured_and_qualified_capacity
     - active_pending_preparing_by_audience
