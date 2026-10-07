@@ -386,6 +386,13 @@ function build(args) {
     }
     copyTree(path.resolve(args["native-launcher"]), path.join(staging, safeRelative(native.target)));
   }
+  const nativeProcessQuery = definition.native_process_query?.[target];
+  if (nativeProcessQuery?.required) {
+    if (!args["native-process-query"] || !existsSync(path.resolve(args["native-process-query"]))) {
+      throw new Error(`${target} requires --native-process-query`);
+    }
+    copyTree(path.resolve(args["native-process-query"]), path.join(staging, safeRelative(nativeProcessQuery.target)));
+  }
   const runtimePackage = {
     name: packageManifest.name,
     version,
@@ -408,10 +415,14 @@ function build(args) {
     ...(existsSync(adjacentNpmCli) ? [adjacentNpmCli] : []),
     ...npmArguments,
   ], { cwd: staging, stdio: "inherit", windowsHide: true });
-  const linkedContract = path.join(staging, "node_modules", "@uci-arena", "time-profile-contract");
-  if (existsSync(linkedContract) && lstatSync(linkedContract).isSymbolicLink()) {
-    rmSync(linkedContract, { recursive: true, force: true });
-    copyTree(path.join(staging, "vendor", "time-profile-contract"), linkedContract);
+  for (const [name, source] of Object.entries(packageManifest.dependencies).filter(([, value]) => value.startsWith("file:vendor/"))) {
+    const linkedContract = path.join(staging, "node_modules", safeRelative(name));
+    const snapshot = path.join(staging, safeRelative(source.slice("file:".length)));
+    if (existsSync(linkedContract) && lstatSync(linkedContract).isSymbolicLink()) {
+      if (!linkedContract.startsWith(`${staging}${path.sep}`)) throw new Error("package link escaped staging root");
+      rmSync(linkedContract, { recursive: true, force: true });
+      copyTree(snapshot, linkedContract);
+    }
   }
   const releaseDirectory = path.join(staging, "release");
   mkdirSync(releaseDirectory, { recursive: true });
@@ -491,6 +502,7 @@ function build(args) {
       time_profile_contract_sha256: sha256File(
         path.join(staging, "vendor", "time-profile-contract", "package.json"),
       ),
+      background_service_runtime_sha256: sha256File(path.join(staging, "vendor", "background-service-runtime", "package.json")),
     },
     build_flags: ["npm ci --ignore-scripts --omit=dev --no-audit --no-fund"],
     sbom_sha256: sha256File(path.join(releaseDirectory, "sbom.spdx.json")),

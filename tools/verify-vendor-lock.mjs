@@ -9,7 +9,12 @@ import { fileURLToPath } from "node:url";
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const vendor = path.join(root, "vendor");
 const lockPath = path.join(vendor, "upstream.lock.json");
-const textExtensions = new Set([".cpp", ".h", ".json", ".md", ".mjs", ".txt", ".yaml", ".yml"]);
+const textExtensions = new Set([".cpp", ".h", ".hpp", ".json", ".md", ".mjs", ".txt", ".yaml", ".yml"]);
+const sourceCommit = "a535772f818eba76473e4f931dcfc7b764f0c6c5";
+const packageVersions = {
+  "@uci-arena/background-service-runtime": "1.2.0",
+  "@uci-arena/time-profile-contract": "1.2.0",
+};
 
 function canonicalBytes(name, bytes) {
   if (path.posix.basename(name) !== "CMakeLists.txt"
@@ -42,8 +47,8 @@ if (process.argv.includes("--write")) {
   writeFileSync(lockPath, `${JSON.stringify({
     schema: "uci_arena_upstream_vendor_lock_v1",
     source_repository: "iteathen/UCI_Arena",
-    source_commit: "1ee19a5c388a4528cb667bc4a89cde6e326919af",
-    packages: { "@uci-arena/time-profile-contract": "1.2.0" },
+    source_commit: sourceCommit,
+    packages: packageVersions,
     files,
   }, null, 2)}\n`);
   process.stdout.write(`wrote ${lockPath}\n`);
@@ -53,8 +58,8 @@ if (process.argv.includes("--write")) {
 const lock = JSON.parse(readFileSync(lockPath, "utf8"));
 if (lock.schema !== "uci_arena_upstream_vendor_lock_v1"
     || lock.source_repository !== "iteathen/UCI_Arena"
-    || lock.source_commit !== "1ee19a5c388a4528cb667bc4a89cde6e326919af"
-    || lock.packages?.["@uci-arena/time-profile-contract"] !== "1.2.0"
+    || lock.source_commit !== sourceCommit
+    || JSON.stringify(lock.packages) !== JSON.stringify(packageVersions)
     || JSON.stringify(lock.files) !== JSON.stringify(files)) {
   throw new Error("vendored upstream package closure does not match its exact lock");
 }

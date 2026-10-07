@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import {
+  processIdentityFromJson,
   sameProcessInstance,
   validProcessIdentity,
 } from "./process-instance-identity.mjs";
@@ -912,11 +913,7 @@ export class LichessStore {
         try {
           observed = ownerProcessProbe(activePid) ?? observed;
         } catch {}
-        let recordedIdentity = null;
-        try {
-          const parsed = JSON.parse(active.process_identity_json);
-          if (validProcessIdentity(parsed, activePid)) recordedIdentity = parsed;
-        } catch {}
+        const recordedIdentity = processIdentityFromJson(active.process_identity_json, activePid);
         ownerProvenReplaced = observed.state === "absent"
           || (recordedIdentity && observed.state === "present"
             && !sameProcessInstance(recordedIdentity, observed.identity));

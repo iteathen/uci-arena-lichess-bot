@@ -1,0 +1,18 @@
+{
+  "schema": "uci_arena_native_process_instance_contract_v1",
+  "capability": "process_instance_query_v1",
+  "operation": "--query-process-instance",
+  "pid_minimum": 1,
+  "pid_maximum": 4294967295,
+  "timeout_ms": 2000,
+  "maximum_response_bytes": 262144,
+  "maximum_executable_path_utf16_units": 32767,
+  "response_schema": "uci_arena_process_instance_query_v1",
+  "identity_schema": "uci_arena_process_instance_identity_v1",
+  "states": ["present", "absent", "unverifiable"],
+  "identity_fields": ["schema", "platform", "pid", "start_token", "executable_path", "boot_id"],
+  "creation_tick_epoch": "0001-01-01T00:00:00Z",
+  "creation_tick_unit_nanoseconds": 100,
+  "creation_tick_minimum": "504911232000000000",
+  "creation_tick_maximum": "3155378975999999999"
+}

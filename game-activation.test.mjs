@@ -39,7 +39,7 @@ function processIdentity(pid) {
     schema: "uci_arena_process_instance_identity_v1",
     platform: "win32",
     pid,
-    start_token: String(pid),
+    start_token: (504911232000000000n + BigInt(pid)).toString(),
     executable_path: "C:\\UCI Arena\\node.exe",
     boot_id: "",
   };

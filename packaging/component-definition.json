@@ -33,6 +33,8 @@
     {"source": "smoke-uci-startup.mjs", "target": "smoke-uci-startup.mjs"},
     {"source": "vendor/time-profile-contract/package.json", "target": "vendor/time-profile-contract/package.json"},
     {"source": "vendor/time-profile-contract/src", "target": "vendor/time-profile-contract/src"},
+    {"source": "vendor/background-service-runtime/package.json", "target": "vendor/background-service-runtime/package.json"},
+    {"source": "vendor/background-service-runtime/src", "target": "vendor/background-service-runtime/src"},
     {"source": "windows-startup.mjs", "target": "windows-startup.mjs"},
     {"source": "README.md", "target": "README.md"}
   ],
@@ -44,6 +46,10 @@
     "linux-x86_64": {
       "required": false
     }
+  },
+  "native_process_query": {
+    "windows-x86_64": { "required": true, "target": "native/uci_arena_background_guard.exe" },
+    "linux-x86_64": { "required": false }
   },
   "required_test_suites": [
     "npm run check"

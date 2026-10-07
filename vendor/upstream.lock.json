@@ -1,11 +1,30 @@
 {
   "schema": "uci_arena_upstream_vendor_lock_v1",
   "source_repository": "iteathen/UCI_Arena",
-  "source_commit": "1ee19a5c388a4528cb667bc4a89cde6e326919af",
+  "source_commit": "a535772f818eba76473e4f931dcfc7b764f0c6c5",
   "packages": {
+    "@uci-arena/background-service-runtime": "1.2.0",
     "@uci-arena/time-profile-contract": "1.2.0"
   },
   "files": {
+    "background-service-runtime/README.md": "fd9c819212cb93769853145a06f2ef6c0923c342a4251f3913b7b3d4bf3bf362",
+    "background-service-runtime/native/CMakeLists.txt": "3479a7f46acb451670e180ec3739fa3b468326b4b70690350f43c7a1f6dbb20e",
+    "background-service-runtime/native/process_instance_query.hpp": "1e818b784499e58f85c5e3202fe20f8575eeb706cc4fcc6017215b0329c78fdc",
+    "background-service-runtime/native/process_instance_query_test.cpp": "6086745c09211bb8c5304b980dc0110d1c7ae445168d3e9942452d4dd4e71ceb",
+    "background-service-runtime/native/uci_arena_background_guard.cpp": "d03b99092d3f474bf779d4c6a8f1ba701b506caed4aac6a21a7f85ab54caebf6",
+    "background-service-runtime/native/uci_arena_service_launcher.cpp": "98bb2b182490f30baa23af14a05d26847be0ede3f97361e20d34db620d2fa769",
+    "background-service-runtime/package.json": "04f44bfa08282298dd70839f861d16d4a1014d8aab41727a53cd3c6cc131d58f",
+    "background-service-runtime/src/background-resource-lease-store.mjs": "ed26a1909e6685391095f51f4a8e4edaf2525740ed1256ea02613887ca96ea5d",
+    "background-service-runtime/src/background-resource-lease.mjs": "65219184605849ada0e6bead9abca0054f8fba1dba8fdc1da24c83d58e05d81f",
+    "background-service-runtime/src/native-resource-helper.mjs": "76a8064798da01a8b1494e8cbac7ed57bd9928b3203029b633b07c09dc03096b",
+    "background-service-runtime/src/process-instance-query-contract.json": "2ac420da6cda0e958063b9b034fccb2f6df3b20e83d57fad7f78be9e183486d3",
+    "background-service-runtime/src/resource-isolation.mjs": "69c1509a9f44b6da4336bb35059d4a6aec080ba07f6e6f9fc4c11832e997f13e",
+    "background-service-runtime/test/native-process-query.test.mjs": "bf94208578d1588d447955408800d94ba4ab6dacd000a425d9db402c85da3144",
+    "background-service-runtime/test/process-identity-test-oracle.mjs": "57121b4d78aa7e5252c3acb151c2064319ea74320fbb185ff2f022d380530196",
+    "background-service-runtime/test/process-identity-test-oracle.test.mjs": "a1461a4312dab467ef4b675a16693201fbfa10dd4185b578980857d9a75835bb",
+    "background-service-runtime/test/process-instance-query.test.mjs": "2a9ac60640b75b3e9f972dd7e367e231895d05bf549719e3f38bc04545e09598",
+    "background-service-runtime/test/resource-isolation.test.mjs": "e5006c275a8fac8198a9e2b56c20973e4f608533645dcb3654f9908b34b792a0",
+    "background-service-runtime/test/resource-lease.test.mjs": "9b92a0559988367b3904883cf8715e87b2fa561fbf8fc8903cf58d970bbba54f",
     "time-profile-contract/package.json": "fe783efc1e9b88bd8175b8fab8cbe954958b41ff7a9b43f1332e4ba4b75523cc",
     "time-profile-contract/src/index.mjs": "15277edc5e85fbd812b088bf693fdc311561cb7a3b644f6cd8c87fc011917bd7",
     "time-profile-contract/test/contract.test.mjs": "69b73f091c31afaa0439c1c622732ef63e4e5d08022c9da74284e5deae06ded6"

@@ -10,5 +10,6 @@ dist/
 native/build/
 native/build-repro/
 native/lichess_adapter_launcher.exe
+native/uci_arena_background_guard.exe
 release-receipts/
 *.log

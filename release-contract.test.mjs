@@ -21,6 +21,8 @@ test("component definition packages runtime contracts without test or source-tre
   assert.equal(sources.includes("vendor"), false);
   assert.equal(sources.includes("vendor/time-profile-contract/package.json"), true);
   assert.equal(sources.includes("vendor/time-profile-contract/src"), true);
+  assert.equal(sources.includes("vendor/background-service-runtime/package.json"), true);
+  assert.equal(sources.includes("vendor/background-service-runtime/src"), true);
   assert.equal(sources.includes("lichess-adapter.mjs"), true);
   assert.equal(sources.includes("provider-incidents.mjs"), true);
   assert.equal(sources.includes("provider-games.mjs"), true);
@@ -31,6 +33,10 @@ test("component definition packages runtime contracts without test or source-tre
   assert.equal(JSON.stringify(definition).includes("../"), false);
   assert.equal(definition.native_launcher["windows-x86_64"].required, true);
   assert.equal(definition.native_launcher["linux-x86_64"].required, false);
+  assert.deepEqual(definition.native_process_query["windows-x86_64"], {
+    required: true, target: "native/uci_arena_background_guard.exe",
+  });
+  assert.equal(definition.native_process_query["linux-x86_64"].required, false);
   assert.deepEqual(Object.keys(definition.native_toolchain_by_target), ["windows-x86_64"]);
 });
 
