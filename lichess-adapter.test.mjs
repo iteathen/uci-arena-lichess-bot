@@ -57,7 +57,7 @@ import {
   BOOTSTRAP_COEFFICIENTS,
   coefficientOptions,
 } from "./test-fixtures/adaptive-temporal-curve.mjs";
-import { ApiSafetyCoordinator, LichessHttpError } from "./lichess-scheduler.mjs";
+import { ApiSafetyCoordinator, LichessHttpError, SlotPool } from "./lichess-scheduler.mjs";
 import { LichessStore } from "./lichess-store.mjs";
 import { startFakeLichessApi } from "./fake-api-server.mjs";
 import { buildProfileIdentity, engineCommandIdentity, sha256Object, validateProfileRuntimeSnapshot,
@@ -286,6 +286,44 @@ test("provider status distinguishes inactive, disconnected, and ready states", (
   assert.equal(stale.ready, false);
   assert.deepEqual(stale.blockers, ["runtime_status_stale", "provider_process_inactive"]);
 });
+
+for (const format of ["current nested snapshot", "historical flat array"]) {
+  test(`provider status projects real SlotPool transitions from ${format}`, async () => {
+    const pool = new SlotPool({ human: { slots: 0, allow_borrowing: false }, bot: { slots: 6 } });
+    pool.acquire("bot");
+    const pending = pool.acquire("bot");
+    pool.pending(pending, "pending-challenge", pending.generation);
+    const cancelling = pool.acquire("bot");
+    pool.pending(cancelling, "cancelling-challenge", cancelling.generation);
+    pool.cancelling(cancelling, cancelling.generation);
+    const active = pool.acquire("bot");
+    pool.active(active, "active-game", active.generation);
+    const draining = pool.acquire("bot");
+    let releaseClose;
+    pool.attachEngine(draining, { close: () => new Promise(resolve => { releaseClose = resolve; }) }, draining.generation);
+    const drain = pool.release(draining, draining.generation);
+    try {
+      const snapshot = pool.snapshot();
+      const runtime = { schema: "uci_arena_lichess_runtime_v3", updated_at: new Date().toISOString(),
+        configured_capacity: 6, qualified_capacity: 6,
+        slots: format === "current nested snapshot" ? snapshot : snapshot.slots };
+      const projected = providerStatusProjection({ runtime, active: true });
+      assert.deepEqual(projected.capacity.slots, {
+        empty: 1, preparing: 1, pending: 1, cancelling: 1, active: 1, draining: 1,
+      });
+      assert.deepEqual(Object.fromEntries(["active", "preparing", "pending", "cancelling", "draining"]
+        .map(state => [state, projected.games[state]])), {
+        active: 1, preparing: 1, pending: 1, cancelling: 1, draining: 1,
+      });
+      assert.equal(pool.occupied("bot"), 5);
+      assert.equal(pool.available("bot"), 1);
+    } finally {
+      releaseClose();
+      await drain;
+      await pool.drainAll();
+    }
+  });
+}
 
 test("startup incident identity excludes clean exits and is stable for one unexpected receipt", () => {
   assert.equal(unexpectedStartupIncident({ disposition: "clean_exit" }), null);
@@ -1136,7 +1174,7 @@ test("component identity is explicit, inventory-bound, and null for external UCI
   const provider = providerComponentIdentity();
   assert.deepEqual(provider, {
     componentId: "lichess.adapter",
-    version: "1.0.38",
+    version: "1.0.39",
     manifestSha256: sha256(readFileSync(path.join(ROOT, "contracts", "component-manifest.json"))),
   });
 
