@@ -1300,6 +1300,15 @@ protected_live_acceptance_2026_07_26:
       private stdin and waits for graceful lease/store cleanup before using
       forced termination as a bounded fallback.
     success: "Observe the authoritative game stream reach a terminal state for a game against the named target."
+    mutable_log_observation: >
+      The harness retains immutable exact-file admission for each log read.
+      A typed append-compatible content-change failure on the same bounded regular file object
+      defers observation to the next bounded poll without consuming bytes or
+      changing the offset or partial record. During-read truncation or shrink,
+      substitution, unsafe paths, quota,
+      unknown errors, and cleanup failures remain fatal. Initial offset admission
+      must succeed before spawn; retries share the original wall-clock deadline
+      and cannot invent completion or promote pre-attempt events.
     inconclusive: >
       Decline, timeout, API ambiguity, adapter exit, participant mismatch,
       attempt exhaustion, or wall-clock expiry is non-success. Runtime state is

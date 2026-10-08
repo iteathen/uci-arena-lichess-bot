@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import { appendFileSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
@@ -12,9 +15,229 @@ import {
   buildAcceptanceConfig,
   executeAcceptancePlan,
   observeAcceptanceEvent,
+  runSpawnedAttempt,
   terminateChild,
   validateAcceptanceOptions,
 } from "./live-acceptance.mjs";
+import { ExactFileError, exactFiles } from "./exact-file.mjs";
+
+function logAttemptFixture(t) {
+  const runtimeDir = mkdtempSync(path.join(os.tmpdir(), "arena-live-log-"));
+  t.after(() => rmSync(runtimeDir, { recursive: true, force: true }));
+  const logPath = path.join(runtimeDir, "adapter.ndjson");
+  writeFileSync(logPath, "");
+  let clock = 0;
+  let spawns = 0;
+  let shutdowns = 0;
+  const child = new EventEmitter();
+  child.exitCode = null;
+  child.signalCode = null;
+  child.stdin = { writable: true, end(value) {
+    assert.equal(value, "shutdown\n");
+    shutdowns += 1;
+    child.exitCode = 0;
+  } };
+  child.kill = () => assert.fail("Fixture should shut down gracefully");
+  return {
+    runtimeDir, logPath, child,
+    get spawns() { return spawns; },
+    get shutdowns() { return shutdowns; },
+    append(event) { appendFileSync(logPath, `${JSON.stringify(event)}\n`); },
+    run(overrides = {}) {
+      return runSpawnedAttempt({ options: options(), configPath: "synthetic-config.json", runtimeDir,
+        deadline: 1000, now: () => clock,
+        waitImpl: async (milliseconds) => { clock += milliseconds; },
+        spawnImpl: () => { spawns += 1; return child; }, ...overrides });
+    },
+  };
+}
+
+const finishedEvent = { event: "game_finished", game_id: "new-game", opponent: "publicbot", status: "mate" };
+
+test("live log concurrent admission append defers and later delivers completed event", async (t) => {
+  const fixture = logAttemptFixture(t);
+  let reads = 0;
+  const result = await fixture.run({
+    spawnImpl: () => { fixture.append({ event: "game_started", game_id: "new-game", opponent: "publicbot" }); return fixture.child; },
+    fileAuthority: { ...exactFiles, readExactFileSync(filename, readOptions) {
+      reads += 1;
+      return exactFiles.readExactFileSync(filename, { ...readOptions, hooks: {
+        afterPathAdmission: () => { if (reads === 2) fixture.append(finishedEvent); },
+      } });
+    } },
+  });
+  assert.equal(result.status, "completed");
+  assert.equal(result.gameId, "new-game");
+  assert.equal(reads, 3);
+  assert.equal(fixture.shutdowns, 1);
+});
+
+test("live log append after fstat discards unadmitted bytes and preserves partial record", async (t) => {
+  const fixture = logAttemptFixture(t);
+  let reads = 0;
+  const line = `${JSON.stringify(finishedEvent)}\n`;
+  const result = await fixture.run({
+    spawnImpl: () => { appendFileSync(fixture.logPath, line.slice(0, 20)); return fixture.child; },
+    fileAuthority: { ...exactFiles, readExactFileSync(filename, readOptions) {
+      reads += 1;
+      return exactFiles.readExactFileSync(filename, { ...readOptions, hooks: {
+        afterOpen: () => { if (reads === 3) appendFileSync(filename, line.slice(20)); },
+      } });
+    } },
+  });
+  assert.equal(result.status, "completed");
+  assert.equal(result.gameId, "new-game");
+  assert.equal(reads, 4);
+  assert.equal(fixture.shutdowns, 1);
+});
+
+test("initial log admission append is retried before spawn and old completion is excluded", async (t) => {
+  const fixture = logAttemptFixture(t);
+  let reads = 0;
+  const result = await fixture.run({ fileAuthority: { ...exactFiles, readExactFileSync(filename, readOptions) {
+    reads += 1;
+    return exactFiles.readExactFileSync(filename, { ...readOptions, hooks: {
+      afterPathAdmission: () => { if (reads === 1) fixture.append(finishedEvent); },
+    } });
+  } } });
+  assert.equal(result.status, "inconclusive");
+  assert.match(result.reason, /wall-clock limit/);
+  assert.equal(fixture.spawns, 1);
+  assert.equal(fixture.shutdowns, 1);
+});
+
+for (const initial of [false, true]) {
+  test(`repeated log mutation reaches deadline without invented completion (initial=${initial})`, async (t) => {
+    const fixture = logAttemptFixture(t);
+    let reads = 0;
+    const result = await fixture.run({ fileAuthority: { ...exactFiles, readExactFileSync(filename, readOptions) {
+      reads += 1;
+      return exactFiles.readExactFileSync(filename, { ...readOptions, hooks: {
+        afterPathAdmission: () => { if (initial || reads > 1) fixture.append(finishedEvent); },
+      } });
+    } } });
+    assert.equal(result.status, "inconclusive");
+    assert.match(result.reason, /wall-clock limit/);
+    assert.equal(fixture.spawns, initial ? 0 : 1);
+    assert.equal(fixture.shutdowns, initial ? 0 : 1);
+    assert.equal(reads, initial ? 4 : 5);
+  });
+}
+
+for (const code of ["EXACT_FILE_TOO_LARGE", "EXACT_FILE_TYPE_INVALID", "EXACT_FILE_READ_FAILED", "EXACT_FILE_OPERATION_AND_CLOSE_FAILED"]) {
+  test(`live log rejects non-mutation ${code}`, async (t) => {
+    const fixture = logAttemptFixture(t);
+    const failure = new ExactFileError(code, "Synthetic log", "rejected");
+    let reads = 0;
+    await assert.rejects(fixture.run({ fileAuthority: { ...exactFiles, readExactFileSync(filename, readOptions) {
+      if (++reads === 2) throw failure;
+      return exactFiles.readExactFileSync(filename, readOptions);
+    } } }), (error) => error === failure);
+    assert.equal(reads, 2);
+    assert.equal(fixture.shutdowns, 1);
+  });
+}
+
+test("live log observed object substitution remains rejected", async (t) => {
+  const fixture = logAttemptFixture(t);
+  let reads = 0;
+  await assert.rejects(fixture.run({ fileAuthority: { ...exactFiles, readExactFileSync(filename, readOptions) {
+    reads += 1;
+    return exactFiles.readExactFileSync(filename, { ...readOptions, hooks: {
+      afterPathAdmission: () => {
+        if (reads === 2) { renameSync(filename, `${filename}.old`); writeFileSync(filename, `${JSON.stringify(finishedEvent)}\n`); }
+      },
+    } });
+  } } }), (error) => error instanceof ExactFileError && error.code === "EXACT_FILE_IDENTITY_CHANGED");
+  assert.equal(reads, 2);
+  assert.equal(fixture.shutdowns, 1);
+});
+
+test("live log growth beyond quota is rejected rather than deferred", async (t) => {
+  const fixture = logAttemptFixture(t);
+  let reads = 0;
+  await assert.rejects(fixture.run({ fileAuthority: { ...exactFiles, readExactFileSync(filename, readOptions) {
+    reads += 1;
+    return exactFiles.readExactFileSync(filename, { ...readOptions, hooks: {
+      afterPathAdmission: () => {
+        if (reads === 2) appendFileSync(filename, Buffer.alloc(readOptions.maximumBytes + 1));
+      },
+    } });
+  } } }), (error) => error instanceof ExactFileError && error.code === "EXACT_FILE_TOO_LARGE");
+  assert.equal(reads, 2);
+  assert.equal(fixture.shutdowns, 1);
+});
+
+test("live log unknown error with a mutation-shaped code remains rejected", async (t) => {
+  const fixture = logAttemptFixture(t);
+  const failure = Object.assign(new Error("Synthetic unexpected failure"), { code: "EXACT_FILE_IDENTITY_CHANGED" });
+  let reads = 0;
+  await assert.rejects(fixture.run({ fileAuthority: { ...exactFiles, readExactFileSync(filename, readOptions) {
+    if (++reads === 2) throw failure;
+    return exactFiles.readExactFileSync(filename, readOptions);
+  } } }), (error) => error === failure);
+  assert.equal(fixture.shutdowns, 1);
+});
+
+test("live log missing poll preserves the admitted partial record", async (t) => {
+  const fixture = logAttemptFixture(t);
+  const line = `${JSON.stringify(finishedEvent)}\n`;
+  let classifications = 0;
+  const result = await fixture.run({
+    spawnImpl: () => { appendFileSync(fixture.logPath, line.slice(0, 20)); return fixture.child; },
+    fileAuthority: { ...exactFiles, classifyExactPathSync(filename, readOptions) {
+      if (++classifications === 3) {
+        appendFileSync(filename, line.slice(20));
+        return { kind: "missing" };
+      }
+      return exactFiles.classifyExactPathSync(filename, readOptions);
+    } },
+  });
+  assert.equal(result.status, "completed");
+  assert.equal(classifications, 4);
+  assert.equal(fixture.shutdowns, 1);
+});
+
+test("live log mutation on child exit is observed at the next bounded poll", async (t) => {
+  const fixture = logAttemptFixture(t);
+  let reads = 0;
+  const result = await fixture.run({ fileAuthority: { ...exactFiles, readExactFileSync(filename, readOptions) {
+    reads += 1;
+    return exactFiles.readExactFileSync(filename, { ...readOptions, hooks: {
+      afterPathAdmission: () => {
+        if (reads === 2) {
+          fixture.append(finishedEvent);
+          fixture.child.exitCode = 0;
+          fixture.child.emit("exit", 0);
+        }
+      },
+    } });
+  } } });
+  assert.equal(result.status, "completed");
+  assert.equal(reads, 3);
+  assert.equal(fixture.shutdowns, 0);
+});
+
+for (const hook of ["afterOpen", "afterPathAdmission"]) {
+  test(`live log same-object shrink cannot promote a pre-attempt completion (${hook})`, async (t) => {
+    const fixture = logAttemptFixture(t);
+    const oldCompletion = `${JSON.stringify({ ...finishedEvent, game_id: "old-game" })}\n`;
+    writeFileSync(fixture.logPath, `${oldCompletion}${JSON.stringify({ event: "historical_padding", padding: "x".repeat(1024) })}\n`);
+    let reads = 0;
+    await assert.rejects(fixture.run({
+      spawnImpl: () => { fixture.append({ event: "game_started", game_id: "new-game", opponent: "publicbot" }); return fixture.child; },
+      fileAuthority: { ...exactFiles, readExactFileSync(filename, readOptions) {
+        reads += 1;
+        return exactFiles.readExactFileSync(filename, { ...readOptions, hooks: {
+          [hook]: () => { if (reads === 2) writeFileSync(filename, oldCompletion); },
+        } });
+      } },
+    }), (error) => error instanceof ExactFileError
+      && error.code === (hook === "afterOpen" ? "EXACT_FILE_TRUNCATED" : "EXACT_FILE_IDENTITY_CHANGED"));
+    assert.equal(reads, 2);
+    assert.equal(fixture.shutdowns, 1);
+  });
+}
 
 function options(overrides = {}) {
   return validateAcceptanceOptions({

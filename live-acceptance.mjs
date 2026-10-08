@@ -10,11 +10,11 @@ import {
 } from "./lichess-adapter.mjs";
 import { normalizedUsername } from "./lichess-store.mjs";
 import {
-  classifyExactPathSync,
   ensureExactDirectorySync,
   publishExactJsonSync,
-  readExactFileSync,
   readExactJsonSync,
+  ExactFileError,
+  exactFiles,
 } from "./exact-file.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -23,11 +23,35 @@ const ADAPTER = path.join(HERE, "lichess-adapter.mjs");
 const ACCEPTANCE_FILE_LIMIT = 1024 * 1024;
 const RUNTIME_LOG_LIMIT = 16 * 1024 * 1024;
 
-function exactRegularFileExistsSync(filename, label) {
-  const admission = classifyExactPathSync(filename, { label });
-  if (admission.kind === "missing") return false;
+function readRuntimeLog(filename, fileAuthority) {
+  const label = "Lichess runtime log";
+  const admission = fileAuthority.classifyExactPathSync(filename, { label });
+  if (admission.kind === "missing") return undefined;
   if (admission.kind !== "file") throw new Error(`${label} is not a regular non-link file`);
-  return true;
+  try {
+    return fileAuthority.readExactFileSync(filename, {
+      maximumBytes: RUNTIME_LOG_LIMIT,
+      label,
+    }).bytes;
+  } catch (error) {
+    if (!(error instanceof ExactFileError)
+        || !["EXACT_FILE_IDENTITY_CHANGED", "EXACT_FILE_GREW"].includes(error.code)) {
+      throw error;
+    }
+    // A changing log supplies no admitted bytes. Only retry when the same
+    // bounded regular object remains without shrinking; replacement, truncation
+    // and unsafe paths fail rather than replaying pre-attempt evidence.
+    const current = fileAuthority.classifyExactPathSync(filename, { label });
+    if (current.kind !== "file"
+        || current.identity.dev !== admission.identity.dev
+        || current.identity.ino !== admission.identity.ino
+        || current.identity.mode !== admission.identity.mode
+        || BigInt(current.identity.size) < BigInt(admission.identity.size)) throw error;
+    if (BigInt(current.identity.size) > BigInt(RUNTIME_LOG_LIMIT)) {
+      throw new ExactFileError("EXACT_FILE_TOO_LARGE", label, `exceeds ${RUNTIME_LOG_LIMIT} bytes`);
+    }
+    return null;
+  }
 }
 
 export const MAX_LIVE_ACCEPTANCE_ATTEMPTS = 3;
@@ -276,14 +300,22 @@ export async function runSpawnedAttempt({
   deadline,
   spawnImpl = spawn,
   now = Date.now,
+  waitImpl = wait,
+  fileAuthority = exactFiles,
 }) {
   const logPath = path.join(runtimeDir, "adapter.ndjson");
-  let logOffset = exactRegularFileExistsSync(logPath, "Lichess runtime log")
-    ? readExactFileSync(logPath, {
-      maximumBytes: RUNTIME_LOG_LIMIT,
-      label: "Lichess runtime log",
-    }).byteLength
-    : 0;
+  let logOffset = 0;
+  while (now() < deadline) {
+    const initialBytes = readRuntimeLog(logPath, fileAuthority);
+    if (initialBytes !== null) {
+      logOffset = initialBytes?.length ?? 0;
+      break;
+    }
+    await waitImpl(250);
+  }
+  if (now() >= deadline) {
+    return { status: "inconclusive", reason: "Live acceptance wall-clock limit expired", gameId: null };
+  }
   let partial = "";
   let state = {
     challengeCreated: false,
@@ -305,11 +337,8 @@ export async function runSpawnedAttempt({
   });
   try {
     while (now() < deadline) {
-      if (exactRegularFileExistsSync(logPath, "Lichess runtime log")) {
-        const bytes = readExactFileSync(logPath, {
-          maximumBytes: RUNTIME_LOG_LIMIT,
-          label: "Lichess runtime log",
-        }).bytes;
+      const bytes = readRuntimeLog(logPath, fileAuthority);
+      if (bytes !== null && bytes !== undefined) {
         if (bytes.length < logOffset) {
           logOffset = 0;
           partial = "";
@@ -340,14 +369,14 @@ export async function runSpawnedAttempt({
         }
       }
       if (state.terminal) return state.terminal;
-      if (exited) {
+      if (exited && bytes !== null) {
         return {
           status: "inconclusive",
           reason: `Adapter exited before a completed game (code ${exitCode ?? "signal"})`,
           gameId: state.gameId,
         };
       }
-      await wait(250);
+      await waitImpl(250);
     }
     return {
       status: "inconclusive",
