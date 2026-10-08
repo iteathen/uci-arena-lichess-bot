@@ -186,7 +186,7 @@ capacity_profile:
     cursor fields have no MCGS authority. A smaller configured capacity may
     use a profile qualified at a greater capacity with identical bindings.
   child_cleanup:
-    - "Fresh qualification returns evidence only after every exact owned UCI child has an observed zero-code, unsignalled exit and completed child stdio close without forced termination or cleanup failure. Active-game close retains its existing best-effort shutdown policy."
+    - "Fresh qualification returns evidence only after every exact owned UCI child has an observed zero-code, unsignalled exit and completed child stdio close without forced termination or cleanup failure. Legacy active-game close retains its existing best-effort shutdown policy; the additive continuous v2 path requires its native join plus strict child-close proof."
     - "Single-child and concurrent qualification preserve every primary startup/runtime rejection, including falsy or immutable reasons, and attach bounded cleanup diagnostics without mutating that reason. Cleanup continues for every acquired child even when another child fails."
     - "New capacity publication requires the actual per-child clean-close observation and retains it in evidence. Missing, rejected, nonzero, signalled, forced, or unobserved close blocks creation or replacement of the capacity artifact; retained historical profiles preserve their existing schema meanings."
   failure: "Missing, stale, mismatched, or undersized capacity evidence blocks live run before credentials are read."
@@ -203,7 +203,38 @@ single_game_profile_publication:
     - "MCGS graph size, Cpuct, outstanding-batch limit, and book-prior blend are copied from qualified identity rather than supplied independently by the operator."
     - "When complete-game evidence selects Syzygy, publication copies its exact external path, manifest path and file SHA-256, manifest identity/cardinality, probe limit and worker topology, rule-50 policy, and root/internal activation into the single-game profile. Publication revalidates the current manifest file before replacing the profile; absent tablebases remain an explicit no-tablebase qualification mode."
     - "Publication validates every input before replacing the profile and copies the exact timing profile plus complete-game artifact beside it; a rejected attempt leaves the prior authoritative profile unchanged."
-    - "V2 profiles remain parseable historical evidence but cannot pass the live adapter's MCGS startup gate."
+    - "Historical V2-search-core profiles remain parseable evidence but cannot pass the live adapter's MCGS startup gate."
+
+
+continuous_local_live_profile:
+  schema: uci_arena_single_game_profile_v2
+  qualification_scope: local_live_safety
+  owner: lichess_provider_profile_publisher
+  input_schema: uci_continuous_complete_game_diagnostic_v1
+  authority:
+    diagnostic: true
+    timing: false
+    strength: false
+    performance: false
+    release: false
+    retention: false
+  rules:
+    - "Explicit schema dispatch preserves single-game v1, historical complete-game v3/v4 and immutable timing-profile v3 meanings. Unknown or missing continuous facts fail closed; this path never falls through to legacy drain/full-seeding acceptance."
+    - "The exact current executable, literal arguments, working directory, model/provider/runtime/hardware identities, public tool source closure, advertised/applied UCI options, configured book/tablebase assets and qualified timing-profile file/identity are bound. Source closure membership follows the pinned Engine-owned public manifest; every declared public source byte is verified without Git execution or private imports. Run-declared source-clean/revision/tree provenance is retained, not independently authenticated by the consumer."
+    - "The model owner's supported selected artifact and complete required relative asset declaration determine closure membership. Every required asset is present with its exact digest and the current child repeats the same declaration. DirectML does not imply selection of a packaged FP16 alternative. Public relative paths, physical containment and non-link identity are admitted before reads; credential/private aliases and trailing-dot/space Windows segments reject before any file operation."
+    - "Completed evidence requires opposite-color natural-terminal games from startpos, legal replay, exact admitted position request/history, canonical raw-en-passant FEN and lossless current focus. The first supported canonical terminal transition is final. Every startup/model/opponent publication respects the producer-declared 500 ms ratio/grace bound independently of the IPC timeout."
+    - "Every full legal candidate remains eligible, including unexpanded candidates. Actual root-policy and completed seed counts remain separate facts; partial seeds do not become complete seeding. Native publication is independently fenced to current focus or proves typed active non-search resolution. Book hints and tablebase constraints remain search-derived."
+    - "Continuous game observations retain stable lineage, workers, evaluation service/fixed queue/cache lifetime and unchanged generation/capacities within one actual child game. Process-local identities are compared only within that child's timeline, never against another qualification child's numeric identities. A genuine ucinewgame clears the old baseline; the first actual admission/publication establishes the new baseline, including an opponent-only game before its first own publication."
+    - "Bounded ongoing reservations/tickets/leases are live work, not leaks or grounds for publication-time global drain. Active final residue is unavailable; failure/stale-publication facts remain independently zero. Known individual cancellation/abandon counts do not alone assert broad cancellation or lifecycle failure. Aggregate actual asynchronous/provider work is required per diagnostic game."
+    - "Actual native joined-search completion binds the ended lineage/epoch with failure false, zero reservation residue/stale backups/async leases and known tickets within their real capacity. It is separate from observed unsignalled zero process exit and completed stdio close without forced cleanup. Neither receipt nor process close asserts universal evaluator/provider destruction. V2 active-game close retains this strict owned proof."
+    - "Startup applies and verifies the qualified timing context before its single bounded publication and candidate request. The public 1.3 historical searched-regime operation may preserve actual enabled book only for the owner's qualified false-book MCGS regime with configured/effective prior blend zero, exact Ponder and declared overhead envelope. It reports searched-regime authority separately from whole-runtime authority; actual options/knowledge are never relabelled false and the immutable profile/reserves/strategy remain unchanged."
+    - "Actual game publications repeat applied timing, full option/declaration, model and knowledge activation, exact history/focus/candidate and owner-continuity validation before move submission. Scores remain optional; the Lichess server remains actual-game terminal authority."
+  capacity:
+    outer_schema: uci_arena_lichess_capacity_profile_v2
+    evidence_schema: uci_arena_continuous_runtime_qualification_v1
+    rules:
+      - "The existing exact single-game profile hash binds the new inner semantics. Each requested concurrent child retains its actual OS process instance, legal bounded startup publication/full candidate evidence and actual native join plus clean exit/stdio proof. Missing or failed cleanup blocks publication/replacement. Stored legacy capacity meanings remain unchanged."
+      - "Capacity process instances distinguish concurrently qualified children; future game children establish their own identity/baseline. Capacity never grants timing, strength, performance or release authority."
 
 engine_adapters:
   selection: explicit_configuration

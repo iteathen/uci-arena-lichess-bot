@@ -42,6 +42,7 @@ export class AuthoritativeChessState {
     this.moves = [];
     this.plySnapshots = [];
     this.canonicalInitialFen = this.chess.fen();
+    this.rawEnPassantSquare = initialFen === "startpos" ? "-" : initialFen.trim().split(/\s+/)[3];
   }
 
   synchronize(moves, { forceRebuild = false } = {}) {
@@ -52,14 +53,21 @@ export class AuthoritativeChessState {
       this.chess = createInitialPosition(this.initialFen);
       this.moves = [];
       this.plySnapshots = [];
+      this.rawEnPassantSquare = this.initialFen === "startpos" ? "-" : this.initialFen.trim().split(/\s+/)[3];
     }
     const firstPly = this.moves.length;
     for (let ply = firstPly; ply < moves.length; ply += 1) {
       const beforeFen = this.chess.fen();
       const moveActorColor = this.chess.turn() === "w" ? "white" : "black";
-      if (!applyLegalMove(this.chess, moves[ply])) {
+      const acceptedMove = applyLegalMove(this.chess, moves[ply]);
+      if (!acceptedMove) {
         throw new Error(`Authoritative move list is illegal at ply ${ply + 1}: ${moves[ply]}`);
       }
+      // Raw FEN projection follows the already validated move flag. chess.js may
+      // discard a non-capturable target internally; legality and v1 FEN remain unchanged.
+      this.rawEnPassantSquare = acceptedMove.isBigPawn()
+        ? `${acceptedMove.from[0]}${(Number(acceptedMove.from[1]) + Number(acceptedMove.to[1])) / 2}`
+        : "-";
       this.moves.push(moves[ply]);
       this.plySnapshots.push(Object.freeze({
         ply,
@@ -94,6 +102,29 @@ export class AuthoritativeChessState {
       elapsedMs: this.now() - startedAt,
       replayedPlies: 0,
       rootFen: this.chess.fen(),
+    };
+  }
+
+  positionObservation() {
+    const fenFields = this.chess.fen({ forceEnpassantSquare: true }).split(" ");
+    fenFields[3] = this.rawEnPassantSquare;
+    const terminal = this.chess.isGameOver();
+    const result = this.chess.isCheckmate()
+      ? (this.chess.turn() === "w" ? "0-1" : "1-0")
+      : this.chess.isDraw() ? "1/2-1/2" : "*";
+    return {
+      fen: fenFields.join(" "),
+      legal_moves: this.chess.moves({ verbose: true }).map((move) =>
+        `${move.from}${move.to}${move.promotion ?? ""}`),
+      terminal,
+      terminal_conditions: {
+        checkmate: this.chess.isCheckmate(),
+        stalemate: this.chess.isStalemate(),
+        fifty_move_rule: Number(this.chess.fen().split(" ")[4]) >= 100 && !this.chess.isCheckmate(),
+        threefold_repetition: this.chess.isThreefoldRepetition(),
+        insufficient_material: this.chess.isInsufficientMaterial(),
+      },
+      result,
     };
   }
 

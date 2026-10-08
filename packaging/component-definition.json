@@ -14,6 +14,8 @@
   "include": [
     {"source": "backfill-game-provenance.mjs", "target": "backfill-game-provenance.mjs"},
     {"source": "chess-legality.mjs", "target": "chess-legality.mjs"},
+    {"source": "continuous-game-qualification.mjs", "target": "continuous-game-qualification.mjs"},
+    {"source": "continuous-uci-observation.mjs", "target": "continuous-uci-observation.mjs"},
     {"source": "config.uci_arena.template.yml", "target": "config.uci_arena.template.yml"},
     {"source": "contracts", "target": "contracts"},
     {"source": "exact-file.mjs", "target": "exact-file.mjs"},
@@ -30,6 +32,7 @@
     {"source": "linux-startup.mjs", "target": "linux-startup.mjs"},
     {"source": "live-acceptance.mjs", "target": "live-acceptance.mjs"},
     {"source": "publish-single-game-profile.mjs", "target": "publish-single-game-profile.mjs"},
+    {"source": "single-game-profile-validation.mjs", "target": "single-game-profile-validation.mjs"},
     {"source": "smoke-uci-startup.mjs", "target": "smoke-uci-startup.mjs"},
     {"source": "vendor/time-profile-contract/package.json", "target": "vendor/time-profile-contract/package.json"},
     {"source": "vendor/time-profile-contract/src", "target": "vendor/time-profile-contract/src"},

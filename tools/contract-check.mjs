@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -23,6 +24,43 @@ const gameDetail = readJson("contracts/game-detail-schema.json");
 const qualificationResult = readJson("contracts/qualification-result-schema.json");
 const template = readFileSync(path.join(root, "config.uci_arena.template.yml"), "utf8");
 const errors = [];
+
+const diagnosticPin = readJson("contracts/continuous-game-diagnostic.upstream.json");
+if (diagnosticPin.schema !== "uci_arena_public_contract_snapshot_v1"
+    || diagnosticPin.source_repository !== "iteathen/uci-arena-engine"
+    || !/^[0-9a-f]{40}$/.test(diagnosticPin.source_commit)
+    || diagnosticPin.encoding !== "utf8_lf_git_blob") {
+  errors.push("continuous diagnostic public provenance is invalid");
+}
+const expectedPublicCopies = ["contracts/continuous-game-diagnostic.schema.json", "contracts/continuous-game-diagnostic-source-closure.v1.json"];
+if (JSON.stringify(Object.keys(diagnosticPin.files ?? {}).sort()) !== JSON.stringify([...expectedPublicCopies].sort())) {
+  errors.push("continuous diagnostic public snapshot closure differs");
+}
+for (const file of expectedPublicCopies) {
+  const binding = diagnosticPin.files?.[file];
+  const canonical = readFileSync(path.join(root, file), "utf8").replaceAll("\r\n", "\n");
+  const sha256 = createHash("sha256").update(canonical, "utf8").digest("hex");
+  if (binding?.upstream_path !== file || binding?.sha256 !== sha256) {
+    errors.push(`continuous diagnostic public Git blob snapshot differs: ${file}`);
+  }
+}
+const diagnosticSchema = readJson(expectedPublicCopies[0]);
+const sourceClosure = readJson(expectedPublicCopies[1]);
+if (diagnosticSchema.$id !== "uci_continuous_complete_game_diagnostic_v1"
+    || diagnosticSchema.additionalProperties !== false
+    || sourceClosure.schema !== "uci_continuous_diagnostic_source_closure_v1"
+    || sourceClosure.entrypoint !== "arena/run_complete_game_matrix.mjs"
+    || JSON.stringify(Object.keys(sourceClosure).sort()) !== JSON.stringify(["entrypoint", "required_source_paths", "schema"])
+    || !Array.isArray(sourceClosure.required_source_paths)
+    || new Set(sourceClosure.required_source_paths).size !== sourceClosure.required_source_paths.length
+    || JSON.stringify(sourceClosure.required_source_paths) !== JSON.stringify([...sourceClosure.required_source_paths].sort())
+    || !sourceClosure.required_source_paths.includes(sourceClosure.entrypoint)
+    || !expectedPublicCopies.every((file) => sourceClosure.required_source_paths.includes(file))) {
+  errors.push("continuous diagnostic public owner schema/source declaration is incompatible");
+}
+if (readJson("vendor/time-profile-contract/package.json").version !== "1.3.0") {
+  errors.push("continuous searched-regime adapter requires public time-profile contract 1.3.0");
+}
 
 function exactKeys(value, schema, label) {
   const expected = [...(schema.required ?? [])].sort();

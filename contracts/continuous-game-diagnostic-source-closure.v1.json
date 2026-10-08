@@ -1,0 +1,15 @@
+{
+  "schema": "uci_continuous_diagnostic_source_closure_v1",
+  "entrypoint": "arena/run_complete_game_matrix.mjs",
+  "required_source_paths": [
+    "arena/continuous_complete_game_diagnostic.mjs",
+    "arena/run_complete_game_matrix.mjs",
+    "contracts/continuous-game-diagnostic-source-closure.v1.json",
+    "contracts/continuous-game-diagnostic.schema.json",
+    "packages/background-service-runtime/src/background-resource-lease-store.mjs",
+    "packages/background-service-runtime/src/background-resource-lease.mjs",
+    "packages/background-service-runtime/src/resource-isolation.mjs",
+    "packages/time-profile-contract/src/index.mjs",
+    "specs/continuous_complete_game_diagnostic_v1.yaml"
+  ]
+}

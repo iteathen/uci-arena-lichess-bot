@@ -1,6 +1,13 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import { continuousObservationFromRuntime, validateNativeAdmission, validateNativeCandidates,
+  validateNativePublication, MOVE_EVIDENCE_PREFIX, EXECUTION_COMPLETION_PREFIX } from "./continuous-uci-observation.mjs";
+import { CONTINUOUS_PROFILE_SCHEMA, validateContinuousProfileShape, validateContinuousGameDiagnostic,
+  requireContinuous, validateContinuousShutdown, safePublicPath, validateContinuousPublicPaths, validateNativeModelAssets,
+  validateContinuousElapsed, validateContinuousLaunchContext, samePublicPath, digestText } from "./continuous-game-qualification.mjs";
+import { validateContinuousObservation, equalFocus, canonicalMoveDigest } from "./continuous-game-qualification.mjs";
+import { validateTimingProfile } from "./single-game-profile-validation.mjs";
 import { createHash, randomUUID } from "node:crypto";
 import {
   rmSync,
@@ -46,12 +53,16 @@ import {
   validateStoredProfile,
   validateAppliedTimeProfileReserve,
   validateProfileRuntimeSnapshot,
+  validateHistoricalSearchedRegimeRuntimeSnapshot,
+  validateAppliedSearchedRegimeTimeProfileReserve,
 } from "@uci-arena/time-profile-contract";
 import { publishSingleGameProfile } from "./publish-single-game-profile.mjs";
 import {
   currentProcessIdentity,
   probeProcessInstance,
   processInstanceIsCurrent,
+  validProcessIdentity,
+  sameProcessInstance,
 } from "./process-instance-identity.mjs";
 import { RuntimeStatusPublisher } from "./runtime-status-publisher.mjs";
 import {
@@ -1510,9 +1521,11 @@ export function loadSingleGameProfile(profilePath) {
     EXACT_FILE_LIMITS.profile,
     "Lichess single-game profile",
   );
-  if (profile.schema !== "uci_arena_single_game_profile_v1") {
+  const continuous = profile?.schema === CONTINUOUS_PROFILE_SCHEMA;
+  if (!continuous && profile?.schema !== "uci_arena_single_game_profile_v1") {
     throw new Error(`Unsupported single-game profile schema: ${profile.schema ?? "missing"}`);
   }
+  if (continuous) validateContinuousProfileShape(profile);
   if (profile.qualified !== true) throw new Error("Single-game profile is not qualified");
   requireString(profile.published_at, "published_at");
   if (!Number.isFinite(Date.parse(profile.published_at))) {
@@ -1554,17 +1567,25 @@ export function loadSingleGameProfile(profilePath) {
   if (!profile.qualification_probe || typeof profile.qualification_probe !== "object") {
     throw new Error("Single-game profile qualification_probe is missing");
   }
-  requireInteger(profile.qualification_probe.depth, "qualification_probe.depth", profile.split_depth, 64);
-  requireInteger(profile.qualification_probe.timeout_ms, "qualification_probe.timeout_ms", 1_000, 600_000);
+  if (!continuous) {
+    requireInteger(profile.qualification_probe.depth, "qualification_probe.depth", profile.split_depth, 64);
+    requireInteger(profile.qualification_probe.timeout_ms, "qualification_probe.timeout_ms", 1_000, 600_000);
+  }
   if (!profile.evidence || typeof profile.evidence !== "object") {
     throw new Error("Single-game profile evidence is missing");
   }
-  for (const name of REQUIRED_PROFILE_EVIDENCE) {
+  const evidencePaths = {};
+  if (continuous) validateContinuousPublicPaths(profile.runtime_binding);
+  for (const name of continuous ? ["continuous_game", "timing"] : REQUIRED_PROFILE_EVIDENCE) {
     const evidence = profile.evidence[name];
     if (!evidence || evidence.passed !== true) {
       throw new Error(`Single-game profile evidence ${name} is not passed`);
     }
     requireString(evidence.artifact, `evidence.${name}.artifact`);
+    if (continuous) {
+      safePublicPath(evidence.artifact, `profile evidence ${name}`);
+      requireContinuous(path.extname(evidence.artifact).toLowerCase() === ".json", "profile evidence has a forbidden public type");
+    }
     requireString(evidence.artifact_sha256, `evidence.${name}.artifact_sha256`, /^sha256:[0-9a-f]{64}$/);
     const artifactCandidates = path.isAbsolute(evidence.artifact)
       ? [evidence.artifact]
@@ -1572,15 +1593,47 @@ export function loadSingleGameProfile(profilePath) {
         path.resolve(ROOT, evidence.artifact),
         path.resolve(path.dirname(resolvedPath), evidence.artifact),
       ];
+    if (continuous) for (const candidate of artifactCandidates) safePublicPath(candidate, `resolved profile evidence ${name}`);
     const artifactPath = artifactCandidates.find((candidate) =>
       exactRegularFileExistsSync(candidate, `Single-game profile evidence ${name}`));
     if (!artifactPath) {
       throw new Error(`Single-game profile evidence ${name} artifact is missing`);
     }
+    evidencePaths[name] = artifactPath;
     if (sha256File(artifactPath, EXACT_FILE_LIMITS.profile, "Single-game evidence")
         !== evidence.artifact_sha256) {
       throw new Error(`Single-game profile evidence ${name} hash mismatch`);
     }
+  }
+  if (continuous) {
+    const checkpoint = readBoundedJson(path.join(profile.runtime_binding.model.root, "checkpoint_manifest.json"),
+      EXACT_FILE_LIMITS.profile, "Model checkpoint manifest");
+    const timeProfile = validateStoredProfile(readBoundedJson(evidencePaths.timing, EXACT_FILE_LIMITS.profile, "Timing profile evidence"));
+    const timingIdentity = validateTimingProfile(timeProfile, checkpoint);
+    const diagnosticAdmission = readExactJsonSync(evidencePaths.continuous_game,
+      { maximumBytes: EXACT_FILE_LIMITS.profile - 1, label: "Continuous complete-game evidence" });
+    const diagnostic = diagnosticAdmission.value;
+    const admitted = validateContinuousGameDiagnostic(diagnostic, {
+      executableSha: profile.engine_build_fingerprint, modelRoot: profile.runtime_binding.model.root,
+      identity: timingIdentity, timeProfile, timeProfileSha: profile.evidence.timing.artifact_sha256,
+    });
+    requireContinuous(sha256Json(profile.runtime_binding) === sha256Json(admitted.binding), "profile runtime binding differs from evidence");
+    requireContinuous(sha256Json(profile.diagnostic_configuration) === sha256Json(diagnostic.configuration),
+      "profile diagnostic bounds differ from evidence");
+    const header = { model_id: timingIdentity.model.model_id, model_fingerprint: timingIdentity.model.model_fingerprint,
+      adapter_id: timingIdentity.model.adapter_id, provider: timingIdentity.search.provider_effective,
+      provider_numeric_fingerprint: timingIdentity.provider.provider_numeric_fingerprint,
+      hardware_driver_fingerprint: timingIdentity.provider.hardware_driver_fingerprint,
+      onnx_runtime_version: timingIdentity.provider.onnx_runtime_version, threads: timingIdentity.search.threads,
+      root_workers: timingIdentity.search.root_workers, split_depth: timingIdentity.search.split_depth,
+      batch_size: timingIdentity.search.batch_size_effective, batch_wait_us: timingIdentity.search.batch_wait_us_effective,
+      speculation: timingIdentity.search.nn_speculation, search_graph_mb: timingIdentity.search.mcgs.search_graph_mb,
+      mcgs_cpuct_permille: timingIdentity.search.mcgs.cpuct_permille,
+      mcgs_outstanding_batches: timingIdentity.search.mcgs.outstanding_batches,
+      mcgs_book_prior_blend_permille: timingIdentity.search.mcgs.book_prior_blend_permille };
+    for (const [field, expected] of Object.entries(header)) requireContinuous(profile[field] === expected, `profile ${field} differs from evidence`);
+    requireContinuous(sha256Json(profile.tablebase ?? null) === sha256Json(admitted.tablebase), "profile tablebase differs from evidence");
+    requireContinuous(profile.checkpoint_hash === checkpoint.checkpoint_hash, "profile checkpoint differs from evidence");
   }
   return { ...profile, profile_path: resolvedPath };
 }
@@ -1701,6 +1754,7 @@ export function applySingleGameProfile(config, { onValidationProgress } = {}) {
     throw new Error("Single-game profile validation progress must be a function");
   }
   const profile = loadSingleGameProfile(config.engine.single_game_profile);
+  if (profile.schema === CONTINUOUS_PROFILE_SCHEMA) validateContinuousLaunchContext(profile.runtime_binding, config.engine);
   if (profile.search_core !== "mcgs") {
     throw new Error("Live deployment requires a qualified MCGS single-game profile");
   }
@@ -2019,7 +2073,65 @@ export function loadCapacityProfile(
       || capacity.evidence.some((entry) => entry?.qualified !== true)) {
     throw new Error("Lichess capacity profile concurrent evidence is incomplete");
   }
+  if (singleGameProfile.schema === CONTINUOUS_PROFILE_SCHEMA) {
+    for (const status of capacity.evidence) {
+      requireContinuous(status.schema === "uci_arena_continuous_runtime_qualification_v1",
+        "capacity continuous evidence schema is unsupported");
+      validateContinuousCapacityStatus(status, singleGameProfile);
+    }
+    requireContinuous(new Set(capacity.evidence.map((status) => sha256Json(status.engine_process_identity))).size === capacity.evidence.length,
+      "capacity cohort repeats one child process instance");
+  }
   return { ...capacity, profile_path: resolvedPath };
+}
+
+function validateContinuousCapacityStatus(status, singleGameProfile) {
+  const cleanup = status.qualification_cleanup;
+  requireContinuous(cleanup?.clean_exit === true && cleanup.exit_observed === true && cleanup.close_observed === true
+    && cleanup.exit_code === 0 && cleanup.exit_signal === null && cleanup.forced_termination === false
+    && Array.isArray(cleanup.cleanup_diagnostics) && cleanup.cleanup_diagnostics.length === 0,
+  "capacity owned child close facts are not clean");
+  requireContinuous(cleanup?.execution_completion !== null && cleanup?.execution_completion !== undefined,
+    "capacity child native completion receipt is missing");
+  const observed = validateContinuousObservation(status.continuous_observation);
+  validateContinuousShutdown(cleanup.execution_completion, observed);
+  requireContinuous(validProcessIdentity(status.engine_process_identity)
+    && sameProcessInstance(status.engine_process_identity, cleanup.engine_process_identity),
+  "capacity close does not identify its actual qualified child process");
+  const state = new AuthoritativeChessState("startpos"); state.synchronize([]);
+  const candidates = status.continuous_candidates;
+  requireContinuous(state.validateCandidate([], status.bestmove).legal && candidates?.count === state.legalMoveCount()
+    && candidates.moves_sha256 === canonicalMoveDigest(state.positionObservation().legal_moves)
+    && equalFocus(candidates.focus, observed.focus), "capacity startup publication/candidate evidence is incomplete");
+  validateContinuousElapsed(status.go_to_bestmove_ms, 500, singleGameProfile.diagnostic_configuration);
+  const timed = status.time_profile;
+  const qualifiedTime = singleGameProfile.runtime_binding.timing_profile;
+  requireContinuous(timed?.accepted === true && timed.applied === true
+    && timed.identity_sha256 === qualifiedTime.identity_sha256
+    && timed.provider_service_reserve_us === qualifiedTime.provider_service_reserve_us
+    && timed.backup_emit_reserve_us === qualifiedTime.backup_emit_reserve_us
+    && timed.iteration_forecast_scale_permille === qualifiedTime.iteration_forecast_scale_permille,
+  "capacity actual applied timing evidence differs from qualification");
+  if (qualifiedTime.validation_scope === "historical_searched_regime") {
+    requireContinuous(timed.schema === "uci_time_profile_searched_regime_runtime_status_v1"
+      && timed.searched_regime_timing_authority_match === true
+      && timed.whole_runtime_timing_authority_match === qualifiedTime.whole_runtime_timing_authority_match
+      && timed.configured_opening_book_enabled === qualifiedTime.configured_opening_book_enabled
+      && timed.qualified_opening_book_enabled === qualifiedTime.qualified_opening_book_enabled
+      && timed.book_prior_blend_permille === qualifiedTime.book_prior_blend_permille
+      && timed.ponder_option === true
+      && Number.isSafeInteger(timed.move_overhead_ms)
+      && timed.move_overhead_ms >= qualifiedTime.move_overhead_envelope.minimum
+      && timed.move_overhead_ms <= qualifiedTime.move_overhead_envelope.maximum
+      && timed.move_overhead_envelope?.minimum === qualifiedTime.move_overhead_envelope.minimum
+      && timed.move_overhead_envelope?.maximum === qualifiedTime.move_overhead_envelope.maximum
+      && JSON.stringify(timed.move_overhead_envelope?.tested_values) === JSON.stringify(qualifiedTime.move_overhead_envelope.tested_values),
+    "capacity searched timing scope differs from qualification");
+  } else {
+    requireContinuous(timed.schema === "uci_time_profile_runtime_status_v1" && timed.timing_authority_match === true,
+      "capacity exact timing scope differs from qualification");
+  }
+  validateNativeModelAssets(status.model_asset_observation, singleGameProfile.runtime_binding.model);
 }
 
 export function publishCapacityProfile(
@@ -2039,6 +2151,12 @@ export function publishCapacityProfile(
         || !Array.isArray(status.qualification_cleanup.cleanup_diagnostics)
         || status.qualification_cleanup.cleanup_diagnostics.length !== 0)) {
     throw new Error("Capacity qualification requires actual clean child close proof");
+  }
+  const continuous = singleGameProfile?.schema === CONTINUOUS_PROFILE_SCHEMA;
+  if (continuous) {
+    statuses.forEach((status) => validateContinuousCapacityStatus(status, singleGameProfile));
+    requireContinuous(new Set(statuses.map((status) => sha256Json(status.engine_process_identity))).size === statuses.length,
+      "capacity cohort repeats one child process instance");
   }
   const target = path.resolve(targetPath);
   ensureExactDirectorySync(path.dirname(target), "Lichess capacity profile directory");
@@ -2101,7 +2219,14 @@ export function publishCapacityProfile(
     search_core: singleGameProfile.search_core,
     provider: singleGameProfile.provider,
     model_id: singleGameProfile.model_id,
-    evidence: statuses.map((status, index) => ({
+    evidence: statuses.map((status, index) => continuous ? {
+      schema: "uci_arena_continuous_runtime_qualification_v1", child: index + 1, qualified: true,
+      engine_process_identity: status.engine_process_identity, continuous_observation: status.continuous_observation,
+      continuous_candidates: status.continuous_candidates, bestmove: status.bestmove,
+      model_asset_observation: status.model_asset_observation,
+      go_to_bestmove_ms: status.go_to_bestmove_ms, time_profile: status.time_profile,
+      qualification_cleanup: status.qualification_cleanup,
+    } : ({
       child: index + 1,
       qualified: true,
       provider: status.provider_effective,
@@ -2634,6 +2759,11 @@ export function apiAuthorityKey(url, expectedAccount) {
 
 function parseInfo(line) {
   const telemetry = {};
+  for (const key of ["mcgs_decision_focus_graph_epoch", "mcgs_decision_focus_subject_identity",
+    "mcgs_decision_focus_position_key", "mcgs_decision_focus_transition_sequence"]) {
+    const match = line.match(new RegExp(`(?:^| )${key} (\\d+)(?= |$)`));
+    if (match) telemetry[key] = match[1];
+  }
   for (const key of [
     "mcgs_graph_node_capacity",
     "mcgs_graph_edge_capacity",
@@ -2672,6 +2802,7 @@ function parseInfo(line) {
     "mcgs_async_admissions",
     "mcgs_async_capacity_deferrals",
     "mcgs_root_seeded_moves",
+    "mcgs_root_policy_moves",
     "mcgs_root_legal_moves",
     "mcgs_book_hint_active",
     "mcgs_book_hint_candidates",
@@ -2917,6 +3048,10 @@ export function validateRuntimeStatus(profile, status) {
     "batch wait mismatch",
   );
   requireRuntimeStatus(status.background_search === false, "background search must be disabled");
+  if (profile.schema === CONTINUOUS_PROFILE_SCHEMA) {
+    continuousObservationFromRuntime(status);
+    return status;
+  }
   requireRuntimeStatus(status.last_search_available === true, "qualification search is missing");
   requireRuntimeStatus(
     status.last_search_core === profile.search_core,
@@ -3055,6 +3190,9 @@ export class UciEngine {
   }
 
   async start() {
+    if (this.config.qualification_profile?.schema === CONTINUOUS_PROFILE_SCHEMA) {
+      validateContinuousLaunchContext(this.config.qualification_profile.runtime_binding, this.config);
+    }
     const admittedLaunchIdentity = engineLaunchIdentity(this.config);
     this.child = spawn(this.config.executable, this.config.arguments ?? [], {
       cwd: this.config.working_directory,
@@ -3085,6 +3223,7 @@ export class UciEngine {
     this.child.once("exit", (code) => this.rejectWaiters(new Error(`UCI engine exited with ${code}`)));
 
     await this.exchange("uci", (line) => line === "uciok", 30_000);
+    if (this.config.qualification_profile?.schema === CONTINUOUS_PROFILE_SCHEMA) this.captureContinuousChildIdentity();
     this.configureUciOptions();
     await this.exchange("isready", (line) => line === "readyok", 30_000);
     this.runtimeGeneration += 1;
@@ -3139,7 +3278,13 @@ export class UciEngine {
         || this.config.qualification_profile?.search_core === "mcgs") {
       requiredTimingOptions.push("McgsTimePolicy");
     }
-    if (this.timing.opponent_turn_search) requiredTimingOptions.push("Ponder");
+    const continuousProfile = this.config.qualification_profile?.schema === CONTINUOUS_PROFILE_SCHEMA;
+    if (continuousProfile) requiredTimingOptions.push("OwnBook");
+    if (this.timing.opponent_turn_search || continuousProfile) requiredTimingOptions.push("Ponder");
+    if (continuousProfile && this.config.uci_options.Ponder !== undefined
+        && String(this.config.uci_options.Ponder).toLocaleLowerCase() !== "true") {
+      throw new Error("Continuous qualification requires exact Ponder publication compatibility=true");
+    }
     const missingTimingOptions = requiredTimingOptions
       .filter((name) => !this.advertisedOptions.has(name));
     if (missingTimingOptions.length) {
@@ -3158,7 +3303,7 @@ export class UciEngine {
     this.setOption("TimeProfileProviderReserveUs", 0);
     this.setOption("TimeProfileBackupEmitReserveUs", 1000);
     this.setOption("TimeProfileIterationForecastScalePermille", 1000);
-    if (this.timing.opponent_turn_search) this.setOption("Ponder", true);
+    if (this.timing.opponent_turn_search || continuousProfile) this.setOption("Ponder", true);
   }
 
   onLine(line) {
@@ -3170,6 +3315,15 @@ export class UciEngine {
     }
     if (line.startsWith("id ") && this.uciIdLines.length < MAX_UCI_ID_LINES) {
       this.uciIdLines.push(line);
+    }
+    if (this.config.qualification_profile?.schema === CONTINUOUS_PROFILE_SCHEMA
+        && line.startsWith(EXECUTION_COMPLETION_PREFIX)) {
+      try {
+        const receipt = JSON.parse(line.slice(EXECUTION_COMPLETION_PREFIX.length));
+        requireContinuous(receipt.schema === "uci_execution_completion_v1" && receipt.decision_authority === "none"
+          && Object.keys(receipt).length === 3, "native completion contract is unsupported");
+        this.nativeCompletionReceipt = receipt;
+      } catch { this.nativeCompletionReceipt = null; }
     }
     if (line.startsWith("option name ") && line.includes(" type ")) {
       if (this.uciOptionLines.length >= MAX_UCI_OPTION_LINES) {
@@ -3227,6 +3381,8 @@ export class UciEngine {
     this.send("ucinewgame");
     await this.exchange("isready", (line) => line === "readyok", 30_000);
     this.runtimeGeneration += 1;
+    // A genuine game boundary owns replacement. The new game's first admission establishes its own baseline.
+    this.continuousObservation = null;
     if (this.qualificationStatus?.live_runtime_status) {
       const previousRuntimeStatus = this.qualificationStatus.live_runtime_status;
       const liveRuntimeStatus = await this.runtimeStatus();
@@ -3301,6 +3457,10 @@ export class UciEngine {
       provider: String(options.OnnxProvider),
       backgroundSearch: booleanOption("BackgroundSearch"),
       nnSpeculation: booleanOption("NNSpeculation"),
+      ownBook: options.OwnBook === undefined
+        ? String(this.effectiveOptionValues().OwnBook ?? "true").toLocaleLowerCase() === "true"
+        : booleanOption("OwnBook"),
+      ponderOption: String(this.appliedUciOptions.Ponder ?? options.Ponder ?? "false").toLocaleLowerCase() === "true",
       moveOverheadMs: this.timing.initial_transport_reserve_ms,
       iterativeTimeController: false,
       appliedTimeProfileReserveUs,
@@ -3360,7 +3520,10 @@ export class UciEngine {
     try {
       profile = loadExactTimeProfile(resolvedPath, this.config.working_directory);
       const configuration = this.timeProfileConfiguration(0);
-      const accepted = validateProfileRuntimeSnapshot({
+      const scoped = this.config.qualification_profile?.schema === CONTINUOUS_PROFILE_SCHEMA
+        && this.config.qualification_profile.runtime_binding.timing_profile.validation_scope === "historical_searched_regime";
+      const validateSnapshot = scoped ? validateHistoricalSearchedRegimeRuntimeSnapshot : validateProfileRuntimeSnapshot;
+      const accepted = validateSnapshot({
         profile,
         status: initialStatus,
         executable: this.config.executable,
@@ -3376,7 +3539,7 @@ export class UciEngine {
       reserveWasSet = true;
       await this.exchange("isready", (line) => line === "readyok", 30_000);
       const appliedStatus = await this.runtimeStatus();
-      const appliedAcceptance = validateProfileRuntimeSnapshot({
+      const appliedInput = {
         profile,
         status: appliedStatus,
         executable: this.config.executable,
@@ -3391,12 +3554,14 @@ export class UciEngine {
           ),
           iterationForecastScalePermille: accepted.iteration_forecast_scale_permille,
         },
-      });
+      };
+      const appliedAcceptance = scoped ? validateAppliedSearchedRegimeTimeProfileReserve(appliedInput)
+        : { ...validateProfileRuntimeSnapshot(appliedInput), ...validateAppliedTimeProfileReserve(profile, appliedStatus) };
       this.timeProfileStatus = {
         ...appliedAcceptance,
-        ...validateAppliedTimeProfileReserve(profile, appliedStatus),
         permissions: profile.permissions ?? {},
       };
+      this.appliedTimeProfile = profile;
     } catch (error) {
       if (reserveWasSet) {
         this.setOption("TimeProfileProviderReserveUs", 0);
@@ -3425,6 +3590,7 @@ export class UciEngine {
 
   async qualifyRuntime() {
     const profile = this.config.qualification_profile;
+    if (profile.schema === CONTINUOUS_PROFILE_SCHEMA) return this.qualifyContinuousRuntime();
     if (!this.advertisedOptions.has("OwnBook")) {
       throw new Error("Qualification requires the OwnBook UCI option");
     }
@@ -3468,6 +3634,134 @@ export class UciEngine {
         };
       }
     }
+    return this.qualificationStatus;
+  }
+
+  effectiveOptionValues() {
+    const result = {};
+    for (const line of this.uciOptionLines) {
+      const match = line.match(/^option name (.+?) type (check|spin|combo|string)(?: default (.*))?$/);
+      if (!match) continue;
+      result[match[1]] = match[2] === "string" ? (match[3] ?? "") : (match[3] ?? "").split(/ (?:min|max|var) /)[0];
+    }
+    for (const [name, value] of Object.entries(this.appliedUciOptions)) {
+      requireContinuous(Object.hasOwn(result, name), "applied option has no actual advertised stateful declaration");
+      result[name] = value;
+    }
+    return result;
+  }
+
+  captureContinuousChildIdentity(probe = probeProcessInstance) {
+    const result = probe(this.child?.pid);
+    requireContinuous(result.state === "present" && validProcessIdentity(result.identity, this.child?.pid)
+      && samePlatformPath(result.identity.executable_path, this.config.executable),
+      "owned child process instance is unavailable or differs from selected executable");
+    this.continuousChild = this.child;
+    this.continuousProcessIdentity = Object.freeze({ ...result.identity });
+    return this.continuousProcessIdentity;
+  }
+
+  validateContinuousRuntimeContext(status) {
+    const profile = this.config.qualification_profile;
+    const binding = profile.runtime_binding;
+    requireContinuous(this.timeProfileStatus.accepted === true && this.timeProfileStatus.applied === true
+      && this.appliedTimeProfile, "continuous startup requires actual accepted and applied timing context");
+    const input = { profile: this.appliedTimeProfile, status, executable: this.config.executable,
+      engineArgs: this.config.arguments ?? [], cwd: this.config.working_directory,
+      uciIdLines: this.uciIdLines, uciOptionLines: this.uciOptionLines,
+      configuration: this.timeProfileConfiguration(binding.timing_profile.provider_service_reserve_us,
+        binding.timing_profile.backup_emit_reserve_us) };
+    const scoped = binding.timing_profile.validation_scope === "historical_searched_regime";
+    const accepted = scoped ? validateAppliedSearchedRegimeTimeProfileReserve(input)
+      : { ...validateProfileRuntimeSnapshot(input), ...validateAppliedTimeProfileReserve(input.profile, status) };
+    requireContinuous(accepted.accepted === true && accepted.applied === true
+      && accepted.identity_sha256 === binding.timing_profile.identity_sha256, "actual applied timing identity differs from qualified context");
+    const current = this.effectiveOptionValues();
+    const reference = binding.effective_options.model;
+    requireContinuous(JSON.stringify(Object.keys(current).sort()) === JSON.stringify(Object.keys(reference).sort()),
+      "actual stateful UCI option set differs from qualified declarations");
+    requireContinuous(digestText(JSON.stringify(this.uciOptionLines)) === binding.engine.uci_option_declarations_sha256
+      && JSON.stringify(this.uciIdLines) === JSON.stringify(binding.engine.uci_id_lines), "actual UCI identity/declarations differ from qualification");
+    const pathOptions = new Set(["ModelRoot", "BookFile", "BookStatsFile", "BookPolicyFile", "SyzygyPath", "SyzygyManifest"]);
+    for (const [name, value] of Object.entries(reference)) {
+      if (name === "Move Overhead") {
+        requireContinuous(status.move_overhead_ms_configured === Number(current[name])
+          && Number(current[name]) === this.timing.initial_transport_reserve_ms, "actual transport overhead differs from native applied state");
+      } else if (pathOptions.has(name) && value && current[name]) {
+        requireContinuous(samePublicPath(current[name], value, this.config.working_directory), `actual option ${name} differs from qualified path`);
+      } else requireContinuous(current[name] === value, `actual option ${name} differs from qualified value`);
+    }
+    requireContinuous(current.Ponder === "true" && status.ponder_option_configured === true,
+      "actual Ponder publication compatibility is not exact");
+    validateNativeModelAssets(status, binding.model);
+    const knowledge = binding.knowledge;
+    for (const field of ["opening_book_enabled", "opening_book_active", "opening_book_identity", "opening_book_snapshot_identity",
+      "opening_book_snapshot_generation", "opening_book_manifest_sha256", "opening_book_policy_sha256", "opening_book_validation",
+      "syzygy_active", "syzygy_manifest_identity", "syzygy_loaded_cardinality", "syzygy_probe_limit", "syzygy_probe_threads",
+      "syzygy_rule50", "syzygy_root_probe", "syzygy_internal_probe"]) {
+      requireContinuous(status[field] === knowledge[field], `actual knowledge ${field} differs from qualified activation`);
+    }
+    for (const field of ["opening_book_file", "opening_book_stats_file", "opening_book_policy_file"]) {
+      requireContinuous(typeof status[field] === "string" && (knowledge[field]
+        ? samePublicPath(status[field], knowledge[field], this.config.working_directory) : status[field] === ""),
+      `actual knowledge ${field} differs from qualified path`);
+    }
+    return accepted;
+  }
+
+  async observeContinuousAdmission(moves) {
+    requireContinuous(!this.continuousChild || this.child === this.continuousChild,
+      "continuous observation belongs to a replaced child process");
+    const state = new AuthoritativeChessState("startpos");
+    state.synchronize(moves);
+    const status = await this.runtimeStatus();
+    this.validateContinuousRuntimeContext(status);
+    validateRuntimeStatus(this.config.qualification_profile, status);
+    const observed = continuousObservationFromRuntime(status, this.continuousObservation);
+    validateNativeAdmission(status, { position_command: this.formatPosition(moves),
+      fen: state.positionObservation().fen, history_length: moves.length + 1 });
+    this.continuousObservation = observed;
+    return observed;
+  }
+
+  async observeContinuousPublication(result, moves, { validateConfiguredAssets = false } = {}) {
+    requireContinuous(!this.continuousChild || this.child === this.continuousChild,
+      "continuous observation belongs to a replaced child process");
+    const state = new AuthoritativeChessState("startpos");
+    state.synchronize(moves);
+    requireContinuous(state.validateCandidate(moves, result.bestmove).legal, "actual publication is illegal");
+    const status = await this.runtimeStatus();
+    this.validateContinuousRuntimeContext(status);
+    validateRuntimeStatus(this.config.qualification_profile, status);
+    const observed = continuousObservationFromRuntime(status, this.continuousObservation);
+    validateNativeAdmission(status, { position_command: this.formatPosition(moves),
+      fen: state.positionObservation().fen, history_length: moves.length + 1 });
+    validateNativePublication(result.telemetry, observed, { legalMoves: state.positionObservation().legal_moves,
+      runtime: status, tablebase: this.config.qualification_profile.tablebase });
+    const line = await this.exchange("move_decision_evidence",
+      (candidate) => candidate.startsWith(MOVE_EVIDENCE_PREFIX), 30_000);
+    const candidates = validateNativeCandidates(JSON.parse(line.slice(MOVE_EVIDENCE_PREFIX.length)), observed,
+      state.positionObservation().legal_moves);
+    if (validateConfiguredAssets) this.validateOpeningBookRuntime(status, this.config.uci_options.OwnBook ?? true);
+    this.continuousObservation = observed;
+    return { ...result, continuous_observation: observed, continuous_candidates: candidates, live_runtime_status: status,
+      model_asset_observation: { model_asset_declaration_supported: status.model_asset_declaration_supported,
+        model_selected_artifact: status.model_selected_artifact, model_required_artifacts: status.model_required_artifacts },
+      ...(this.continuousProcessIdentity ? { engine_process_identity: this.continuousProcessIdentity } : {}) };
+  }
+
+  async qualifyContinuousRuntime() {
+    requireContinuous(this.timeProfileStatus.accepted === true && this.timeProfileStatus.applied === true,
+      "continuous startup requires actual accepted and applied timing context");
+    await this.newGame();
+    this.latestInfo = {};
+    this.send("position startpos");
+    const startedAt = performance.now();
+    const line = await this.exchange("go movetime 500", (candidate) => candidate.startsWith("bestmove "), 30_000);
+    const result = { ...this.parseBestmove(line), telemetry: { ...this.latestInfo },
+      go_to_bestmove_ms: performance.now() - startedAt };
+    validateContinuousElapsed(result.go_to_bestmove_ms, 500, this.config.qualification_profile.diagnostic_configuration);
+    this.qualificationStatus = await this.observeContinuousPublication(result, [], { validateConfiguredAssets: true });
     return this.qualificationStatus;
   }
 
@@ -3749,17 +4043,21 @@ export class UciEngine {
     if (predictedMove) {
       const ponderRoot = [...moves, predictedMove];
       this.send(this.formatPosition(ponderRoot));
-      return this.beginSearch(
+      const active = this.beginSearch(
         "ponder",
         this.formatClockGo("go ponder", { wtime, btime, winc, binc }),
         { rootMoves: ponderRoot, predictedMove },
       );
+      if (this.config.qualification_profile?.schema === CONTINUOUS_PROFILE_SCHEMA) await this.observeContinuousAdmission(ponderRoot);
+      return active;
     }
     this.send(this.formatPosition(moves));
     const command = this.config.adapter === "standard_uci_v1"
       ? "go infinite"
       : "go infinite opponentroot";
-    return this.beginSearch("opponent_root", command, { rootMoves: moves });
+    const active = this.beginSearch("opponent_root", command, { rootMoves: moves });
+    if (this.config.qualification_profile?.schema === CONTINUOUS_PROFILE_SCHEMA) await this.observeContinuousAdmission(moves);
+    return active;
   }
 
   async ponderHit({ timeoutMs, signal }) {
@@ -3775,12 +4073,14 @@ export class UciEngine {
     active.kind = "foreground";
     this.mode = "foreground";
     try {
-      return await this.awaitCancellableSearch(
+      const result = await this.awaitCancellableSearch(
         active,
         timeoutMs,
         signal,
         "authoritative_state_changed",
       );
+      return this.config.qualification_profile?.schema === CONTINUOUS_PROFILE_SCHEMA
+        ? await this.observeContinuousPublication(result, active.rootMoves) : result;
     } catch (error) {
       await this.stopAndDrain("ponderhit_failure").catch(() => {});
       throw error;
@@ -3801,7 +4101,7 @@ export class UciEngine {
       { rootMoves: moves },
     );
     try {
-      return {
+      const result = {
         ...await this.awaitCancellableSearch(
           active,
           timeoutMs,
@@ -3810,6 +4110,8 @@ export class UciEngine {
         ),
         staleBestmoveDrained: drained.drained,
       };
+      return this.config.qualification_profile?.schema === CONTINUOUS_PROFILE_SCHEMA
+        ? await this.observeContinuousPublication(result, moves) : result;
     } catch (error) {
       await this.stopAndDrain("foreground_search_failure").catch(() => {});
       throw error;
@@ -3817,6 +4119,8 @@ export class UciEngine {
   }
 
   async close({ requireCleanExit = false } = {}) {
+    const continuousClose = this.config.qualification_profile?.schema === CONTINUOUS_PROFILE_SCHEMA;
+    if (continuousClose) requireCleanExit = true;
     const child = this.child;
     if (!child) {
       if (requireCleanExit && this.closeOutcome?.clean_exit !== true) {
@@ -3874,6 +4178,7 @@ export class UciEngine {
     };
     try {
       if (child.stdin.writable) {
+        if (continuousClose) this.nativeCompletionReceipt = null;
         child.stdin.write("quit\n");
         child.stdin.end();
       }
@@ -3901,6 +4206,20 @@ export class UciEngine {
       recordFailure("protocol_close", error);
       normalCloseError ??= error;
     }
+    let executionCompletion;
+    if (continuousClose) {
+      try {
+        requireContinuous(!this.continuousChild || child === this.continuousChild,
+          "final completion belongs to a replaced child process");
+        requireContinuous(this.continuousObservation !== null && this.continuousObservation !== undefined,
+          "actual child game baseline was never observed");
+        executionCompletion = validateContinuousShutdown({ receipt_schema: this.nativeCompletionReceipt?.schema,
+          decision_authority: this.nativeCompletionReceipt?.decision_authority, completion: this.nativeCompletionReceipt?.completion ?? null,
+          exit_observed: exited, stdio_closed: streamsClosed, exit_code: exitCode ?? null, exit_signal: exitSignal,
+          forced: forcedTermination, joined_search_safe: true, normal_process_close: true,
+          provider_destruction_observed: false }, this.continuousObservation);
+      } catch (error) { recordFailure("native_completion", error); }
+    }
     this.closeOutcome = Object.freeze({
       clean_exit: exited && streamsClosed && exitCode === 0 && exitSignal === null
         && !forcedTermination && cleanupDiagnostics.length === 0,
@@ -3910,6 +4229,8 @@ export class UciEngine {
       exit_signal: exitSignal,
       forced_termination: forcedTermination,
       cleanup_diagnostics: Object.freeze(cleanupDiagnostics),
+      ...(continuousClose ? { execution_completion: executionCompletion ?? null } : {}),
+      ...(continuousClose && this.continuousProcessIdentity ? { engine_process_identity: this.continuousProcessIdentity } : {}),
     });
     if (requireCleanExit && !this.closeOutcome.clean_exit) {
       const reason = forcedTermination ? "forced termination"
@@ -4120,7 +4441,7 @@ export function gameRuntimeProvenance(config, engine) {
     ...(config.engine.uci_options ?? {}),
     ...(engine.appliedUciOptions ?? {}),
     "Move Overhead": config.timing?.initial_transport_reserve_ms ?? 0,
-    Ponder: config.timing?.opponent_turn_search ?? false,
+    Ponder: profile.schema === CONTINUOUS_PROFILE_SCHEMA ? engine.appliedUciOptions?.Ponder : (config.timing?.opponent_turn_search ?? false),
     OwnBook: configuredBook,
     IterativeTimeController: timeProfile.predictive_controller_enabled ?? false,
     TimeProfileProviderReserveUs: timeProfile.provider_service_reserve_us ?? 0,
@@ -4180,6 +4501,9 @@ export function gameRuntimeProvenance(config, engine) {
       applied: timeProfile.applied ?? false,
       permissions: timeProfile.permissions ?? {},
       timing_authority_match: timeProfile.timing_authority_match ?? false,
+      ...(profile.schema === CONTINUOUS_PROFILE_SCHEMA ? { validation_scope: profile.runtime_binding?.timing_profile.validation_scope,
+        searched_regime_timing_authority_match: timeProfile.searched_regime_timing_authority_match ?? false,
+        whole_runtime_timing_authority_match: timeProfile.whole_runtime_timing_authority_match ?? false } : {}),
       engine_provenance: timeProfile.engine_provenance ?? null,
       provider_service_reserve_us: timeProfile.provider_service_reserve_us ?? 0,
       backup_emit_reserve_us: timeProfile.backup_emit_reserve_us ?? 1000,

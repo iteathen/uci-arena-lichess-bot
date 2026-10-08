@@ -629,3 +629,77 @@ export function validateProfileRuntimeSnapshot({
     reason: "exact_runtime_identity_match",
   };
 }
+
+const SEARCHED_REGIME_SCHEMA = "uci_time_profile_searched_regime_runtime_status_v1";
+const DOWNSTREAM_BOOK_OPTIONS = new Set([
+  "ownbook", "bookfile", "bookstatsfile", "bookpolicyfile", "bookseed", "bookmaxply",
+]);
+
+// This is an explicit applicability composition, not a change to v3 identity.
+// With zero configured AND native applied prior blend, book resolution cannot
+// contribute priors to the qualified searched regime. Resolved publications are
+// separately classified by the native publication owner. Everything else stays
+// exact, including tablebase, model, provider and material extra options.
+export function validateHistoricalSearchedRegimeRuntimeSnapshot(input) {
+  const profile = validateStoredProfile(input?.profile);
+  const configuration = input?.configuration;
+  const status = input?.status;
+  if (profile.schema !== PROFILE_SCHEMA || profile.identity?.search?.search_core !== "mcgs"
+      || profile.identity.search.opening_book !== false
+      || configuration?.searchCore !== "mcgs") {
+    throw new Error("Historical searched regime requires v3 MCGS qualification with opening_book=false");
+  }
+  const permissions = timingProfilePermissions(profile);
+  if (!permissions.provider_safety_qualified || !permissions.forecast_shadow_qualified) throw new Error("Historical searched regime lacks declared provider/forecast qualification");
+  if (typeof configuration.ownBook !== "boolean" || status?.opening_book_enabled !== configuration.ownBook) throw new Error("Actual opening-book configuration differs from native applied state");
+  if (configuration.mcgsBookPriorBlendPermille !== 0 || status?.mcgs_book_prior_blend_permille_configured !== 0
+      || profile.identity.search.mcgs?.book_prior_blend_permille !== 0) throw new Error("Historical searched regime requires zero actual and qualified book prior blend");
+  if (configuration.ponderOption !== true || status?.ponder_option_configured !== true
+      || profile.identity.search.ponder_option !== true) throw new Error("Historical searched regime requires exact Ponder publication compatibility=true");
+  if (status?.move_overhead_ms_configured !== configuration.moveOverheadMs) throw new Error("Actual Move Overhead differs from native applied state");
+  const actualExtras = configuration.extraEngineOptions ?? {};
+  const projectedExtras = {};
+  for (const [name, value] of Object.entries(actualExtras)) {
+    if (DOWNSTREAM_BOOK_OPTIONS.has(name.toLowerCase())) {
+      if (name.toLowerCase() === "ownbook" && String(value).toLowerCase() !== String(configuration.ownBook)) throw new Error("Actual OwnBook option contradicts its configuration");
+    } else projectedExtras[name] = value;
+  }
+  // A profile with different historical recipe fields is not reinterpreted.
+  if (Object.keys(profile.identity.search.extra_engine_options ?? {}).some(name => DOWNSTREAM_BOOK_OPTIONS.has(name.toLowerCase()))) throw new Error("Historical searched regime profile declares unsupported book-resolution extras");
+  const qualifiedConfiguration = { ...configuration, ownBook: false, extraEngineOptions: projectedExtras };
+  const accepted = validateProfileRuntimeSnapshot({ ...input, profile, configuration: qualifiedConfiguration });
+  const actualIdentity = buildProfileIdentity(status, { idLines: input.uciIdLines, optionLines: input.uciOptionLines }, engineCommandIdentity({ engine: input.executable, engineArgs: input.engineArgs ?? [], cwd: input.cwd ?? process.cwd() }), configuration);
+  const wholeMatch = canonicalJson(timingAuthorityIdentity(actualIdentity)) === canonicalJson(timingAuthorityIdentity(profile.identity));
+  const { timing_authority_match: ignoredWholeLabel, schema: ignoredSchema, reason: ignoredReason, ...facts } = accepted;
+  return {
+    ...facts,
+    permissions,
+    schema: SEARCHED_REGIME_SCHEMA,
+    validation_scope: "historical_searched_regime",
+    searched_regime_timing_authority_match: true,
+    whole_runtime_timing_authority_match: wholeMatch,
+    configured_opening_book_enabled: status.opening_book_enabled,
+    qualified_opening_book_enabled: false,
+    book_prior_blend_permille: 0,
+    ponder_option: status.ponder_option_configured,
+    move_overhead_ms: status.move_overhead_ms_configured,
+    move_overhead_envelope: { minimum: profile.applicability.move_overhead_ms.minimum, maximum: profile.applicability.move_overhead_ms.maximum, tested_values: [...profile.applicability.move_overhead_ms.tested_values] },
+    actual_search_contract_fingerprint: actualIdentity.search_contract_fingerprint,
+    qualified_search_contract_fingerprint: searchContractFingerprint(profile.identity),
+    actual_configuration_sha256: sha256Object(configuration),
+    reason: "explicit_historical_searched_regime_applicability",
+  };
+}
+
+export function validateAppliedSearchedRegimeTimeProfileReserve(input) {
+  const acceptance = validateHistoricalSearchedRegimeRuntimeSnapshot(input);
+  const applied = validateAppliedTimeProfileReserve(input.profile, input.status);
+  return {
+    ...acceptance,
+    applied: applied.applied,
+    provider_service_reserve_us: applied.provider_service_reserve_us,
+    backup_emit_reserve_us: applied.backup_emit_reserve_us,
+    iteration_forecast_scale_permille: applied.iteration_forecast_scale_permille,
+    reason: "historical_searched_regime_validated_and_reserves_applied",
+  };
+}
