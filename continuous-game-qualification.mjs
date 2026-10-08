@@ -249,6 +249,8 @@ function exactFile(binding, label, maximumBytes = 16 * 1024 * 1024 * 1024, files
 export function safePublicPath(value, label) {
   requireContinuous(typeof value === "string" && value.length > 0 && value.length <= 32768
     && !/[\u0000\r\n]/.test(value), `${label} public path is invalid`);
+  const drivePrefixLength = /^[A-Za-z]:[\\/]/.test(value) ? 2 : 0;
+  requireContinuous(!value.slice(drivePrefixLength).includes(":"), `${label} forbidden colon or alternate-stream path`);
   const parts = value.replaceAll("\\", "/").split("/");
   requireContinuous(!parts.some((part) => /[. ]$/.test(part)), `${label} ambiguous trailing-dot/space path segment`);
   requireContinuous(!parts.some((part) =>

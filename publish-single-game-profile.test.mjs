@@ -819,6 +819,24 @@ for (const relative of ["client-key.json", "signing-key.json", "private_key.json
   });
 }
 
+for (const [role, mutate] of [
+  ["producer runtime", (diagnostic, alias) => { diagnostic.producer.node_runtime.path = alias; }],
+  ["engine executable", (diagnostic, alias) => { diagnostic.binding.engine.path = alias; }],
+  ["configured book", (diagnostic, alias) => { diagnostic.binding.knowledge.opening_book_file = alias; }],
+]) {
+  test(`continuous absolute ADS-shaped ${role} path rejects before any IO`, () => {
+    const options = fixture("mcgs");
+    const diagnostic = continuousDiagnosticFixture(options);
+    mutate(diagnostic, "C:/public/model.onnx:auth.json");
+    const calls = [];
+    assert.throws(() => validateContinuousGameDiagnostic(diagnostic, { fileAuthority: {
+      hashExactFileSync: (...args) => { calls.push(args); throw new Error("must not hash"); },
+      readExactJsonSync: (...args) => { calls.push(args); throw new Error("must not read"); },
+    } }), /colon|alternate.stream/);
+    assert.deepEqual(calls, []);
+  });
+}
+
 test("continuous public path admission preserves absolute Windows drive context and ordinary model inputs", () => {
   safePublicPath("C:/Public Models/runtime_adapters/contract.json", "public absolute drive context");
   assert.deepEqual(validateModelAssetDeclaration({ supported: true, selected_relative_file: "model.onnx",
