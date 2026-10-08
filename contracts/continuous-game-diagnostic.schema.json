@@ -1490,7 +1490,10 @@
           "pattern": "^sha256:[0-9a-f]{64}$"
         },
         "schema": {
-          "const": "uci_time_profile_v3"
+          "enum": [
+            "uci_time_profile_v3",
+            "uci_time_profile_v4"
+          ]
         },
         "identity_sha256": {
           "type": "string"
@@ -1597,13 +1600,15 @@
         "validation_schema": {
           "enum": [
             "uci_time_profile_runtime_status_v1",
-            "uci_time_profile_searched_regime_runtime_status_v1"
+            "uci_time_profile_searched_regime_runtime_status_v1",
+            "uci_time_profile_continuous_searched_regime_runtime_status_v1"
           ]
         },
         "validation_scope": {
           "enum": [
             "exact_runtime",
-            "historical_searched_regime"
+            "historical_searched_regime",
+            "continuous_searched_regime"
           ]
         },
         "searched_regime_timing_authority_match": {
@@ -1661,7 +1666,73 @@
             }
           }
         }
-      }
+      },
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "schema": {
+                  "const": "uci_time_profile_v3"
+                },
+                "validation_schema": {
+                  "const": "uci_time_profile_runtime_status_v1"
+                },
+                "validation_scope": {
+                  "const": "exact_runtime"
+                }
+              },
+              "additionalProperties": true
+            },
+            {
+              "type": "object",
+              "properties": {
+                "schema": {
+                  "const": "uci_time_profile_v3"
+                },
+                "validation_schema": {
+                  "const": "uci_time_profile_searched_regime_runtime_status_v1"
+                },
+                "validation_scope": {
+                  "const": "historical_searched_regime"
+                }
+              },
+              "additionalProperties": true
+            },
+            {
+              "type": "object",
+              "properties": {
+                "schema": {
+                  "const": "uci_time_profile_v4"
+                },
+                "validation_schema": {
+                  "const": "uci_time_profile_runtime_status_v1"
+                },
+                "validation_scope": {
+                  "const": "exact_runtime"
+                }
+              },
+              "additionalProperties": true
+            },
+            {
+              "type": "object",
+              "properties": {
+                "schema": {
+                  "const": "uci_time_profile_v4"
+                },
+                "validation_schema": {
+                  "const": "uci_time_profile_continuous_searched_regime_runtime_status_v1"
+                },
+                "validation_scope": {
+                  "const": "continuous_searched_regime"
+                }
+              },
+              "additionalProperties": true
+            }
+          ]
+        }
+      ]
     },
     "knowledge": {
       "type": "object",

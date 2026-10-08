@@ -144,7 +144,7 @@ export function continuousDiagnosticFixture(options, history = ["f2f3", "e7e5", 
     IterativeTimeController: "false", TimeProfileProviderReserveUs: "2000",
     TimeProfileBackupEmitReserveUs: "1000", TimeProfileIterationForecastScalePermille: "1000" }, opponent: {} };
   Object.assign(result.binding.effective_options.model, { Ponder: "true", "Move Overhead": "250" });
-  Object.assign(result.binding.timing_profile, { ...file(options.time_profile), identity_sha256: time.identity_sha256,
+  Object.assign(result.binding.timing_profile, { ...file(options.time_profile), schema: time.schema, identity_sha256: time.identity_sha256,
     accepted: true, applied: true, timing_authority_match: true, predictive_controller_enabled: false,
     validation_schema: "uci_time_profile_runtime_status_v1", validation_scope: "exact_runtime",
     searched_regime_timing_authority_match: true, whole_runtime_timing_authority_match: true,

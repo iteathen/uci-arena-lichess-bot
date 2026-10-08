@@ -20,7 +20,8 @@ import { sameProcessInstance } from "./process-instance-identity.mjs";
 
 import { continuousDiagnosticFixture } from "./test-fixtures/continuous-game-diagnostic.mjs";
 
-import { loadSingleGameProfile, applySingleGameProfile, UciEngine, publishCapacityProfile, loadCapacityProfile, gameRuntimeProvenance } from "./lichess-adapter.mjs";
+import { loadSingleGameProfile, applySingleGameProfile, UciEngine, publishCapacityProfile, loadCapacityProfile, gameRuntimeProvenance,
+  updateManagerOptions, loadRuntimeConfig, loadManagerConfig, managerOptionsProjection, DEFAULT_TEMPLATE, main } from "./lichess-adapter.mjs";
 import { publishSingleGameProfile } from "./publish-single-game-profile.mjs";
 import { validateContinuousGameDiagnostic, safePublicPath, validateModelAssetDeclaration } from "./continuous-game-qualification.mjs";
 
@@ -668,11 +669,18 @@ test("applying continuous profile rejects a changed literal launch argument with
   assert.throws(() => applySingleGameProfile(config), /literal argument vector/);
 });
 
-function continuousCapacityFixture(scoped = true) {
+function continuousCapacityFixture(scoped = true, continuousTiming = false) {
   const options = fixture("mcgs");
+  if (continuousTiming) {
+    const timing = JSON.parse(readFileSync(options.time_profile, "utf8"));
+    continuousTimingProfileFixture(timing);
+    writeFileSync(options.time_profile, JSON.stringify(timing));
+  }
   const diagnostic = continuousDiagnosticFixture(options);
   if (scoped) Object.assign(diagnostic.binding.timing_profile, {
-    validation_scope: "historical_searched_regime", validation_schema: "uci_time_profile_searched_regime_runtime_status_v1" });
+    validation_scope: continuousTiming ? "continuous_searched_regime" : "historical_searched_regime",
+    validation_schema: continuousTiming ? "uci_time_profile_continuous_searched_regime_runtime_status_v1"
+      : "uci_time_profile_searched_regime_runtime_status_v1" });
   writeFileSync(options.complete_game_evidence, JSON.stringify(diagnostic));
   publishSingleGameProfile({ ...options, qualification_scope: "local_live_safety" });
   const single = loadSingleGameProfile(options.output);
@@ -691,8 +699,160 @@ function continuousCapacityFixture(scoped = true) {
   if (scoped) delete status.time_profile.timing_authority_match;
   const config = { engine: { executable: options.engine, time_profile: options.time_profile,
     time_profile_status: { ...status.time_profile, profile_path: options.time_profile } }, capacity: { total_slots: 1 } };
-  return { options, single, status, config, target: path.join(path.dirname(options.output), "capacity.json") };
+  return { options, single, status, config, diagnostic, target: path.join(path.dirname(options.output), "capacity.json") };
 }
+
+const oneBotCapacity = { total_slots: 1, startup_parallelism: 1,
+  human: { slots: 0, allow_borrowing: false, accept_public: false }, bot: { slots: 1, target_active: 1 } };
+
+function evidenceAdoptionFixture(totalSlots = 2) {
+  const item = continuousCapacityFixture();
+  publishCapacityProfile(item.target, 1, item.config, item.single, [item.status]);
+  const raw = JSON.parse(readFileSync(DEFAULT_TEMPLATE, "utf8"));
+  raw.engine.executable = item.options.engine;
+  raw.engine.working_directory = path.dirname(item.options.engine);
+  raw.engine.component_manifest = null;
+  raw.engine.uci_options.ModelRoot = item.options.model_root;
+  raw.engine.uci_options.OwnBook = false;
+  if (totalSlots === 1) Object.assign(raw.capacity, oneBotCapacity);
+  raw.engine.single_game_profile = path.join(path.dirname(item.options.output), "obsolete-single.json");
+  raw.engine.time_profile = path.join(path.dirname(item.options.output), "obsolete-time.json");
+  raw.capacity.capacity_profile = path.join(path.dirname(item.options.output), "obsolete-capacity.json");
+  for (const file of [raw.engine.single_game_profile, raw.engine.time_profile, raw.capacity.capacity_profile]) writeFileSync(file, "obsolete-evidence");
+  const configPath = path.join(path.dirname(item.options.output), "operator-config.json");
+  writeFileSync(configPath, JSON.stringify(raw, null, 2));
+  const valid = structuredClone(raw);
+  Object.assign(valid.capacity, oneBotCapacity, { capacity_profile: item.target });
+  valid.engine.single_game_profile = item.options.output;
+  valid.engine.time_profile = item.options.time_profile;
+  const controlPath = path.join(path.dirname(item.options.output), "qualified-fixture-control.json");
+  writeFileSync(controlPath, JSON.stringify(valid));
+  assert.equal(managerOptionsProjection(loadManagerConfig({ templatePath: controlPath })).capacity.evidence.qualified, true,
+    "synthetic replacement evidence must pass the current complete owner validator before testing adoption");
+  return { ...item, raw, configPath, adoption: { templatePath: configPath,
+    profilePath: item.options.output, timeProfilePath: item.options.time_profile, capacityProfilePath: item.target,
+    settings: { capacity: oneBotCapacity } } };
+}
+
+test("operator evidence adoption recovers obsolete bindings atomically with one-slot policy", () => {
+  const item = evidenceAdoptionFixture();
+  const updated = updateManagerOptions(item.adoption);
+  assert.equal(updated.capacity.total_slots, 1);
+  assert.equal(updated.capacity.evidence.qualified, true);
+  const persisted = JSON.parse(readFileSync(item.configPath, "utf8"));
+  assert.equal(persisted.engine.single_game_profile, path.resolve(item.options.output));
+  assert.equal(persisted.engine.time_profile, path.resolve(item.options.time_profile));
+  assert.equal(persisted.capacity.capacity_profile, path.resolve(item.target));
+  assert.equal(persisted.engine.executable, item.raw.engine.executable);
+  assert.equal(persisted.engine.component_manifest, item.raw.engine.component_manifest);
+  assert.deepEqual(persisted.engine.uci_options, item.raw.engine.uci_options);
+  assert.deepEqual(persisted.challenges, item.raw.challenges);
+  const loaded = loadRuntimeConfig({ templatePath: item.configPath, environment: {} });
+  assert.equal(loaded.engine.single_game_profile, path.resolve(item.options.output));
+  const later = updateManagerOptions({ templatePath: item.configPath, settings: { opponent_selection: { rating_target: 2100 } } });
+  assert.equal(later.capacity.evidence.qualified, true);
+  assert.equal(JSON.parse(readFileSync(item.configPath, "utf8")).engine.time_profile, path.resolve(item.options.time_profile));
+});
+
+test("operator evidence adoption validates a fresh bundle even when capacity shape stays unchanged", () => {
+  const item = evidenceAdoptionFixture(1);
+  const updated = updateManagerOptions({ ...item.adoption, settings: { scheduler: { discovery_interval_seconds: 75 } } });
+  assert.equal(updated.capacity.evidence.qualified, true);
+  assert.equal(JSON.parse(readFileSync(item.configPath, "utf8")).engine.single_game_profile, path.resolve(item.options.output));
+});
+
+test("operator config CLI forwards explicit evidence adoption into the atomic owner", async () => {
+  const item = evidenceAdoptionFixture();
+  const output = [], previous = console.log;
+  console.log = value => output.push(value);
+  try {
+    assert.equal(await main(["config", "update", "--config", item.configPath,
+      "--settings", JSON.stringify(item.adoption.settings), "--profile", item.options.output,
+      "--time-profile", item.options.time_profile, "--capacity-profile", item.target]), 0);
+  } finally { console.log = previous; }
+  assert.equal(JSON.parse(output[0]).capacity.evidence.qualified, true);
+  assert.equal(JSON.parse(readFileSync(item.configPath, "utf8")).capacity.capacity_profile, path.resolve(item.target));
+});
+
+for (const [label, mutate] of [
+  ["missing profile flag", item => { delete item.adoption.profilePath; }],
+  ["missing timing flag", item => { delete item.adoption.timeProfilePath; }],
+  ["missing capacity flag", item => { delete item.adoption.capacityProfilePath; }],
+  ["empty reference", item => { item.adoption.profilePath = ""; }],
+  ["private reference", item => { item.adoption.profilePath = path.join(path.dirname(item.configPath), "client-key.json"); }],
+  ["ADS reference", item => { item.adoption.profilePath = "C:/public/synthetic-profile.json:auth.json"; }],
+  ["unknown timing gates", item => {
+    const timing = JSON.parse(readFileSync(item.options.time_profile, "utf8"));
+    timing.gates.mcgs_single_owner_passed = false; writeFileSync(item.options.time_profile, JSON.stringify(timing));
+  }],
+  ["invalid child close", item => {
+    const capacity = JSON.parse(readFileSync(item.target, "utf8"));
+    capacity.evidence[0].qualification_cleanup.forced_termination = true;
+    writeFileSync(item.target, JSON.stringify(capacity));
+  }],
+  ["global slots exceed actual qualification", item => {
+    item.adoption.settings = { capacity: { ...oneBotCapacity, total_slots: 2, startup_parallelism: 2,
+      human: { slots: 1, allow_borrowing: false, accept_public: true } } };
+  }],
+]) {
+  test(`operator evidence adoption rejects ${label} without activating config`, () => {
+    const item = evidenceAdoptionFixture(1);
+    mutate(item);
+    const original = readFileSync(item.configPath, "utf8");
+    assert.throws(() => updateManagerOptions(item.adoption),
+      label === "private reference" || label === "ADS reference" ? /forbidden/ : undefined);
+    assert.equal(readFileSync(item.configPath, "utf8"), original);
+  });
+}
+
+test("operator evidence adoption rejects actual selected engine/model/manifest drift", () => {
+  for (const field of ["executable", "model", "component_manifest"]) {
+    const item = evidenceAdoptionFixture(1);
+    const original = JSON.parse(readFileSync(item.configPath, "utf8"));
+    if (field === "model") original.engine.uci_options.ModelRoot = path.join(path.dirname(item.configPath), "different-model");
+    else original.engine[field] = path.join(path.dirname(item.configPath), `${field}-different.json`);
+    writeFileSync(item.configPath, JSON.stringify(original));
+    const retained = readFileSync(item.configPath, "utf8");
+    assert.throws(() => updateManagerOptions(item.adoption));
+    assert.equal(readFileSync(item.configPath, "utf8"), retained);
+  }
+});
+
+test("operator evidence adoption cannot replace legacy shared authority with unchecked file paths", () => {
+  const item = evidenceAdoptionFixture(1);
+  const original = JSON.parse(readFileSync(item.configPath, "utf8"));
+  original.capacity.legacy_shared = true;
+  writeFileSync(item.configPath, JSON.stringify(original));
+  const retained = readFileSync(item.configPath, "utf8");
+  assert.throws(() => updateManagerOptions(item.adoption), /legacy shared/);
+  assert.equal(readFileSync(item.configPath, "utf8"), retained);
+});
+
+test("operator evidence adoption preserves an actual concurrent target edit", () => {
+  const item = evidenceAdoptionFixture();
+  const concurrent = structuredClone(item.raw); concurrent.scheduler.rating_target = 2345;
+  const concurrentBytes = JSON.stringify(concurrent);
+  let edited = false;
+  const settings = {};
+  Object.defineProperty(settings, "capacity", { enumerable: true, get() {
+    if (!edited) { edited = true; writeFileSync(item.configPath, concurrentBytes); }
+    return oneBotCapacity;
+  } });
+  assert.throws(() => updateManagerOptions({ ...item.adoption, settings }), /changed/);
+  assert.equal(edited, true);
+  assert.equal(readFileSync(item.configPath, "utf8"), concurrentBytes);
+});
+
+test("operator evidence adoption rejects evidence invalidated before staged validation", () => {
+  const item = evidenceAdoptionFixture(1), original = readFileSync(item.configPath, "utf8");
+  const settings = {};
+  Object.defineProperty(settings, "scheduler", { enumerable: true, get() {
+    writeFileSync(item.target, "invalidated-during-update");
+    return { discovery_interval_seconds: 75 };
+  } });
+  assert.throws(() => updateManagerOptions({ ...item.adoption, settings }), /qualified capacity/);
+  assert.equal(readFileSync(item.configPath, "utf8"), original);
+});
 
 test("continuous capacity v2 round trip binds profile and actual per-child native/model/timing proof", () => {
   const { target, config, single, status } = continuousCapacityFixture();
@@ -877,16 +1037,23 @@ test("continuous historical searched regime preserves actual enabled book and ke
   assert.equal(loadSingleGameProfile(options.output).runtime_binding.timing_profile.whole_runtime_timing_authority_match, false);
 });
 
-async function scopedRuntimeFixture({ profileVersion = TIME_POLICY_VERSION, runtimeVersion = TIME_POLICY_VERSION } = {}) {
+async function scopedRuntimeFixture({ profileVersion = TIME_POLICY_VERSION, runtimeVersion = TIME_POLICY_VERSION,
+  validationScope = "historical_searched_regime", transformTimingProfile = null } = {}) {
   const baselineOptions = fixture("mcgs");
   const diagnostic = continuousDiagnosticFixture(baselineOptions);
   const options = profileVersion === TIME_POLICY_VERSION ? baselineOptions : fixture("mcgs", profileVersion);
+  if (transformTimingProfile) {
+    const timing = JSON.parse(readFileSync(options.time_profile, "utf8"));
+    transformTimingProfile(timing);
+    writeFileSync(options.time_profile, `${JSON.stringify(timing, null, 2)}\n`);
+  }
   const selected = { ...diagnostic.binding.effective_options.model, OwnBook: "true", "Move Overhead": "650" };
   delete selected.McgsTemporalWeightProfile;
   const engine = new UciEngine({ executable: options.engine, arguments: [], working_directory: path.dirname(options.engine),
     time_profile: options.time_profile, uci_options: selected, timing: { initial_transport_reserve_ms: 650 },
     qualification_profile: { schema: "uci_arena_single_game_profile_v2",
-      runtime_binding: { timing_profile: { validation_scope: "historical_searched_regime" } } } });
+      runtime_binding: { timing_profile: { validation_scope: validationScope,
+        schema: JSON.parse(readFileSync(options.time_profile, "utf8")).schema } } } });
   engine.uciIdLines = ["id name explicit synthetic Engine"];
   engine.uciOptionLines = Object.entries(selected).map(([name, value]) => `option name ${name} type string default ${value}`);
   engine.send = () => {};
@@ -907,6 +1074,119 @@ async function scopedRuntimeFixture({ profileVersion = TIME_POLICY_VERSION, runt
     time_profile_iteration_forecast_scale_permille: Number(engine.appliedUciOptions.TimeProfileIterationForecastScalePermille ?? 1000) });
   const result = await engine.configureTimeProfile();
   return { engine, diagnostic, options, result };
+}
+
+function continuousTimingProfileFixture(profile) {
+  // Synthetic conformance data for the draft public owner v4 fixture, not real qualification.
+  const cases = ["startpos", "complex_kiwipete", "forced_response", "low_budget_startpos", "relative_clock_surplus"];
+  profile.schema = "uci_time_profile_v4";
+  profile.qualification_regime = "continuous_mcgs_provider_deadline_v1";
+  profile.qualification = { repetitions_per_case: 30, cases, authority: {
+    predictive_controller_promotion: false, provider_default_tuning: false, strength_promotion: false,
+    allocation_strategy: false, minimum_useful_blocks: false, adaptive_timing: false,
+  } };
+  profile.permissions = { provider_safety_qualified: true, forecast_shadow_qualified: true, adaptive_play_qualified: false };
+  profile.samples = cases.flatMap(case_id => [250, 650, 700, 1500].flatMap(move_overhead_ms =>
+    Array.from({ length: 30 }, (_, index) => ({ case_id, move_overhead_ms, repetition: index,
+      temperature: index === 0 ? "cold_process" : "warm_process",
+      timing_applicability: case_id === "forced_response" ? "non_search_resolved" : "search_derived" }))));
+  for (const gate of ["continuous_case_population_passed", "continuous_focus_candidates_passed", "continuous_publication_fence_passed",
+    "continuous_live_resource_bounds_passed", "continuous_joined_completion_passed", "continuous_normal_close_passed",
+    "continuous_search_work_passed", "continuous_async_provider_work_passed", "continuous_temporal_compatibility_passed"]) profile.gates[gate] = true;
+  for (const gate of ["mcgs_policy_only_fallback_passed", "mcgs_single_owner_passed",
+    "mcgs_low_budget_fallback_passed", "mcgs_deterministic_fallback_passed"]) profile.gates[gate] = false;
+}
+
+test("Bot applies explicit continuous v4 timing through its actual runtime boundary", async () => {
+  const { result, options } = await scopedRuntimeFixture({
+    validationScope: "continuous_searched_regime", transformTimingProfile: continuousTimingProfileFixture,
+  });
+  assert.equal(result.accepted, true, result.reason);
+  assert.equal(result.applied, true);
+  assert.equal(result.schema, "uci_time_profile_continuous_searched_regime_runtime_status_v1");
+  assert.equal(result.validation_scope, "continuous_searched_regime");
+  assert.equal(result.provider_service_reserve_us, 2000);
+  assert.equal(result.whole_runtime_timing_authority_match, false);
+  assert.equal(result.searched_regime_timing_authority_match, true);
+  const retained = JSON.parse(readFileSync(options.time_profile, "utf8"));
+  assert.equal(retained.schema, "uci_time_profile_v4");
+  assert.equal(retained.gates.mcgs_single_owner_passed, false);
+  assert.equal(retained.permissions.adaptive_play_qualified, false);
+});
+
+for (const scoped of [false, true]) {
+  test(`continuous v4 publisher loader capacity retain their exact ${scoped ? "searched" : "whole"} scope`, () => {
+    const { target, config, single, status, options } = continuousCapacityFixture(scoped, true);
+    assert.equal(single.schema, "uci_arena_single_game_profile_v2");
+    assert.equal(single.runtime_binding.timing_profile.schema, "uci_time_profile_v4");
+    assert.equal(single.runtime_binding.timing_profile.validation_scope, scoped ? "continuous_searched_regime" : "exact_runtime");
+    assert.equal(JSON.parse(readFileSync(options.time_profile, "utf8")).gates.mcgs_single_owner_passed, false);
+    publishCapacityProfile(target, 1, config, single, [status]);
+    const accepted = loadCapacityProfile(target, config, single);
+    assert.equal(accepted.evidence[0].time_profile.schema, scoped
+      ? "uci_time_profile_continuous_searched_regime_runtime_status_v1" : "uci_time_profile_runtime_status_v1");
+    assert.equal(accepted.maximum_concurrency, 1);
+    const retained = readFileSync(target, "utf8");
+    status.time_profile.schema = "uci_time_profile_searched_regime_runtime_status_v1";
+    assert.throws(() => publishCapacityProfile(target, 1, config, single, [status]), /scope/);
+    assert.equal(readFileSync(target, "utf8"), retained);
+  });
+}
+
+test("legacy single-game-v1 publisher cannot infer qualification from new v4 timing", () => {
+  const options = fixture("mcgs");
+  const timing = JSON.parse(readFileSync(options.time_profile, "utf8"));
+  continuousTimingProfileFixture(timing); writeFileSync(options.time_profile, JSON.stringify(timing));
+  assert.throws(() => publishSingleGameProfile(options), /uci_time_profile_v3/);
+});
+
+test("continuous v4 public artifact rejects a mixed timing schema/scope tuple before publication", () => {
+  const options = fixture("mcgs"), timing = JSON.parse(readFileSync(options.time_profile, "utf8"));
+  continuousTimingProfileFixture(timing); writeFileSync(options.time_profile, JSON.stringify(timing));
+  const diagnostic = continuousDiagnosticFixture(options);
+  diagnostic.binding.timing_profile.validation_scope = "historical_searched_regime";
+  diagnostic.binding.timing_profile.validation_schema = "uci_time_profile_searched_regime_runtime_status_v1";
+  writeFileSync(options.complete_game_evidence, JSON.stringify(diagnostic));
+  mkdirSync(path.dirname(options.output), { recursive: true }); writeFileSync(options.output, "prior-authority");
+  assert.throws(() => publishSingleGameProfile({ ...options, qualification_scope: "local_live_safety" }), /public contract/);
+  assert.equal(readFileSync(options.output, "utf8"), "prior-authority");
+});
+
+test("Bot retains historical v3 gate failures as rejection instead of inferring continuous permission", async () => {
+  const { result } = await scopedRuntimeFixture({ transformTimingProfile(profile) {
+    profile.gates.mcgs_single_owner_passed = false;
+  } });
+  assert.equal(result.accepted, false);
+  assert.equal(result.applied, false);
+  assert.equal(result.provider_service_reserve_us, 0);
+});
+
+test("Bot rejects historical v3 timing labelled as the continuous v4 regime", async () => {
+  const { result } = await scopedRuntimeFixture({ validationScope: "continuous_searched_regime" });
+  assert.equal(result.accepted, false);
+  assert.equal(result.applied, false);
+  assert.equal(result.provider_service_reserve_us, 0);
+  assert.match(result.reason, /v3 binding and scope/);
+});
+
+for (const [label, mutate] of [
+  ["false continuous gate", profile => { profile.gates.continuous_normal_close_passed = false; }],
+  ["missing continuous gate", profile => { delete profile.gates.continuous_focus_candidates_passed; }],
+  ["duplicate sample repetition", profile => { profile.samples[1].repetition = 0; }],
+  ["incomplete case population", profile => { profile.samples.pop(); }],
+  ["wrong cold process repetition", profile => { profile.samples[0].temperature = "warm_process"; }],
+  ["unsupported tuning authority", profile => { profile.qualification.authority.provider_default_tuning = true; }],
+  ["unsupported adaptive authority", profile => { profile.permissions.adaptive_play_qualified = true; }],
+]) {
+  test(`Bot rejects continuous v4 ${label} without applying reserves`, async () => {
+    const { result } = await scopedRuntimeFixture({ validationScope: "continuous_searched_regime",
+      transformTimingProfile(profile) { continuousTimingProfileFixture(profile); mutate(profile); } });
+    assert.equal(result.accepted, false);
+    assert.equal(result.applied, false);
+    assert.equal(result.provider_service_reserve_us, 0);
+    assert.doesNotMatch(result.reason, /unexpected profile schema/,
+      "the accepted SDK must reject the v4 defect specifically, not reject every v4 profile as unsupported");
+  });
 }
 
 test("Bot applies actual reserves through the public scoped operation with book enabled and overhead650", async () => {
@@ -960,12 +1240,15 @@ test("Bot rejects an unknown stored timing policy before applying reserves", asy
 });
 
 
-async function completeRuntimeContextFixture() {
-  const { engine, diagnostic, options, result } = await scopedRuntimeFixture();
+async function completeRuntimeContextFixture(continuousTiming = false) {
+  const { engine, diagnostic, options, result } = await scopedRuntimeFixture(continuousTiming ? {
+    validationScope: "continuous_searched_regime", transformTimingProfile: continuousTimingProfileFixture,
+  } : {});
   assert.equal(result.accepted, true, result.reason);
   const binding = diagnostic.binding;
-  Object.assign(binding.timing_profile, { validation_scope: "historical_searched_regime",
-    validation_schema: "uci_time_profile_searched_regime_runtime_status_v1", configured_opening_book_enabled: true,
+  Object.assign(binding.timing_profile, { schema: engine.appliedTimeProfile.schema, sha256: sha256(readFileSync(options.time_profile)),
+    validation_scope: continuousTiming ? "continuous_searched_regime" : "historical_searched_regime",
+    validation_schema: result.schema, configured_opening_book_enabled: true,
     timing_authority_match: false, whole_runtime_timing_authority_match: false, move_overhead_ms: 650 });
   binding.engine.uci_id_lines = [...engine.uciIdLines];
   binding.engine.uci_option_declarations_sha256 = sha256(JSON.stringify(engine.uciOptionLines));
@@ -999,6 +1282,16 @@ test("continuous context validates actual complete declarations, knowledge and a
   assert.equal(result.accepted, true);
   assert.equal(result.applied, true);
   assert.equal(result.whole_runtime_timing_authority_match, false);
+});
+
+test("continuous v4 actual publication context revalidates applied scope and rejects native reserve drift", async () => {
+  const { engine, status } = await completeRuntimeContextFixture(true);
+  const accepted = engine.validateContinuousRuntimeContext(status);
+  assert.equal(accepted.schema, "uci_time_profile_continuous_searched_regime_runtime_status_v1");
+  assert.equal(accepted.validation_scope, "continuous_searched_regime");
+  assert.equal(accepted.applied, true);
+  status.time_profile_provider_reserve_us += 1;
+  assert.throws(() => engine.validateContinuousRuntimeContext(status), /reserve|not applied/);
 });
 
 for (const [label, mutate, expected] of [

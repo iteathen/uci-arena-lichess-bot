@@ -135,6 +135,24 @@ Common path flags:
 Explicit flags override template values. Paths are normalized to absolute paths
 at the process boundary; stored path values never contain embedded quotes.
 
+The local operator can adopt a newly qualified evidence bundle through
+`config update --config <saved-config> --settings <editable-settings-json>
+--profile <single-game-profile> --time-profile <timing-profile>
+--capacity-profile <capacity-profile>`. Supply all three evidence references.
+The provider validates the complete effective engine, model, timing and capacity
+binding before atomically saving the paths and policy, including when the slot
+shape is unchanged. Failure preserves the previous configuration. This operation
+does not start the Bot or update Installer locators; startup still performs its
+native preflight. Evidence paths persist through normal starts and policy updates,
+while a subsequent Installer render regenerates them from its installation context.
+
+For recovery, `capacity-qualify --max-concurrency 1` can qualify one actual child
+using explicit fresh evidence paths while the old saved two-slot configuration
+remains unstarted. Adopt the resulting bundle and one-slot policy together before
+startup. An automated single-bot slot uses human slots0, borrowingfalse,
+publicfalse, bot slots1/target1 and startup parallelism1. Existing borrowing is
+one-way: bots may borrow an idle human slot; humans cannot borrow a bot slot.
+
 Lichess transport evidence is stored separately from Engine timing evidence.
 New collection uses `uci_arena_lichess_transport_profile_v2`, whose reserve
 covers the complete bestmove-to-ack tail: legality replay, serialized request

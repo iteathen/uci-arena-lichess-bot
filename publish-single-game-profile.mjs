@@ -5,7 +5,6 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import {
-  PROFILE_SCHEMA,
   validateStoredProfile,
 } from "@uci-arena/time-profile-contract";
 import { validateTimingProfile } from "./single-game-profile-validation.mjs";
@@ -336,13 +335,13 @@ export function publishSingleGameProfile(options) {
     label: "Timing profile",
   });
   const timeProfile = validateStoredProfile(admittedTimeProfile.value);
-  const identity = validateTimingProfile(timeProfile, checkpoint);
   const timeProfileSha = admittedTimeProfile.sha256;
   const admittedCompleteGame = readExactJsonSync(completeGamePath, {
     maximumBytes: PROFILE_FILE_LIMIT,
     label: "Complete-game evidence",
   });
   const continuous = admittedCompleteGame.value?.schema === CONTINUOUS_DIAGNOSTIC_SCHEMA;
+  const identity = validateTimingProfile(timeProfile, checkpoint, { allowContinuous: continuous });
   if (continuous) {
     requireValue(scope === LOCAL_SCOPE, "Continuous profile v2 is local_live_safety only");
     requireValue(admittedCompleteGame.byteLength < PROFILE_FILE_LIMIT, "Continuous evidence exceeds exclusive artifact byte bound");

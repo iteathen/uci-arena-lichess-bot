@@ -36,6 +36,76 @@ function searchedRegimeFixture(directory, version = TIME_POLICY_VERSION) {
 const HISTORICAL_NATIVE_VERSION = "persistent_mcgs_relative_clock_temporal_v4";
 const RETENTION_NATIVE_VERSION = "persistent_mcgs_relative_clock_temporal_v5";
 
+function continuousProfileFixture(directory) {
+  const input = searchedRegimeFixture(directory, RETENTION_NATIVE_VERSION);
+  const cases = ["startpos", "complex_kiwipete", "forced_response", "low_budget_startpos", "relative_clock_surplus"];
+  input.profile = { ...input.profile, schema: "uci_time_profile_v4",
+    qualification_regime: "continuous_mcgs_provider_deadline_v1",
+    qualification: { repetitions_per_case: 30, cases, authority: {
+      predictive_controller_promotion: false, provider_default_tuning: false, strength_promotion: false,
+      allocation_strategy: false, minimum_useful_blocks: false, adaptive_timing: false } },
+    permissions: { provider_safety_qualified: true, forecast_shadow_qualified: true, adaptive_play_qualified: false },
+    samples: cases.flatMap(case_id => [250, 650, 700, 1500].flatMap(move_overhead_ms =>
+      Array.from({ length: 30 }, (_, index) => ({ case_id, move_overhead_ms,
+        repetition: index,
+        temperature: index === 0 ? "cold_process" : "warm_process",
+        timing_applicability: case_id === "forced_response" ? "non_search_resolved" : "search_derived" })))),
+    gates: { ...input.profile.gates, ...Object.fromEntries([
+      "continuous_case_population_passed", "continuous_focus_candidates_passed", "continuous_publication_fence_passed",
+      "continuous_live_resource_bounds_passed", "continuous_joined_completion_passed", "continuous_normal_close_passed",
+      "continuous_search_work_passed", "continuous_async_provider_work_passed", "continuous_temporal_compatibility_passed",
+    ].map(name => [name, true])), mcgs_policy_only_fallback_passed: false, mcgs_single_owner_passed: false,
+      mcgs_low_budget_fallback_passed: false, mcgs_deterministic_fallback_passed: false },
+  };
+  return input;
+}
+
+test("explicit continuous profile qualifies its own gates and keeps historical schema/API scope", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "time-continuous-v4-"));
+  try {
+    assert.equal(contract.CONTINUOUS_TIME_PROFILE_SCHEMA, "uci_time_profile_v4");
+    assert.equal(PROFILE_SCHEMA, "uci_time_profile_v3");
+    const input = continuousProfileFixture(directory);
+    assert.equal(validateStoredProfile(input.profile).schema, "uci_time_profile_v4");
+    assert.equal(timingProfilePermissions(input.profile).provider_safety_qualified, true);
+    assert.equal(validateProfileRuntimeSnapshot(input).accepted, true);
+    assert.throws(() => contract.validateHistoricalSearchedRegimeRuntimeSnapshot(input), /requires v3/);
+    assert.equal(contract.validateContinuousSearchedRegimeRuntimeSnapshot(input).accepted, true);
+    const historical = searchedRegimeFixture(directory);
+    assert.throws(() => contract.validateContinuousSearchedRegimeRuntimeSnapshot(historical), /requires v4/);
+    input.status.opening_book_enabled = true; input.configuration.ownBook = true;
+    const accepted = contract.validateContinuousSearchedRegimeRuntimeSnapshot(input);
+    assert.equal(accepted.schema, "uci_time_profile_continuous_searched_regime_runtime_status_v1");
+    assert.equal(accepted.searched_regime_timing_authority_match, true);
+    assert.equal(accepted.whole_runtime_timing_authority_match, false);
+    const applied = { ...input, configuration: { ...input.configuration, appliedTimeProfileReserveUs: 77000, appliedBackupEmitReserveUs: 2000 },
+      status: { ...input.status, time_profile_provider_reserve_us: 77000, time_profile_backup_emit_reserve_us: 2000 } };
+    assert.equal(contract.validateAppliedContinuousSearchedRegimeTimeProfileReserve(applied).applied, true);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("continuous profile rejects incomplete population, false gates and unsupported authority", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "time-continuous-invalid-"));
+  try {
+    const input = continuousProfileFixture(directory);
+    for (const mutate of [
+      p => { p.qualification_regime = "guessed"; }, p => { p.qualification.repetitions_per_case = 29; },
+      p => { p.samples.pop(); }, p => { p.samples[0].temperature = "warm_process"; },
+      p => { p.samples[2] = structuredClone(p.samples[1]); },
+      p => { p.samples[0].case_id = "unknown"; }, p => { p.samples[0].timing_applicability = "unknown"; },
+      p => { p.qualification.authority.minimum_useful_blocks = true; }, p => { p.permissions.adaptive_play_qualified = true; },
+      p => { p.identity.time_policy_version = HISTORICAL_NATIVE_VERSION; p.identity_sha256 = sha256Object(p.identity); },
+    ]) {
+      const bad = structuredClone(input.profile); mutate(bad);
+      assert.throws(() => validateStoredProfile(bad));
+    }
+    for (const gate of Object.keys(input.profile.gates).filter(name => name.startsWith("continuous_"))) {
+      const bad = structuredClone(input.profile); bad.gates[gate] = false;
+      assert.equal(timingProfilePermissions(bad).provider_safety_qualified, false);
+    }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
 for (const version of [HISTORICAL_NATIVE_VERSION, RETENTION_NATIVE_VERSION]) {
   test(`profile identity preserves native ${version} and accepts only that runtime`, () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), "time-native-version-"));

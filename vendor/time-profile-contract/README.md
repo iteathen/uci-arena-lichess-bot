@@ -64,6 +64,37 @@ profiles require their own qualification; SDK support grants no new evidence,
 allocation-policy, adaptive-play, strength, or deployment authority. Existing
 schema v1/v2 stored-profile compatibility remains unchanged.
 
+## Explicit continuous execution qualification (1.5.0)
+
+`CONTINUOUS_TIME_PROFILE_SCHEMA` identifies `uci_time_profile_v4` under the exact
+`continuous_mcgs_provider_deadline_v1` regime and native timing version 5.
+`PROFILE_SCHEMA` remains version 3. The producer opts in with
+`--qualification-contract continuous-v4 --referee <native executable>`; existing
+version-3-only consumers keep their declared defaults.
+
+Version 4 requires every declared continuous gate and actual coverage of all five
+cases, four qualified overheads, and at least 30 repetitions per cell with one
+cold and the remaining warm process samples. It observes complete canonical legal
+candidates, current native publication fences, bounded live resources, positive
+aggregate searched execution/provider work, genuine joined completion, and normal
+child close. It does not require short publication waits to stop neural admission
+or execution-lifetime root evaluation totals to remain at one. Actual non-search
+resolutions are classified separately and excluded from searched calibration.
+
+`validateContinuousSearchedRegimeRuntimeSnapshot(input)` and
+`validateAppliedContinuousSearchedRegimeTimeProfileReserve(input)` accept version
+4 only and return `uci_time_profile_continuous_searched_regime_runtime_status_v1`
+with `validation_scope=continuous_searched_regime`. Historical searched-regime
+operations remain version 3 only. Actual downstream book resolution composes with
+zero book prior and unchanged exact material/runtime/overhead identity in both
+operations; it grants no new move-allocation semantics.
+
+Permissions remain provider safety and forecast shadow only. Version 4 explicitly
+declares false adaptive timing, allocation strategy, minimum useful blocks,
+predictive-controller promotion, default tuning, and strength authority. It is
+implemented compatibility support until an actual native probe qualifies a target;
+unit fixtures, release signatures and this SDK do not establish that evidence.
+
 ## Future policy evolution
 
 The future timing-policy artifact must be introduced through an explicit versioned contract after its owning Evidence/Engine specifications are implemented and qualified.

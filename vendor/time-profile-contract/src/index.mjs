@@ -3,6 +3,16 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 
 export const PROFILE_SCHEMA = "uci_time_profile_v3";
+export const CONTINUOUS_TIME_PROFILE_SCHEMA = "uci_time_profile_v4";
+export const CONTINUOUS_QUALIFICATION_REGIME = "continuous_mcgs_provider_deadline_v1";
+export const CONTINUOUS_QUALIFICATION_CASES = Object.freeze([
+  "startpos", "complex_kiwipete", "forced_response", "low_budget_startpos", "relative_clock_surplus",
+]);
+export const CONTINUOUS_TIMING_GATES = Object.freeze([
+  "continuous_case_population_passed", "continuous_focus_candidates_passed", "continuous_publication_fence_passed",
+  "continuous_live_resource_bounds_passed", "continuous_joined_completion_passed", "continuous_normal_close_passed",
+  "continuous_search_work_passed", "continuous_async_provider_work_passed", "continuous_temporal_compatibility_passed",
+]);
 export const PREVIOUS_PROFILE_SCHEMA = "uci_time_profile_v2";
 export const LEGACY_PROFILE_SCHEMA = "uci_time_profile_v1";
 export const TIME_POLICY_VERSION = "persistent_mcgs_relative_clock_temporal_v5";
@@ -37,6 +47,42 @@ const MCGS_TIMING_GATES = Object.freeze([
   "mcgs_temporal_policy_passed",
   "mcgs_deadline_tail_telemetry_passed",
 ]);
+
+function modernTimingProfile(profile) {
+  return profile?.schema === PROFILE_SCHEMA || profile?.schema === CONTINUOUS_TIME_PROFILE_SCHEMA;
+}
+
+export function continuousProfilePopulationPassed(samples, repetitions = 30) {
+  if (!Number.isSafeInteger(repetitions) || repetitions < 30 || repetitions > 100 || !Array.isArray(samples)) return false;
+  const cells = new Map(CONTINUOUS_QUALIFICATION_CASES.flatMap(caseId => [250, 650, 700, 1500]
+    .map(overhead => [`${caseId}:${overhead}`, { cold: 0, warm: 0, indices: new Set() }])));
+  for (const sample of samples) {
+    const cell = cells.get(`${sample?.case_id}:${sample?.move_overhead_ms}`);
+    if (!cell || !["search_derived", "non_search_resolved"].includes(sample?.timing_applicability)) return false;
+    if (!Number.isSafeInteger(sample.repetition) || sample.repetition < 0 || sample.repetition >= repetitions
+        || cell.indices.has(sample.repetition) || sample.temperature !== (sample.repetition === 0 ? "cold_process" : "warm_process")) return false;
+    cell.indices.add(sample.repetition);
+    if (sample.temperature === "cold_process") ++cell.cold;
+    else if (sample.temperature === "warm_process") ++cell.warm;
+    else return false;
+  }
+  return [...cells.values()].every(cell => cell.cold === 1 && cell.warm === repetitions - 1);
+}
+
+function continuousRegimeValid(profile) {
+  const qualification = profile?.qualification;
+  return profile?.qualification_regime === CONTINUOUS_QUALIFICATION_REGIME
+    && profile.identity?.time_policy_version === TIME_POLICY_VERSION
+    && profile.identity?.search?.search_core === "mcgs"
+    && Array.isArray(qualification?.cases)
+    && canonicalJson([...qualification.cases].sort()) === canonicalJson([...CONTINUOUS_QUALIFICATION_CASES].sort())
+    && continuousProfilePopulationPassed(profile.samples, qualification.repetitions_per_case)
+    && ["predictive_controller_promotion", "provider_default_tuning", "strength_promotion", "allocation_strategy", "minimum_useful_blocks", "adaptive_timing"]
+      .every(name => qualification.authority?.[name] === false)
+    && typeof profile.permissions?.provider_safety_qualified === "boolean"
+    && typeof profile.permissions?.forecast_shadow_qualified === "boolean"
+    && profile.permissions?.adaptive_play_qualified === false;
+}
 
 export function canonicalize(value) {
   if (Array.isArray(value)) return value.map(canonicalize);
@@ -101,7 +147,11 @@ function explicitPermission(value, name) {
 }
 
 export function timingProfileGatesPassed(profile) {
-  if (profile?.schema !== PROFILE_SCHEMA || profile.qualified !== true) return false;
+  if (!modernTimingProfile(profile) || profile.qualified !== true) return false;
+  if (profile.schema === CONTINUOUS_TIME_PROFILE_SCHEMA) {
+    return continuousRegimeValid(profile)
+      && [...BASE_TIMING_GATES, ...CONTINUOUS_TIMING_GATES].every(gate => profile.gates?.[gate] === true);
+  }
   const required = profile.identity?.search?.search_core === "mcgs"
     ? [...BASE_TIMING_GATES, ...MCGS_TIMING_GATES]
     : BASE_TIMING_GATES;
@@ -121,12 +171,12 @@ export function timingProfilePermissions(profile) {
   return {
     provider_safety_qualified: gatesPassed && provider !== false,
     forecast_shadow_qualified: gatesPassed && forecast !== false,
-    adaptive_play_qualified: adaptive === true,
+    adaptive_play_qualified: profile?.schema === CONTINUOUS_TIME_PROFILE_SCHEMA ? false : adaptive === true,
   };
 }
 
 export function validateStoredProfile(profile) {
-  if (![PROFILE_SCHEMA, PREVIOUS_PROFILE_SCHEMA, LEGACY_PROFILE_SCHEMA]
+  if (![PROFILE_SCHEMA, CONTINUOUS_TIME_PROFILE_SCHEMA, PREVIOUS_PROFILE_SCHEMA, LEGACY_PROFILE_SCHEMA]
     .includes(profile?.schema)) {
     throw new Error(`unexpected profile schema: ${profile?.schema}`);
   }
@@ -137,7 +187,10 @@ export function validateStoredProfile(profile) {
       || profile.predictive_controller?.default_enabled !== false) {
     throw new Error("timing profile attempts to enable the predictive controller");
   }
-  const providerReserveUs = profile.schema === PROFILE_SCHEMA
+  if (profile.schema === CONTINUOUS_TIME_PROFILE_SCHEMA && !timingProfileGatesPassed(profile)) {
+    throw new Error("continuous timing profile regime, population or authority is invalid");
+  }
+  const providerReserveUs = modernTimingProfile(profile)
     ? profile.calibration?.provider_batch_reserve_us
     : profile.schema === PREVIOUS_PROFILE_SCHEMA
       ? profile.calibration?.provider_service_reserve_us
@@ -147,7 +200,7 @@ export function validateStoredProfile(profile) {
       || providerReserveUs > 5_000_000) {
     throw new Error("timing profile provider-service reserve is missing or invalid");
   }
-  const backupEmitReserveUs = profile.schema === PROFILE_SCHEMA
+  const backupEmitReserveUs = modernTimingProfile(profile)
     ? profile.calibration?.backup_emit_reserve_us
     : 1000;
   if (!Number.isSafeInteger(backupEmitReserveUs)
@@ -155,7 +208,7 @@ export function validateStoredProfile(profile) {
       || backupEmitReserveUs > 5_000_000) {
     throw new Error("timing profile backup/emission reserve is missing or invalid");
   }
-  if (profile.schema === PROFILE_SCHEMA) {
+  if (modernTimingProfile(profile)) {
     if (!SUPPORTED_TIME_POLICY_VERSIONS.includes(profile.identity?.time_policy_version)) {
       throw new Error(
         `timing profile time policy is stale: ${profile.identity?.time_policy_version ?? "missing"}`,
@@ -491,7 +544,7 @@ export function loadTimeProfile(filename, cwd = process.cwd()) {
 
 export function validateAppliedTimeProfileReserve(profileValue, status) {
   const profile = validateStoredProfile(profileValue);
-  if (profile.schema === PROFILE_SCHEMA
+  if (modernTimingProfile(profile)
       && status?.timing_contract_version !== profile.identity.time_policy_version) {
     throw new Error(
       `Timing-profile timing_contract_version expected ${profile.identity.time_policy_version}`
@@ -579,9 +632,9 @@ export function validateProfileRuntimeSnapshot({
     iterativeTimeController: false,
     expectedModelId: profile.identity.model.model_id,
     expectedModelFingerprint: profile.identity.model.model_fingerprint,
-    includeMoveOverheadIdentity: profile.schema !== PROFILE_SCHEMA,
+    includeMoveOverheadIdentity: !modernTimingProfile(profile),
   };
-  if (profile.schema === PROFILE_SCHEMA) {
+  if (modernTimingProfile(profile)) {
     const overhead = Number(configuration?.moveOverheadMs);
     const envelope = profile.applicability.move_overhead_ms;
     if (!Number.isFinite(overhead) || overhead < envelope.minimum || overhead > envelope.maximum) {
@@ -597,7 +650,7 @@ export function validateProfileRuntimeSnapshot({
     options,
   );
   const provenance = engineProvenanceComparison(profile.identity.engine, currentIdentity.engine);
-  if (profile.schema === PROFILE_SCHEMA) {
+  if (modernTimingProfile(profile)) {
     assertMatchingIdentity(
       timingAuthorityIdentity(profile.identity),
       timingAuthorityIdentity(currentIdentity),
@@ -651,14 +704,14 @@ const DOWNSTREAM_BOOK_OPTIONS = new Set([
 // contribute priors to the qualified searched regime. Resolved publications are
 // separately classified by the native publication owner. Everything else stays
 // exact, including tablebase, model, provider and material extra options.
-export function validateHistoricalSearchedRegimeRuntimeSnapshot(input) {
+function validateSearchedRegimeRuntimeSnapshot(input, expectedSchema, resultSchema, scope) {
   const profile = validateStoredProfile(input?.profile);
   const configuration = input?.configuration;
   const status = input?.status;
-  if (profile.schema !== PROFILE_SCHEMA || profile.identity?.search?.search_core !== "mcgs"
+  if (profile.schema !== expectedSchema || profile.identity?.search?.search_core !== "mcgs"
       || profile.identity.search.opening_book !== false
       || configuration?.searchCore !== "mcgs") {
-    throw new Error("Historical searched regime requires v3 MCGS qualification with opening_book=false");
+    throw new Error(`Searched regime requires ${expectedSchema === PROFILE_SCHEMA ? "v3" : "v4"} MCGS qualification with opening_book=false`);
   }
   const permissions = timingProfilePermissions(profile);
   if (!permissions.provider_safety_qualified || !permissions.forecast_shadow_qualified) throw new Error("Historical searched regime lacks declared provider/forecast qualification");
@@ -685,8 +738,8 @@ export function validateHistoricalSearchedRegimeRuntimeSnapshot(input) {
   return {
     ...facts,
     permissions,
-    schema: SEARCHED_REGIME_SCHEMA,
-    validation_scope: "historical_searched_regime",
+    schema: resultSchema,
+    validation_scope: scope,
     searched_regime_timing_authority_match: true,
     whole_runtime_timing_authority_match: wholeMatch,
     configured_opening_book_enabled: status.opening_book_enabled,
@@ -698,8 +751,25 @@ export function validateHistoricalSearchedRegimeRuntimeSnapshot(input) {
     actual_search_contract_fingerprint: actualIdentity.search_contract_fingerprint,
     qualified_search_contract_fingerprint: searchContractFingerprint(profile.identity),
     actual_configuration_sha256: sha256Object(configuration),
-    reason: "explicit_historical_searched_regime_applicability",
+    reason: scope === "historical_searched_regime" ? "explicit_historical_searched_regime_applicability" : "explicit_continuous_searched_regime_applicability",
   };
+}
+
+export function validateHistoricalSearchedRegimeRuntimeSnapshot(input) {
+  return validateSearchedRegimeRuntimeSnapshot(input, PROFILE_SCHEMA, SEARCHED_REGIME_SCHEMA, "historical_searched_regime");
+}
+
+export function validateContinuousSearchedRegimeRuntimeSnapshot(input) {
+  return validateSearchedRegimeRuntimeSnapshot(input, CONTINUOUS_TIME_PROFILE_SCHEMA,
+    "uci_time_profile_continuous_searched_regime_runtime_status_v1", "continuous_searched_regime");
+}
+
+export function validateAppliedContinuousSearchedRegimeTimeProfileReserve(input) {
+  const acceptance = validateContinuousSearchedRegimeRuntimeSnapshot(input);
+  const applied = validateAppliedTimeProfileReserve(input.profile, input.status);
+  return { ...acceptance, applied: applied.applied, provider_service_reserve_us: applied.provider_service_reserve_us,
+    backup_emit_reserve_us: applied.backup_emit_reserve_us, iteration_forecast_scale_permille: applied.iteration_forecast_scale_permille,
+    reason: "continuous_searched_regime_validated_and_reserve_applied" };
 }
 
 export function validateAppliedSearchedRegimeTimeProfileReserve(input) {
