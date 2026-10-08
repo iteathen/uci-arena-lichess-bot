@@ -17,6 +17,7 @@ import {
   parseWindowsTaskResult,
   prepareWindowsStartupReplacement,
   quoteWindowsArgument,
+  queryWindowsStartup,
   recoverWindowsStartup,
   reconcileWindowsTaskXml,
   retargetWindowsTaskXml,
@@ -339,6 +340,62 @@ test("startup replacement retargets the owned task paths while preserving creden
   assert.match(updated, new RegExp(tokenFile.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "iu"));
   assert.match(updated, /<Settings>[\s\S]*?<Enabled>false<\/Enabled>/u);
   assert.match(updated, /<LogonTrigger>[\s\S]*?<Enabled>true<\/Enabled>/u);
+});
+
+test("inactive startup ownership rejects a foreign registration before completion", async (t) => {
+  if (process.platform !== "win32") return t.skip("Windows Task Scheduler contract");
+  const replacementRoot = path.resolve("owned-replacement");
+  await assert.rejects(queryWindowsStartup({
+    replacementRoot,
+    execute: async (_file, args) => ({ stdout: args.includes("/XML")
+      ? buildTaskXml(options(), "S-1-5-21-1")
+      : "Status: Ready\nScheduled Task State: Disabled\nLast Result: 0\n" }),
+  }), /receipt-owned component root/);
+});
+
+test("replacement preparation retries an already retargeted disabled task", async (t) => {
+  if (process.platform !== "win32") return t.skip("Windows Task Scheduler contract");
+  const previousRoot = path.dirname(path.dirname(NATIVE_LAUNCHER));
+  const replacementRoot = path.resolve("owned-replacement");
+  const runtimeDir = mkdtempSync(path.join(os.tmpdir(), "uci-arena-retargeted-retry-"));
+  t.after(() => rmSync(runtimeDir, { recursive: true, force: true }));
+  const updated = retargetWindowsTaskXml(buildTaskXml(options(), "S-1-5-21-1"), previousRoot, replacementRoot);
+  let published;
+  const prepared = await prepareWindowsStartupReplacement({
+    previousRoot, replacementRoot, runtimeDir,
+    execute: async (_file, args) => {
+      if (args[0] === "/Create") published = readFileSync(args[args.indexOf("/XML") + 1], "utf16le").slice(1);
+      return { stdout: args[0] === "/Query" ? updated : "" };
+    },
+    query: async () => ({ installed: true, active: false, enabled: false, taskStatus: "Disabled" }),
+  });
+  assert.equal(prepared.replacementReady, true);
+  assert.equal(published, updated);
+});
+
+test("retargeted active task retry fails before any platform control", async (t) => {
+  if (process.platform !== "win32") return t.skip("Windows Task Scheduler contract");
+  const previousRoot = path.dirname(path.dirname(NATIVE_LAUNCHER));
+  const replacementRoot = path.join(previousRoot, "owned-replacement");
+  const updated = retargetWindowsTaskXml(buildTaskXml(options(), "S-1-5-21-1"), previousRoot, replacementRoot);
+  await assert.rejects(prepareWindowsStartupReplacement({
+    previousRoot, replacementRoot, runtimeDir: os.tmpdir(),
+    execute: async (_file, args) => {
+      assert.equal(args[0], "/Query", "retry must reject before platform control");
+      return { stdout: updated };
+    },
+    query: async () => ({ installed: true, active: true, enabled: true, taskStatus: "Running" }),
+  }), /not disabled and inactive for retry/);
+});
+
+test("startup retarget preserves token paths in a sibling with the same root prefix", () => {
+  const previousRoot = path.dirname(path.dirname(NATIVE_LAUNCHER));
+  const replacementRoot = path.join(previousRoot, "owned-replacement");
+  const tokenFile = `${previousRoot}-operator-secrets\\token`;
+  const updated = retargetWindowsTaskXml(buildTaskXml({ ...options(), tokenFile }, "S-1-5-21-1"), previousRoot, replacementRoot);
+  assert.equal(updated.includes(tokenFile), true);
+  assert.throws(() => retargetWindowsTaskXml(updated, previousRoot, replacementRoot), /receipt-owned component root/);
+  assert.equal(retargetWindowsTaskXml(updated, replacementRoot, replacementRoot), updated);
 });
 
 test("startup replacement accepts the Task Scheduler default when task enablement is omitted", () => {
