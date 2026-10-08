@@ -5,7 +5,11 @@ import { isAbsolute, resolve } from "node:path";
 export const PROFILE_SCHEMA = "uci_time_profile_v3";
 export const PREVIOUS_PROFILE_SCHEMA = "uci_time_profile_v2";
 export const LEGACY_PROFILE_SCHEMA = "uci_time_profile_v1";
-export const TIME_POLICY_VERSION = "persistent_mcgs_relative_clock_temporal_v4";
+export const TIME_POLICY_VERSION = "persistent_mcgs_relative_clock_temporal_v5";
+export const SUPPORTED_TIME_POLICY_VERSIONS = Object.freeze([
+  "persistent_mcgs_relative_clock_temporal_v4",
+  TIME_POLICY_VERSION,
+]);
 export const REQUIRED_MCGS_TIME_POLICY = "RelativeClockTemporalV1";
 
 const BASE_TIMING_GATES = Object.freeze([
@@ -152,7 +156,7 @@ export function validateStoredProfile(profile) {
     throw new Error("timing profile backup/emission reserve is missing or invalid");
   }
   if (profile.schema === PROFILE_SCHEMA) {
-    if (profile.identity?.time_policy_version !== TIME_POLICY_VERSION) {
+    if (!SUPPORTED_TIME_POLICY_VERSIONS.includes(profile.identity?.time_policy_version)) {
       throw new Error(
         `timing profile time policy is stale: ${profile.identity?.time_policy_version ?? "missing"}`,
       );
@@ -265,9 +269,9 @@ export function validateRuntimeIdentity(status, options, label = "runtime_status
   if (typeof status.provider_effective !== "string" || status.provider_effective.length === 0) {
     throw new Error(`${label}: provider_effective is empty`);
   }
-  if (status.timing_contract_version !== TIME_POLICY_VERSION) {
+  if (!SUPPORTED_TIME_POLICY_VERSIONS.includes(status.timing_contract_version)) {
     throw new Error(
-      `${label}.timing_contract_version expected ${TIME_POLICY_VERSION}`
+      `${label}.timing_contract_version expected one of ${SUPPORTED_TIME_POLICY_VERSIONS.join(", ")}`
       + ` got ${JSON.stringify(status.timing_contract_version)}`,
     );
   }
@@ -397,7 +401,7 @@ export function buildProfileIdentity(status, engine, commandIdentity, options) {
   };
   const search = materialSearchConfiguration(status, options);
   return {
-    time_policy_version: TIME_POLICY_VERSION,
+    time_policy_version: status.timing_contract_version,
     search_contract_fingerprint: searchContractFingerprint({
       time_policy_version: status.timing_contract_version,
       search,
@@ -487,6 +491,13 @@ export function loadTimeProfile(filename, cwd = process.cwd()) {
 
 export function validateAppliedTimeProfileReserve(profileValue, status) {
   const profile = validateStoredProfile(profileValue);
+  if (profile.schema === PROFILE_SCHEMA
+      && status?.timing_contract_version !== profile.identity.time_policy_version) {
+    throw new Error(
+      `Timing-profile timing_contract_version expected ${profile.identity.time_policy_version}`
+      + ` got ${JSON.stringify(status?.timing_contract_version)}`,
+    );
+  }
   const expectedProviderReserveUs = profile.calibration.provider_service_reserve_us;
   const expectedForecastScalePermille = profile.calibration.iteration_forecast_scale_permille;
   const expectedBackupEmitReserveUs = profile.calibration.backup_emit_reserve_us;

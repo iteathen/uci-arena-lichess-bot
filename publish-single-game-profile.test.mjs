@@ -28,7 +28,7 @@ function sha256(value) {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
 }
 
-function fixture(searchCore = "v2") {
+function fixture(searchCore = "v2", timePolicyVersion = TIME_POLICY_VERSION) {
   const root = mkdtempSync(path.join(os.tmpdir(), "uci-single-game-profile-"));
   const engine = path.join(root, "uci_arena_engine.exe");
   const modelRoot = path.join(root, "models", "default");
@@ -43,7 +43,7 @@ function fixture(searchCore = "v2") {
   }));
   const engineSha = sha256("exact-engine");
   const identity = {
-    time_policy_version: TIME_POLICY_VERSION,
+    time_policy_version: timePolicyVersion,
     engine: { executable_sha256: engineSha },
     model: {
       model_id: "model-a",
@@ -877,9 +877,10 @@ test("continuous historical searched regime preserves actual enabled book and ke
   assert.equal(loadSingleGameProfile(options.output).runtime_binding.timing_profile.whole_runtime_timing_authority_match, false);
 });
 
-async function scopedRuntimeFixture() {
-  const options = fixture("mcgs");
-  const diagnostic = continuousDiagnosticFixture(options);
+async function scopedRuntimeFixture({ profileVersion = TIME_POLICY_VERSION, runtimeVersion = TIME_POLICY_VERSION } = {}) {
+  const baselineOptions = fixture("mcgs");
+  const diagnostic = continuousDiagnosticFixture(baselineOptions);
+  const options = profileVersion === TIME_POLICY_VERSION ? baselineOptions : fixture("mcgs", profileVersion);
   const selected = { ...diagnostic.binding.effective_options.model, OwnBook: "true", "Move Overhead": "650" };
   delete selected.McgsTemporalWeightProfile;
   const engine = new UciEngine({ executable: options.engine, arguments: [], working_directory: path.dirname(options.engine),
@@ -891,7 +892,7 @@ async function scopedRuntimeFixture() {
   engine.send = () => {};
   engine.exchange = async () => "readyok";
   engine.appliedUciOptions = { Ponder: "true", "Move Overhead": "650" };
-  engine.runtimeStatus = async () => ({ schema: "uci_runtime_status_v1", timing_contract_version: TIME_POLICY_VERSION,
+  engine.runtimeStatus = async () => ({ schema: "uci_runtime_status_v1", timing_contract_version: runtimeVersion,
     model_loaded: true, model_id: "model-a", model_fingerprint: "123", adapter_id: "adapter-a",
     provider_requested: "directml", provider_effective: "directml", provider_numeric_fingerprint: "456",
     hardware_driver_fingerprint: "789", onnx_runtime_version: "1.2.3", search_core_configured: "mcgs",
@@ -918,6 +919,44 @@ test("Bot applies actual reserves through the public scoped operation with book 
   assert.equal(result.configured_opening_book_enabled, true);
   assert.equal(result.provider_service_reserve_us, 2000);
   assert.equal(Object.hasOwn(result, "timing_authority_match"), false);
+});
+
+for (const [profileVersion, runtimeVersion, accepted] of [
+  ["persistent_mcgs_relative_clock_temporal_v5", "persistent_mcgs_relative_clock_temporal_v5", true],
+  ["persistent_mcgs_relative_clock_temporal_v4", "persistent_mcgs_relative_clock_temporal_v4", true],
+  ["persistent_mcgs_relative_clock_temporal_v4", "persistent_mcgs_relative_clock_temporal_v5", false],
+  ["persistent_mcgs_relative_clock_temporal_v5", "persistent_mcgs_relative_clock_temporal_v4", false],
+  ["persistent_mcgs_relative_clock_temporal_v5", "persistent_mcgs_relative_clock_temporal_v999", false],
+  ["persistent_mcgs_relative_clock_temporal_v5", undefined, false],
+]) {
+  test(`Bot native timing compatibility ${profileVersion}/${runtimeVersion} accepts=${accepted}`, async () => {
+    // Null makes the missing runtime fact explicit rather than selecting the default fixture version.
+    const { result, engine, options } = await scopedRuntimeFixture({ profileVersion, runtimeVersion: runtimeVersion ?? null });
+    assert.equal(result.accepted, accepted, result.reason);
+    assert.equal(result.applied, accepted);
+    const retained = JSON.parse(readFileSync(options.time_profile, "utf8"));
+    assert.equal(retained.identity.time_policy_version, profileVersion);
+    if (accepted) {
+      assert.equal(result.provider_service_reserve_us, 2000);
+      assert.equal(result.searched_regime_timing_authority_match, true);
+      assert.equal(result.whole_runtime_timing_authority_match, false);
+      assert.equal(engine.config.uci_options.OwnBook, "true");
+    } else {
+      assert.equal(result.provider_service_reserve_us, 0);
+      assert.match(result.reason, /timing_contract_version|time policy|identity mismatch/);
+    }
+  });
+}
+
+test("Bot rejects an unknown stored timing policy before applying reserves", async () => {
+  const { result } = await scopedRuntimeFixture({
+    profileVersion: "persistent_mcgs_relative_clock_temporal_v999",
+    runtimeVersion: "persistent_mcgs_relative_clock_temporal_v999",
+  });
+  assert.equal(result.accepted, false);
+  assert.equal(result.applied, false);
+  assert.equal(result.provider_service_reserve_us, 0);
+  assert.match(result.reason, /time policy is stale/);
 });
 
 

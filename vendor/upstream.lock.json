@@ -1,10 +1,10 @@
 {
   "schema": "uci_arena_upstream_vendor_lock_v1",
   "source_repository": "iteathen/uci-arena-engine",
-  "source_commit": "f72d6da36973f136117c29394e06392f8094e13d",
+  "source_commit": "3d33a7551258b6e36d5443e656658d3b1ea68376",
   "packages": {
     "@uci-arena/background-service-runtime": "1.2.0",
-    "@uci-arena/time-profile-contract": "1.3.0"
+    "@uci-arena/time-profile-contract": "1.4.0"
   },
   "files": {
     "background-service-runtime/README.md": "fd9c819212cb93769853145a06f2ef6c0923c342a4251f3913b7b3d4bf3bf362",
@@ -25,9 +25,9 @@
     "background-service-runtime/test/process-instance-query.test.mjs": "2a9ac60640b75b3e9f972dd7e367e231895d05bf549719e3f38bc04545e09598",
     "background-service-runtime/test/resource-isolation.test.mjs": "e5006c275a8fac8198a9e2b56c20973e4f608533645dcb3654f9908b34b792a0",
     "background-service-runtime/test/resource-lease.test.mjs": "9b92a0559988367b3904883cf8715e87b2fa561fbf8fc8903cf58d970bbba54f",
-    "time-profile-contract/README.md": "17759afe8f9e31acaf410d463a3a155e1d4c45c90e167a378b64f136c41209bd",
-    "time-profile-contract/package.json": "14fcbd8d05cedb8bcc789a73a1ea4fd3e8650e614e5aae99d99a474143183d04",
-    "time-profile-contract/src/index.mjs": "03fbf4f3b6fe358572ea4dbb09f2f0c05ebf003ef622a0e8955d0b7a9aef7108",
-    "time-profile-contract/test/contract.test.mjs": "09984beba26ab9c7e35801d94fce8b4e4cb49239d6f021e7dbd322d19c2ed318"
+    "time-profile-contract/README.md": "8f5116e0bd439a700bad516cc64bfdea02ce57a99ec884e97d47223e6f6c4ca6",
+    "time-profile-contract/package.json": "eee0fe424ad49b2408da931eba5915e3c7094701e963f206841ffbe1b614ba81",
+    "time-profile-contract/src/index.mjs": "1f992a08da98b306473a5ce9c4f407fba8c60f9a1a49fd3c97348b4d6a40b047",
+    "time-profile-contract/test/contract.test.mjs": "ff3097cfc7ce3d6be6e095b570d61e33eebc23b54d597ba21d04a89656ff20bc"
   }
 }

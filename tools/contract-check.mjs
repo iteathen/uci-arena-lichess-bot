@@ -58,8 +58,8 @@ if (diagnosticSchema.$id !== "uci_continuous_complete_game_diagnostic_v1"
     || !expectedPublicCopies.every((file) => sourceClosure.required_source_paths.includes(file))) {
   errors.push("continuous diagnostic public owner schema/source declaration is incompatible");
 }
-if (readJson("vendor/time-profile-contract/package.json").version !== "1.3.0") {
-  errors.push("continuous searched-regime adapter requires public time-profile contract 1.3.0");
+if (readJson("vendor/time-profile-contract/package.json").version !== "1.4.0") {
+  errors.push("continuous searched-regime adapter requires public time-profile contract 1.4.0");
 }
 
 function exactKeys(value, schema, label) {
