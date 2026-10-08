@@ -251,8 +251,12 @@ export function safePublicPath(value, label) {
     && !/[\u0000\r\n]/.test(value), `${label} public path is invalid`);
   const parts = value.replaceAll("\\", "/").split("/");
   requireContinuous(!parts.some((part) => /[. ]$/.test(part)), `${label} ambiguous trailing-dot/space path segment`);
-  requireContinuous(!parts.some((part) => /^(secrets?|credentials?|\.ssh|\.aws|\.azure|\.git)$/i.test(part))
-    && !/^(lichess[_-]bot[_-]token\.txt|auth\.json|credentials?\.json|client\.key|.*\.(pem|p12|pfx|key))$/i.test(parts.at(-1)),
+  requireContinuous(!parts.some((part) =>
+    /^(?:secrets?|credentials?|tokens?|private|signing|client[_-]?keys?)(?:[._-]|$)/i.test(part)
+    || /^\.(?:git|env|ssh|aws|azure|gcp)(?:\.|$)/i.test(part)
+    || /^(?:lichess_bot_token\.txt|auth\.json)$/i.test(part)
+    || /\.(?:pem|key|p12|pfx|jks|keystore)$/i.test(part)
+    || /(?:^|[^a-z0-9])(?:token|secret|password|credential|private[_-]?key|client[_-]?key|signing[_-]?key)(?:[^a-z0-9]|$)/i.test(part)),
   `${label} forbidden credential or private path`);
 }
 export function samePublicPath(left, right, workingDirectory = process.cwd()) {
@@ -315,7 +319,7 @@ export function validateModelAssetDeclaration(value) {
   for (const relative of [value.selected_relative_file, ...value.required_relative_files]) {
     safePublicPath(relative, "declared model input");
     requireContinuous(relative.length <= 1024 && !path.isAbsolute(relative) && !/^[A-Za-z]:/.test(relative)
-      && !relative.includes("\\") && relative.split("/").every((segment) => segment && segment !== "." && segment !== "..")
+      && !relative.includes("\\") && !relative.includes(":") && relative.split("/").every((segment) => segment && segment !== "." && segment !== "..")
       && publicModelAsset(relative, true), "declared model input is not a safe public relative package asset");
   }
   requireContinuous(new Set(value.required_relative_files).size === value.required_relative_files.length

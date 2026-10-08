@@ -2079,10 +2079,18 @@ export function loadCapacityProfile(
         "capacity continuous evidence schema is unsupported");
       validateContinuousCapacityStatus(status, singleGameProfile);
     }
-    requireContinuous(new Set(capacity.evidence.map((status) => sha256Json(status.engine_process_identity))).size === capacity.evidence.length,
-      "capacity cohort repeats one child process instance");
+    requireDistinctContinuousChildren(capacity.evidence);
   }
   return { ...capacity, profile_path: resolvedPath };
+}
+
+function requireDistinctContinuousChildren(statuses) {
+  requireContinuous(statuses.length >= 1 && statuses.length <= 64, "capacity cohort exceeds its supported child bound");
+  for (let index = 0; index < statuses.length; index += 1) {
+    requireContinuous(!statuses.some((prior, priorIndex) => priorIndex < index
+      && sameProcessInstance(prior.engine_process_identity, statuses[index].engine_process_identity)),
+    "capacity cohort repeats one child process instance");
+  }
 }
 
 function validateContinuousCapacityStatus(status, singleGameProfile) {
@@ -2155,8 +2163,7 @@ export function publishCapacityProfile(
   const continuous = singleGameProfile?.schema === CONTINUOUS_PROFILE_SCHEMA;
   if (continuous) {
     statuses.forEach((status) => validateContinuousCapacityStatus(status, singleGameProfile));
-    requireContinuous(new Set(statuses.map((status) => sha256Json(status.engine_process_identity))).size === statuses.length,
-      "capacity cohort repeats one child process instance");
+    requireDistinctContinuousChildren(statuses);
   }
   const target = path.resolve(targetPath);
   ensureExactDirectorySync(path.dirname(target), "Lichess capacity profile directory");

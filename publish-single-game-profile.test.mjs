@@ -16,11 +16,13 @@ import {
   TIME_POLICY_VERSION,
 } from "@uci-arena/time-profile-contract";
 
+import { sameProcessInstance } from "./process-instance-identity.mjs";
+
 import { continuousDiagnosticFixture } from "./test-fixtures/continuous-game-diagnostic.mjs";
 
 import { loadSingleGameProfile, applySingleGameProfile, UciEngine, publishCapacityProfile, loadCapacityProfile, gameRuntimeProvenance } from "./lichess-adapter.mjs";
 import { publishSingleGameProfile } from "./publish-single-game-profile.mjs";
-import { validateContinuousGameDiagnostic } from "./continuous-game-qualification.mjs";
+import { validateContinuousGameDiagnostic, safePublicPath, validateModelAssetDeclaration } from "./continuous-game-qualification.mjs";
 
 function sha256(value) {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
@@ -701,6 +703,32 @@ test("continuous capacity v2 round trip binds profile and actual per-child nativ
   assert.equal(loaded.evidence[0].model_asset_observation.model_selected_artifact, "model.onnx");
 });
 
+test("continuous capacity rejects the same Windows child under case/separator aliases before replacement and on load", () => {
+  const { target, config, single, status } = continuousCapacityFixture();
+  const identity = { schema: "uci_arena_process_instance_identity_v1", platform: "win32", pid: 123,
+    start_token: "638000000000000000", executable_path: "C:/Public Engine/engine.exe", boot_id: "" };
+  status.engine_process_identity = identity;
+  status.qualification_cleanup.engine_process_identity = identity;
+  publishCapacityProfile(target, 1, config, single, [status]);
+  const prior = readFileSync(target);
+  const alias = structuredClone(status);
+  alias.engine_process_identity.executable_path = identity.executable_path.replaceAll("/", "\\").toUpperCase();
+  alias.qualification_cleanup.engine_process_identity = alias.engine_process_identity;
+  assert.equal(sameProcessInstance(identity, alias.engine_process_identity), true);
+  assert.throws(() => publishCapacityProfile(target, 2, config, single, [status, alias]), /repeats one child/);
+  assert.deepEqual(readFileSync(target), prior);
+  const retained = JSON.parse(prior);
+  retained.maximum_concurrency = 2;
+  retained.evidence.push({ ...structuredClone(alias), schema: "uci_arena_continuous_runtime_qualification_v1", child: 2 });
+  writeFileSync(target, JSON.stringify(retained));
+  assert.throws(() => loadCapacityProfile(target, config, single), /repeats one child/);
+  alias.engine_process_identity.start_token = "638000000000000001";
+  alias.qualification_cleanup.engine_process_identity = alias.engine_process_identity;
+  assert.equal(sameProcessInstance(identity, alias.engine_process_identity), false);
+  publishCapacityProfile(target, 2, config, single, [status, alias]);
+  assert.equal(loadCapacityProfile(target, config, single).maximum_concurrency, 2);
+});
+
 test("continuous capacity retains the exact-runtime public timing branch", () => {
   const { target, config, single, status } = continuousCapacityFixture(false);
   publishCapacityProfile(target, 1, config, single, [status]);
@@ -773,6 +801,30 @@ for (const relative of ["secrets/synthetic-private.json", "runtime_adapters/cred
     assert.deepEqual(calls, []);
   });
 }
+
+for (const relative of ["client-key.json", "signing-key.json", "private_key.json", "token.json",
+  "nested/password-data.json", "nested/credentials-data.json", "keys/service-client-key.json",
+  "keys/service-secret.json", ".env.json", "nested/private/assets.json", "model.onnx:auth.json"]) {
+  test(`continuous protected required model path ${JSON.stringify(relative)} rejects before any IO`, () => {
+    const options = fixture("mcgs");
+    const diagnostic = continuousDiagnosticFixture(options);
+    diagnostic.binding.model.asset_declaration.required_relative_files.push(relative);
+    diagnostic.binding.model.files.push({ path: path.join(options.model_root, relative), sha256: `sha256:${"f".repeat(64)}` });
+    const calls = [];
+    assert.throws(() => validateContinuousGameDiagnostic(diagnostic, { fileAuthority: {
+      hashExactFileSync: (...args) => { calls.push(args); throw new Error("must not hash"); },
+      readExactJsonSync: (...args) => { calls.push(args); throw new Error("must not read"); },
+    } }), /forbidden|protected|safe public/);
+    assert.deepEqual(calls, []);
+  });
+}
+
+test("continuous public path admission preserves absolute Windows drive context and ordinary model inputs", () => {
+  safePublicPath("C:/Public Models/runtime_adapters/contract.json", "public absolute drive context");
+  assert.deepEqual(validateModelAssetDeclaration({ supported: true, selected_relative_file: "model.onnx",
+    required_relative_files: ["model.onnx", "runtime_adapters/chess_v1_dense_planes_contract.json"] }),
+  ["model.onnx", "runtime_adapters/chess_v1_dense_planes_contract.json"]);
+});
 
 test("continuous model closure rejects an omitted declared native input", () => {
   const options = fixture("mcgs");
