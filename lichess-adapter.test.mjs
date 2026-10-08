@@ -60,6 +60,8 @@ import {
 import { ApiSafetyCoordinator, LichessHttpError } from "./lichess-scheduler.mjs";
 import { LichessStore } from "./lichess-store.mjs";
 import { startFakeLichessApi } from "./fake-api-server.mjs";
+import { buildProfileIdentity, engineCommandIdentity, sha256Object, validateProfileRuntimeSnapshot,
+  TIME_POLICY_VERSION } from "@uci-arena/time-profile-contract";
 import {
   AuthoritativeChessState,
   validateLegalMoveAtAuthoritativeRoot,
@@ -1134,7 +1136,7 @@ test("component identity is explicit, inventory-bound, and null for external UCI
   const provider = providerComponentIdentity();
   assert.deepEqual(provider, {
     componentId: "lichess.adapter",
-    version: "1.0.31",
+    version: "1.0.32",
     manifestSha256: sha256(readFileSync(path.join(ROOT, "contracts", "component-manifest.json"))),
   });
 
@@ -2003,7 +2005,7 @@ test("qualified MCGS profile owns graph and batching topology", () => {
 });
 
 test("MCGS timing identity includes graph and outstanding-work topology", () => {
-  const engine = Object.create(UciEngine.prototype);
+  const engine = new UciEngine({ uci_options: {} });
   engine.config = {
     uci_options: {
       SearchCore: "mcgs",
@@ -2569,6 +2571,41 @@ test("timing identity excludes independently validated local knowledge options",
       TimePolicy: "RelativeClockV2",
     },
   );
+});
+
+test("timing runtime configuration reports actual enabled book instead of the legacy false default", () => {
+  const engine = new UciEngine({ uci_options: { OwnBook: true } });
+  assert.equal(engine.timeProfileConfiguration().ownBook, true);
+  engine.config.uci_options.OwnBook = false;
+  assert.equal(engine.timeProfileConfiguration().ownBook, false);
+});
+
+test("legacy exact timing caller rejects enabled book against unchanged false-book profile", () => {
+  const fixture = qualifiedFixture();
+  applySingleGameProfile(fixture.config);
+  fixture.config.engine.uci_options.OwnBook = false;
+  fixture.config.engine.uci_options.McgsTimePolicy = "RelativeClockTemporalV1";
+  const engine = new UciEngine(fixture.config.engine);
+  const status = { ...qualifiedRuntimeStatus(fixture.profile), timing_contract_version: TIME_POLICY_VERSION,
+    time_profile_provider_reserve_us: 0, time_profile_backup_emit_reserve_us: 1000,
+    time_profile_iteration_forecast_scale_permille: 1000,
+    search_graph_mb_configured: fixture.profile.search_graph_mb,
+    mcgs_cpuct_permille_configured: fixture.profile.mcgs_cpuct_permille,
+    mcgs_outstanding_batches_configured: fixture.profile.mcgs_outstanding_batches };
+  const uciIdLines = ["id name explicit test engine"];
+  const uciOptionLines = ["option name OwnBook type check default true"];
+  const configuration = engine.timeProfileConfiguration();
+  const identity = buildProfileIdentity(status, { idLines: uciIdLines, optionLines: uciOptionLines },
+    engineCommandIdentity({ engine: fixture.config.engine.executable, engineArgs: [], cwd: fixture.directory }), configuration);
+  const stored = { schema: "uci_time_profile_v3", qualified: true, gates: { passed: true },
+    predictive_controller: { enabled_by_profile: false, default_enabled: false }, identity, identity_sha256: sha256Object(identity),
+    calibration: { provider_batch_reserve_us: 2000, backup_emit_reserve_us: 1000, iteration_forecast_scale_permille: 1000 },
+    applicability: { move_overhead_ms: { minimum: 250, maximum: 1500, tested_values: [250, 650, 700, 1500] } } };
+  const input = { profile: stored, status, executable: fixture.config.engine.executable, cwd: fixture.directory,
+    uciIdLines, uciOptionLines, configuration };
+  assert.equal(validateProfileRuntimeSnapshot(input).timing_authority_match, true);
+  fixture.config.engine.uci_options.OwnBook = true;
+  assert.throws(() => validateProfileRuntimeSnapshot({ ...input, configuration: engine.timeProfileConfiguration() }), /opening_book/);
 });
 
 test("missing timing profile remains observable with zero reserve and controller disabled", async () => {
@@ -5576,4 +5613,17 @@ test("qualification preserves a frozen non-Error startup reason without mutation
   await assert.rejects(main(["qualify", "--config", fixture.configPath]),
     (error) => error.cause === primary && error.cleanupDiagnostics.length === 1);
   assert.deepEqual(primary, { reason: "fixture startup failure" });
+});
+
+
+test("additive canonical position observation preserves raw en-passant and full legal moves", () => {
+  const state = new AuthoritativeChessState("startpos");
+  state.synchronize(["e2e4"]);
+  const observed = state.positionObservation();
+  assert.equal(observed.fen.split(" ")[3], "e3");
+  assert.equal(observed.legal_moves.length, 20);
+  assert.equal(new Set(observed.legal_moves).size, 20);
+  assert.ok(observed.legal_moves.includes("e7e5"));
+  assert.equal(observed.terminal, false);
+  assert.equal(state.synchronize(["e2e4"]).rootFen.split(" ")[3], "-");
 });

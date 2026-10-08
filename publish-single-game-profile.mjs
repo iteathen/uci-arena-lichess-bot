@@ -8,6 +8,9 @@ import {
   PROFILE_SCHEMA,
   validateStoredProfile,
 } from "@uci-arena/time-profile-contract";
+import { validateTimingProfile } from "./single-game-profile-validation.mjs";
+import { CONTINUOUS_DIAGNOSTIC_SCHEMA, CONTINUOUS_PROFILE_SCHEMA, CONTINUOUS_AUTHORITY,
+  validateContinuousGameDiagnostic } from "./continuous-game-qualification.mjs";
 import {
   activateExactDirectorySync,
   admitExactDirectorySync,
@@ -96,67 +99,6 @@ function parseArguments(argv) {
   return { ...options, qualification_scope: scope, probe_depth: depth, probe_timeout_ms: timeoutMs };
 }
 
-function validateTimingProfile(input, checkpoint) {
-  const profile = validateStoredProfile(input);
-  requireValue(profile.schema === PROFILE_SCHEMA,
-    "Timing evidence schema is not uci_time_profile_v3");
-  requireInteger(
-    profile.qualification?.repetitions_per_case,
-    "Timing-profile repetitions per case",
-    30,
-    100,
-  );
-  for (const gate of [
-    "legal_moves",
-    "nonterminal_null_moves",
-    "controller_disabled",
-    "provider_timing_captured",
-    "provider_service_reserve_valid",
-    "applied_provider_service_reserve_covered",
-    "applied_backup_emit_reserve_covered",
-    "p99_deadline_overshoot_passed",
-    "maximum_deadline_overshoot_passed",
-    "passed",
-  ]) {
-    requireValue(profile.gates?.[gate] === true, `Timing-profile gate ${gate} did not pass`);
-  }
-  const identity = profile.identity;
-  requireValue(new Set(["v2", "mcgs"]).has(identity?.search?.search_core),
-    "Timing profile did not qualify a supported search core");
-  requireValue(new Set(["directml", "cuda"]).has(identity.search.provider_effective),
-    "Timing profile did not retain a supported GPU provider");
-  requireValue(identity.search.provider_requested === identity.search.provider_effective,
-    "Timing-profile provider request/effective identity differs");
-  requireValue(identity.search.background_search === false,
-    "Timing profile must disable background search");
-  same(identity.model.model_id, checkpoint.model_id, "Timing-profile model id");
-  if (identity.search.search_core === "mcgs") {
-    for (const gate of [
-      "mcgs_root_coverage_passed",
-      "mcgs_policy_only_fallback_passed",
-      "mcgs_graph_population_passed",
-      "mcgs_async_overlap_passed",
-      "mcgs_single_owner_passed",
-      "mcgs_low_budget_fallback_passed",
-      "mcgs_deterministic_fallback_passed",
-      "mcgs_completion_integrity_passed",
-      "mcgs_temporal_policy_passed",
-      "mcgs_deadline_tail_telemetry_passed",
-    ]) {
-      requireValue(profile.gates?.[gate] === true,
-        `Timing-profile MCGS gate ${gate} did not pass`);
-    }
-    const mcgs = identity.search.mcgs;
-    requireValue(mcgs?.time_policy === "RelativeClockTemporalV1",
-      "Timing-profile MCGS temporal policy is not RelativeClockTemporalV1");
-    requireInteger(mcgs.search_graph_mb, "Timing-profile MCGS graph size", 64, 4_096);
-    requireInteger(mcgs.cpuct_permille, "Timing-profile MCGS Cpuct", 100, 10_000);
-    requireInteger(mcgs.outstanding_batches, "Timing-profile MCGS outstanding batches", 1, 4);
-    requireInteger(mcgs.book_prior_blend_permille,
-      "Timing-profile MCGS book-prior blend", 0, 500);
-  }
-  return identity;
-}
 
 function validateMcgsCompleteGame(runtime) {
   for (const [value, label] of [
@@ -400,14 +342,16 @@ export function publishSingleGameProfile(options) {
     maximumBytes: PROFILE_FILE_LIMIT,
     label: "Complete-game evidence",
   });
-  const tablebase = validateCompleteGame(
-    admittedCompleteGame.value,
-    identity,
-    executableSha,
-    scope,
-    timeProfile,
-    timeProfileSha,
-  );
+  const continuous = admittedCompleteGame.value?.schema === CONTINUOUS_DIAGNOSTIC_SCHEMA;
+  if (continuous) {
+    requireValue(scope === LOCAL_SCOPE, "Continuous profile v2 is local_live_safety only");
+    requireValue(admittedCompleteGame.byteLength < PROFILE_FILE_LIMIT, "Continuous evidence exceeds exclusive artifact byte bound");
+  }
+  const tablebase = continuous
+    ? validateContinuousGameDiagnostic(admittedCompleteGame.value, {
+      executableSha, modelRoot, identity, timeProfile, timeProfileSha,
+    }).tablebase
+    : validateCompleteGame(admittedCompleteGame.value, identity, executableSha, scope, timeProfile, timeProfileSha);
 
   const completeGameSha = admittedCompleteGame.sha256;
   const evidenceRoot = path.join(path.dirname(output), "evidence");
@@ -428,7 +372,7 @@ export function publishSingleGameProfile(options) {
     artifact_sha256: completeGameSha,
   };
   const profile = {
-    schema: "uci_arena_single_game_profile_v1",
+    schema: continuous ? CONTINUOUS_PROFILE_SCHEMA : "uci_arena_single_game_profile_v1",
     qualified: true,
     qualification_scope: scope,
     published_at: new Date().toISOString(),
@@ -448,16 +392,14 @@ export function publishSingleGameProfile(options) {
     batch_size: identity.search.batch_size_effective,
     batch_wait_us: identity.search.batch_wait_us_effective,
     speculation: identity.search.nn_speculation,
-    qualification_probe: {
-      depth: options.probe_depth ?? 6,
-      timeout_ms: options.probe_timeout_ms ?? 240_000,
-    },
-    evidence: {
-      cursor_correctness: completeGameEvidence,
-      provider_parity: timingProfileEvidence,
-      deadline: timingProfileEvidence,
-      topology: completeGameEvidence,
-      complete_game: completeGameEvidence,
+    qualification_probe: continuous ? {
+      publication_wait_ms: admittedCompleteGame.value.configuration.startup_publication_wait_ms,
+      publication_timeout_ms: admittedCompleteGame.value.configuration.publication_timeout_ms,
+      publication_count: 1, candidate_sample_count: 1, read_only_candidate_request: true,
+    } : { depth: options.probe_depth ?? 6, timeout_ms: options.probe_timeout_ms ?? 240_000 },
+    evidence: continuous ? { continuous_game: completeGameEvidence, timing: timingProfileEvidence } : {
+      cursor_correctness: completeGameEvidence, provider_parity: timingProfileEvidence,
+      deadline: timingProfileEvidence, topology: completeGameEvidence, complete_game: completeGameEvidence,
     },
   };
   if (identity.search.search_core === "mcgs") {
@@ -469,8 +411,13 @@ export function publishSingleGameProfile(options) {
         identity.search.mcgs.book_prior_blend_permille,
     });
   }
+  if (continuous) {
+    profile.runtime_binding = admittedCompleteGame.value.binding;
+    profile.diagnostic_authority = CONTINUOUS_AUTHORITY;
+    profile.diagnostic_configuration = admittedCompleteGame.value.configuration;
+  }
   if (tablebase) profile.tablebase = tablebase;
-  requireValue(profile.qualification_probe.depth >= profile.split_depth,
+  requireValue(continuous || profile.qualification_probe.depth >= profile.split_depth,
     "Qualification probe depth must be at least split depth");
   ensureExactDirectorySync(path.dirname(output), "Single-game profile directory");
   ensureExactDirectorySync(evidenceRoot, "Single-game evidence directory");

@@ -1,0 +1,16 @@
+{
+  "schema": "uci_arena_public_contract_snapshot_v1",
+  "source_repository": "iteathen/uci-arena-engine",
+  "source_commit": "770099de00427ab800ea1b1d203205fe89c47e26",
+  "encoding": "utf8_lf_git_blob",
+  "files": {
+    "contracts/continuous-game-diagnostic.schema.json": {
+      "upstream_path": "contracts/continuous-game-diagnostic.schema.json",
+      "sha256": "f372738108b99720c93e5b6a404fabb21e9b047d5888accac1bc05b495d1f4df"
+    },
+    "contracts/continuous-game-diagnostic-source-closure.v1.json": {
+      "upstream_path": "contracts/continuous-game-diagnostic-source-closure.v1.json",
+      "sha256": "43fdd8fca83a226d7f9c18f952c0a1e6c013fdd4ebc2fdfc8501d4ec8410a9bc"
+    }
+  }
+}

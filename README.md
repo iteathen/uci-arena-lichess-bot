@@ -224,6 +224,31 @@ recorded but does not invalidate compatible timing. The publisher copies both
 immutable inputs beside the generated profile and never replaces prior
 authority when validation fails.
 
+The additive `uci_arena_single_game_profile_v2` path consumes the Engine-owned
+`uci_continuous_complete_game_diagnostic_v1` artifact with
+`--qualification-scope local_live_safety`. It requires the genuine completed
+opposite-color pair, bounded legal current-focus publications, the complete
+canonical candidate set, continuous owner/resource observations, and final
+native join plus unsignalled zero process exit and stdio close. Live work may
+remain active at publication; actual partial seed counts are retained. Existing
+v1/v3/v4 evidence keeps its original gates.
+
+This profile grants local runtime safety only. Timing remains governed by the
+immutable qualified timing profile and public application contract; strength,
+performance and release authority remain false. The 1.3 historical searched
+regime can bind an actual enabled book with zero prior blend while reporting
+whole-runtime timing authority separately. It never rewrites the actual
+configuration or buys an unaffordable partial useful timing block.
+
+The exact executable/arguments/cwd, complete Engine-owned source manifest,
+model owner's selected/required assets, provider/runtime/hardware, options,
+book and tablebase assets are checked before publication and startup. Each
+fresh child establishes its own process and game-lifetime baseline. The existing
+capacity v2 envelope binds the exact new single-game profile hash and retains
+its distinct continuous per-child evidence; a failed native/process close
+cannot create or replace capacity authority. No fixture or incomplete diagnostic
+attempt may be published as completed safety evidence.
+
 Validate the exact engine package before using credentials:
 
 ```powershell
