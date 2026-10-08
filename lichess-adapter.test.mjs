@@ -37,6 +37,7 @@ import {
   parseArguments,
   parseRuntimeStatus,
   probeAccount,
+  publishCapacityProfile,
   providerComponentIdentity,
   providerStatusProjection,
   replacementStartupReadiness,
@@ -5332,4 +5333,247 @@ test("timeout cancellation 404 recovers an already-started game without releasin
     await controller.slots.drainAll();
     store.close();
   }
+});
+
+
+function shutdownQualificationFixture(t) {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-qualification-close-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const configPath = path.join(directory, "config.json");
+  const raw = JSON.parse(readFileSync(DEFAULT_TEMPLATE, "utf8"));
+  raw.engine = { adapter: "standard_uci_v1", executable: process.execPath,
+    arguments: [path.join(ROOT, "test-fixtures", "fake-standard-uci-engine.mjs")],
+    working_directory: directory, uci_options: {}, shutdown_grace_ms: 1_000 };
+  raw.capacity = { total_slots: 1, capacity_profile: null, startup_parallelism: 1,
+    human: { slots: 1, allow_borrowing: false, accept_public: true },
+    bot: { slots: 0, target_active: 0 } };
+  raw.scheduler.enabled = false;
+  writeFileSync(configPath, JSON.stringify(raw));
+  return { directory, configPath, config: loadRuntimeConfig({ templatePath: configPath }) };
+}
+
+test("capacity qualification rejects child cleanup failure before replacing evidence", { concurrency: false }, async (t) => {
+  const fixture = shutdownQualificationFixture(t);
+  const output = path.join(fixture.directory, "capacity.json");
+  writeFileSync(output, "prior authoritative capacity");
+  t.mock.method(console, "log", () => {});
+  const originalClose = UciEngine.prototype.close;
+  t.mock.method(UciEngine.prototype, "close", async function () {
+    throw new Error("fixture child cleanup failed");
+  });
+  // Inject only cleanup failure; startup still executes real UCI.
+  const engines = [];
+  const originalStart = UciEngine.prototype.start;
+  t.mock.method(UciEngine.prototype, "start", async function () {
+    engines.push(this);
+    return originalStart.call(this);
+  });
+  try {
+    await assert.rejects(main(["capacity-qualify", "--config", fixture.configPath,
+      "--capacity-profile", output, "--max-concurrency", "2"]), /cleanup failed/);
+    assert.equal(readFileSync(output, "utf8"), "prior authoritative capacity");
+  } finally {
+    await Promise.all(engines.map((engine) => originalClose.call(engine)));
+  }
+});
+
+test("qualification child close rejects actual nonzero exit", async (t) => {
+  const fixture = shutdownQualificationFixture(t);
+  const source = path.join(fixture.directory, "nonzero.mjs");
+  writeFileSync(source, 'setInterval(() => {}, 1000); process.stdin.once("data", () => process.exit(7));');
+  const engine = new UciEngine({ ...fixture.config.engine, arguments: [source] });
+  const { spawn } = await import("node:child_process");
+  engine.child = spawn(process.execPath, [source], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+  await new Promise((resolve, reject) => { engine.child.once("spawn", resolve); engine.child.once("error", reject); });
+  await assert.rejects(engine.close({ requireCleanExit: true }), (error) =>
+    error.code === "UCI_CHILD_CLOSE_FAILED" && error.closeOutcome.exit_code === 7);
+});
+
+test("qualification child close rejects actual forced termination and observes exit", async (t) => {
+  const fixture = shutdownQualificationFixture(t);
+  const source = path.join(fixture.directory, "ignore-quit.mjs");
+  writeFileSync(source, 'setInterval(() => {}, 1000); process.stdin.resume();');
+  const engine = new UciEngine({ ...fixture.config.engine, arguments: [source], shutdown_grace_ms: 100 });
+  const { spawn } = await import("node:child_process");
+  engine.child = spawn(process.execPath, [source], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+  const child = engine.child;
+  await new Promise((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
+  try {
+    await assert.rejects(engine.close({ requireCleanExit: true }), (error) =>
+      error.code === "UCI_CHILD_CLOSE_FAILED" && error.closeOutcome.forced_termination === true
+      && error.closeOutcome.exit_observed === true);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+  }
+});
+
+test("capacity publisher rejects statuses without actual child cleanup proof", (t) => {
+  const fixture = shutdownQualificationFixture(t);
+  const output = path.join(fixture.directory, "capacity.json");
+  const status = { qualified: true, engine_build_fingerprint: "sha256:" + "a".repeat(64),
+    engine_launch_identity_sha256: "sha256:" + "b".repeat(64),
+    uci_identity_sha256: "sha256:" + "c".repeat(64),
+    applied_options_sha256: "sha256:" + "d".repeat(64), bestmove: "e2e4" };
+  assert.throws(() => publishCapacityProfile(output, 1, fixture.config, null, [status]), /close|cleanup/i);
+  assert.equal(existsSync(output), false);
+});
+
+
+test("qualification preserves startup failure and retains every child cleanup failure", { concurrency: false }, async (t) => {
+  const fixture = shutdownQualificationFixture(t);
+  const primary = new Error("fixture startup failed");
+  t.mock.method(UciEngine.prototype, "start", async () => { throw primary; });
+  t.mock.method(UciEngine.prototype, "close", async () => {
+    const error = new Error("fixture cleanup failed");
+    error.cleanupDiagnostics = ["fixture cleanup failed detail"];
+    throw error;
+  });
+  await assert.rejects(main(["capacity-qualify", "--config", fixture.configPath,
+    "--capacity-profile", path.join(fixture.directory, "capacity.json"), "--max-concurrency", "2"]),
+  (error) => error.cause === primary && error.cleanupDiagnostics.length === 4
+    && error.cleanupDiagnostics.every((detail) => detail.includes("cleanup failed")));
+  assert.equal(existsSync(path.join(fixture.directory, "capacity.json")), false);
+});
+
+test("qualification child close rejects an unobserved exit without inventing success", async () => {
+  const { EventEmitter } = await import("node:events");
+  const child = new EventEmitter();
+  Object.assign(child, { exitCode: null, signalCode: null,
+    stdin: { writable: false }, kill: () => false });
+  const engine = new UciEngine({ uci_options: {}, timing: {}, shutdown_grace_ms: 1 });
+  engine.child = child;
+  await assert.rejects(engine.close({ requireCleanExit: true }), (error) =>
+    error.code === "UCI_CHILD_CLOSE_FAILED" && error.closeOutcome.exit_observed === false);
+});
+
+test("ordinary child close retains best-effort nonzero shutdown behavior", async (t) => {
+  const fixture = shutdownQualificationFixture(t);
+  const { spawn } = await import("node:child_process");
+  const engine = new UciEngine(fixture.config.engine);
+  engine.child = spawn(process.execPath, ["-e", 'process.stdin.once("data", () => process.exit(7));'],
+    { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+  await new Promise((resolve, reject) => { engine.child.once("spawn", resolve); engine.child.once("error", reject); });
+  const outcome = await engine.close();
+  assert.equal(outcome.clean_exit, false);
+  assert.equal(outcome.exit_code, 7);
+});
+
+test("capacity qualification publishes only after actual clean child exits", { concurrency: false }, async (t) => {
+  const fixture = shutdownQualificationFixture(t);
+  const output = path.join(fixture.directory, "capacity.json");
+  t.mock.method(console, "log", () => {});
+  assert.equal(await main(["capacity-qualify", "--config", fixture.configPath,
+    "--capacity-profile", output, "--max-concurrency", "2"]), 0);
+  const capacity = JSON.parse(readFileSync(output));
+  assert.equal(capacity.evidence.length, 2);
+  for (const entry of capacity.evidence) {
+    assert.equal(entry.qualification_cleanup.clean_exit, true);
+    assert.equal(entry.qualification_cleanup.exit_observed, true);
+    assert.equal(entry.qualification_cleanup.close_observed, true);
+    assert.equal(entry.qualification_cleanup.exit_code, 0);
+    assert.equal(entry.qualification_cleanup.forced_termination, false);
+  }
+});
+
+
+test("single-child qualification rejects a real nonzero shutdown", { concurrency: false }, async (t) => {
+  const fixture = shutdownQualificationFixture(t);
+  const source = path.join(fixture.directory, "nonzero-uci.mjs");
+  writeFileSync(source, readFileSync(path.join(ROOT, "test-fixtures", "fake-standard-uci-engine.mjs"), "utf8")
+    .replace("process.exitCode = 0;", "process.exitCode = 7;"));
+  const raw = JSON.parse(readFileSync(fixture.configPath));
+  raw.engine.arguments = [source];
+  writeFileSync(fixture.configPath, JSON.stringify(raw));
+  t.mock.method(console, "log", () => { throw new Error("qualification must not publish success"); });
+  await assert.rejects(main(["qualify", "--config", fixture.configPath]),
+    (error) => error.code === "UCI_QUALIFICATION_CLEANUP_FAILED"
+      && error.cleanupDiagnostics[0].includes("exit code 7"));
+});
+
+test("qualification observes child exit despite a protocol-close cleanup failure", async (t) => {
+  const fixture = shutdownQualificationFixture(t);
+  const engine = new UciEngine(fixture.config.engine);
+  await engine.start();
+  const originalLines = engine.lines;
+  engine.lines = { close: () => { throw new Error("fixture protocol cleanup failed"); } };
+  try {
+    await assert.rejects(engine.close({ requireCleanExit: true }), (error) =>
+      error.closeOutcome.exit_observed === true && error.closeOutcome.exit_code === 0
+        && error.closeOutcome.cleanup_diagnostics.some((detail) => detail.includes("protocol cleanup failed")));
+  } finally {
+    originalLines.close();
+  }
+});
+
+
+test("strict qualification waits for child stdio close and retains final receipt", async () => {
+  const { EventEmitter } = await import("node:events");
+  const child = new EventEmitter();
+  const receipts = [];
+  Object.assign(child, { exitCode: null, signalCode: null, kill: () => false,
+    stdin: { writable: true, end: () => {}, write: () => {
+      queueMicrotask(() => {
+        child.exitCode = 0;
+        child.emit("exit", 0, null);
+        setTimeout(() => { receipts.push("final lifecycle receipt"); child.emit("close", 0, null); }, 25);
+      });
+    } } });
+  const engine = new UciEngine({ uci_options: {}, timing: {}, shutdown_grace_ms: 500 });
+  engine.child = child;
+  engine.lines = { close: () => assert.deepEqual(receipts, ["final lifecycle receipt"]) };
+  const outcome = await engine.close({ requireCleanExit: true });
+  assert.equal(outcome.clean_exit, true);
+  assert.equal(outcome.close_observed, true);
+});
+
+
+for (const reason of [null, 0, undefined]) {
+  test(`qualification rejects falsy startup reason ${String(reason)}`, { concurrency: false }, async (t) => {
+    const fixture = shutdownQualificationFixture(t);
+    const output = path.join(fixture.directory, "capacity.json");
+    t.mock.method(UciEngine.prototype, "start", async () => { throw reason; });
+    t.mock.method(UciEngine.prototype, "close", async () => ({ clean_exit: true, exit_observed: true,
+      close_observed: true, exit_code: 0, exit_signal: null, forced_termination: false, cleanup_diagnostics: [] }));
+    await assert.rejects(main(["qualify", "--config", fixture.configPath]),
+      (error) => error instanceof Error && Object.hasOwn(error, "cause") && error.cause === reason);
+    assert.equal(existsSync(output), false);
+  });
+}
+
+test("qualification preserves a frozen primary cause when child cleanup also fails", { concurrency: false }, async (t) => {
+  const fixture = shutdownQualificationFixture(t);
+  const primary = Object.freeze(new Error("frozen primary failure"));
+  t.mock.method(UciEngine.prototype, "start", async () => { throw primary; });
+  t.mock.method(UciEngine.prototype, "close", async () => { throw new Error("fixture cleanup failed"); });
+  await assert.rejects(main(["qualify", "--config", fixture.configPath]), (error) =>
+    error.cause === primary && error.cleanupDiagnostics.some((detail) => detail.includes("cleanup failed")));
+  assert.equal(Object.hasOwn(primary, "cleanupDiagnostics"), false);
+});
+
+
+test("strict qualification rejects exited child whose stdio never closes", async () => {
+  const { EventEmitter } = await import("node:events");
+  const child = new EventEmitter();
+  let disposed = 0;
+  Object.assign(child, { exitCode: null, signalCode: null, kill: () => false,
+    stdio: [{ destroy: () => { disposed += 1; } }],
+    stdin: { writable: true, end: () => {}, write: () => {
+      queueMicrotask(() => { child.exitCode = 0; child.emit("exit", 0, null); });
+    } } });
+  const engine = new UciEngine({ uci_options: {}, timing: {}, shutdown_grace_ms: 10 });
+  engine.child = child;
+  await assert.rejects(engine.close({ requireCleanExit: true }), (error) =>
+    error.closeOutcome.exit_code === 0 && error.closeOutcome.exit_observed === true
+      && error.closeOutcome.close_observed === false && error.closeOutcome.clean_exit === false);
+  assert.equal(disposed, 1);
+});
+
+test("qualification preserves a frozen non-Error startup reason without mutation", { concurrency: false }, async (t) => {
+  const fixture = shutdownQualificationFixture(t);
+  const primary = Object.freeze({ reason: "fixture startup failure" });
+  t.mock.method(UciEngine.prototype, "start", async () => { throw primary; });
+  t.mock.method(UciEngine.prototype, "close", async () => { throw new Error("fixture cleanup failed"); });
+  await assert.rejects(main(["qualify", "--config", fixture.configPath]),
+    (error) => error.cause === primary && error.cleanupDiagnostics.length === 1);
+  assert.deepEqual(primary, { reason: "fixture startup failure" });
 });
