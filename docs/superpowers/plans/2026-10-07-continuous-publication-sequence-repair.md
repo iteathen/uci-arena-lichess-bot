@@ -1,0 +1,16 @@
+# Continuous publication sequence repair
+
+Goal: accept genuine same-node publication metadata advances while preserving exact canonical admission, native/candidate publication identity and later transition chronology. Root authorized one coherent 1.0.33 candidate; no Engine changes, artifact edits, GPU/live/credential/installation work or release before guarded merge.
+
+Owner: Bot's public continuous diagnostic consumer. Engine owns canonical focus/publication facts. Earlier canonical observation and later publication may have different metadata sequence without different node ownership.
+
+1. Reproduce genuine-shaped White ply3 and Black ply2 publication sequence advance in source tests (RED). Keep startup full tuple exact because startup observation was captured with publication.
+2. Validate every publication current tuple in lossless native domains; require same graph epoch/subject/key as earlier canonical observation and sequence >= earlier sequence. Candidates and any emitted native fence match the publication tuple exactly; search requires native fence.
+3. Require the next canonical transition sequence strictly greater than publication sequence for model moves, and strictly greater than previous canonical sequence for opponent moves. Never assume fixed +1 or globally coherent older observations.
+4. Positive controls: equal metadata sequence, advanced same-node search/fallback and book resolution. Negative controls: backward/zero/nondecimal/overflow sequence, changed node/epoch/key, stale/future candidate/native tuple, chronology beyond next transition and backward opponent transition. Preserve all existing history/legality/lifetime/stale/failure gates.
+5. Run public validator read-only on the exact unchanged genuine pair4 artifact with actual engine/model/time/file authorities, recording result and artifact hash before/after. This is validation evidence only; no profile promotion.
+6. Reconcile owning spec and version 1.0.33, run focused tests, all four owning checks/full Node24 suite, inspect diff and freeze a draft PR for independent review. No signed release until root guarded merge.
+
+Inputs: genuine pair E:/uci-arena-task-builds/engine-live-progress/continuous-directml-pair-v1-attempt4.json, SHA77090aa9eaa2b8c995aab44a42b5ac364db671c08990b65d1719f78a31beedf9. Accepted Bot base ee5bd10f801453a781731c8a0a3c7d19a27ef69c. Signed 1.0.32 remains immutable, with its failed publication attempt retained.
+
+Validation: five publication-source/sequence positives reproduced the original mismatch, then passed; 16 domain/node/chronology/native/candidate/startup controls passed. The public validator directly accepted the unchanged genuine pair4 with actual filesystem/model/executable/time authority: SHA77090aa9... identical before/after, White62 and Black55 natural-terminal games. No actual profile was published. Evidence: E:/UCI Arena Workspaces/services-repair-20261007/bot-1.0.33-genuine-pair-read-only-validation.json. Full exact Node24 suite: 546 passed, zero failed, two existing optional skips (548 total), with official32 helper0a explicitly staged; all four owning checks passed. Ready for independent exact-head review; formal release only after root guarded merge.

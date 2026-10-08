@@ -141,17 +141,27 @@ export function validateContinuousElapsed(elapsed, requested, configuration) {
     && elapsed <= requested * configuration.maximum_movetime_ratio + configuration.maximum_movetime_grace_ms,
   "publication exceeded declared diagnostic movetime tolerance");
 }
-function validatePublication(record, state, moves, observed, knowledge, configuration) {
+function validatePublication(record, state, moves, observed, knowledge, configuration, requireExactObservedFocus = false) {
   const canonical = state.positionObservation();
   same(record.ply, moves.length + 1, "selected publication ply");
   validateContinuousElapsed(record.elapsed_ms, record.requested_ms, configuration);
   same(record.position_key, observed.focus.position_key, "publication canonical key");
-  requireContinuous(equalFocus(record.current_focus, observed.focus), "publication current focus mismatch");
+  const publishedFocus = record.current_focus;
+  for (const field of ["graph_epoch", "subject_identity", "transition_sequence"]) identity(publishedFocus[field], `publication ${field}`);
+  requireContinuous(DECIMAL.test(publishedFocus.position_key)
+    && BigInt(publishedFocus.position_key) <= 0xffff_ffff_ffff_ffffn
+    && BigInt(publishedFocus.transition_sequence) <= 0xffff_ffffn, "publication focus is outside its lossless native domain");
+  requireContinuous(["graph_epoch", "subject_identity", "position_key"].every((field) => publishedFocus[field] === observed.focus[field]),
+    "publication current node differs from admitted focus");
+  requireContinuous(BigInt(publishedFocus.transition_sequence) >= BigInt(observed.focus.transition_sequence),
+    "publication sequence precedes canonical admission");
+  if (requireExactObservedFocus) requireContinuous(equalFocus(publishedFocus, observed.focus), "startup publication focus differs from its captured observation");
+  if (record.native_focus !== null) requireContinuous(equalFocus(record.native_focus, publishedFocus), "native publication focus mismatch");
   requireContinuous(state.validateCandidate(moves, record.move).legal, "publication move is illegal at the canonical root");
   const candidates = record.candidates;
   same(candidates.current, true, "candidate currentness");
   same(candidates.complete_legal_set, true, "complete candidate eligibility");
-  requireContinuous(equalFocus(candidates.focus, observed.focus), "candidate focus mismatch");
+  requireContinuous(equalFocus(candidates.focus, publishedFocus), "candidate focus mismatch");
   same(candidates.execution_lineage, observed.execution_lineage, "candidate lineage");
   same(candidates.worker_set_identity, observed.worker_set_identity, "candidate worker identity");
   same(candidates.canonical_count, canonical.legal_moves.length, "canonical candidate count");
@@ -163,7 +173,7 @@ function validatePublication(record, state, moves, observed, knowledge, configur
   requireContinuous(!["unknown"].includes(record.completion_source), "publication completion source is unknown");
   if (record.timing_applicability === "search_derived") {
     requireContinuous(["search", "fallback"].includes(record.completion_source), "searched applicability has a conflicting source");
-    requireContinuous(equalFocus(record.native_focus, observed.focus), "native publication focus mismatch");
+    requireContinuous(record.native_focus !== null, "native search publication focus is missing");
     requireContinuous(Number.isSafeInteger(record.publication_allowed_count)
       && record.publication_allowed_count > 0 && record.publication_allowed_count <= canonical.legal_moves.length,
     "publication candidate constraint is invalid");
@@ -191,7 +201,7 @@ function validateGame(game, expectedColor, knowledge, configuration) {
   same(previous.admitted_fen, state.positionObservation().fen, "startup admitted FEN");
   same(previous.accepted_position_command_sha256, digestText("position startpos"), "startup accepted request");
   same(previous.history_length, 1, "startup repetition prefix length");
-  validatePublication(game.startup_probe.publication, state, [], previous, knowledge, configuration);
+  validatePublication(game.startup_probe.publication, state, [], previous, knowledge, configuration, true);
   same(game.startup_probe.used_as_game_move, expectedColor === "white", "startup publication game use");
   if (expectedColor === "white") {
     same(game.startup_probe.publication.move, game.moves[0], "consumed startup move");
@@ -201,8 +211,9 @@ function validateGame(game, expectedColor, knowledge, configuration) {
   for (let index = 0; index < game.moves.length; index += 1) {
     const moves = game.moves.slice(0, index);
     const modelMove = (index % 2 === 0) === (expectedColor === "white");
+    let publication = null;
     if (modelMove) {
-      const publication = game.publications[modelPly++];
+      publication = game.publications[modelPly++];
       requireContinuous(publication !== undefined, "model publication is missing");
       same(publication.move, game.moves[index], "actual applied publication");
       validatePublication(publication, state, moves, previous, knowledge, configuration);
@@ -221,6 +232,8 @@ function validateGame(game, expectedColor, knowledge, configuration) {
     requireContinuous(!refereeTerminal || index === game.moves.length - 1,
       "game continued after its first canonical terminal transition");
     const current = validateContinuousObservation(transition.observation, previous);
+    requireContinuous(BigInt(current.focus.transition_sequence) > BigInt(publication?.current_focus.transition_sequence ?? previous.focus.transition_sequence),
+      "canonical transition does not follow its preceding publication/admission sequence");
     same(current.admitted_fen, canonical.fen, "native admitted FEN");
     same(current.focus.position_key, transition.position_key, "native admitted canonical key");
     same(current.accepted_position_command_sha256,
