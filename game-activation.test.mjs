@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   BotController,
   prepareProviderReplacementInterlock,
+  providerStatusProjection,
 } from "./lichess-adapter.mjs";
 import { LichessStore } from "./lichess-store.mjs";
 
@@ -24,10 +25,10 @@ function config() {
   };
 }
 
-function statusPublisher() {
+function statusPublisher(onSnapshot = null) {
   let generation = 0;
   return {
-    schedule: () => ++generation,
+    schedule: snapshot => { onSnapshot?.(snapshot); return ++generation; },
     flush: async () => {},
     close: async () => {},
     health: () => ({ state: "ready", last_success_generation: generation || null }),
@@ -74,6 +75,7 @@ test("pre-replacement leaves an active game and startup control untouched", asyn
   const sessionFinishPromise = new Promise((resolve) => { finishSession = resolve; });
   let closes = 0;
   let prepareCalls = 0;
+  let publishedStatus;
   store.acquireApiLease(
     authority,
     owner,
@@ -92,8 +94,11 @@ test("pre-replacement leaves an active game and startup control untouched", asyn
     signal: new AbortController().signal,
     store,
     lifecycleOwner: owner,
-    statusPublisher: statusPublisher(),
-    sessionFactory: ({ gameId }) => ({
+    statusPublisher: statusPublisher(snapshot => { publishedStatus = snapshot; }),
+    sessionFactory: ({ gameId, slot }) => ({
+      gameId,
+      slot,
+      authoritativeGeneration: 0,
       finished: true,
       run: async () => {
         sessionStarted();
@@ -121,6 +126,12 @@ test("pre-replacement leaves an active game and startup control untouched", asyn
     });
     await sessionStartedPromise;
     activeTask = controller.activeGames.get("interlock-game");
+    await controller.writeStatus({ flush: true });
+    const publicStatus = providerStatusProjection({ runtime: publishedStatus, active: true });
+    assert.equal(publicStatus.games.active, 1);
+    assert.equal(publicStatus.capacity.slots.active, 1);
+    assert.equal(controller.slots.available("bot"), 0);
+    assert.equal(controller.activeGames.size, 1);
     await assert.rejects(prepareProviderReplacementInterlock({
       runtimeDir: directory,
       storeFile,

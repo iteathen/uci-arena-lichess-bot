@@ -7326,7 +7326,8 @@ export function providerStatusProjection({
     : null;
   const effectiveRuntimeError = runtimeError ?? freshnessError;
   const effectiveActive = Boolean(active && !effectiveRuntimeError);
-  const slots = Array.isArray(runtime?.slots) ? runtime.slots : [];
+  const slots = Array.isArray(runtime?.slots) ? runtime.slots
+    : Array.isArray(runtime?.slots?.slots) ? runtime.slots.slots : [];
   const slotCounts = Object.fromEntries(
     ["empty", "preparing", "pending", "cancelling", "active", "draining"].map((state) => [
       state,

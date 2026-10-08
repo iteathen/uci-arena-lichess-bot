@@ -3,7 +3,7 @@
   "component": {
     "id": "lichess.adapter",
     "product_id": "uci_arena.lichess_bot",
-    "version": "1.0.38",
+    "version": "1.0.39",
     "repository": "iteathen/uci-arena-lichess-bot"
   },
   "runtime": {
