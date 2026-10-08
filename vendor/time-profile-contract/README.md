@@ -47,6 +47,23 @@ Applied reserve validation takes the same actual inputs and revalidates this
 scope before checking provider/emit reserves and forecast scale. Neither operation
 mutates its inputs or grants adaptive timing, strength or deployment authority.
 
+## Native timing identity support (1.4.0)
+
+The SDK recognizes `persistent_mcgs_relative_clock_temporal_v4` and
+`persistent_mcgs_relative_clock_temporal_v5`. `TIME_POLICY_VERSION` identifies
+the current version 5; `SUPPORTED_TIME_POLICY_VERSIONS` lists the exact supported
+versions. Profile construction records the captured native version and includes
+it in the search-contract fingerprint. Version 5 identifies the changed graph
+retention and evaluation-admission regime; it does not redefine profile schema v3.
+
+A version 4 profile remains valid for an otherwise matching version 4 runtime.
+It cannot authorize a version 5 runtime, and the converse also fails. Runtime
+snapshot validation and v3 applied-reserve validation require matching native
+and profile versions. Missing or unknown versions fail closed. New version 5
+profiles require their own qualification; SDK support grants no new evidence,
+allocation-policy, adaptive-play, strength, or deployment authority. Existing
+schema v1/v2 stored-profile compatibility remains unchanged.
+
 ## Future policy evolution
 
 The future timing-policy artifact must be introduced through an explicit versioned contract after its owning Evidence/Engine specifications are implemented and qualified.
