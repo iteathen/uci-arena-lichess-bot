@@ -1038,7 +1038,7 @@ test("continuous historical searched regime preserves actual enabled book and ke
 });
 
 async function scopedRuntimeFixture({ profileVersion = TIME_POLICY_VERSION, runtimeVersion = TIME_POLICY_VERSION,
-  validationScope = "historical_searched_regime", transformTimingProfile = null } = {}) {
+  validationScope = "historical_searched_regime", transformTimingProfile = null, configuredOptions = {} } = {}) {
   const baselineOptions = fixture("mcgs");
   const diagnostic = continuousDiagnosticFixture(baselineOptions);
   const options = profileVersion === TIME_POLICY_VERSION ? baselineOptions : fixture("mcgs", profileVersion);
@@ -1049,6 +1049,7 @@ async function scopedRuntimeFixture({ profileVersion = TIME_POLICY_VERSION, runt
   }
   const selected = { ...diagnostic.binding.effective_options.model, OwnBook: "true", "Move Overhead": "650" };
   delete selected.McgsTemporalWeightProfile;
+  Object.assign(selected, configuredOptions);
   const engine = new UciEngine({ executable: options.engine, arguments: [], working_directory: path.dirname(options.engine),
     time_profile: options.time_profile, uci_options: selected, timing: { initial_transport_reserve_ms: 650 },
     qualification_profile: { schema: "uci_arena_single_game_profile_v2",
@@ -1112,6 +1113,108 @@ test("Bot applies explicit continuous v4 timing through its actual runtime bound
   assert.equal(retained.schema, "uci_time_profile_v4");
   assert.equal(retained.gates.mcgs_single_owner_passed, false);
   assert.equal(retained.permissions.adaptive_play_qualified, false);
+});
+
+const configuredV4TablebaseOptions = {
+  BehaviorProfile: "balanced", McgsTemporalWeightProfile: "EarlyCurrent", ModelBackend: "onnx",
+  Syzygy50MoveRule: true, SyzygyInternalProbe: true,
+  SyzygyManifest: "E:/syzygy/standard/6/syzygy_manifest_v1.json", SyzygyPath: "E:/syzygy/standard/6",
+  SyzygyProbeLimit: 6, SyzygyProbeThreads: 4, SyzygyRootProbe: true,
+};
+
+function tablebaseTimingProfileFixture(profile) {
+  continuousTimingProfileFixture(profile);
+  // Literal immutable qualification shape, independently specified from configured values.
+  profile.identity.search.extra_engine_options = {
+    BehaviorProfile: "balanced", McgsTemporalWeightProfile: "EarlyCurrent", ModelBackend: "onnx",
+    Syzygy50MoveRule: "true", SyzygyInternalProbe: "true",
+    SyzygyManifest: "E:/syzygy/standard/6/syzygy_manifest_v1.json", SyzygyPath: "E:/syzygy/standard/6",
+    SyzygyProbeLimit: "6", SyzygyProbeThreads: "4", SyzygyRootProbe: "true",
+  };
+  profile.identity_sha256 = sha256Object(profile.identity);
+}
+
+test("V4 timing retains every configured tablebase material input through initial and applied validation", async () => {
+  const { result, engine, options } = await scopedRuntimeFixture({ validationScope: "continuous_searched_regime",
+    transformTimingProfile: tablebaseTimingProfileFixture, configuredOptions: configuredV4TablebaseOptions });
+  assert.equal(result.accepted, true, result.reason);
+  assert.equal(result.applied, true);
+  assert.deepEqual(engine.timeProfileConfiguration().extraEngineOptions, {
+    BehaviorProfile: "balanced", McgsTemporalWeightProfile: "EarlyCurrent", ModelBackend: "onnx",
+    Syzygy50MoveRule: "true", SyzygyInternalProbe: "true",
+    SyzygyManifest: "E:/syzygy/standard/6/syzygy_manifest_v1.json", SyzygyPath: "E:/syzygy/standard/6",
+    SyzygyProbeLimit: "6", SyzygyProbeThreads: "4", SyzygyRootProbe: "true",
+  });
+  assert.equal(JSON.parse(readFileSync(options.time_profile)).identity.search.extra_engine_options.SyzygyProbeLimit, "6");
+});
+
+for (const [name, wrong] of [["Syzygy50MoveRule", false], ["SyzygyInternalProbe", false],
+  ["SyzygyManifest", "E:/other-manifest.json"], ["SyzygyPath", "E:/other-tablebase"],
+  ["SyzygyProbeLimit", 5], ["SyzygyProbeThreads", 2], ["SyzygyRootProbe", false], ["SyzygyProbeDepth", 1]]) {
+  test(`V4 timing rejects configured ${name} drift against unchanged qualification`, async () => {
+    const { result, options } = await scopedRuntimeFixture({ validationScope: "continuous_searched_regime",
+      transformTimingProfile: tablebaseTimingProfileFixture, configuredOptions: { ...configuredV4TablebaseOptions, [name]: wrong } });
+    assert.equal(result.accepted, false);
+    assert.equal(result.applied, false);
+    assert.equal(result.provider_service_reserve_us, 0);
+    assert.match(result.reason, /extra_engine_options/);
+    const retained = JSON.parse(readFileSync(options.time_profile));
+    assert.equal(retained.identity.search.extra_engine_options.SyzygyProbeLimit, "6");
+  });
+}
+
+test("historical V3 timing keeps the existing reserved tablebase projection", async () => {
+  const { result, engine } = await scopedRuntimeFixture({ configuredOptions: {
+    SyzygyPath: "E:/syzygy/standard/6", SyzygyProbeLimit: 6, SyzygyProbeDepth: 1,
+    Syzygy50MoveRule: true, SyzygyRootProbe: true, SyzygyInternalProbe: true,
+  } });
+  assert.equal(result.accepted, true, result.reason);
+  assert.equal(result.applied, true);
+  assert.deepEqual(engine.timeProfileConfiguration().extraEngineOptions, {});
+});
+
+test("V2 profile application retains qualified portable tablebase paths over equivalent raw configuration aliases", () => {
+  const options = fixture("mcgs");
+  const tablebase = attachTablebase(options);
+  const portablePath = tablebase.path.replaceAll("\\", "/");
+  const portableManifest = tablebase.manifest.replaceAll("\\", "/");
+  const timing = JSON.parse(readFileSync(options.time_profile));
+  continuousTimingProfileFixture(timing);
+  timing.identity.search.extra_engine_options = {
+    McgsTemporalWeightProfile: "EarlyCurrent", Syzygy50MoveRule: "true", SyzygyInternalProbe: "true",
+    SyzygyManifest: portableManifest, SyzygyPath: portablePath,
+    SyzygyProbeLimit: "3", SyzygyProbeThreads: "2", SyzygyRootProbe: "true",
+  };
+  timing.identity_sha256 = sha256Object(timing.identity);
+  writeFileSync(options.time_profile, JSON.stringify(timing));
+  const diagnostic = continuousDiagnosticFixture(options);
+  Object.assign(diagnostic.binding.knowledge, {
+    syzygy_path: portablePath, syzygy_manifest: portableManifest,
+    syzygy_manifest_identity: tablebase.manifest_identity, syzygy_manifest_file_sha256: tablebase.manifest_file_sha256,
+    syzygy_active: true, syzygy_loaded_cardinality: 3, syzygy_probe_limit: 3, syzygy_probe_threads: 2,
+    syzygy_rule50: true, syzygy_root_probe: true, syzygy_internal_probe: true,
+  });
+  Object.assign(diagnostic.binding.effective_options.model, {
+    SyzygyPath: portablePath, SyzygyManifest: portableManifest,
+    SyzygyProbeLimit: "3", SyzygyProbeThreads: "2", Syzygy50MoveRule: "true",
+    SyzygyRootProbe: "true", SyzygyInternalProbe: "true",
+  });
+  Object.assign(diagnostic.binding.timing_profile, { validation_scope: "continuous_searched_regime",
+    validation_schema: "uci_time_profile_continuous_searched_regime_runtime_status_v1" });
+  writeFileSync(options.complete_game_evidence, JSON.stringify(diagnostic));
+  const published = publishSingleGameProfile({ ...options, qualification_scope: "local_live_safety" });
+  assert.equal(published.tablebase.path, portablePath);
+  assert.equal(loadSingleGameProfile(options.output).tablebase.manifest, portableManifest);
+  const config = { engine: { executable: options.engine, arguments: [], working_directory: path.dirname(options.engine),
+    single_game_profile: options.output, uci_options: { ModelRoot: options.model_root,
+      McgsTemporalWeightProfile: "EarlyCurrent", OwnBook: false,
+      SyzygyPath: `${tablebase.path}${path.sep}.${path.sep}`,
+      SyzygyManifest: `${tablebase.path}${path.sep}.${path.sep}${path.basename(tablebase.manifest)}` } } };
+  applySingleGameProfile(config);
+  assert.equal(config.engine.uci_options.SyzygyPath, portablePath);
+  assert.equal(config.engine.uci_options.SyzygyManifest, portableManifest);
+  assert.deepEqual(new UciEngine(config.engine).timeProfileConfiguration(0, 1000, "uci_time_profile_v4").extraEngineOptions,
+    timing.identity.search.extra_engine_options);
 });
 
 for (const scoped of [false, true]) {
@@ -1240,13 +1343,14 @@ test("Bot rejects an unknown stored timing policy before applying reserves", asy
 });
 
 
-async function completeRuntimeContextFixture(continuousTiming = false) {
+async function completeRuntimeContextFixture(continuousTiming = false, timingOverrides = {}) {
   const { engine, diagnostic, options, result } = await scopedRuntimeFixture(continuousTiming ? {
-    validationScope: "continuous_searched_regime", transformTimingProfile: continuousTimingProfileFixture,
+    validationScope: "continuous_searched_regime", transformTimingProfile: continuousTimingProfileFixture, ...timingOverrides,
   } : {});
   assert.equal(result.accepted, true, result.reason);
   const binding = diagnostic.binding;
   Object.assign(binding.timing_profile, { schema: engine.appliedTimeProfile.schema, sha256: sha256(readFileSync(options.time_profile)),
+    identity_sha256: engine.appliedTimeProfile.identity_sha256,
     validation_scope: continuousTiming ? "continuous_searched_regime" : "historical_searched_regime",
     validation_schema: result.schema, configured_opening_book_enabled: true,
     timing_authority_match: false, whole_runtime_timing_authority_match: false, move_overhead_ms: 650 });
@@ -1292,6 +1396,15 @@ test("continuous v4 actual publication context revalidates applied scope and rej
   assert.equal(accepted.applied, true);
   status.time_profile_provider_reserve_us += 1;
   assert.throws(() => engine.validateContinuousRuntimeContext(status), /reserve|not applied/);
+});
+
+test("continuous V4 runtime context revalidates actual tablebase configuration after reserve application", async () => {
+  const { engine, status } = await completeRuntimeContextFixture(true, {
+    transformTimingProfile: tablebaseTimingProfileFixture, configuredOptions: configuredV4TablebaseOptions,
+  });
+  assert.equal(engine.validateContinuousRuntimeContext(status).applied, true);
+  engine.config.uci_options.SyzygyRootProbe = false;
+  assert.throws(() => engine.validateContinuousRuntimeContext(status), /extra_engine_options.SyzygyRootProbe/);
 });
 
 for (const [label, mutate, expected] of [

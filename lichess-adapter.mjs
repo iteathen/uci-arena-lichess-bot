@@ -3627,11 +3627,15 @@ export class UciEngine {
     } while (true);
   }
 
-  timeProfileConfiguration(appliedTimeProfileReserveUs = 0, appliedBackupEmitReserveUs = 1000) {
+  timeProfileConfiguration(appliedTimeProfileReserveUs = 0, appliedBackupEmitReserveUs = 1000,
+    timingProfileSchema = this.appliedTimeProfile?.schema) {
     const options = this.config.uci_options;
+    // V4 binds tablebase material values as extras; historical V3 keeps its reserved projection.
+    const continuousTiming = timingProfileSchema === TimeProfileContract.CONTINUOUS_TIME_PROFILE_SCHEMA;
     const extraEngineOptions = Object.fromEntries(
       Object.entries(options)
-        .filter(([name]) => !TIME_PROFILE_RESERVED_OPTIONS.has(name))
+        .filter(([name]) => !TIME_PROFILE_RESERVED_OPTIONS.has(name)
+          || (continuousTiming && name.startsWith("Syzygy")))
         .sort(([left], [right]) => left.localeCompare(right))
         .map(([name, value]) => [name, String(value)]),
     );
@@ -3717,7 +3721,7 @@ export class UciEngine {
     let reserveWasSet = false;
     try {
       profile = loadExactTimeProfile(resolvedPath, this.config.working_directory);
-      const configuration = this.timeProfileConfiguration(0);
+      const configuration = this.timeProfileConfiguration(0, 1000, profile.schema);
       const operations = timingValidationOperations(profile, this.config.qualification_profile);
       const accepted = operations.snapshot({
         profile,
@@ -3747,6 +3751,7 @@ export class UciEngine {
           ...this.timeProfileConfiguration(
             accepted.provider_service_reserve_us,
             accepted.backup_emit_reserve_us,
+            profile.schema,
           ),
           iterationForecastScalePermille: accepted.iteration_forecast_scale_permille,
         },
@@ -3865,7 +3870,7 @@ export class UciEngine {
       engineArgs: this.config.arguments ?? [], cwd: this.config.working_directory,
       uciIdLines: this.uciIdLines, uciOptionLines: this.uciOptionLines,
       configuration: this.timeProfileConfiguration(binding.timing_profile.provider_service_reserve_us,
-        binding.timing_profile.backup_emit_reserve_us) };
+        binding.timing_profile.backup_emit_reserve_us, this.appliedTimeProfile.schema) };
     const accepted = timingValidationOperations(this.appliedTimeProfile, profile).applied(input);
     requireContinuous(accepted.accepted === true && accepted.applied === true
       && accepted.identity_sha256 === binding.timing_profile.identity_sha256, "actual applied timing identity differs from qualified context");
