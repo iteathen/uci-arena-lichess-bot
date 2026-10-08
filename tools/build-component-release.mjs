@@ -247,24 +247,31 @@ function installerManifest(componentContract, version, target, staging) {
       )
       || !Array.isArray(installerIntegration.dependency_bindings)
       || !Array.isArray(installerIntegration.locator_bindings)
-      || startupControl?.schema !== "arena_provider_startup_control_v2"
-      || startupControl.schema_version !== 2
+      || startupControl?.schema !== "arena_provider_startup_control_v3"
+      || startupControl.schema_version !== 3
       || startupControl.entrypoint !== "startup"
       || !Object.hasOwn(entrypoints, startupControl.entrypoint)
-      || JSON.stringify(startupControl.actions?.install) !== JSON.stringify(["startup", "install"])
-      || JSON.stringify(startupControl.actions?.uninstall) !== JSON.stringify(["startup", "uninstall"])
-      || JSON.stringify(startupControl.actions?.pre_replace) !== JSON.stringify(["startup", "prepare_replace"])
-      || JSON.stringify(startupControl.actions?.post_replace) !== JSON.stringify(["startup", "complete_replace"])
+      || JSON.stringify(startupControl.operations?.install?.arguments)
+        !== JSON.stringify(["startup", "install", "--lifecycle-result", "typed_v1"])
+      || JSON.stringify(startupControl.operations?.install?.success_dispositions)
+        !== JSON.stringify(["ready"])
+      || JSON.stringify(startupControl.operations?.uninstall?.arguments)
+        !== JSON.stringify(["startup", "uninstall", "--lifecycle-result", "typed_v1"])
+      || JSON.stringify(startupControl.operations?.uninstall?.success_dispositions)
+        !== JSON.stringify(["ready"])
+      || JSON.stringify(startupControl.operations?.pre_replace?.arguments)
+        !== JSON.stringify(["startup", "prepare_replace", "--lifecycle-result", "typed_v1"])
+      || JSON.stringify(startupControl.operations?.pre_replace?.success_dispositions)
+        !== JSON.stringify(["ready"])
+      || JSON.stringify(startupControl.operations?.post_replace?.arguments)
+        !== JSON.stringify(["startup", "complete_replace", "--lifecycle-result", "typed_v1"])
+      || JSON.stringify(startupControl.operations?.post_replace?.success_dispositions)
+        !== JSON.stringify(["ready", "safe_inactive"])
       || startupControl.replacement_arguments?.previous_root !== "--previous-root"
       || startupControl.replacement_arguments?.replacement_root !== "--replacement-root"
       || startupControl.workspace_argument?.flag !== "--runtime-dir"
       || !isSafeWorkspaceRelative(startupControl.workspace_argument?.relative_path)
-      || startupControl.configuration_argument !== "--config"
-      || startupControl.result?.envelope !== "startup"
-      || startupControl.result?.require_configuration_match_on_install !== false
-      || startupControl.result?.require_live_on_install !== false
-      || startupControl.result?.require_live_on_post_replace !== false
-      || startupControl.result?.allow_deferred_requalification_on_post_replace !== true) {
+      || startupControl.configuration_argument !== "--config") {
     throw new Error("component installer-integration contract is invalid");
   }
   const acceptedLocatorSources = new Set(["saved_locator", "install_receipt"]);

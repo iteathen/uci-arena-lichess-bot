@@ -61,29 +61,26 @@ test("component manifest separates operator engine overrides from managed suite 
   );
   assert.equal(
     manifest.installation.installer_integration.startup_control.schema,
-    "arena_provider_startup_control_v2",
+    "arena_provider_startup_control_v3",
   );
   assert.deepEqual(
-    manifest.installation.installer_integration.startup_control.actions.pre_replace,
-    ["startup", "prepare_replace"],
+    manifest.installation.installer_integration.startup_control
+      .operations.pre_replace.arguments,
+    ["startup", "prepare_replace", "--lifecycle-result", "typed_v1"],
   );
   assert.deepEqual(
-    manifest.installation.installer_integration.startup_control.actions.post_replace,
-    ["startup", "complete_replace"],
+    manifest.installation.installer_integration.startup_control
+      .operations.post_replace.arguments,
+    ["startup", "complete_replace", "--lifecycle-result", "typed_v1"],
   );
   assert.deepEqual(
     manifest.installation.installer_integration.startup_control.replacement_arguments,
     { previous_root: "--previous-root", replacement_root: "--replacement-root" },
   );
-  assert.equal(
-    manifest.installation.installer_integration.startup_control.result
-      .require_live_on_post_replace,
-    false,
-  );
-  assert.equal(
-    manifest.installation.installer_integration.startup_control.result
-      .allow_deferred_requalification_on_post_replace,
-    true,
+  assert.deepEqual(
+    manifest.installation.installer_integration.startup_control
+      .operations.post_replace.success_dispositions,
+    ["ready", "safe_inactive"],
   );
   assert.deepEqual(manifest.installation.external_user_data, ["provider_workspace"]);
   assert.deepEqual(

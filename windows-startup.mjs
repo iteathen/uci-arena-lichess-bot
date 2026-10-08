@@ -445,9 +445,16 @@ async function queryStartupTask(execute = execFileAsync, runtimeDir) {
   }
 }
 
-export async function queryWindowsStartup({ runtimeDir, execute = execFileAsync } = {}) {
+export async function queryWindowsStartup({ runtimeDir, replacementRoot, execute = execFileAsync } = {}) {
   requireWindows();
-  return queryStartupTask(execute, runtimeDir);
+  const state = await queryStartupTask(execute, runtimeDir);
+  if (state.installed && replacementRoot) {
+    const { stdout } = await execute("schtasks.exe", ["/Query", "/TN", STARTUP_TASK_NAME, "/XML"], {
+      windowsHide: true, timeout: 10_000, maxBuffer: 1024 * 1024,
+    });
+    retargetWindowsTaskXml(stdout, replacementRoot, replacementRoot);
+  }
+  return state;
 }
 
 export async function recoverWindowsStartup({
@@ -572,19 +579,27 @@ export async function stopAndDeleteWindowsTask(options = {}) {
   throw new Error("Lichess startup task teardown did not complete");
 }
 
-function escapeRegExp(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-}
-
 export function retargetWindowsTaskXml(taskXml, previousRoot, replacementRoot) {
-  const previous = xmlEscape(path.resolve(previousRoot));
-  const replacement = xmlEscape(path.resolve(replacementRoot));
-  const rootPattern = new RegExp(escapeRegExp(previous), "giu");
-  const matches = taskXml.match(rootPattern) ?? [];
-  if (matches.length < 2) {
+  const previous = path.resolve(previousRoot);
+  const replacement = path.resolve(replacementRoot);
+  const actions = [...taskXml.matchAll(/<Exec>[\s\S]*?<\/Exec>/giu)];
+  const action = actions.length === 1 ? actions[0][0] : "";
+  const command = exactXmlElement(action, "Command");
+  const workingDirectory = exactXmlElement(action, "WorkingDirectory");
+  const argumentsList = parseWindowsArguments(exactXmlElement(action, "Arguments"));
+  if (path.resolve(command) !== path.join(previous, "native", "lichess_adapter_launcher.exe")
+      || path.resolve(workingDirectory) !== previous
+      || path.resolve(argumentsList[1] ?? "") !== path.join(previous, "lichess-adapter.mjs")) {
     throw new Error("Existing Lichess startup task does not match the receipt-owned component root");
   }
-  let updated = taskXml.replace(rootPattern, () => replacement);
+  const retarget = (value) => {
+    if (!path.isAbsolute(value)) return value;
+    const relative = path.relative(previous, path.resolve(value));
+    return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))
+      ? path.join(replacement, relative) : value;
+  };
+  const updatedAction = `<Exec><Command>${xmlEscape(retarget(command))}</Command><Arguments>${xmlEscape(argumentsList.map(retarget).map(quoteWindowsArgument).join(" "))}</Arguments><WorkingDirectory>${xmlEscape(replacement)}</WorkingDirectory></Exec>`;
+  let updated = taskXml.replace(action, updatedAction);
   const settingsPattern = /(<Settings>[\s\S]*?<Enabled>)true(<\/Enabled>)/iu;
   if (settingsPattern.test(updated)) {
     updated = updated.replace(settingsPattern, "$1false$2");
@@ -612,7 +627,19 @@ export async function prepareWindowsStartupReplacement({
     "schtasks.exe", ["/Query", "/TN", STARTUP_TASK_NAME, "/XML"],
     { windowsHide: true, timeout: 10_000, maxBuffer: 1024 * 1024 },
   );
-  const updatedXml = retargetWindowsTaskXml(stdout, previousRoot, replacementRoot);
+  let updatedXml;
+  try {
+    updatedXml = retargetWindowsTaskXml(stdout, previousRoot, replacementRoot);
+  } catch (error) {
+    try {
+      updatedXml = retargetWindowsTaskXml(stdout, replacementRoot, replacementRoot);
+    } catch {
+      throw error;
+    }
+    if (before.active !== false || before.enabled !== false) {
+      throw new Error("Retargeted Lichess startup task is not disabled and inactive for retry");
+    }
+  }
   await stopWindowsTask({
     execute,
     query,

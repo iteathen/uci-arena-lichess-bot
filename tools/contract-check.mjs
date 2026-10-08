@@ -112,19 +112,27 @@ if (defaultEngineManifestBinding?.component_id !== "uci_arena.engine"
     || defaultEngineManifestBinding.required !== false) {
   errors.push("optional Engine component-manifest binding is incomplete");
 }
-if (startupControl?.schema !== "arena_provider_startup_control_v2"
-    || startupControl.schema_version !== 2
-    || JSON.stringify(startupControl.actions?.install) !== JSON.stringify(["startup", "install"])
-    || JSON.stringify(startupControl.actions?.uninstall) !== JSON.stringify(["startup", "uninstall"])
-    || JSON.stringify(startupControl.actions?.pre_replace)
-      !== JSON.stringify(["startup", "prepare_replace"])
-    || JSON.stringify(startupControl.actions?.post_replace)
-      !== JSON.stringify(["startup", "complete_replace"])
+if (startupControl?.schema !== "arena_provider_startup_control_v3"
+    || startupControl.schema_version !== 3
+    || JSON.stringify(startupControl.operations?.install?.arguments)
+      !== JSON.stringify(["startup", "install", "--lifecycle-result", "typed_v1"])
+    || JSON.stringify(startupControl.operations?.install?.success_dispositions)
+      !== JSON.stringify(["ready"])
+    || JSON.stringify(startupControl.operations?.uninstall?.arguments)
+      !== JSON.stringify(["startup", "uninstall", "--lifecycle-result", "typed_v1"])
+    || JSON.stringify(startupControl.operations?.uninstall?.success_dispositions)
+      !== JSON.stringify(["ready"])
+    || JSON.stringify(startupControl.operations?.pre_replace?.arguments)
+      !== JSON.stringify(["startup", "prepare_replace", "--lifecycle-result", "typed_v1"])
+    || JSON.stringify(startupControl.operations?.pre_replace?.success_dispositions)
+      !== JSON.stringify(["ready"])
+    || JSON.stringify(startupControl.operations?.post_replace?.arguments)
+      !== JSON.stringify(["startup", "complete_replace", "--lifecycle-result", "typed_v1"])
+    || JSON.stringify(startupControl.operations?.post_replace?.success_dispositions)
+      !== JSON.stringify(["ready", "safe_inactive"])
     || startupControl.replacement_arguments?.previous_root !== "--previous-root"
-    || startupControl.replacement_arguments?.replacement_root !== "--replacement-root"
-    || startupControl.result?.require_live_on_post_replace !== false
-    || startupControl.result?.allow_deferred_requalification_on_post_replace !== true) {
-  errors.push("Installer startup-control v2 projection is incomplete");
+    || startupControl.replacement_arguments?.replacement_root !== "--replacement-root") {
+  errors.push("Installer startup-control v3 projection is incomplete");
 }
 if (service.startup?.credential_gated !== true
     || service.persistence?.upgrade !== "preserve_and_migrate"

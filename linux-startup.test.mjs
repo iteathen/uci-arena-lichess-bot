@@ -82,11 +82,27 @@ test("systemd replacement retargets only the receipt-owned component root", () =
   const previousRoot = path.resolve("test-components", "lichess.adapter", "1.0.9");
   const replacementRoot = path.resolve("test-components", "lichess.adapter", "1.0.10");
   const tokenFile = path.resolve("operator-private", "lichess.token");
-  const original = `WorkingDirectory=${previousRoot}\nExecStart=/usr/bin/node ${previousRoot}/lichess-adapter.mjs --token-file ${tokenFile}\n`;
+  const original = `WorkingDirectory=${systemdEscapeArgument(previousRoot)}\nExecStart=${[
+    "/usr/bin/node", path.join(previousRoot, "lichess-adapter.mjs"), "--token-file", tokenFile,
+  ].map(systemdEscapeArgument).join(" ")}\n`;
   const updated = retargetSystemdUnit(original, previousRoot, replacementRoot);
-  assert.equal(updated.includes(previousRoot), false);
-  assert.equal(updated.includes(replacementRoot), true);
-  assert.equal(updated.includes(tokenFile), true);
+  assert.equal(updated.includes(systemdEscapeArgument(previousRoot)), false);
+  assert.equal(updated.includes(systemdEscapeArgument(replacementRoot)), true);
+  assert.equal(updated.includes(systemdEscapeArgument(tokenFile)), true);
+  assert.equal(retargetSystemdUnit(updated, replacementRoot, replacementRoot), updated);
+});
+
+test("systemd replacement rejects root lookalikes and preserves external sibling paths", () => {
+  const previousRoot = path.resolve("components", "old");
+  const replacementRoot = path.resolve("components", "old", "new");
+  const token = path.resolve("components", "old-sibling", "operator.token");
+  const unit = `WorkingDirectory=${systemdEscapeArgument(previousRoot)}\nExecStart=${[
+    "/usr/bin/node", path.join(previousRoot, "lichess-adapter.mjs"), "--token-file", token,
+  ].map(systemdEscapeArgument).join(" ")}\n`;
+  const updated = retargetSystemdUnit(unit, previousRoot, replacementRoot);
+  assert.equal(updated.includes(systemdEscapeArgument(token)), true);
+  assert.throws(() => retargetSystemdUnit(updated, previousRoot, replacementRoot), /receipt-owned component root/);
+  assert.equal(retargetSystemdUnit(updated, replacementRoot, replacementRoot), updated);
 });
 
 test("systemd user unit is network ordered, restartable, and non-root", () => {

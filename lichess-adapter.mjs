@@ -101,6 +101,9 @@ export const LIVE_ACCEPTANCE_CONFIRMATION = "I_ACCEPT_ONE_BOT_GAME";
 export const RATED_PLAY_CONFIRMATION = "I_ACCEPT_RATED_BOT_GAMES";
 export const OUTBOUND_CHALLENGE_CONFIRMATION = "I_ACCEPT_AUTOMATIC_OUTBOUND_CHALLENGES";
 export const MANAGER_OPTIONS_SCHEMA = "uci_arena_lichess_manager_options_v1";
+export const PROVIDER_COMPONENT_ID = "lichess.adapter";
+export const PROVIDER_LIFECYCLE_RESULT_SCHEMA = "arena_provider_lifecycle_result_v1";
+const STARTUP_REPLACEMENT_INTENT_SCHEMA = "uci_arena_lichess_startup_replacement_intent_v1";
 const FIRST_MOVE_ABORT_RETRY_MS = Object.freeze([15_000, 30_000, 60_000, 120_000, 300_000]);
 const HISTORICAL_GAME_EXPORT_MAXIMUM_BYTES = 16_777_216;
 const EXACT_FILE_LIMITS = Object.freeze({
@@ -116,6 +119,132 @@ const EXACT_FILE_LIMITS = Object.freeze({
 
 function readBoundedJson(filename, maximumBytes, label) {
   return readExactJsonSync(filename, { maximumBytes, label }).value;
+}
+
+function providerComponentVersion() {
+  const packageDocument = readBoundedJson(
+    path.join(ROOT, "package.json"),
+    EXACT_FILE_LIMITS.configuration,
+    "Lichess component package identity",
+  );
+  const version = packageDocument?.version;
+  if (typeof version !== "string" || !/^\d+\.\d+\.\d+$/u.test(version)) {
+    throw new Error("Lichess component version is invalid");
+  }
+  return version;
+}
+
+export function providerLifecycleResult(operation, disposition, reason = null, startup = null, platform = process.platform) {
+  if (operation === "install" && disposition === "ready") {
+    const active = platform === "win32" ? startup?.active === true
+      : platform === "linux" && startup?.active === "active";
+    const enabled = platform === "win32" ? startup?.enabled === true
+      : platform === "linux" && startup?.enabled === "enabled";
+    if (startup?.installed !== true || !active || !enabled) {
+      throw new Error("Typed install requires observed installed, enabled, and active startup");
+    }
+  }
+  const observations = {
+    install: {
+      ready: ["installed", "active", "matches", "not_applicable"],
+      safe_inactive: ["installed", "inactive", "matches", "not_applicable"],
+    },
+    uninstall: {
+      ready: ["absent", "inactive", "not_applicable", "not_applicable"],
+    },
+    pre_replace: {
+      ready: ["installed", "inactive", "matches", "safe"],
+    },
+    post_replace: {
+      ready: ["installed", "active", "matches", "safe"],
+      safe_inactive: ["installed", "inactive", "matches", "safe"],
+    },
+  };
+  const observed = observations[operation]?.[disposition];
+  if (!observed) throw new Error("Lichess provider lifecycle result is invalid");
+  if (disposition === "safe_inactive"
+      && (typeof reason?.id !== "string" || !reason.id || /[\0\r\n]/u.test(reason.id))) {
+    throw new Error("Lichess safe-inactive lifecycle reason is invalid");
+  }
+  const result = {
+    schema: PROVIDER_LIFECYCLE_RESULT_SCHEMA,
+    schema_version: 1,
+    component_id: PROVIDER_COMPONENT_ID,
+    component_version: providerComponentVersion(),
+    operation,
+    disposition,
+    observed: {
+      installation: observed[0],
+      activity: observed[1],
+      configuration: observed[2],
+      replacement: observed[3],
+    },
+  };
+  if (reason) {
+    result.reason = {
+      id: reason.id.slice(0, 128),
+      message: String(reason.message ?? "").slice(0, 1_024),
+    };
+  }
+  return result;
+}
+
+function startupReplacementIntentPath(runtimeDir) {
+  return path.join(path.resolve(runtimeDir), "startup-replacement-intent.json");
+}
+
+function readStartupReplacementIntent(runtimeDir) {
+  const filename = startupReplacementIntentPath(runtimeDir);
+  if (classifyExactPathSync(filename, { label: "Lichess startup replacement intent" }).kind
+      === "missing") {
+    return null;
+  }
+  const intent = readBoundedJson(
+    filename,
+    EXACT_FILE_LIMITS.startupDefinition,
+    "Lichess startup replacement intent",
+  );
+  if (intent?.schema !== STARTUP_REPLACEMENT_INTENT_SCHEMA
+      || Object.keys(intent).some((key) => !new Set([
+        "schema", "schema_version", "previous_root", "replacement_root",
+        "preserve_inactive", "registration_present", "phase",
+      ]).has(key))
+      || intent.schema_version !== 1
+      || !path.isAbsolute(intent.previous_root ?? "")
+      || !path.isAbsolute(intent.replacement_root ?? "")
+      || typeof intent.preserve_inactive !== "boolean"
+      || typeof intent.registration_present !== "boolean"
+      || !new Set(["preparing", "prepared", "completed"]).has(intent.phase)) {
+    throw new Error("Lichess startup replacement intent is invalid");
+  }
+  return intent;
+}
+
+function publishStartupReplacementIntent(runtimeDir, intent) {
+  ensureExactDirectorySync(runtimeDir, "Lichess runtime directory");
+  const document = {
+    schema: STARTUP_REPLACEMENT_INTENT_SCHEMA,
+    schema_version: 1,
+    previous_root: path.resolve(intent.previous_root),
+    replacement_root: path.resolve(intent.replacement_root),
+    preserve_inactive: intent.preserve_inactive === true,
+    registration_present: intent.registration_present === true,
+    phase: intent.phase,
+  };
+  publishExactJsonSync(startupReplacementIntentPath(runtimeDir), document, {
+    maximumBytes: EXACT_FILE_LIMITS.startupDefinition,
+    label: "Lichess startup replacement intent",
+  });
+  return document;
+}
+
+function matchingStartupReplacementIntent(runtimeDir, previousRoot, replacementRoot) {
+  const intent = readStartupReplacementIntent(runtimeDir);
+  if (!intent) return null;
+  return path.resolve(intent.previous_root) === path.resolve(previousRoot)
+      && path.resolve(intent.replacement_root) === path.resolve(replacementRoot)
+    ? intent
+    : null;
 }
 
 function exactRegularFileExistsSync(filename, label) {
@@ -8260,7 +8389,9 @@ export async function main(argv = process.argv.slice(2)) {
       : process.platform === "linux"
         ? await uninstallLinuxStartup(runtimeDir)
         : (() => { throw new Error(`Unsupported startup platform: ${process.platform}`); })();
-    console.log(JSON.stringify({ status: "ready", startup }));
+    console.log(JSON.stringify(options.lifecycle_result === "typed_v1"
+      ? providerLifecycleResult("uninstall", "ready")
+      : { status: "ready", startup }));
     return 0;
   }
   if (options.command === "startup" && options.action === "prepare_replace") {
@@ -8272,33 +8403,118 @@ export async function main(argv = process.argv.slice(2)) {
       : process.platform === "linux"
         ? await queryLinuxStartup()
         : (() => { throw new Error(`Unsupported startup platform: ${process.platform}`); })();
-    const allowUnowned = process.platform === "win32"
-      ? existingStartup.installed === true
-        && existingStartup.active === false
-        && existingStartup.enabled === false
-      : existingStartup.installed === true
-        && existingStartup.active === "inactive"
-        && existingStartup.enabled === "disabled";
+    const previousRoot = path.resolve(options.previous_root);
+    const replacementRoot = path.resolve(options.replacement_root);
+    const retainedIntent = matchingStartupReplacementIntent(
+      runtimeDir,
+      previousRoot,
+      replacementRoot,
+    );
+    const priorIntent = readStartupReplacementIntent(runtimeDir);
+    if (priorIntent && !retainedIntent && priorIntent.phase !== "completed") {
+      throw new Error("Lichess startup replacement intent belongs to different exact roots");
+    }
+    if (retainedIntent && (existingStartup.installed === true) !== retainedIntent.registration_present) {
+      throw new Error("Lichess startup registration changed during replacement");
+    }
+    const preserveInactive = retainedIntent?.preserve_inactive
+      ?? (existingStartup.installed !== true
+        || (process.platform === "win32"
+          ? existingStartup.active === false && existingStartup.enabled === false
+          : existingStartup.active === "inactive" && existingStartup.enabled === "disabled"));
     const replacement = await prepareProviderReplacementInterlock({
       runtimeDir,
-      allowUnowned,
-      prepare: () => (process.platform === "win32"
-        ? prepareWindowsStartupReplacement({
-          previousRoot: options.previous_root,
-          replacementRoot: options.replacement_root,
-          runtimeDir,
-        })
-        : process.platform === "linux"
-          ? prepareLinuxStartupReplacement({
-            previousRoot: options.previous_root,
-            replacementRoot: options.replacement_root,
-          })
-          : (() => { throw new Error(`Unsupported startup platform: ${process.platform}`); })()),
+      allowUnowned: preserveInactive,
+      prepare: async () => {
+        const intent = publishStartupReplacementIntent(runtimeDir, {
+          previous_root: previousRoot,
+          replacement_root: replacementRoot,
+          preserve_inactive: preserveInactive,
+          registration_present: retainedIntent?.registration_present
+            ?? existingStartup.installed === true,
+          phase: "preparing",
+        });
+        const prepared = existingStartup.installed !== true
+          ? {
+            installed: false,
+            active: false,
+            enabled: false,
+            matchesCurrentConfiguration: true,
+            replacementReady: true,
+            supervisionPreservedInactive: true,
+          }
+          : process.platform === "win32"
+            ? await prepareWindowsStartupReplacement({
+              previousRoot,
+              replacementRoot,
+              runtimeDir,
+            })
+            : process.platform === "linux"
+              ? await prepareLinuxStartupReplacement({
+                previousRoot,
+                replacementRoot,
+              })
+              : (() => { throw new Error(`Unsupported startup platform: ${process.platform}`); })();
+        publishStartupReplacementIntent(runtimeDir, { ...intent, phase: "prepared" });
+        return prepared;
+      },
     });
-    console.log(JSON.stringify({ status: "ready", startup: replacement }));
+    console.log(JSON.stringify(options.lifecycle_result === "typed_v1"
+      ? providerLifecycleResult("pre_replace", "ready")
+      : { status: "ready", startup: replacement }));
     return 0;
   }
   if (options.command === "startup" && options.action === "complete_replace") {
+    const typedLifecycle = options.lifecycle_result === "typed_v1";
+    if (typedLifecycle && (!options.previous_root || !options.replacement_root)) {
+      throw new Error("typed startup complete_replace requires exact replacement roots");
+    }
+    const replacementIntent = options.previous_root && options.replacement_root
+      ? matchingStartupReplacementIntent(
+        runtimeDir,
+        options.previous_root,
+        options.replacement_root,
+      )
+      : null;
+    if (typedLifecycle && (!replacementIntent
+        || !new Set(["prepared", "completed"]).has(replacementIntent.phase))) {
+      throw new Error("typed startup complete_replace requires prepared exact-root replacement intent");
+    }
+    if (replacementIntent?.preserve_inactive) {
+      const startup = process.platform === "win32"
+        ? await queryWindowsStartup({ runtimeDir, replacementRoot: replacementIntent.replacement_root })
+        : process.platform === "linux"
+          ? await queryLinuxStartup({ replacementRoot: replacementIntent.replacement_root })
+          : (() => { throw new Error(`Unsupported startup platform: ${process.platform}`); })();
+      const safelyInactive = startup.installed !== true
+        || (process.platform === "win32"
+          ? startup.active === false && startup.enabled === false
+          : startup.active === "inactive" && startup.enabled === "disabled");
+      if (!safelyInactive
+          || (startup.installed === true) !== replacementIntent.registration_present) {
+        throw new Error("Lichess startup did not preserve its inactive replacement state");
+      }
+      resumeProviderReplacementAdmissions(runtimeDir);
+      publishStartupReplacementIntent(runtimeDir, {
+        ...replacementIntent,
+        phase: "completed",
+      });
+      const inactive = {
+        ...startup,
+        installed: startup.installed === true,
+        active: false,
+        matchesCurrentConfiguration: true,
+        replacementReady: false,
+        supervisionPreservedInactive: true,
+      };
+      console.log(JSON.stringify(typedLifecycle
+        ? providerLifecycleResult("post_replace", "safe_inactive", {
+          id: "startup.explicitly_inactive",
+          message: "Operator startup state remained inactive during replacement",
+        })
+        : { status: "ready", startup: inactive }));
+      return 0;
+    }
     let requalification = null;
     let replacementConfig = null;
     const replacementConfigPath = path.resolve(options.config ?? DEFAULT_TEMPLATE);
@@ -8322,24 +8538,36 @@ export async function main(argv = process.argv.slice(2)) {
     }
     if (requalification) {
       const startup = process.platform === "win32"
-        ? await queryWindowsStartup({ runtimeDir })
+        ? await queryWindowsStartup({ runtimeDir, replacementRoot: replacementIntent?.replacement_root })
         : process.platform === "linux"
-          ? await queryLinuxStartup()
+          ? await queryLinuxStartup({ replacementRoot: replacementIntent?.replacement_root })
           : (() => { throw new Error(`Unsupported startup platform: ${process.platform}`); })();
-      if (!startupIsExplicitlyDisabledAndInactive(startup)) {
+      if (!startupIsExplicitlyDisabledAndInactive(startup)
+          || (replacementIntent
+            && (startup.installed === true) !== replacementIntent.registration_present)) {
         throw new Error("Lichess startup is not safely disabled for exact evidence requalification");
       }
-      console.log(JSON.stringify({
-        status: "ready",
-        startup: {
-          ...startup,
-          installed: true,
-          active: false,
-          providerReady: false,
-          replacementReady: false,
-          ...requalification,
-        },
-      }));
+      resumeProviderReplacementAdmissions(runtimeDir);
+      if (replacementIntent) {
+        publishStartupReplacementIntent(runtimeDir, {
+          ...replacementIntent,
+          phase: "completed",
+        });
+      }
+      const inactive = {
+        ...startup,
+        installed: true,
+        active: false,
+        providerReady: false,
+        replacementReady: false,
+        ...requalification,
+      };
+      console.log(JSON.stringify(typedLifecycle
+        ? providerLifecycleResult("post_replace", "safe_inactive", {
+          id: "evidence.requalification_required",
+          message: "Exact engine evidence must be requalified before startup",
+        })
+        : { status: "ready", startup: inactive }));
       return 0;
     }
     const startupOptions = startupRuntimeOptions(
@@ -8376,17 +8604,23 @@ export async function main(argv = process.argv.slice(2)) {
       : process.platform === "linux"
         ? await completeLinuxStartupReplacement()
         : (() => { throw new Error(`Unsupported startup platform: ${process.platform}`); })();
-    console.log(JSON.stringify({
-      status: "ready",
-      startup: process.platform === "win32"
-        ? {
-          ...replacement,
-          providerReady: replacementReadiness.providerReady,
-          apiCooldownDeferred: replacementReadiness.apiCooldownDeferred,
-          startupPending: replacementReadiness.startupPending,
-        }
-        : replacement,
-    }));
+    if (replacementIntent) {
+      publishStartupReplacementIntent(runtimeDir, {
+        ...replacementIntent,
+        phase: "completed",
+      });
+    }
+    const readyStartup = process.platform === "win32"
+      ? {
+        ...replacement,
+        providerReady: replacementReadiness.providerReady,
+        apiCooldownDeferred: replacementReadiness.apiCooldownDeferred,
+        startupPending: replacementReadiness.startupPending,
+      }
+      : replacement;
+    console.log(JSON.stringify(typedLifecycle
+      ? providerLifecycleResult("post_replace", "ready")
+      : { status: "ready", startup: readyStartup }));
     return 0;
   }
   const configPath = path.resolve(options.config ?? DEFAULT_TEMPLATE);
@@ -8502,7 +8736,9 @@ export async function main(argv = process.argv.slice(2)) {
       : process.platform === "linux"
         ? await installLinuxStartup(startupOptions)
         : (() => { throw new Error(`Unsupported startup platform: ${process.platform}`); })();
-    console.log(JSON.stringify({ status: "ready", startup }));
+    console.log(JSON.stringify(options.lifecycle_result === "typed_v1"
+      ? providerLifecycleResult("install", "ready", null, startup)
+      : { status: "ready", startup }));
     return 0;
   }
   if (!new Set(["qualify", "capacity-qualify", "probe", "run"]).has(options.command)) {

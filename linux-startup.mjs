@@ -231,6 +231,11 @@ export async function queryLinuxStartup(options = {}) {
   if (!exactRegularFileExistsSync(unitPath, "Lichess systemd unit")) {
     return classifyLinuxStartup({ installed: false, unitName: SYSTEMD_UNIT_NAME, unitPath });
   }
+  if (options.replacementRoot) {
+    retargetSystemdUnit(readExactTextSync(unitPath, {
+      maximumBytes: STARTUP_FILE_LIMIT, label: "Lichess systemd unit",
+    }).text, options.replacementRoot, options.replacementRoot);
+  }
   const [enabled, active] = await Promise.all([
     systemctlState("is-enabled"),
     systemctlState("is-active"),
@@ -342,11 +347,23 @@ export async function uninstallLinuxStartup(runtimeDir) {
 export function retargetSystemdUnit(unit, previousRoot, replacementRoot) {
   const previous = path.resolve(previousRoot);
   const replacement = path.resolve(replacementRoot);
-  const occurrences = unit.split(previous).length - 1;
-  if (occurrences < 2) {
+  const working = [...unit.matchAll(/^WorkingDirectory=(.*)$/gmu)];
+  const commands = [...unit.matchAll(/^ExecStart=(.*)$/gmu)];
+  const argumentsList = commands.length === 1 ? parseSystemdArguments(commands[0][1]) : [];
+  if (working.length !== 1 || parseSystemdArguments(working[0][1]).length !== 1
+      || path.resolve(parseSystemdArguments(working[0][1])[0]) !== previous
+      || argumentsList.length < 2
+      || path.resolve(argumentsList[1]) !== path.join(previous, "lichess-adapter.mjs")) {
     throw new Error("Existing Lichess systemd unit does not match the receipt-owned component root");
   }
-  return unit.split(previous).join(replacement);
+  const retarget = (value) => {
+    if (!path.isAbsolute(value)) return value;
+    const relative = path.relative(previous, path.resolve(value));
+    return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))
+      ? path.join(replacement, relative) : value;
+  };
+  return unit.replace(working[0][0], `WorkingDirectory=${systemdEscapeArgument(replacement)}`)
+    .replace(commands[0][0], `ExecStart=${argumentsList.map(retarget).map(systemdEscapeArgument).join(" ")}`);
 }
 
 export async function prepareLinuxStartupReplacement({
@@ -365,11 +382,28 @@ export async function prepareLinuxStartupReplacement({
     maximumBytes: STARTUP_FILE_LIMIT,
     label: "Lichess systemd unit",
   });
-  const updated = retargetSystemdUnit(
-    admittedUnit.text,
-    previousRoot,
-    replacementRoot,
-  );
+  let updated;
+  try {
+    updated = retargetSystemdUnit(
+      admittedUnit.text,
+      previousRoot,
+      replacementRoot,
+    );
+  } catch (error) {
+    try {
+      updated = retargetSystemdUnit(
+        admittedUnit.text,
+        replacementRoot,
+        replacementRoot,
+      );
+    } catch {
+      throw error;
+    }
+    const before = await queryLinuxStartup();
+    if (before.enabled !== "disabled" || before.active !== "inactive") {
+      throw new Error("Retargeted Lichess systemd unit is not disabled and inactive for retry");
+    }
+  }
   await systemctl(["disable", "--now", SYSTEMD_UNIT_NAME]);
   if (await systemctlState("is-active") === "active") {
     throw new Error(`${SYSTEMD_UNIT_NAME} did not stop for replacement`);
