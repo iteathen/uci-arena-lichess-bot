@@ -1489,6 +1489,18 @@ installer_component_contract_2026_08_01:
     - "A second build from the same clean source, target, epoch, native launcher, and test receipt produces the same artifact digest."
     - "Installer substitution tests consume the artifact as an arbitrary component identity and reject a changed service contract, unlisted file, unsafe path, digest mismatch, or incompatible contract major before mutation."
 
+managed_standard_engine_launch_2026_10_08:
+  status: active
+  owner: lichess_provider_installer_configuration
+  contract: arena_uci_engine_launch_profile_v1
+  rules:
+    - "An optional default_engine_launch_profile binding selects an engine-owned immutable portable launch profile through a declared component entrypoint. Its companion default_engine_launch_manifest binding names that same component's arena-component.json. Installer resolves both through verified installed component contracts; caller-authored shell commands are never launch authority."
+    - "The portable form uses component.root and engine.working_directory equal to '.', exact component id/version, engine.adapter equal to standard_uci_v1, conservative state, enabled true, and expected_runtime null. Engine executable and program paths are bounded forward-slash component-relative paths, independently listed by exact size and SHA-256 in that component inventory. The profile and executable are declared component entrypoints."
+    - "The portable program argument is one inventoried .mjs file. Only the exact --experimental-ffi literal may precede it, once, when declared by the immutable profile. Eval, inspection, require, loader, unknown switches, absolute paths, escaping paths, duplicate flags, and flags after the program are rejected."
+    - "The provider verifies the profile, executable, and program before resolving the launch to absolute paths and reuses the standard UCI configuration policy without legacy model, timing, capacity, or evidence assumptions. Bounded scalar UCI options come only from the declared profile."
+    - "An explicitly saved external UCI locator retains precedence. A present malformed or changed managed profile fails closed instead of selecting the legacy default; absence preserves the existing legacy default behavior."
+    - "The existing engine component identity owner checks selected executable and program-file argument inventory again before process creation. Existing pre/post-spawn launch identity checks retain exact byte and argument generation evidence."
+
 provider_release_reproducibility_2026_08_01:
   status: active
   owner: lichess_provider_release
