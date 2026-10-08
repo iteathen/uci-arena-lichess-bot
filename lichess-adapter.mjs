@@ -2029,6 +2029,16 @@ export function publishCapacityProfile(
   singleGameProfile,
   statuses,
 ) {
+  if (!Array.isArray(statuses) || statuses.length !== maximumConcurrency
+      || statuses.some((status) => status?.qualification_cleanup?.clean_exit !== true
+        || status.qualification_cleanup.exit_observed !== true
+        || status.qualification_cleanup.exit_code !== 0
+        || status.qualification_cleanup.exit_signal !== null
+        || status.qualification_cleanup.forced_termination !== false
+        || !Array.isArray(status.qualification_cleanup.cleanup_diagnostics)
+        || status.qualification_cleanup.cleanup_diagnostics.length !== 0)) {
+    throw new Error("Capacity qualification requires actual clean child close proof");
+  }
   const target = path.resolve(targetPath);
   ensureExactDirectorySync(path.dirname(target), "Lichess capacity profile directory");
   if (config.engine.adapter === "standard_uci_v1") {
@@ -2054,6 +2064,7 @@ export function publishCapacityProfile(
         qualified: true,
         uci_identity_sha256: status.uci_identity_sha256,
         bestmove: status.bestmove,
+        qualification_cleanup: status.qualification_cleanup,
       })),
     };
     publishExactJsonSync(target, profile, {
@@ -2103,6 +2114,7 @@ export function publishCapacityProfile(
       mcgs_completed_simulations: status.mcgs_completed_simulations,
       mcgs_async_admissions: status.mcgs_async_admissions,
       mcgs_outstanding_peak: status.mcgs_outstanding_peak,
+      qualification_cleanup: status.qualification_cleanup,
     })),
   };
   publishExactJsonSync(target, profile, {
@@ -3801,33 +3813,97 @@ export class UciEngine {
     }
   }
 
-  async close() {
+  async close({ requireCleanExit = false } = {}) {
     const child = this.child;
-    if (!child) return;
-    await this.stopAndDrain("engine_close").catch((error) => {
-      this.telemetry({ event: "engine_close_drain_error", message: error.message });
-    });
+    if (!child) {
+      if (requireCleanExit && this.closeOutcome?.clean_exit !== true) {
+        const error = new Error("UCI child close has no clean exit observation");
+        error.code = "UCI_CHILD_CLOSE_FAILED";
+        error.closeOutcome = this.closeOutcome;
+        throw error;
+      }
+      return this.closeOutcome;
+    }
+    const cleanupDiagnostics = [];
+    let normalCloseError;
+    const recordFailure = (operation, error) => {
+      cleanupDiagnostics.push(`${operation}:${String(error?.message ?? "failure").slice(0, 256)}`);
+    };
+    try {
+      await this.stopAndDrain("engine_close");
+    } catch (error) {
+      recordFailure("publication_drain", error);
+      try { this.telemetry({ event: "engine_close_drain_error", message: error.message }); }
+      catch (telemetryError) { recordFailure("telemetry", telemetryError); }
+    }
     this.child = undefined;
-    let exited = child.exitCode !== null;
+    let exited = typeof child.exitCode === "number" || child.signalCode != null;
+    let exitCode = child.exitCode;
+    let exitSignal = child.signalCode ?? null;
+    let forcedTermination = false;
+    const observeExit = (code, signal) => {
+      exited = true;
+      exitCode = code;
+      exitSignal = signal ?? null;
+    };
     const exitPromise = exited
       ? Promise.resolve()
-      : new Promise((resolve) => child.once("exit", () => {
-        exited = true;
+      : new Promise((resolve) => child.once("exit", (code, signal) => {
+        observeExit(code, signal);
         resolve();
       }));
-    if (child.stdin.writable) {
-      child.stdin.write("quit\n");
-      child.stdin.end();
+    const waitForExit = async () => {
+      let timer;
+      await Promise.race([
+        exitPromise,
+        new Promise((resolve) => {
+          timer = setTimeout(resolve, Number(this.config.shutdown_grace_ms ?? 5_000));
+        }),
+      ]).finally(() => clearTimeout(timer));
+    };
+    try {
+      if (child.stdin.writable) {
+        child.stdin.write("quit\n");
+        child.stdin.end();
+      }
+    } catch (error) {
+      recordFailure("quit", error);
+      normalCloseError ??= error;
     }
-    let timer;
-    await Promise.race([
-      exitPromise,
-      new Promise((resolve) => {
-        timer = setTimeout(resolve, Number(this.config.shutdown_grace_ms ?? 5_000));
-      }),
-    ]).finally(() => clearTimeout(timer));
-    if (!exited) child.kill();
-    this.lines?.close();
+    await waitForExit();
+    if (!exited) {
+      forcedTermination = true;
+      try { child.kill(); } catch (error) {
+        recordFailure("terminate", error);
+        normalCloseError ??= error;
+      }
+      // Qualification requires an observed disposition even when graceful shutdown fails.
+      if (requireCleanExit) await waitForExit();
+    }
+    try { this.lines?.close(); } catch (error) {
+      recordFailure("protocol_close", error);
+      normalCloseError ??= error;
+    }
+    this.closeOutcome = Object.freeze({
+      clean_exit: exited && exitCode === 0 && exitSignal === null
+        && !forcedTermination && cleanupDiagnostics.length === 0,
+      exit_observed: exited,
+      exit_code: exitCode ?? null,
+      exit_signal: exitSignal,
+      forced_termination: forcedTermination,
+      cleanup_diagnostics: Object.freeze(cleanupDiagnostics),
+    });
+    if (requireCleanExit && !this.closeOutcome.clean_exit) {
+      const reason = forcedTermination ? "forced termination"
+        : !exited ? "unobserved exit" : `exit code ${exitCode}, signal ${exitSignal}`;
+      const error = new Error(`UCI child did not close cleanly: ${reason}`);
+      error.code = "UCI_CHILD_CLOSE_FAILED";
+      error.closeOutcome = this.closeOutcome;
+      error.cleanupDiagnostics = cleanupDiagnostics;
+      throw error;
+    }
+    if (normalCloseError) throw normalCloseError;
+    return this.closeOutcome;
   }
 }
 
@@ -7050,28 +7126,47 @@ export function bindShutdownInput(controller, input = process.stdin) {
 }
 
 async function preflightQualifiedEngine(config) {
-  const engine = new UciEngine(config.engine);
-  try {
-    await engine.start();
-    config.engine.time_profile_status = engine.timeProfileStatus;
-    return engine.qualificationStatus;
-  } finally {
-    await engine.close();
-  }
+  return (await preflightQualifiedEngines(config, 1))[0];
 }
 
 async function preflightQualifiedEngines(config, count) {
   const engines = Array.from({ length: count }, () => new UciEngine(config.engine));
+  let primaryError;
   try {
     const outcomes = await Promise.allSettled(engines.map((engine) => engine.start()));
     const failure = outcomes.find((outcome) => outcome.status === "rejected");
     if (failure) throw failure.reason;
-    config.engine.time_profile_status = engines[0]?.timeProfileStatus
-      ?? timeProfileFallbackStatus("missing", "no timing-profile engine status was produced");
-    return engines.map((engine) => engine.qualificationStatus);
-  } finally {
-    await Promise.allSettled(engines.map((engine) => engine.close()));
+  } catch (error) {
+    primaryError = error;
   }
+  const closes = await Promise.allSettled(engines.map((engine) =>
+    engine.close({ requireCleanExit: true })));
+  const cleanupFailures = closes.flatMap((outcome, index) => {
+    if (outcome.status !== "rejected") return [];
+    const details = Array.isArray(outcome.reason?.cleanupDiagnostics)
+      ? outcome.reason.cleanupDiagnostics.slice(0, 8) : [];
+    return [
+      `child ${index + 1}:${String(outcome.reason?.message ?? "cleanup failure").slice(0, 256)}`,
+      ...details.map((detail) => `child ${index + 1}:${String(detail).slice(0, 256)}`),
+    ];
+  });
+  if (primaryError) {
+    if (cleanupFailures.length > 0) primaryError.cleanupDiagnostics = [
+      ...(primaryError.cleanupDiagnostics ?? []), ...cleanupFailures,
+    ];
+    throw primaryError;
+  }
+  if (cleanupFailures.length > 0) {
+    const error = new Error(`Qualification child cleanup failed: ${cleanupFailures.slice(0, 3).join("; ")}`);
+    error.code = "UCI_QUALIFICATION_CLEANUP_FAILED";
+    error.cleanupDiagnostics = cleanupFailures;
+    throw error;
+  }
+  config.engine.time_profile_status = engines[0]?.timeProfileStatus
+    ?? timeProfileFallbackStatus("missing", "no timing-profile engine status was produced");
+  return engines.map((engine, index) => ({
+    ...engine.qualificationStatus, qualification_cleanup: closes[index].value,
+  }));
 }
 
 function qualificationRegularFile(value, label) {
