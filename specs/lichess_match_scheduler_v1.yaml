@@ -186,8 +186,8 @@ capacity_profile:
     cursor fields have no MCGS authority. A smaller configured capacity may
     use a profile qualified at a greater capacity with identical bindings.
   child_cleanup:
-    - "Fresh qualification returns evidence only after every exact owned UCI child has an observed zero-code, unsignalled exit without forced termination or cleanup failure. Active-game close retains its existing best-effort shutdown policy."
-    - "Single-child and concurrent qualification preserve the primary startup/runtime failure and attach bounded cleanup diagnostics. Cleanup continues for every acquired child even when another child fails."
+    - "Fresh qualification returns evidence only after every exact owned UCI child has an observed zero-code, unsignalled exit and completed child stdio close without forced termination or cleanup failure. Active-game close retains its existing best-effort shutdown policy."
+    - "Single-child and concurrent qualification preserve every primary startup/runtime rejection, including falsy or immutable reasons, and attach bounded cleanup diagnostics without mutating that reason. Cleanup continues for every acquired child even when another child fails."
     - "New capacity publication requires the actual per-child clean-close observation and retains it in evidence. Missing, rejected, nonzero, signalled, forced, or unobserved close blocks creation or replacement of the capacity artifact; retained historical profiles preserve their existing schema meanings."
   failure: "Missing, stale, mismatched, or undersized capacity evidence blocks live run before credentials are read."
 

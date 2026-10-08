@@ -2032,6 +2032,7 @@ export function publishCapacityProfile(
   if (!Array.isArray(statuses) || statuses.length !== maximumConcurrency
       || statuses.some((status) => status?.qualification_cleanup?.clean_exit !== true
         || status.qualification_cleanup.exit_observed !== true
+        || status.qualification_cleanup.close_observed !== true
         || status.qualification_cleanup.exit_code !== 0
         || status.qualification_cleanup.exit_signal !== null
         || status.qualification_cleanup.forced_termination !== false
@@ -3060,6 +3061,8 @@ export class UciEngine {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
+    const launchedChild = this.child;
+    launchedChild.once("close", () => { this.closedChild = launchedChild; });
     let postSpawnLaunchIdentity;
     try {
       postSpawnLaunchIdentity = engineLaunchIdentity(this.config);
@@ -3824,6 +3827,13 @@ export class UciEngine {
       }
       return this.closeOutcome;
     }
+    let streamsClosed = this.closedChild === child;
+    const closePromise = streamsClosed ? Promise.resolve()
+      : new Promise((resolve) => child.once("close", () => {
+        streamsClosed = true;
+        this.closedChild = child;
+        resolve();
+      }));
     const cleanupDiagnostics = [];
     let normalCloseError;
     const recordFailure = (operation, error) => {
@@ -3852,10 +3862,11 @@ export class UciEngine {
         observeExit(code, signal);
         resolve();
       }));
+    const dispositionPromise = requireCleanExit ? Promise.all([exitPromise, closePromise]) : exitPromise;
     const waitForExit = async () => {
       let timer;
       await Promise.race([
-        exitPromise,
+        dispositionPromise,
         new Promise((resolve) => {
           timer = setTimeout(resolve, Number(this.config.shutdown_grace_ms ?? 5_000));
         }),
@@ -3880,14 +3891,21 @@ export class UciEngine {
       // Qualification requires an observed disposition even when graceful shutdown fails.
       if (requireCleanExit) await waitForExit();
     }
+    if (requireCleanExit && !streamsClosed) {
+      recordFailure("stdio_close", new Error("child stdio close was not observed within the shutdown bound"));
+      for (const stream of child.stdio ?? []) {
+        try { stream?.destroy(); } catch (error) { recordFailure("stdio_dispose", error); }
+      }
+    }
     try { this.lines?.close(); } catch (error) {
       recordFailure("protocol_close", error);
       normalCloseError ??= error;
     }
     this.closeOutcome = Object.freeze({
-      clean_exit: exited && exitCode === 0 && exitSignal === null
+      clean_exit: exited && streamsClosed && exitCode === 0 && exitSignal === null
         && !forcedTermination && cleanupDiagnostics.length === 0,
       exit_observed: exited,
+      close_observed: streamsClosed,
       exit_code: exitCode ?? null,
       exit_signal: exitSignal,
       forced_termination: forcedTermination,
@@ -7132,11 +7150,13 @@ async function preflightQualifiedEngine(config) {
 async function preflightQualifiedEngines(config, count) {
   const engines = Array.from({ length: count }, () => new UciEngine(config.engine));
   let primaryError;
+  let startupRejected = false;
   try {
     const outcomes = await Promise.allSettled(engines.map((engine) => engine.start()));
     const failure = outcomes.find((outcome) => outcome.status === "rejected");
     if (failure) throw failure.reason;
   } catch (error) {
+    startupRejected = true;
     primaryError = error;
   }
   const closes = await Promise.allSettled(engines.map((engine) =>
@@ -7150,11 +7170,14 @@ async function preflightQualifiedEngines(config, count) {
       ...details.map((detail) => `child ${index + 1}:${String(detail).slice(0, 256)}`),
     ];
   });
-  if (primaryError) {
-    if (cleanupFailures.length > 0) primaryError.cleanupDiagnostics = [
-      ...(primaryError.cleanupDiagnostics ?? []), ...cleanupFailures,
-    ];
-    throw primaryError;
+  if (startupRejected) {
+    if (primaryError instanceof Error && cleanupFailures.length === 0) throw primaryError;
+    const error = new Error(primaryError instanceof Error ? primaryError.message : "Qualification startup rejected", {
+      cause: primaryError,
+    });
+    error.code = "UCI_QUALIFICATION_STARTUP_FAILED";
+    error.cleanupDiagnostics = cleanupFailures;
+    throw error;
   }
   if (cleanupFailures.length > 0) {
     const error = new Error(`Qualification child cleanup failed: ${cleanupFailures.slice(0, 3).join("; ")}`);
