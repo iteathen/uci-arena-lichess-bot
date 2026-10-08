@@ -218,6 +218,27 @@ test("live log mutation on child exit is observed at the next bounded poll", asy
   assert.equal(fixture.shutdowns, 0);
 });
 
+for (const hook of ["afterOpen", "afterPathAdmission"]) {
+  test(`live log same-object shrink cannot promote a pre-attempt completion (${hook})`, async (t) => {
+    const fixture = logAttemptFixture(t);
+    const oldCompletion = `${JSON.stringify({ ...finishedEvent, game_id: "old-game" })}\n`;
+    writeFileSync(fixture.logPath, `${oldCompletion}${JSON.stringify({ event: "historical_padding", padding: "x".repeat(1024) })}\n`);
+    let reads = 0;
+    await assert.rejects(fixture.run({
+      spawnImpl: () => { fixture.append({ event: "game_started", game_id: "new-game", opponent: "publicbot" }); return fixture.child; },
+      fileAuthority: { ...exactFiles, readExactFileSync(filename, readOptions) {
+        reads += 1;
+        return exactFiles.readExactFileSync(filename, { ...readOptions, hooks: {
+          [hook]: () => { if (reads === 2) writeFileSync(filename, oldCompletion); },
+        } });
+      } },
+    }), (error) => error instanceof ExactFileError
+      && error.code === (hook === "afterOpen" ? "EXACT_FILE_TRUNCATED" : "EXACT_FILE_IDENTITY_CHANGED"));
+    assert.equal(reads, 2);
+    assert.equal(fixture.shutdowns, 1);
+  });
+}
+
 function options(overrides = {}) {
   return validateAcceptanceOptions({
     confirm: LIVE_ACCEPTANCE_CONFIRMATION,

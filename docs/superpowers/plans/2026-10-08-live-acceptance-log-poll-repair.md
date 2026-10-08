@@ -6,8 +6,10 @@ is correct; the harness owns retrying a mutable diagnostic observation.
 
 1. Reproduce append between admission/open and fstat/read through the actual
    exact-file boundary, including the initial pre-spawn offset.
-2. Defer only typed content changes while a fresh exact classification still
-   proves the same bounded regular object. Preserve unread offset and partial
+2. Defer only typed append-compatible changes while a fresh exact classification
+   proves the same bounded regular object with nondecreasing size. During-read
+   truncation or shrink must reject before it can replay an old completion.
+   Preserve unread offset and partial
    record. Retain the original deadline and cleanup lifecycle.
 3. Prove later completed-event delivery, partial-record preservation, pre-attempt
    exclusion, repeated mutation/deadline, substitution, quota, unknown error and

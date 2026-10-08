@@ -35,16 +35,18 @@ function readRuntimeLog(filename, fileAuthority) {
     }).bytes;
   } catch (error) {
     if (!(error instanceof ExactFileError)
-        || !["EXACT_FILE_IDENTITY_CHANGED", "EXACT_FILE_GREW", "EXACT_FILE_TRUNCATED"].includes(error.code)) {
+        || !["EXACT_FILE_IDENTITY_CHANGED", "EXACT_FILE_GREW"].includes(error.code)) {
       throw error;
     }
     // A changing log supplies no admitted bytes. Only retry when the same
-    // bounded regular object remains; path replacement and unsafe paths fail.
+    // bounded regular object remains without shrinking; replacement, truncation
+    // and unsafe paths fail rather than replaying pre-attempt evidence.
     const current = fileAuthority.classifyExactPathSync(filename, { label });
     if (current.kind !== "file"
         || current.identity.dev !== admission.identity.dev
         || current.identity.ino !== admission.identity.ino
-        || current.identity.mode !== admission.identity.mode) throw error;
+        || current.identity.mode !== admission.identity.mode
+        || BigInt(current.identity.size) < BigInt(admission.identity.size)) throw error;
     if (BigInt(current.identity.size) > BigInt(RUNTIME_LOG_LIMIT)) {
       throw new ExactFileError("EXACT_FILE_TOO_LARGE", label, `exceeds ${RUNTIME_LOG_LIMIT} bytes`);
     }
