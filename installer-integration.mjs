@@ -10,6 +10,7 @@ import {
 import {
   admitExactDirectorySync,
   admitExactFileSync,
+  hashExactFileSync,
   readExactJsonSync,
 } from './exact-file.mjs';
 
@@ -120,6 +121,87 @@ function preserveManagerOptions(configuration, workspace, engineRoot) {
   return applyManagerOptionsPatch(configuration, editableManagerOptionsProjection(current));
 }
 
+function portableStandardLaunch(bindings) {
+  const profilePath = optionalAbsolutePath(bindings.default_engine_launch_profile, 'launch profile binding');
+  if (profilePath === undefined) return undefined;
+  const manifestPath = requireAbsolutePath(bindings.default_engine_launch_manifest, 'launch profile manifest binding');
+  const manifest = readExactJsonSync(manifestPath, {
+    maximumBytes: MAXIMUM_CONTEXT_BYTES, label: 'Managed launch component manifest',
+  }).value;
+  if (manifest?.schema !== 'arena_install_component_v1' || manifest.schema_version !== 1
+      || !Array.isArray(manifest.files) || manifest.files.length > 100_000
+      || typeof manifest.component_id !== 'string' || !/^[A-Za-z0-9._-]{1,128}$/u.test(manifest.component_id)
+      || typeof manifest.component_version !== 'string' || !/^[A-Za-z0-9._-]{1,128}$/u.test(manifest.component_version)
+      || !manifest.entrypoints || typeof manifest.entrypoints !== 'object'
+      || Array.isArray(manifest.entrypoints) || !Array.isArray(manifest.capabilities)
+      || !manifest.capabilities.includes('uci_engine_launch_profile_v1')) {
+    throw new Error('launch profile component inventory is invalid');
+  }
+  const root = path.dirname(manifestPath);
+  admitExactDirectorySync(root, { label: 'Managed launch component root' });
+  function ownedFile(relative) {
+    if (typeof relative !== 'string' || !relative || Buffer.byteLength(relative, 'utf8') > 4096
+        || relative.startsWith('-') || path.isAbsolute(relative) || path.win32.isAbsolute(relative)
+        || /[\u0000\r\n\\:]/u.test(relative)
+        || relative.split('/').some((part) => !part || part === '.' || part === '..')) {
+      throw new Error('launch profile contains an unsafe component-relative path');
+    }
+    const records = manifest.files.filter((record) => record?.path === relative);
+    if (records.length !== 1 || !Number.isSafeInteger(records[0].size_bytes)
+        || records[0].size_bytes < 0 || !/^[a-f0-9]{64}$/u.test(records[0].sha256)) {
+      throw new Error('launch profile file inventory is invalid');
+    }
+    const absolute = path.join(root, ...relative.split('/'));
+    const exact = hashExactFileSync(absolute, {
+      maximumBytes: 16 * 1024 * 1024 * 1024, label: 'Managed launch inventory file',
+    });
+    if (exact.byteLength !== records[0].size_bytes || exact.sha256 !== `sha256:${records[0].sha256}`) {
+      throw new Error('launch profile file does not match its component inventory');
+    }
+    return { absolute, sha256: exact.sha256 };
+  }
+  const profileRelative = path.relative(root, profilePath).split(path.sep).join('/');
+  if (!Object.values(manifest.entrypoints).includes(profileRelative)) {
+    throw new Error('launch profile is not a declared component entrypoint');
+  }
+  const profileFile = ownedFile(profileRelative);
+  const admitted = readExactJsonSync(profileFile.absolute, {
+    maximumBytes: MAXIMUM_CONTEXT_BYTES, label: 'Managed engine launch profile',
+  });
+  if (admitted.sha256 !== profileFile.sha256) throw new Error('launch profile inventory changed during admission');
+  const profile = admitted.value;
+  if (profile?.schema !== 'arena_uci_engine_launch_profile_v1' || profile.schema_version !== 1
+      || profile.component?.id !== manifest.component_id || profile.component?.version !== manifest.component_version
+      || profile.component?.root !== '.' || profile.engine?.working_directory !== '.'
+      || profile.engine?.adapter !== 'standard_uci_v1' || profile.state !== 'conservative'
+      || profile.enabled !== true || profile.expected_runtime !== null) {
+    throw new Error('launch profile identity or standard adapter contract is invalid');
+  }
+  const argumentsList = profile.engine.arguments;
+  const offset = argumentsList?.[0] === '--experimental-ffi' ? 1 : 0;
+  if (!Array.isArray(argumentsList) || argumentsList.length !== offset + 1
+      || typeof argumentsList[offset] !== 'string' || !argumentsList[offset].endsWith('.mjs')) {
+    throw new Error('launch profile must declare one program and only the approved leading runtime flag');
+  }
+  const executable = ownedFile(profile.engine.executable).absolute;
+  if (!Object.values(manifest.entrypoints).includes(profile.engine.executable)) {
+    throw new Error('launch profile executable is not a declared component entrypoint');
+  }
+  const program = ownedFile(argumentsList[offset]).absolute;
+  const options = requireObject(profile.uci_options, 'launch profile UCI options');
+  if (Object.keys(options).length > 128 || Object.entries(options).some(([name, value]) =>
+    !/^[A-Za-z0-9_ -]{1,128}$/u.test(name)
+    || !['string', 'number', 'boolean'].includes(typeof value)
+    || (typeof value === 'number' && !Number.isFinite(value))
+    || Buffer.byteLength(String(value), 'utf8') > 4096 || /[\u0000\r\n]/u.test(String(value)))) {
+    throw new Error('launch profile UCI options are invalid');
+  }
+  return {
+    executable, arguments: [...argumentsList.slice(0, offset), program],
+    working_directory: root, uci_options: { ...options }, component_manifest: manifestPath,
+  };
+}
+
 export function renderInstallerConfiguration(context) {
   requireObject(context, 'installer context');
   if (context.schema !== 'arena_provider_install_context_v1'
@@ -135,24 +217,27 @@ export function renderInstallerConfiguration(context) {
     label: 'Default Lichess configuration template',
   }).value;
   const importedEngine = optionalAbsolutePath(locators.uci_engine, 'locators.uci_engine');
+  const standardLaunch = importedEngine ? undefined : portableStandardLaunch(bindings);
   const defaultEngine = optionalAbsolutePath(bindings.default_engine, 'bindings.default_engine');
-  const engine = importedEngine ?? defaultEngine;
+  const engine = importedEngine ?? standardLaunch?.executable ?? defaultEngine;
   if (!engine) throw new Error('no conforming UCI engine binding is available');
-  const policyEngineRoot = optionalAbsolutePath(
+  const policyEngineRoot = standardLaunch?.working_directory ?? optionalAbsolutePath(
     bindings.default_engine_root,
     'bindings.default_engine_root',
   ) ?? path.dirname(engine);
   configuration = preserveManagerOptions(configuration, workspace, policyEngineRoot);
 
-  if (importedEngine) {
+  if (importedEngine || standardLaunch) {
     configuration.engine.adapter = 'standard_uci_v1';
-    configuration.engine.executable = importedEngine;
-    configuration.engine.working_directory = path.dirname(importedEngine);
-    configuration.engine.uci_options = {};
+    configuration.engine.executable = engine;
+    configuration.engine.arguments = standardLaunch?.arguments ?? [];
+    configuration.engine.working_directory = standardLaunch?.working_directory ?? path.dirname(importedEngine);
+    configuration.engine.uci_options = standardLaunch?.uci_options ?? {};
     delete configuration.engine.single_game_profile;
     delete configuration.engine.time_profile;
     delete configuration.engine.temporal_curve_profile;
     delete configuration.engine.component_manifest;
+    if (standardLaunch) configuration.engine.component_manifest = standardLaunch.component_manifest;
     delete configuration.engine.fallback_bundle;
     configuration.capacity.total_slots = 1;
     configuration.capacity.startup_parallelism = 1;

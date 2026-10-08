@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import {
   mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
 } from 'node:fs';
@@ -7,8 +8,129 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { renderInstallerConfiguration } from './installer-integration.mjs';
+import { engineComponentIdentity, UciEngine } from './lichess-adapter.mjs';
 
 const DEFAULT_TEMPLATE = new URL('./config.uci_arena.template.yml', import.meta.url);
+
+function managedStandardEngine(t) {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'arena-managed-standard-engine-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  mkdirSync(path.join(root, 'bin'));
+  mkdirSync(path.join(root, 'dist'));
+  mkdirSync(path.join(root, 'contracts'));
+  const profile = {
+    schema: 'arena_uci_engine_launch_profile_v1', schema_version: 1,
+    component: { id: 'uci_arena.vector', version: '0.1.0', root: '.' },
+    engine: {
+      adapter: 'standard_uci_v1', executable: 'bin/node.exe',
+      arguments: ['--experimental-ffi', 'dist/uci.mjs'], working_directory: '.',
+    },
+    state: 'conservative', enabled: true, uci_options: { Hash: 128 },
+    expected_runtime: null, evidence: {}, knowledge: {}, diagnostics: [],
+  };
+  function publish() {
+    writeFileSync(path.join(root, 'contracts', 'uci-engine-launch-profile.json'), JSON.stringify(profile));
+    const files = ['bin/node.exe', 'dist/uci.mjs', 'contracts/uci-engine-launch-profile.json'].map((relative) => {
+      const bytes = readFileSync(path.join(root, relative));
+      return { path: relative, size_bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') };
+    });
+    writeFileSync(path.join(root, 'arena-component.json'), JSON.stringify({
+      schema: 'arena_install_component_v1', schema_version: 1,
+      component_id: 'uci_arena.vector', component_version: '0.1.0',
+      entrypoints: { uci_engine: 'bin/node.exe', uci_launch_profile: 'contracts/uci-engine-launch-profile.json' },
+      capabilities: ['uci_engine_launch_profile_v1'], files,
+    }));
+  }
+  writeFileSync(path.join(root, 'bin', 'node.exe'), 'independently inventoried runtime fixture');
+  writeFileSync(path.join(root, 'dist', 'uci.mjs'), 'independently inventoried UCI program fixture');
+  publish();
+  const context = {
+    schema: 'arena_provider_install_context_v1', schema_version: 1,
+    workspace: path.join(root, 'workspace'), enabled: true,
+    bindings: {
+      default_engine_launch_profile: path.join(root, 'contracts', 'uci-engine-launch-profile.json'),
+      default_engine_launch_manifest: path.join(root, 'arena-component.json'),
+    }, locators: {},
+  };
+  return { root, profile, publish, context };
+}
+
+test('installed standard engine launch uses its owned runtime and program without legacy model or profiles', (t) => {
+  const { root, context } = managedStandardEngine(t);
+  const result = renderInstallerConfiguration(context);
+  assert.equal(result.configuration.engine.adapter, 'standard_uci_v1');
+  assert.equal(result.configuration.engine.executable, path.join(root, 'bin', 'node.exe'));
+  assert.deepEqual(result.configuration.engine.arguments, ['--experimental-ffi', path.join(root, 'dist', 'uci.mjs')]);
+  assert.equal(result.configuration.engine.working_directory, root);
+  assert.deepEqual(result.configuration.engine.uci_options, { Hash: 128 });
+  assert.equal(result.configuration.engine.component_manifest, path.join(root, 'arena-component.json'));
+  assert.equal(Object.hasOwn(result.configuration.engine, 'time_profile'), false);
+  assert.equal(Object.hasOwn(result.configuration.engine, 'single_game_profile'), false);
+  assert.equal(Object.hasOwn(result.configuration, 'qualification'), false);
+  assert.equal(result.configuration.capacity.total_slots, 1);
+  assert.equal(result.configuration.timing.opponent_turn_search, false);
+});
+
+test('managed engine identity rejects a program changed after installer configuration admission', (t) => {
+  const { root, context } = managedStandardEngine(t);
+  const { configuration } = renderInstallerConfiguration(context);
+  writeFileSync(path.join(root, 'dist', 'uci.mjs'), 'post-install program replacement');
+  assert.throws(() => engineComponentIdentity(configuration), /manifest inventory/i);
+});
+
+test('managed UCI launch rejects program inventory drift before creating its child process', async (t) => {
+  const { root, context } = managedStandardEngine(t);
+  const { configuration } = renderInstallerConfiguration(context);
+  writeFileSync(path.join(root, 'dist', 'uci.mjs'), 'post-install program replacement');
+  const engine = new UciEngine(configuration.engine);
+  await assert.rejects(() => engine.start(), /manifest inventory/i);
+  assert.equal(engine.child, undefined);
+});
+
+test('a present default launch profile cannot silently fall back to the legacy engine after inventory drift', (t) => {
+  const { root, context } = managedStandardEngine(t);
+  Object.assign(context.bindings, {
+    default_engine: path.join(root, 'legacy.exe'), default_engine_root: root,
+    default_model_root: path.join(root, 'models'),
+  });
+  writeFileSync(path.join(root, 'dist', 'uci.mjs'), 'replaced executable program');
+  assert.throws(() => renderInstallerConfiguration(context), /launch.*inventory/i);
+});
+
+for (const [label, change] of [
+  ['outside executable', (profile) => { profile.engine.executable = '../outside.exe'; }],
+  ['absolute argument', (profile) => { profile.engine.arguments = [path.resolve(os.tmpdir(), 'unowned.mjs')]; }],
+  ['runtime eval switch', (profile) => { profile.engine.arguments = ['--eval', 'process.exit()']; }],
+  ['duplicate runtime flags', (profile) => { profile.engine.arguments = ['--experimental-ffi', '--experimental-ffi', 'dist/uci.mjs']; }],
+  ['runtime flag after entrypoint', (profile) => { profile.engine.arguments = ['dist/uci.mjs', '--experimental-ffi']; }],
+  ['outside working directory', (profile) => { profile.engine.working_directory = '..'; }],
+  ['foreign component identity', (profile) => { profile.component.version = '9.9.9'; }],
+  ['unknown adapter', (profile) => { profile.engine.adapter = 'untrusted_adapter'; }],
+]) {
+  test(`portable managed launch rejects ${label} before configuration composition`, (t) => {
+    const { profile, publish, context } = managedStandardEngine(t);
+    change(profile);
+    publish();
+    assert.throws(() => renderInstallerConfiguration(context), /launch profile/i);
+  });
+}
+
+for (const relative of ['bin/node.exe', 'contracts/uci-engine-launch-profile.json']) {
+  test(`managed default launch rejects changed inventoried ${relative}`, (t) => {
+    const { root, context } = managedStandardEngine(t);
+    writeFileSync(path.join(root, relative), 'changed payload');
+    assert.throws(() => renderInstallerConfiguration(context), /launch.*inventory/i);
+  });
+}
+
+test('an explicit saved UCI locator retains precedence over the optional managed default launch', (t) => {
+  const { root, context } = managedStandardEngine(t);
+  context.locators.uci_engine = path.join(root, 'operator-engine.exe');
+  const result = renderInstallerConfiguration(context);
+  assert.equal(result.configuration.engine.executable, path.join(root, 'operator-engine.exe'));
+  assert.deepEqual(result.configuration.engine.arguments, []);
+  assert.deepEqual(result.configuration.engine.uci_options, {});
+});
 
 test('installer integration preserves validated Manager policy while refreshing bindings', (t) => {
   const root = mkdtempSync(path.join(os.tmpdir(), 'arena-lichess-policy-preservation-'));

@@ -1174,7 +1174,7 @@ test("component identity is explicit, inventory-bound, and null for external UCI
   const provider = providerComponentIdentity();
   assert.deepEqual(provider, {
     componentId: "lichess.adapter",
-    version: "1.0.39",
+    version: "1.0.40",
     manifestSha256: sha256(readFileSync(path.join(ROOT, "contracts", "component-manifest.json"))),
   });
 

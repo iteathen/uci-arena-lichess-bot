@@ -911,6 +911,7 @@ function uciProtocolScalar(value, label, { allowEmpty = false } = {}) {
 }
 
 function engineLaunchIdentity(config) {
+  engineComponentIdentity({ engine: config });
   const argumentsList = validateEngineArguments(config.arguments);
   const argumentFiles = argumentsList.map((argument) => {
     const candidate = path.isAbsolute(argument)
@@ -4594,29 +4595,39 @@ export function engineComponentIdentity(config) {
   }
   const manifestRoot = path.dirname(path.resolve(manifestPath));
   const executable = path.resolve(config.engine.executable);
-  const matches = manifest.files.filter((entry) => {
+  const inventory = manifest.files.map((entry) => {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)
         || typeof entry.path !== "string" || !entry.path
         || entry.path.includes("\\") || path.isAbsolute(entry.path)
         || entry.path.split("/").some((segment) => !segment || segment === "." || segment === "..")) {
       throw new Error("Engine component manifest contains an unsafe file path");
     }
-    return samePlatformPath(path.join(manifestRoot, ...entry.path.split("/")), executable);
+    return { entry, absolute: path.join(manifestRoot, ...entry.path.split("/")) };
   });
-  if (matches.length !== 1) {
-    throw new Error("Engine component manifest does not own the exact selected executable");
+  const selectedFiles = [{ absolute: executable, maximumBytes: EXACT_FILE_LIMITS.largeAsset, label: "executable" }];
+  for (const argument of validateEngineArguments(config.engine.arguments)) {
+    const absolute = path.resolve(config.engine.working_directory ?? manifestRoot, argument);
+    if (inventory.some((record) => samePlatformPath(record.absolute, absolute))
+        || classifyExactPathSync(absolute, { label: "Engine argument path" }).kind === "file") {
+      selectedFiles.push({ absolute, maximumBytes: EXACT_FILE_LIMITS.argumentFile, label: "argument file" });
+    }
   }
-  const [entry] = matches;
-  if (!Number.isSafeInteger(entry.size_bytes) || entry.size_bytes < 0
-      || typeof entry.sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(entry.sha256)) {
-    throw new Error("Engine component executable inventory is malformed");
-  }
-  const exact = hashExactFileSync(executable, {
-    maximumBytes: EXACT_FILE_LIMITS.largeAsset,
-    label: "Engine component executable",
-  });
-  if (exact.byteLength !== entry.size_bytes || exact.sha256 !== `sha256:${entry.sha256}`) {
-    throw new Error("Engine component executable does not match its manifest inventory");
+  for (const selected of selectedFiles) {
+    const matches = inventory.filter((record) => samePlatformPath(record.absolute, selected.absolute));
+    if (matches.length !== 1) {
+      throw new Error(`Engine component manifest does not own the exact selected ${selected.label}`);
+    }
+    const [{ entry }] = matches;
+    if (!Number.isSafeInteger(entry.size_bytes) || entry.size_bytes < 0
+        || typeof entry.sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(entry.sha256)) {
+      throw new Error(`Engine component ${selected.label} inventory is malformed`);
+    }
+    const exact = hashExactFileSync(selected.absolute, {
+      maximumBytes: selected.maximumBytes, label: `Engine component ${selected.label}`,
+    });
+    if (exact.byteLength !== entry.size_bytes || exact.sha256 !== `sha256:${entry.sha256}`) {
+      throw new Error(`Engine component ${selected.label} does not match its manifest inventory`);
+    }
   }
   return normalizeProviderComponentIdentity({
     componentId: manifest.component_id,

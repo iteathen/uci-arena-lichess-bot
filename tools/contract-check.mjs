@@ -24,6 +24,19 @@ const gameDetail = readJson("contracts/game-detail-schema.json");
 const qualificationResult = readJson("contracts/qualification-result-schema.json");
 const template = readFileSync(path.join(root, "config.uci_arena.template.yml"), "utf8");
 const errors = [];
+const launchBindings = component.installation?.installer_integration?.dependency_bindings ?? [];
+const launchProfileBinding = launchBindings.find((binding) => binding.name === 'default_engine_launch_profile');
+const launchManifestBinding = launchBindings.find((binding) => binding.name === 'default_engine_launch_manifest');
+if (!launchProfileBinding || !launchManifestBinding
+    || launchProfileBinding.component_id !== launchManifestBinding.component_id
+    || launchProfileBinding.source !== 'entrypoint'
+    || launchProfileBinding.entrypoint !== 'uci_launch_profile'
+    || launchProfileBinding.required !== false
+    || launchManifestBinding.source !== 'component_path'
+    || launchManifestBinding.path !== 'arena-component.json'
+    || launchManifestBinding.required !== false) {
+  errors.push('optional managed standard engine launch bindings are incomplete');
+}
 
 const diagnosticPin = readJson("contracts/continuous-game-diagnostic.upstream.json");
 if (diagnosticPin.schema !== "uci_arena_public_contract_snapshot_v1"
