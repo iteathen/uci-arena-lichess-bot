@@ -980,6 +980,99 @@ for (const [label, mutate, expected] of [
   });
 }
 
+function publicationSequenceFixture(options, { advance = true, source = "search", bookFence = false } = {}) {
+  const diagnostic = continuousDiagnosticFixture(options);
+  for (const game of diagnostic.games) {
+    for (const [index, transition] of game.transitions.entries()) {
+      transition.observation.focus.transition_sequence = String(game.model_color === "white" ? 2 * (index + 1) : 3 + 2 * index);
+    }
+    for (const publication of game.publications) {
+      const startupMove = game.model_color === "white" && publication.ply === 1;
+      const previous = startupMove ? game.startup_probe.observation : game.transitions[publication.ply - 2].observation;
+      const sequence = BigInt(previous.focus.transition_sequence) + (advance && !startupMove ? 1n : 0n);
+      publication.current_focus = { ...publication.current_focus, transition_sequence: String(sequence) };
+      publication.candidates.focus = { ...publication.current_focus };
+      publication.native_focus = { ...publication.current_focus };
+      if (!startupMove) {
+        publication.completion_source = source;
+        if (source === "opening_book") {
+          publication.timing_applicability = "non_search_resolved";
+          publication.native_focus = bookFence ? { ...publication.current_focus } : null;
+          publication.publication_allowed_count = null; publication.policy_moves = null; publication.seeded_moves = null;
+        }
+      }
+    }
+    if (game.model_color === "white") game.startup_probe.publication = structuredClone(game.publications[0]);
+  }
+  if (source === "opening_book") {
+    const book = path.join(path.dirname(options.engine), "public-book.bin");
+    writeFileSync(book, Buffer.alloc(16));
+    Object.assign(diagnostic.binding.knowledge, { opening_book_enabled: true, opening_book_active: true,
+      opening_book_file: book, opening_book_identity: "1", files: [{ path: book, sha256: sha256(readFileSync(book)) }] });
+    Object.assign(diagnostic.binding.effective_options.model, { OwnBook: "true", BookFile: book, BookStatsFile: "", BookPolicyFile: "" });
+    Object.assign(diagnostic.binding.timing_profile, { validation_schema: "uci_time_profile_searched_regime_runtime_status_v1",
+      validation_scope: "historical_searched_regime", configured_opening_book_enabled: true,
+      timing_authority_match: false, whole_runtime_timing_authority_match: false });
+  }
+  return diagnostic;
+}
+
+for (const optionsShape of [{ advance: true, source: "search" }, { advance: true, source: "fallback" },
+  { advance: true, source: "opening_book" }, { advance: true, source: "opening_book", bookFence: true },
+  { advance: false, source: "search" }]) {
+  test(`same-node publication sequence accepts ${JSON.stringify(optionsShape)}`, () => {
+    const options = fixture("mcgs");
+    const diagnostic = publicationSequenceFixture(options, optionsShape);
+    writeFileSync(options.complete_game_evidence, JSON.stringify(diagnostic));
+    assert.equal(publishSingleGameProfile({ ...options, qualification_scope: "local_live_safety" }).schema,
+      "uci_arena_single_game_profile_v2");
+  });
+}
+
+for (const [label, mutate] of [
+  ["backward sequence", (publication) => { publication.current_focus.transition_sequence = "3"; }],
+  ["zero sequence", (publication) => { publication.current_focus.transition_sequence = "0"; }],
+  ["nondecimal sequence", (publication) => { publication.current_focus.transition_sequence = "not-a-sequence"; }],
+  ["UInt32 overflow", (publication) => { publication.current_focus.transition_sequence = "4294967296"; }],
+  ["changed node", (publication) => { publication.current_focus.subject_identity = "99"; }],
+  ["changed epoch", (publication) => { publication.current_focus.graph_epoch = "2"; }],
+  ["changed canonical key", (publication) => { publication.current_focus.position_key = "999"; }],
+  ["stale candidate tuple", (publication) => { publication.candidates.focus.transition_sequence = "4"; }],
+  ["future candidate tuple", (publication) => { publication.candidates.focus.transition_sequence = "6"; }],
+  ["stale native tuple", (publication) => { publication.native_focus.transition_sequence = "4"; }],
+  ["future native tuple", (publication) => { publication.native_focus.transition_sequence = "6"; }],
+  ["publication at next transition", (publication) => { for (const focus of [publication.current_focus, publication.candidates.focus, publication.native_focus]) focus.transition_sequence = "6"; }],
+  ["publication beyond next transition", (publication) => { for (const focus of [publication.current_focus, publication.candidates.focus, publication.native_focus]) focus.transition_sequence = "7"; }],
+  ["nonadvancing opponent transition", (_publication, diagnostic) => { diagnostic.games[0].transitions[1].observation.focus.transition_sequence = "2"; }],
+]) {
+  test(`publication chronology rejects ${label} without replacing prior authority`, () => {
+    const options = fixture("mcgs");
+    const diagnostic = publicationSequenceFixture(options);
+    mutate(diagnostic.games[0].publications[1], diagnostic);
+    writeFileSync(options.complete_game_evidence, JSON.stringify(diagnostic));
+    mkdirSync(path.dirname(options.output), { recursive: true }); writeFileSync(options.output, "prior-authority");
+    assert.throws(() => publishSingleGameProfile({ ...options, qualification_scope: "local_live_safety" }));
+    assert.equal(readFileSync(options.output, "utf8"), "prior-authority");
+  });
+}
+
+test("startup publication remains exactly bound to its captured observation", () => {
+  const options = fixture("mcgs");
+  const diagnostic = publicationSequenceFixture(options);
+  const startup = diagnostic.games[1].startup_probe.publication;
+  for (const focus of [startup.current_focus, startup.candidates.focus, startup.native_focus]) focus.transition_sequence = "2";
+  writeFileSync(options.complete_game_evidence, JSON.stringify(diagnostic));
+  assert.throws(() => publishSingleGameProfile({ ...options, qualification_scope: "local_live_safety" }), /startup publication focus/);
+});
+
+test("non-search publication rejects contradictory optional native fence", () => {
+  const options = fixture("mcgs");
+  const diagnostic = publicationSequenceFixture(options, { source: "opening_book", bookFence: true });
+  diagnostic.games[0].publications[1].native_focus.transition_sequence = "4";
+  writeFileSync(options.complete_game_evidence, JSON.stringify(diagnostic));
+  assert.throws(() => publishSingleGameProfile({ ...options, qualification_scope: "local_live_safety" }));
+});
+
 test("continuous pair rejects legal moves after first canonical threefold terminal", () => {
   const options = fixture("mcgs");
   const repeatedPrefix = ["g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6", "f3g1", "f6g8"];
