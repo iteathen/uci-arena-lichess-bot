@@ -56,6 +56,7 @@ import {
   validateHistoricalSearchedRegimeRuntimeSnapshot,
   validateAppliedSearchedRegimeTimeProfileReserve,
 } from "@uci-arena/time-profile-contract";
+import * as TimeProfileContract from "@uci-arena/time-profile-contract";
 import { publishSingleGameProfile } from "./publish-single-game-profile.mjs";
 import {
   currentProcessIdentity,
@@ -1171,6 +1172,9 @@ export function updateManagerOptions({
   templatePath,
   settings,
   engineRoot = ROOT,
+  profilePath,
+  timeProfilePath,
+  capacityProfilePath,
   ratedConfirmation,
   outboundConfirmation,
 } = {}) {
@@ -1186,6 +1190,23 @@ export function updateManagerOptions({
   const before = loadManagerConfig({ templatePath: target, engineRoot });
   const patch = typeof settings === "string" ? JSON.parse(settings) : settings;
   const updatedRaw = applyManagerOptionsPatch(originalRaw, patch);
+  const evidenceReferences = [
+    ["--profile", profilePath], ["--time-profile", timeProfilePath],
+    ["--capacity-profile", capacityProfilePath],
+  ];
+  const adoptingEvidence = evidenceReferences.some(([, value]) => value !== undefined);
+  if (adoptingEvidence) {
+    const selected = evidenceReferences.map(([flag, value]) => {
+      if (typeof value !== "string" || !value.trim()) {
+        throw new Error("Evidence adoption requires --profile, --time-profile, and --capacity-profile");
+      }
+      safePublicPath(value, `${flag} evidence reference`);
+      return path.resolve(value);
+    });
+    updatedRaw.engine.single_game_profile = selected[0];
+    updatedRaw.engine.time_profile = selected[1];
+    updatedRaw.capacity.capacity_profile = selected[2];
+  }
   if (originalRaw.schema !== CURRENT_CONFIG_SCHEMA) {
     updatedRaw.scheduler.challenge_interval_seconds = Math.max(
       MINIMUM_CHALLENGE_INTERVAL_SECONDS,
@@ -1218,8 +1239,13 @@ export function updateManagerOptions({
     expectedTargetIdentity: originalAdmission.identity,
     hooks: {
       beforeActivation({ temporary }) {
-        after = loadManagerConfig({ templatePath: temporary, engineRoot });
-        if (capacityShapeChanged(before, after) && !after.capacity.legacy_shared) {
+        after = adoptingEvidence
+          ? loadRuntimeConfig({ templatePath: temporary, engineRoot, environment: {} })
+          : loadManagerConfig({ templatePath: temporary, engineRoot });
+        if (adoptingEvidence && after.capacity.legacy_shared) {
+          throw new Error("Evidence adoption requires qualified capacity, not legacy shared authority");
+        }
+        if (adoptingEvidence || (capacityShapeChanged(before, after) && !after.capacity.legacy_shared)) {
           const evidence = capacityEvidenceSummary(after);
           if (!evidence.qualified) {
             throw new Error("Capacity changes require a present qualified capacity profile");
@@ -1609,7 +1635,7 @@ export function loadSingleGameProfile(profilePath) {
     const checkpoint = readBoundedJson(path.join(profile.runtime_binding.model.root, "checkpoint_manifest.json"),
       EXACT_FILE_LIMITS.profile, "Model checkpoint manifest");
     const timeProfile = validateStoredProfile(readBoundedJson(evidencePaths.timing, EXACT_FILE_LIMITS.profile, "Timing profile evidence"));
-    const timingIdentity = validateTimingProfile(timeProfile, checkpoint);
+    const timingIdentity = validateTimingProfile(timeProfile, checkpoint, { allowContinuous: true });
     const diagnosticAdmission = readExactJsonSync(evidencePaths.continuous_game,
       { maximumBytes: EXACT_FILE_LIMITS.profile - 1, label: "Continuous complete-game evidence" });
     const diagnostic = diagnosticAdmission.value;
@@ -2120,8 +2146,12 @@ function validateContinuousCapacityStatus(status, singleGameProfile) {
     && timed.backup_emit_reserve_us === qualifiedTime.backup_emit_reserve_us
     && timed.iteration_forecast_scale_permille === qualifiedTime.iteration_forecast_scale_permille,
   "capacity actual applied timing evidence differs from qualification");
-  if (qualifiedTime.validation_scope === "historical_searched_regime") {
-    requireContinuous(timed.schema === "uci_time_profile_searched_regime_runtime_status_v1"
+  if (qualifiedTime.validation_scope === "historical_searched_regime" || qualifiedTime.validation_scope === "continuous_searched_regime") {
+    const continuous = qualifiedTime.validation_scope === "continuous_searched_regime";
+    requireContinuous(qualifiedTime.schema === (continuous ? "uci_time_profile_v4" : "uci_time_profile_v3")
+      && timed.schema === (continuous ? "uci_time_profile_continuous_searched_regime_runtime_status_v1"
+        : "uci_time_profile_searched_regime_runtime_status_v1")
+      && timed.validation_scope === qualifiedTime.validation_scope
       && timed.searched_regime_timing_authority_match === true
       && timed.whole_runtime_timing_authority_match === qualifiedTime.whole_runtime_timing_authority_match
       && timed.configured_opening_book_enabled === qualifiedTime.configured_opening_book_enabled
@@ -2136,7 +2166,8 @@ function validateContinuousCapacityStatus(status, singleGameProfile) {
       && JSON.stringify(timed.move_overhead_envelope?.tested_values) === JSON.stringify(qualifiedTime.move_overhead_envelope.tested_values),
     "capacity searched timing scope differs from qualification");
   } else {
-    requireContinuous(timed.schema === "uci_time_profile_runtime_status_v1" && timed.timing_authority_match === true,
+    requireContinuous(qualifiedTime.validation_scope === "exact_runtime" && ["uci_time_profile_v3", "uci_time_profile_v4"].includes(qualifiedTime.schema)
+      && timed.schema === "uci_time_profile_runtime_status_v1" && timed.timing_authority_match === true,
       "capacity exact timing scope differs from qualification");
   }
   validateNativeModelAssets(status.model_asset_observation, singleGameProfile.runtime_binding.model);
@@ -3175,6 +3206,37 @@ export function validateRuntimeStatus(profile, status) {
   return status;
 }
 
+function timingValidationOperations(profile, singleGameProfile) {
+  const continuousGame = singleGameProfile?.schema === CONTINUOUS_PROFILE_SCHEMA;
+  const binding = continuousGame ? singleGameProfile.runtime_binding?.timing_profile : null;
+  const scope = binding?.validation_scope;
+  const continuousTiming = profile.schema === TimeProfileContract.CONTINUOUS_TIME_PROFILE_SCHEMA;
+  if (continuousTiming) {
+    requireContinuous(continuousGame && ["continuous_searched_regime", "exact_runtime"].includes(scope)
+      && binding.schema === profile.schema, "continuous v4 timing requires its explicit v2 binding and scope");
+    if (scope === "continuous_searched_regime") {
+      requireContinuous(typeof TimeProfileContract.validateContinuousSearchedRegimeRuntimeSnapshot === "function"
+        && typeof TimeProfileContract.validateAppliedContinuousSearchedRegimeTimeProfileReserve === "function",
+      "public continuous timing operations are unavailable");
+      return { snapshot: TimeProfileContract.validateContinuousSearchedRegimeRuntimeSnapshot,
+        applied: TimeProfileContract.validateAppliedContinuousSearchedRegimeTimeProfileReserve };
+    }
+  }
+  if (continuousGame && !continuousTiming) {
+    requireContinuous(profile.schema === TimeProfileContract.PROFILE_SCHEMA
+      && ["historical_searched_regime", "exact_runtime"].includes(scope),
+    "historical timing requires its v3 binding and scope");
+    if (binding.schema !== undefined) requireContinuous(binding.schema === profile.schema, "timing binding schema differs from actual profile");
+  }
+  if (scope === "historical_searched_regime") {
+    return { snapshot: validateHistoricalSearchedRegimeRuntimeSnapshot,
+      applied: validateAppliedSearchedRegimeTimeProfileReserve };
+  }
+  return { snapshot: validateProfileRuntimeSnapshot,
+    applied: input => ({ ...validateProfileRuntimeSnapshot(input),
+      ...validateAppliedTimeProfileReserve(input.profile, input.status) }) };
+}
+
 export class UciEngine {
   constructor(config, telemetry = () => {}) {
     this.config = config;
@@ -3527,10 +3589,8 @@ export class UciEngine {
     try {
       profile = loadExactTimeProfile(resolvedPath, this.config.working_directory);
       const configuration = this.timeProfileConfiguration(0);
-      const scoped = this.config.qualification_profile?.schema === CONTINUOUS_PROFILE_SCHEMA
-        && this.config.qualification_profile.runtime_binding.timing_profile.validation_scope === "historical_searched_regime";
-      const validateSnapshot = scoped ? validateHistoricalSearchedRegimeRuntimeSnapshot : validateProfileRuntimeSnapshot;
-      const accepted = validateSnapshot({
+      const operations = timingValidationOperations(profile, this.config.qualification_profile);
+      const accepted = operations.snapshot({
         profile,
         status: initialStatus,
         executable: this.config.executable,
@@ -3562,8 +3622,7 @@ export class UciEngine {
           iterationForecastScalePermille: accepted.iteration_forecast_scale_permille,
         },
       };
-      const appliedAcceptance = scoped ? validateAppliedSearchedRegimeTimeProfileReserve(appliedInput)
-        : { ...validateProfileRuntimeSnapshot(appliedInput), ...validateAppliedTimeProfileReserve(profile, appliedStatus) };
+      const appliedAcceptance = operations.applied(appliedInput);
       this.timeProfileStatus = {
         ...appliedAcceptance,
         permissions: profile.permissions ?? {},
@@ -3678,9 +3737,7 @@ export class UciEngine {
       uciIdLines: this.uciIdLines, uciOptionLines: this.uciOptionLines,
       configuration: this.timeProfileConfiguration(binding.timing_profile.provider_service_reserve_us,
         binding.timing_profile.backup_emit_reserve_us) };
-    const scoped = binding.timing_profile.validation_scope === "historical_searched_regime";
-    const accepted = scoped ? validateAppliedSearchedRegimeTimeProfileReserve(input)
-      : { ...validateProfileRuntimeSnapshot(input), ...validateAppliedTimeProfileReserve(input.profile, status) };
+    const accepted = timingValidationOperations(this.appliedTimeProfile, profile).applied(input);
     requireContinuous(accepted.accepted === true && accepted.applied === true
       && accepted.identity_sha256 === binding.timing_profile.identity_sha256, "actual applied timing identity differs from qualified context");
     const current = this.effectiveOptionValues();
@@ -8339,6 +8396,9 @@ export async function main(argv = process.argv.slice(2)) {
       templatePath: configPath,
       settings: options.settings,
       engineRoot: path.resolve(options.engine_root ?? ROOT),
+      profilePath: options.profile,
+      timeProfilePath: options.time_profile,
+      capacityProfilePath: options.capacity_profile,
       ratedConfirmation: options.confirm_rated,
       outboundConfirmation: options.confirm_outbound,
     });

@@ -10,10 +10,10 @@ const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const vendor = path.join(root, "vendor");
 const lockPath = path.join(vendor, "upstream.lock.json");
 const textExtensions = new Set([".cpp", ".h", ".hpp", ".json", ".md", ".mjs", ".txt", ".yaml", ".yml"]);
-const sourceCommit = "3d33a7551258b6e36d5443e656658d3b1ea68376";
+const sourceCommit = "40fb4a494b89ce6c90152513e3a8fe8eb549be40";
 const packageVersions = {
   "@uci-arena/background-service-runtime": "1.2.0",
-  "@uci-arena/time-profile-contract": "1.4.0",
+  "@uci-arena/time-profile-contract": "1.5.0",
 };
 
 function canonicalBytes(name, bytes) {

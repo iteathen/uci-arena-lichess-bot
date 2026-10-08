@@ -1,4 +1,5 @@
 import { PROFILE_SCHEMA, validateStoredProfile } from "@uci-arena/time-profile-contract";
+import * as TimeProfileContract from "@uci-arena/time-profile-contract";
 function requireValue(condition, message) { if (!condition) throw new Error(message); }
 function same(value, expected, label) { requireValue(String(value) === String(expected), `${label} mismatch`); }
 function requireInteger(value, label, minimum = 0, maximum = Number.MAX_SAFE_INTEGER) {
@@ -6,9 +7,10 @@ function requireInteger(value, label, minimum = 0, maximum = Number.MAX_SAFE_INT
     `${label} must be an integer in ${minimum}..${maximum}`);
 }
 
-export function validateTimingProfile(input, checkpoint) {
+export function validateTimingProfile(input, checkpoint, { allowContinuous = false } = {}) {
   const profile = validateStoredProfile(input);
-  requireValue(profile.schema === PROFILE_SCHEMA,
+  const continuous = profile.schema === TimeProfileContract.CONTINUOUS_TIME_PROFILE_SCHEMA;
+  requireValue(profile.schema === PROFILE_SCHEMA || (allowContinuous && continuous),
     "Timing evidence schema is not uci_time_profile_v3");
   requireInteger(
     profile.qualification?.repetitions_per_case,
@@ -41,7 +43,9 @@ export function validateTimingProfile(input, checkpoint) {
     "Timing profile must disable background search");
   same(identity.model.model_id, checkpoint.model_id, "Timing-profile model id");
   if (identity.search.search_core === "mcgs") {
-    for (const gate of [
+    // The public SDK owns the distinct v4 population/continuous gates. Historical
+    // move-scoped gates retain their original meaning for v3 only.
+    for (const gate of continuous ? [] : [
       "mcgs_root_coverage_passed",
       "mcgs_policy_only_fallback_passed",
       "mcgs_graph_population_passed",

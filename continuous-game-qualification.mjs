@@ -33,12 +33,13 @@ export function canonicalMoveDigest(moves) {
 }
 // Deliberately limited to the pinned producer schema's vocabulary; unsupported evolution fails closed.
 function shape(value, node, location = "artifact") {
-  const vocabulary = ["$schema", "$id", "$defs", "$ref", "anyOf", "const", "enum", "type", "minimum", "maximum",
+  const vocabulary = ["$schema", "$id", "$defs", "$ref", "anyOf", "allOf", "const", "enum", "type", "minimum", "maximum",
     "pattern", "items", "maxItems", "maxLength", "properties", "required", "additionalProperties", "maxProperties"];
   requireContinuous(node && Object.keys(node).every((key) => vocabulary.includes(key)), "public schema vocabulary is unsupported");
   if (node.maxLength !== undefined) requireContinuous(typeof value === "string"
     && Array.from(value).length <= node.maxLength, `${location} string exceeds its bound`);
   if (node.$ref) return shape(value, artifactSchema.$defs[node.$ref.split("/").at(-1)], location);
+  if (node.allOf) for (const branch of node.allOf) shape(value, branch, location);
   if (node.anyOf) {
     for (const branch of node.anyOf) {
       try { shape(value, branch, location); return; } catch {}
@@ -454,12 +455,17 @@ export function validateContinuousGameDiagnostic(value, { executableSha, modelRo
     && timing.move_overhead_ms >= timing.move_overhead_envelope.minimum
     && timing.move_overhead_ms <= timing.move_overhead_envelope.maximum, "actual transport overhead is outside qualified applicability");
   same(timing.searched_regime_timing_authority_match, true, "searched timing regime match");
-  if (timing.validation_scope === "historical_searched_regime") {
-    same(timing.validation_schema, "uci_time_profile_searched_regime_runtime_status_v1", "scoped timing public schema");
+  same(timing.schema, timeProfile.schema, "timing profile schema");
+  if (timing.validation_scope === "historical_searched_regime" || timing.validation_scope === "continuous_searched_regime") {
+    const continuous = timing.validation_scope === "continuous_searched_regime";
+    same(timeProfile.schema, continuous ? "uci_time_profile_v4" : "uci_time_profile_v3", "declared searched timing regime schema");
+    same(timing.validation_schema, continuous ? "uci_time_profile_continuous_searched_regime_runtime_status_v1"
+      : "uci_time_profile_searched_regime_runtime_status_v1", "scoped timing public schema");
     same(timing.qualified_opening_book_enabled, false, "historical searched book regime");
     same(timing.book_prior_blend_permille, 0, "unchanged searched prior blend");
     same(timing.whole_runtime_timing_authority_match, !knowledge.opening_book_enabled, "whole actual timing context match");
   } else {
+    requireContinuous(["uci_time_profile_v3", "uci_time_profile_v4"].includes(timeProfile.schema), "exact timing profile schema is unsupported");
     same(timing.validation_scope, "exact_runtime", "timing validation scope");
     same(timing.validation_schema, "uci_time_profile_runtime_status_v1", "exact timing public schema");
     same(timing.configured_opening_book_enabled, timing.qualified_opening_book_enabled, "exact timing book regime");
