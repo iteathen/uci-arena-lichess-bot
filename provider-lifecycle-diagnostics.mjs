@@ -25,7 +25,8 @@ function verifiedSource(error, root) {
       { maximumBytes: 1048576, label: 'Lifecycle public source inventory' });
     if (!Array.isArray(inventory.files) || inventory.files.length > 4096) return undefined;
     // Never inspect the message line, arbitrary cause text, or a private filename.
-    const frames = typeof error?.stack === 'string' ? error.stack.slice(0, 16384).split('\n').slice(1, 33) : [];
+    const stack = error?.stack;
+    const frames = typeof stack === 'string' ? stack.slice(0, 16384).split('\n').slice(1, 33) : [];
     for (const frame of frames) {
       const location = /\(?((?:file:\/\/\/|[A-Za-z]:[\\/]|\/).+?):(\d{1,10}):(\d{1,10})\)?$/u.exec(frame.trim());
       if (!location) continue;
@@ -53,8 +54,9 @@ export function startupFailureDiagnostic(error, root) {
   let code = 'STARTUP_OPERATION_FAILED';
   let category = 'operation';
   try {
-    if (typeof error?.code === 'string' && codes.has(error.code)) {
-      code = error.code;
+    const observedCode = error?.code;
+    if (typeof observedCode === 'string' && codes.has(observedCode)) {
+      code = observedCode;
       category = codes.get(code);
     }
   } catch { /* Unknown exception objects carry no public diagnostic authority. */ }

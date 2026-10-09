@@ -58,6 +58,15 @@ test('startup diagnostics retain only allowlisted code and hash-verified invento
     id: 'startup.storage_failed', message: JSON.stringify({ code: error.code,
       source: { path: 'owner.mjs', line: 1, column: 2, sha256 } }),
   });
+  const capturedStack = error.stack;
+  let stackReads = 0;
+  Object.defineProperty(error, 'stack', { configurable: true, get() {
+    stackReads++;
+    return stackReads === 1 ? capturedStack : 'DO_NOT_EXPOSE_CHANGED_STACK';
+  } });
+  assert.equal(JSON.parse(startupFailureDiagnostic(error, root).message).source.sha256, sha256);
+  assert.equal(stackReads, 1);
+  Object.defineProperty(error, 'stack', { configurable: true, writable: true, value: capturedStack });
   error.code = 'DO_NOT_EXPOSE_PRIVATE_CODE';
   writeFileSync(path.join(root, 'owner.mjs'), source + '// drift\n');
   assert.deepEqual(startupFailureDiagnostic(error, root), {
@@ -85,4 +94,18 @@ test('failed lifecycle frame enforces the public bounded reason contract', () =>
   const result = providerLifecycleResult('pre_replace', 'failed',
     { id: 'startup.operation_failed', message: '{"code":"STARTUP_OPERATION_FAILED"}' });
   assert.equal(result.disposition, 'failed');
+});
+
+test('changing or throwing exception getters cannot bypass the code allowlist', async () => {
+  const { startupFailureDiagnostic } = await import('./provider-lifecycle-diagnostics.mjs');
+  let reads = 0;
+  const error = Object.defineProperty(new Error('private message'), 'code', { configurable: true,
+    get() { return ++reads < 3 ? 'ENOENT' : 'CANARY_GETTER_PRIVATE_TOKEN'; } });
+  const result = startupFailureDiagnostic(error, import.meta.dirname);
+  assert.deepEqual(result, { id: 'startup.platform_failed', message: '{"code":"ENOENT"}' });
+  assert.equal(reads, 1);
+  Object.defineProperty(error, 'code', { get() { throw new Error('CANARY_THROWING_PRIVATE_TOKEN'); } });
+  assert.deepEqual(startupFailureDiagnostic(error, import.meta.dirname), {
+    id: 'startup.operation_failed', message: '{"code":"STARTUP_OPERATION_FAILED"}',
+  });
 });
