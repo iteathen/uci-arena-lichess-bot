@@ -3,6 +3,8 @@ import { rm } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+import { createHash } from 'node:crypto';
+import { WindowsTaskScheduler } from '@uci-arena/background-service-runtime/windows-task-scheduler';
 import { setTimeout as wait } from "node:timers/promises";
 import {
   classifyExactPathSync,
@@ -95,7 +97,7 @@ export function parseWindowsArguments(commandLine) {
   return result;
 }
 
-function existingCredentialProjection(argumentsText, adapterPath) {
+function existingCredentialProjection(argumentsText, adapterPath, componentRoot = ROOT) {
   const values = parseWindowsArguments(argumentsText);
   if (values.length < 11 || values[2] !== "run"
       || path.resolve(values[1]) !== path.resolve(adapterPath)
@@ -121,7 +123,7 @@ function existingCredentialProjection(argumentsText, adapterPath) {
     }
   }
   const tokenFile = path.resolve(bindings.get("--token-file"));
-  const relativeToken = path.relative(ROOT, tokenFile);
+  const relativeToken = path.relative(componentRoot, tokenFile);
   if (relativeToken === "" || (!relativeToken.startsWith("..") && !path.isAbsolute(relativeToken))) {
     throw new Error("Existing Lichess startup token path is inside the component root");
   }
@@ -130,6 +132,242 @@ function existingCredentialProjection(argumentsText, adapterPath) {
     throw new Error("Existing Lichess startup account identity is invalid");
   }
   return { tokenFile, expectedAccount };
+}
+
+const sameWindowsPath = (left, right) => typeof left === 'string' && typeof right === 'string'
+  && path.isAbsolute(left) && path.isAbsolute(right)
+  && path.resolve(left).toLowerCase() === path.resolve(right).toLowerCase();
+
+export function validateWindowsOwnedAction(action, { componentRoot, runtimeDir, configPath } = {}) {
+  if (!componentRoot || !runtimeDir || !action
+      || !sameWindowsPath(action.command, path.join(path.resolve(componentRoot), 'native', 'lichess_adapter_launcher.exe'))
+      || !sameWindowsPath(action.working_directory, componentRoot)) {
+    throw new Error('Windows startup action does not match the owned component root');
+  }
+  const args = parseWindowsArguments(action.arguments);
+  existingCredentialProjection(action.arguments, path.join(path.resolve(componentRoot), 'lichess-adapter.mjs'), componentRoot);
+  const bindings = new Map();
+  for (let index = 3; index < args.length; index += 2) bindings.set(args[index], args[index + 1]);
+  if (!sameWindowsPath(bindings.get('--runtime-dir'), runtimeDir)
+      || (configPath && !sameWindowsPath(bindings.get('--config'), configPath))) {
+    throw new Error('Windows startup action does not match provider runtime authority');
+  }
+  return Object.freeze({ ...action });
+}
+
+async function performWindowsReplacementTask(scheduler, request, timeoutMs = 10000) {
+  const result = await scheduler.perform({ task_path: `\\${STARTUP_TASK_NAME}`, ...request }, { timeoutMs });
+  if (result?.outcome !== 'completed' || !result.observation) {
+    const error = new Error('Windows startup platform operation was not confirmed');
+    error.code = 'LICHESS_STARTUP_PLATFORM_FAILURE';
+    throw error;
+  }
+  return result.observation;
+}
+
+export async function inspectWindowsReplacement({ componentRoot, allowedRoots = [componentRoot], runtimeDir, configPath,
+  scheduler = new WindowsTaskScheduler(), platform = process.platform } = {}) {
+  if (platform !== 'win32') throw new Error('Unsupported Windows startup platform');
+  const observed = await performWindowsReplacementTask(scheduler, { operation: 'inspect' });
+  if (typeof observed.registered !== 'boolean') throw new Error('Windows startup observation is unavailable');
+  if (!observed.registered) {
+    if (observed.enabled !== null || observed.action !== null || observed.definition_xml !== null
+        || observed.definition_sha256 !== null || observed.principal !== null
+        || !Array.isArray(observed.instance_guids) || observed.instance_guids.length) {
+      throw new Error('Windows startup absence was not confirmed');
+    }
+    return Object.freeze({ platform: 'win32', registered: false,
+    enabled: false, active: false, definition_text: null, definition_sha256: null, action: null,
+    instances: Object.freeze([]) });
+  }
+  let action = null;
+  if (!Array.isArray(allowedRoots) || allowedRoots.length < 1 || allowedRoots.length > 2) throw new Error('Invalid owned startup roots');
+  for (const ownerRoot of allowedRoots) {
+    try { action = validateWindowsOwnedAction(observed.action, { componentRoot: ownerRoot, runtimeDir, configPath }); break; }
+    catch {}
+  }
+  if (!action) throw new Error('Windows startup action is not an admitted owned root');
+  if (typeof observed.enabled !== 'boolean' || !Array.isArray(observed.instance_guids)
+      || typeof observed.definition_xml !== 'string' || typeof observed.definition_sha256 !== 'string'
+      || createHash('sha256').update(observed.definition_xml, 'utf8').digest('hex') !== observed.definition_sha256) {
+    throw new Error('Windows startup before-image was not confirmed');
+  }
+  if (windowsDefinitionEnablement(observed.definition_xml).enabled !== observed.enabled) {
+    throw new Error('Windows startup enablement observation is inconsistent');
+  }
+  return Object.freeze({ platform: 'win32', registered: true, enabled: observed.enabled,
+    active: observed.instance_guids.length > 0, definition_text: observed.definition_xml,
+    definition_sha256: observed.definition_sha256, action,
+    instances: Object.freeze([...observed.instance_guids]) });
+}
+
+function windowsDefinitionEnablement(definition) {
+  const blocks = [...definition.matchAll(/<Settings>[\s\S]*?<\/Settings>/giu)];
+  if (blocks.length !== 1 || [...definition.matchAll(/<Settings(?=[\s/>])/giu)].length !== 1
+      || [...definition.matchAll(/<\/Settings\s*>/giu)].length !== 1) {
+    throw new Error('Windows startup enablement definition is unavailable');
+  }
+  const block = blocks[0][0];
+  const opening = [...block.matchAll(/<Enabled(?=[\s/>])/giu)];
+  const closing = [...block.matchAll(/<\/Enabled\s*>/giu)];
+  const values = [...block.matchAll(/<Enabled>(true|false)<\/Enabled>/giu)];
+  if (!opening.length && !closing.length) return { block, omitted: true, enabled: true };
+  if (opening.length !== 1 || closing.length !== 1 || values.length !== 1) {
+    throw new Error('Windows startup enablement definition is unavailable');
+  }
+  return { block, omitted: false, enabled: values[0][1].toLowerCase() === 'true' };
+}
+
+function enabledWindowsDefinition(definition, enabled) {
+  const settings = windowsDefinitionEnablement(definition);
+  if (settings.enabled === enabled) return definition;
+  const block = settings.omitted ? settings.block.replace(/<\/Settings>/iu, '<Enabled>false</Enabled></Settings>')
+    : settings.block.replace(/<Enabled>(?:true|false)<\/Enabled>/iu, `<Enabled>${enabled ? 'true' : 'false'}</Enabled>`);
+  return definition.replace(settings.block, block);
+}
+
+const xmlDigest = (definition) => createHash('sha256').update(definition, 'utf8').digest('hex');
+
+const equalWindowsAction = (left, right) => left && right
+  && sameWindowsPath(left.command, right.command) && sameWindowsPath(left.working_directory, right.working_directory)
+  && JSON.stringify(parseWindowsArguments(left.arguments)) === JSON.stringify(parseWindowsArguments(right.arguments));
+
+function actionFromDefinition(definition) {
+  const blocks = [...definition.matchAll(/<Exec>[\s\S]*?<\/Exec>/giu)];
+  if (blocks.length !== 1) throw new Error('Windows startup definition has no single action');
+  return { command: exactXmlElement(blocks[0][0], 'Command'), arguments: exactXmlElement(blocks[0][0], 'Arguments'),
+    working_directory: exactXmlElement(blocks[0][0], 'WorkingDirectory') };
+}
+
+export function deriveWindowsReplacementAction({ state, targetRoot, runtimeDir, configPath,
+  nodePath = process.execPath, startupOptions = null } = {}) {
+  if (!state.before.registered) return null;
+  validateWindowsOwnedAction(state.before.action, { componentRoot: state.previous_root, runtimeDir });
+  const original = parseWindowsArguments(state.before.action.arguments);
+  const values = [...original];
+  values[0] = path.resolve(nodePath); values[1] = path.join(path.resolve(targetRoot), 'lichess-adapter.mjs');
+  const updates = new Map([['--runtime-dir', path.resolve(runtimeDir)], ['--config', path.resolve(configPath)]]);
+  if (startupOptions) for (const [flag, field] of [['--profile', 'profile'], ['--time-profile', 'timeProfile'],
+    ['--temporal-curve-profile', 'temporalCurve'], ['--capacity-profile', 'capacityProfile'], ['--model-root', 'modelRoot']]) {
+    updates.set(flag, startupOptions[field] ? path.resolve(startupOptions[field]) : null);
+  }
+  const rebuilt = values.slice(0, 3);
+  for (let index = 3; index < values.length; index += 2) {
+    const flag = values[index]; const supplied = updates.has(flag) ? updates.get(flag) : values[index + 1];
+    if (supplied !== null) rebuilt.push(flag, supplied);
+    updates.delete(flag);
+  }
+  for (const [flag, value] of updates) if (value !== null) rebuilt.push(flag, value);
+  const action = { command: path.join(path.resolve(targetRoot), 'native', 'lichess_adapter_launcher.exe'),
+    arguments: rebuilt.length === original.length && rebuilt.every((value, index) =>
+      path.isAbsolute(value) && path.isAbsolute(original[index]) ? sameWindowsPath(value, original[index]) : value === original[index]) ? state.before.action.arguments
+      : rebuilt.map(quoteWindowsArgument).join(' '), working_directory: path.resolve(targetRoot) };
+  return validateWindowsOwnedAction(action, { componentRoot: targetRoot, runtimeDir, configPath });
+}
+
+function definitionWithAction(definition, action) {
+  const blocks = [...definition.matchAll(/<Exec>[\s\S]*?<\/Exec>/giu)];
+  if (blocks.length !== 1) throw new Error('Windows startup definition has no single action');
+  return definition.replace(blocks[0][0], `<Exec><Command>${xmlEscape(action.command)}</Command><Arguments>${xmlEscape(action.arguments)}</Arguments><WorkingDirectory>${xmlEscape(action.working_directory)}</WorkingDirectory></Exec>`);
+}
+
+export async function quiesceWindowsReplacement({ state, runtimeDir, configPath,
+  scheduler = new WindowsTaskScheduler(), execute = execFileAsync, platform = process.platform,
+  timeoutMilliseconds = 20000, targetDefinition = null, targetRoot = state.replacement_root } = {}) {
+  if (!Number.isSafeInteger(timeoutMilliseconds) || timeoutMilliseconds < 1 || timeoutMilliseconds > 25000) {
+    throw new Error('Invalid Windows replacement timeout');
+  }
+  const before = state.before;
+  const roots = [state.previous_root, state.replacement_root];
+  let observed = await inspectWindowsReplacement({ allowedRoots: roots, componentRoot: state.previous_root,
+    runtimeDir, configPath, scheduler, platform });
+  if (!before.registered) {
+    if (observed.registered) throw new Error('Windows startup registration changed after before-state capture');
+    return { installed: false, active: false, enabled: false, replacementReady: true };
+  }
+  if (!observed.registered) throw new Error('Windows startup registration disappeared after capture');
+  if (!before.enabled && !before.active && (observed.enabled || observed.active)) {
+    throw new Error('Windows startup activity changed after an inactive before-state capture');
+  }
+  const retargeted = retargetWindowsTaskXml(before.definition_text, state.previous_root, state.replacement_root);
+  const desired = enabledWindowsDefinition(targetDefinition ?? retargeted, false);
+  const candidates = [before.definition_text, retargeted, state.completed_observation?.definition_text, targetDefinition]
+    .filter((value) => typeof value === 'string').map((value) => enabledWindowsDefinition(value, observed.enabled));
+  const selected = candidates.find((definition) => equalWindowsAction(observed.action, actionFromDefinition(definition)));
+  if (!selected) throw new Error('Windows startup action changed after capture');
+  // Exact selected definition, with the same desired definition, is a public
+  // repeat-convergent admission. A changed field cannot be overwritten here.
+  await performWindowsReplacementTask(scheduler, { operation: 'register', expected_definition_xml: selected,
+    expected_xml_sha256: xmlDigest(selected), definition_xml: selected });
+  const disabled = await performWindowsReplacementTask(scheduler, { operation: 'set_enabled',
+    expected_definition_xml: selected, expected_xml_sha256: xmlDigest(selected), enabled: false });
+  await performWindowsReplacementTask(scheduler, { operation: 'stop_instances',
+    expected_definition_xml: disabled.definition_xml, expected_xml_sha256: disabled.definition_sha256,
+    instance_guids: [...disabled.instance_guids] }, timeoutMilliseconds);
+  const ownedRoot = observed.action.working_directory;
+  await execute(path.resolve(NATIVE_LAUNCHER), ['--terminate-owned-tree',
+    path.join(path.resolve(ownedRoot), 'native', 'lichess_adapter_launcher.exe'),
+    '--timeout-ms', String(timeoutMilliseconds)],
+  { windowsHide: true, timeout: timeoutMilliseconds + 5000, maxBuffer: 1048576 });
+  observed = await inspectWindowsReplacement({ allowedRoots: roots, componentRoot: ownedRoot,
+    runtimeDir, configPath, scheduler, platform });
+  if (!observed.registered || observed.enabled || observed.active) throw new Error('Windows startup did not quiesce');
+  await performWindowsReplacementTask(scheduler, { operation: 'register',
+    expected_definition_xml: observed.definition_text, expected_xml_sha256: observed.definition_sha256,
+    definition_xml: desired }, timeoutMilliseconds);
+  const after = await inspectWindowsReplacement({ componentRoot: targetRoot,
+    runtimeDir, configPath, scheduler, platform });
+  if (!after.registered || after.active || after.enabled) throw new Error('Windows startup replacement was not confirmed');
+  return { installed: true, active: false, enabled: false, replacementReady: true, observation: after };
+}
+
+export async function convergeWindowsReplacement({ state, target, requestedAction, runtimeDir, configPath,
+  scheduler = new WindowsTaskScheduler(), execute = execFileAsync, platform = process.platform } = {}) {
+  if (!['before', 'desired'].includes(target)) throw new Error('Invalid Windows replacement target');
+  const targetRoot = target === 'before' ? state.previous_root : state.replacement_root;
+  if (!state.before.registered) {
+    const observation = await inspectWindowsReplacement({ componentRoot: targetRoot, runtimeDir, configPath, scheduler, platform });
+    if (observation.registered || requestedAction !== null) throw new Error('Windows startup absence changed');
+    return { installed: false, active: false, enabled: false, replacementReady: false, observation };
+  }
+  validateWindowsOwnedAction(requestedAction, { componentRoot: targetRoot, runtimeDir, configPath });
+  if (target === 'before' && !equalWindowsAction(requestedAction, state.before.action)) {
+    throw new Error('Requested Windows before authority does not match the capture');
+  }
+  const definition = target === 'before' ? state.before.definition_text
+    : definitionWithAction(retargetWindowsTaskXml(state.before.definition_text, state.previous_root, state.replacement_root), requestedAction);
+  return quiesceWindowsReplacement({ state, runtimeDir, configPath, scheduler, execute, platform, targetRoot,
+    targetDefinition: definition });
+}
+
+export async function activateWindowsReplacement({ observation, componentRoot, runtimeDir, configPath,
+  scheduler = new WindowsTaskScheduler(), ready, ...policy } = {}) {
+  const inspect = async () => {
+    const current = await inspectWindowsReplacement({ componentRoot, runtimeDir, configPath, scheduler });
+    const expected = enabledWindowsDefinition(observation.definition_text, current.enabled);
+    if (!current.registered || !equalWindowsAction(current.action, observation.action)) {
+      throw new Error('Windows startup action changed during activation');
+    }
+    await performWindowsReplacementTask(scheduler, { operation: 'register', expected_definition_xml: expected,
+      expected_xml_sha256: xmlDigest(expected), definition_xml: expected });
+    return current;
+  };
+  const query = async () => {
+    const current = await inspect();
+    return { installed: current.registered, enabled: current.enabled, active: current.active };
+  };
+  const execute = async (_file, args) => {
+    const current = await inspect();
+    if (args[0] === '/Change' && args.at(-1) === '/ENABLE') {
+      await performWindowsReplacementTask(scheduler, { operation: 'set_enabled',
+        expected_definition_xml: current.definition_text, expected_xml_sha256: current.definition_sha256, enabled: true });
+    } else if (args[0] === '/Run') {
+      await performWindowsReplacementTask(scheduler, { operation: 'run',
+        expected_definition_xml: current.definition_text, expected_xml_sha256: current.definition_sha256 });
+    } else throw new Error('Unadmitted Windows replacement activation operation');
+    return { stdout: '', stderr: '' };
+  };
+  return completeWindowsStartupReplacement({ ...policy, ready, query, execute });
 }
 
 function exactXmlElement(block, name) {

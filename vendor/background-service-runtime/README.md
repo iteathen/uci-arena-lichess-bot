@@ -11,6 +11,137 @@ capability from its selected immutable helper closure before requiring the query
 `NativeResourceHelper.queryProcessInstanceSync(pid, { timeoutMs } = {})` invokes
 only the configured absolute helper path. It has no discovery or PowerShell fallback.
 
+Version 1.3.0 adds a bounded Windows Task Scheduler COM adapter. Existing native
+helper sources and bytes are unchanged. This platform adapter does not replace
+the native process-incarnation query or grant PID termination authority.
+
+## Exact Windows task observation and control
+
+```js
+import { WindowsTaskScheduler } from '@uci-arena/background-service-runtime/windows-task-scheduler';
+const scheduler = new WindowsTaskScheduler();
+const result = await scheduler.perform({ operation: 'inspect', task_path: '\\Owned Task' },
+  { timeoutMs: 5000, signal });
+```
+
+The public `./windows-task-scheduler-contract` JSON export declares closed
+schemas and bounds. `perform` snapshots data-property requests before any await;
+unknown fields, getters, symbol keys, XML byte-bound/DTD violations, mismatched before-image
+hashes, duplicate instance IDs, and invalid deadlines throw `TypeError` before
+invocation. The task is one named task in the Scheduler root folder. Each platform
+invocation runs the package's fixed static `.ps1` file under the absolute system
+Windows PowerShell executable, with JSON on stdin, bounded stdout, and discarded
+stderr. `powershellExecutable` can explicitly select another absolute executable;
+`platform` and `invoke` are explicit qualification transport substitutions.
+Cancellation requires an actual unproxied `AbortSignal`; options with accessors
+or invalid signals are rejected before invocation. The adapter uses stable
+platform event methods instead of caller-overridden subscription properties,
+and installs the child join before further setup. Any post-spawn setup failure
+stops and joins that owned child before a failed result can return.
+
+Request fields depend on the operation:
+
+| Operation | Fields in addition to `operation` and `task_path` |
+| --- | --- |
+| `inspect` | none |
+| `set_enabled` | `expected_definition_xml`, `expected_xml_sha256`, `enabled` |
+| `stop_instances` | `expected_definition_xml`, `expected_xml_sha256`, `instance_guids` |
+| `register` | `expected_definition_xml`, `expected_xml_sha256`, `definition_xml` |
+| `delete`, `run` | `expected_definition_xml`, `expected_xml_sha256` |
+
+Before-image hashes are lowercase SHA256 of the exact UTF-8 observed XML text.
+Only `register` and `delete` permit both before-image fields to be null, meaning
+expected absence. A registered observation returns its full bounded XML and
+digest, enabled bit, exact running-instance GUIDs, and principal facts. An absent
+observation has null XML/digest/enabled/principal/action and no instances. A registered
+observation also carries the closed typed Exec tuple
+`action: { command, arguments, working_directory }`. These are the exact strings
+captured once from `IExecAction`, without interpretation or requoting, each at
+most 32767 UTF-16 units and well-formed Unicode; command is nonempty. All
+definition-owned XML, enabled, principal and action facts come from one captured
+TaskDefinition. Consumers admit their own action/root grammar rather than parsing
+XML or assuming a private Task Scheduler formatter. No native process commandline
+is queried. Before-state action data remains provider-owned and must not be
+copied into arbitrary public logs.
+Successful
+observations admit one Exec action under the current Windows SID,
+InteractiveToken (3), and LeastPrivilege (0). Windows account aliases are resolved
+to a SID through the OS. This matters because
+[GetInstances](https://learn.microsoft.com/en-us/windows/win32/api/taskschd/nf-taskschd-iregisteredtask-getinstances)
+can omit instances above the caller's security context. Unknown identity or
+unsupported privilege fails, rather than reporting an empty owned task.
+
+Before mutation, the actual task must match its admitted before-image. Registration
+and enabled-state retries also recognize the complete already-satisfied target.
+Canonical comparison keeps every task field and attribute, action leaf text,
+and declared setting; it normalizes account naming and inter-element XML
+formatting only. Task Scheduler is not an atomic compare-and-swap store: providers
+must serialize their own intent and observe ambiguous completion. The SDK owns
+neither provider root selection nor the before-state transaction. Providers must
+validate exact public component actions and persist their own restoration record
+before gate/task changes. Equal roots or task names alone convey no rollback meaning.
+
+`stop_instances` rejects a running instance not in the supplied admitted GUID set;
+already-ended supplied instances are harmless. `delete` requires an empty task.
+Registration uses `TASK_CREATE_OR_UPDATE | TASK_IGNORE_REGISTRATION_TRIGGERS`
+(38); registration triggers cannot implicitly start a preserved inactive task.
+Other scheduled triggers remain in the definition, so provider gate/intent
+sequencing remains required.
+`run` requires an enabled admitted task and avoids starting another instance when
+one is already present; after-observation must retain the exact admitted definition.
+Its completed result is not daemon readiness. The result
+is a closed completed/failed envelope. Failed output carries only a category and
+optional unsigned HRESULT; no arbitrary PowerShell/exception bytes are copied.
+A timeout or cancellation stops and joins only the owned platform helper, and
+does not imply no task effect. The provider must inspect and converge afterward.
+
+Task definition defaults need actual readback qualification. On the current
+Windows fixture host, registration rewrites explicit
+`UseUnifiedSchedulingEngine=false` to `true`; strict verification reports that
+as an identity mismatch. New fixtures select `true` explicitly. A saved prior
+definition with different effective settings cannot be claimed restored without
+matching readback. This is a scoped platform observation, not a new semantic
+default; Microsoft's [schema](https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-useunifiedschedulingengine-settingstype-element)
+continues to declare false as the default.
+
+Set `UCI_ARENA_TASK_SCHEDULER_FIXTURE=1` on Windows to run the guarded actual COM
+tests. The child-running cycle additionally requires the explicitly configured
+`UCI_ARENA_NATIVE_HELPER`; it independently observes the exact owned child
+incarnation gone after cleanup. Tests operate only on fresh
+`UCI Arena SDK Fixture <UUID>` tasks, with an
+owned temporary Node child and exact-action cleanup. Registration-trigger suppression/retry, changed
+definition rejection, enabled retries, run/gate/drain/delete, helper timeout and
+cancellation are tested. These fixtures grant no installed-service replacement
+claim. Other platforms and normal package tests explicitly skip these cases.
+
+Version 1.3.1 corrects explicit logon-trigger user comparison. Windows may
+rewrite a declared SID as an account name on registration. The SDK translates
+each nonempty `LogonTrigger.UserId` through Windows SID resolution, just like
+the principal, before semantic comparison. Empty UserId remains any-user;
+different identities, trigger enabled state and delay remain different. Unknown
+accounts fail closed. No trigger is removed, defaulted or broadened. The request,
+result and contract wire versions stay at v1; version 1.3.0 source snapshots
+remain historical. The actual owned UUID fixture covers SID/account readback,
+retry, distinct/empty users and trigger-setting rejection without touching
+installed provider tasks. See Microsoft's
+[LogonTrigger.UserId contract](https://learn.microsoft.com/en-us/windows/win32/taskschd/logontrigger-userid).
+
+Version 1.3.2 corrects running-instance visibility for Hidden tasks. The owned
+Windows fixture reproduced a live current-user Hidden Node task for which
+`GetInstances(0)` returned no instances. The SDK now uses
+[GetRunningTasks(1)](https://learn.microsoft.com/en-us/windows/win32/taskschd/taskservice-getrunningtasks),
+whose explicit flag includes Hidden tasks, then filters the captured admitted
+`Task.Path` with ordinal case-insensitive comparison. The selected principal is
+verified first. Only foreign entries' paths are read for this filter; their
+definitions, actions, principals and instance GUIDs are not read or returned.
+The 4096-entry scan and 16-selected-instance bounds fail closed on overflow,
+without reporting absence. Duplicate/empty selected GUIDs also fail. Definition
+and exact-instance mutation guards remain unchanged. The v1 wire schemas stay
+unchanged; the contract adds the explicit scan bound. Historical 1.3.1 snapshots
+remain distinct. Guarded fixtures cover both the existing plain task and two
+self-expiring Hidden tasks, rejecting another task's GUID set before stopping
+the selected task and positively joining both owned children and task deletion.
+
 ## Exact process instance query
 
 `uci_arena_background_guard --query-process-instance <pid>` accepts decimal PIDs

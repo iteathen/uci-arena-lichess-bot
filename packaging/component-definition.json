@@ -28,6 +28,7 @@
     {"source": "process-instance-identity.mjs", "target": "process-instance-identity.mjs"},
     {"source": "provider-lifecycle-diagnostics.mjs", "target": "provider-lifecycle-diagnostics.mjs"},
     {"source": "provider-maintenance.mjs", "target": "provider-maintenance.mjs"},
+    {"source": "provider-replacement-state.mjs", "target": "provider-replacement-state.mjs"},
     {"source": "runtime-status-publisher.mjs", "target": "runtime-status-publisher.mjs"},
     {"source": "runtime-status-worker.mjs", "target": "runtime-status-worker.mjs"},
     {"source": "installer-integration.mjs", "target": "installer-integration.mjs"},

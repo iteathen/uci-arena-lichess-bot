@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+import { createHash } from 'node:crypto';
+import { setTimeout as wait } from 'node:timers/promises';
 import {
   classifyExactPathSync,
   ensureExactDirectorySync,
@@ -88,9 +90,9 @@ export function parseSystemdArguments(commandLine) {
   return result;
 }
 
-function existingCredentialProjection(values) {
+function existingCredentialProjection(values, componentRoot = ROOT) {
   if (values.length < 11 || values[2] !== "run"
-      || path.resolve(values[1]) !== path.resolve(ADAPTER)
+      || path.resolve(values[1]) !== path.join(path.resolve(componentRoot), 'lichess-adapter.mjs')
       || !path.isAbsolute(values[0])) {
     throw new Error("Existing Lichess systemd action is not the owned adapter command");
   }
@@ -111,7 +113,7 @@ function existingCredentialProjection(values) {
     if (!bindings.get(flag)) throw new Error(`Existing Lichess systemd action omits ${flag}`);
   }
   const tokenFile = path.resolve(bindings.get("--token-file"));
-  const relativeToken = path.relative(ROOT, tokenFile);
+  const relativeToken = path.relative(componentRoot, tokenFile);
   if (relativeToken === "" || (!relativeToken.startsWith("..") && !path.isAbsolute(relativeToken))) {
     throw new Error("Existing Lichess startup token path is inside the component root");
   }
@@ -133,8 +135,9 @@ export function startupUnitPath({
 }
 
 export function startupAction(options) {
+  const componentRoot = path.resolve(options.componentRoot ?? ROOT);
   const argumentsList = [
-    ADAPTER,
+    path.join(componentRoot, 'lichess-adapter.mjs'),
     "run",
     "--config",
     path.resolve(options.config),
@@ -155,9 +158,9 @@ export function startupAction(options) {
     if (value) argumentsList.push(flag, path.resolve(value));
   }
   return {
-    command: path.resolve(process.execPath),
+    command: path.resolve(options.nodePath ?? process.execPath),
     arguments: argumentsList,
-    workingDirectory: ROOT,
+    workingDirectory: componentRoot,
   };
 }
 
@@ -462,4 +465,152 @@ export async function completeLinuxStartupReplacement() {
     throw new Error(`${SYSTEMD_UNIT_NAME} did not resume after replacement`);
   }
   return { ...state, installed: true, active: true, replacementReady: false };
+}
+
+function linuxDefinitionAction(unit) {
+  const working = [...unit.matchAll(/^WorkingDirectory=(.*)$/gmu)];
+  const commands = [...unit.matchAll(/^ExecStart=(.*)$/gmu)];
+  if (working.length !== 1 || commands.length !== 1) throw new Error('Linux startup unit action is unavailable');
+  const dirs = parseSystemdArguments(working[0][1]); const values = parseSystemdArguments(commands[0][1]);
+  if (dirs.length !== 1 || values.length < 3 || !path.isAbsolute(values[0]) || !path.isAbsolute(dirs[0])) {
+    throw new Error('Linux startup unit action is invalid');
+  }
+  return { command: values[0], arguments: values.slice(1).map(systemdEscapeArgument).join(' '), working_directory: dirs[0] };
+}
+
+function validateLinuxReplacementAction(action, { componentRoot, runtimeDir, configPath }) {
+  const values = [action.command, ...parseSystemdArguments(action.arguments)];
+  existingCredentialProjection(values, componentRoot);
+  const bindings = new Map(); for (let index = 3; index < values.length; index += 2) bindings.set(values[index], values[index + 1]);
+  if (path.resolve(action.working_directory) !== path.resolve(componentRoot)
+      || path.resolve(bindings.get('--runtime-dir')) !== path.resolve(runtimeDir)
+      || (configPath && path.resolve(bindings.get('--config')) !== path.resolve(configPath))) {
+    throw new Error('Linux startup action does not match provider authority');
+  }
+  return Object.freeze({ ...action });
+}
+
+async function executeLinuxReplacement(execute, args) {
+  try { return await execute('systemctl', ['--user', ...args], { timeout: 20000, maxBuffer: STARTUP_FILE_LIMIT }); }
+  catch (error) {
+    const code = error?.code; const stdout = error?.stdout;
+    if (args[0] === 'is-active' && code === 3 && stdout === 'inactive\n'
+        || args[0] === 'is-enabled' && code === 1 && stdout === 'disabled\n') return { stdout };
+    throw new Error('Linux startup platform operation was not confirmed');
+  }
+}
+
+export async function inspectLinuxReplacement({ componentRoot, allowedRoots = [componentRoot], runtimeDir, configPath,
+  unitPath = startupUnitPath(), execute = execFileAsync, platform = process.platform } = {}) {
+  if (platform !== 'linux') throw new Error('Unsupported Linux startup platform');
+  const admission = classifyExactPathSync(unitPath, { label: 'Lichess systemd unit' });
+  if (admission.kind === 'missing') {
+    // A deleted on-disk unit may still be loaded by systemd. Absence requires
+    // the platform's own read-only loaded-unit observation as well.
+    const { stdout } = await executeLinuxReplacement(execute,
+      ['show', '--property=LoadState', '--value', SYSTEMD_UNIT_NAME]);
+    if (stdout.trim() !== 'not-found') throw new Error('Linux startup absence was not confirmed');
+    return Object.freeze({ platform: 'linux', registered: false, enabled: false, active: false,
+      definition_text: null, definition_sha256: null, action: null, instances: Object.freeze([]) });
+  }
+  const unit = readExactTextSync(unitPath, { maximumBytes: STARTUP_FILE_LIMIT, label: 'Lichess systemd unit' }).text;
+  const typedAction = linuxDefinitionAction(unit);
+  let action;
+  for (const root of allowedRoots) {
+    try { action = validateLinuxReplacementAction(typedAction, { componentRoot: root, runtimeDir, configPath }); break; }
+    catch {}
+  }
+  if (!action) throw new Error('Linux startup unit has no admitted owner action');
+  const { stdout: enabled } = await executeLinuxReplacement(execute, ['is-enabled', SYSTEMD_UNIT_NAME]);
+  const { stdout: active } = await executeLinuxReplacement(execute, ['is-active', SYSTEMD_UNIT_NAME]);
+  if (!['enabled', 'disabled'].includes(enabled.trim()) || !['active', 'inactive'].includes(active.trim())) {
+    throw new Error('Linux startup state is unavailable');
+  }
+  return Object.freeze({ platform: 'linux', registered: true, enabled: enabled.trim() === 'enabled', active: active.trim() === 'active',
+    definition_text: unit, definition_sha256: createHash('sha256').update(unit).digest('hex'), action, instances: Object.freeze([]) });
+}
+
+export function deriveLinuxReplacementAction({ state, targetRoot, runtimeDir, configPath,
+  nodePath = process.execPath, startupOptions = null } = {}) {
+  if (!state.before.registered) return null;
+  validateLinuxReplacementAction(state.before.action, { componentRoot: state.previous_root, runtimeDir });
+  const original = parseSystemdArguments(state.before.action.arguments);
+  const values = [...original]; values[0] = path.join(path.resolve(targetRoot), 'lichess-adapter.mjs');
+  const updates = new Map([['--runtime-dir', path.resolve(runtimeDir)], ['--config', path.resolve(configPath)]]);
+  if (startupOptions) for (const [flag, field] of [['--profile', 'profile'], ['--time-profile', 'timeProfile'],
+    ['--temporal-curve-profile', 'temporalCurve'], ['--capacity-profile', 'capacityProfile'], ['--model-root', 'modelRoot']]) {
+    updates.set(flag, startupOptions[field] ? path.resolve(startupOptions[field]) : null);
+  }
+  const rebuilt = values.slice(0, 2);
+  for (let index = 2; index < values.length; index += 2) {
+    const flag = values[index]; const value = updates.has(flag) ? updates.get(flag) : values[index + 1];
+    if (value !== null) rebuilt.push(flag, value); updates.delete(flag);
+  }
+  for (const [flag, value] of updates) if (value !== null) rebuilt.push(flag, value);
+  return validateLinuxReplacementAction({ command: path.resolve(nodePath), arguments: rebuilt.map(systemdEscapeArgument).join(' '),
+    working_directory: path.resolve(targetRoot) }, { componentRoot: targetRoot, runtimeDir, configPath });
+}
+
+export async function convergeLinuxReplacement({ state, target, requestedAction, runtimeDir, configPath,
+  unitPath = startupUnitPath(), execute = execFileAsync, platform = process.platform } = {}) {
+  if (!['before', 'desired'].includes(target)) throw new Error('Invalid Linux replacement target');
+  const targetRoot = target === 'before' ? state.previous_root : state.replacement_root;
+  const options = { componentRoot: targetRoot, allowedRoots: [state.previous_root, state.replacement_root], runtimeDir, configPath, unitPath, execute, platform };
+  const observed = await inspectLinuxReplacement(options);
+  if (!state.before.registered) {
+    if (observed.registered || requestedAction !== null) throw new Error('Linux startup absence changed');
+    return { installed: false, active: false, enabled: false, observation: observed };
+  }
+  if (!observed.registered || (!state.before.enabled && !state.before.active && (observed.enabled || observed.active))) {
+    throw new Error('Linux startup activity changed after before-state capture');
+  }
+  validateLinuxReplacementAction(requestedAction, { componentRoot: targetRoot, runtimeDir, configPath });
+  if (target === 'before' && JSON.stringify(requestedAction) !== JSON.stringify(state.before.action)) {
+    throw new Error('Requested Linux before authority does not match capture');
+  }
+  const retargeted = retargetSystemdUnit(state.before.definition_text, state.previous_root, state.replacement_root);
+  const desired = target === 'before' ? state.before.definition_text : retargeted
+    .replace(/^ExecStart=.*$/mu, `ExecStart=${[requestedAction.command, ...parseSystemdArguments(requestedAction.arguments)].map(systemdEscapeArgument).join(' ')}`);
+  const candidates = [state.before.definition_text, retargeted, state.completed_observation?.definition_text, desired];
+  if (!candidates.includes(observed.definition_text)) throw new Error('Linux startup unit changed after capture');
+  const admitted = readExactTextSync(unitPath, { maximumBytes: STARTUP_FILE_LIMIT, label: 'Lichess systemd unit' });
+  if (admitted.text !== observed.definition_text) throw new Error('Linux startup unit changed before quiescence');
+  await executeLinuxReplacement(execute, ['disable', '--now', SYSTEMD_UNIT_NAME]);
+  const stopped = await inspectLinuxReplacement(options);
+  if (stopped.active || stopped.enabled || stopped.definition_text !== admitted.text) throw new Error('Linux startup did not quiesce');
+  publishExactFileSync(unitPath, desired, { maximumBytes: STARTUP_FILE_LIMIT,
+    label: 'Lichess replacement systemd unit', expectedTargetIdentity: admitted.identity });
+  await executeLinuxReplacement(execute, ['daemon-reload']);
+  const completed = await inspectLinuxReplacement({ ...options, allowedRoots: [targetRoot] });
+  if (!completed.registered || completed.active || completed.enabled || completed.definition_text !== desired) {
+    throw new Error('Linux startup replacement was not confirmed');
+  }
+  return { installed: true, active: false, enabled: false, observation: completed };
+}
+
+export async function quiesceLinuxReplacement({ state, runtimeDir, configPath, ...options } = {}) {
+  const unit = state.before.registered ? retargetSystemdUnit(state.before.definition_text, state.previous_root, state.replacement_root) : null;
+  return convergeLinuxReplacement({ ...options, state, runtimeDir, configPath, target: 'desired',
+    requestedAction: unit ? linuxDefinitionAction(unit) : null });
+}
+
+export async function activateLinuxReplacement({ observation, componentRoot, runtimeDir, configPath,
+  unitPath = startupUnitPath(), execute = execFileAsync, platform = process.platform,
+  ready, delay = wait, pollMilliseconds = 100, timeoutMilliseconds = 20000, stabilityMilliseconds = 3000 } = {}) {
+  if (typeof ready !== 'function' || ![pollMilliseconds, timeoutMilliseconds, stabilityMilliseconds].every(Number.isSafeInteger)
+      || pollMilliseconds < 10 || timeoutMilliseconds < pollMilliseconds || timeoutMilliseconds > 30000
+      || stabilityMilliseconds < pollMilliseconds || stabilityMilliseconds > timeoutMilliseconds) throw new Error('Invalid Linux activation policy');
+  const options = { componentRoot, runtimeDir, configPath, unitPath, execute, platform };
+  const before = await inspectLinuxReplacement(options);
+  if (before.definition_text !== observation.definition_text) throw new Error('Linux startup changed before activation');
+  await executeLinuxReplacement(execute, ['enable', '--now', SYSTEMD_UNIT_NAME]);
+  let stable = 0;
+  for (let attempt = 0; attempt <= Math.ceil(timeoutMilliseconds / pollMilliseconds); attempt += 1) {
+    const current = await inspectLinuxReplacement(options);
+    if (current.definition_text !== observation.definition_text) throw new Error('Linux startup changed during activation');
+    stable = current.enabled && current.active && await ready() ? stable + 1 : 0;
+    if (stable >= Math.ceil(stabilityMilliseconds / pollMilliseconds)) return { installed: true, enabled: true, active: true };
+    await delay(pollMilliseconds);
+  }
+  throw new Error('Linux provider readiness was not confirmed');
 }

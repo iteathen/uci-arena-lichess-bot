@@ -655,7 +655,7 @@ export class LichessStore {
     return this.withImmediateTransaction(() => {
       const result = this.db.prepare(`
         UPDATE provider_lifecycle_control SET owner_id='', updated_at=?
-        WHERE id=1 AND owner_id=? AND active_work=0
+        WHERE id=1 AND owner_id=? AND active_work=0 AND admission_blocked=0
       `).run(now, owner);
       return result.changes > 0;
     });
@@ -708,11 +708,12 @@ export class LichessStore {
     });
   }
 
-  requestProviderReplacement(now = Date.now(), { allowUnowned = false } = {}) {
+  requestProviderReplacement(now = Date.now(), { allowUnowned = false, beforeEffect = null } = {}) {
     now = safeInteger(now, "provider replacement timestamp");
+    if (beforeEffect !== null && typeof beforeEffect !== 'function') throw new Error('Invalid before-state capture');
     return this.withImmediateTransaction(() => {
       const control = this.db.prepare(`
-        SELECT admission_blocked, owner_id, active_work
+        SELECT admission_blocked, owner_id, active_work, updated_at
         FROM provider_lifecycle_control WHERE id=1
       `).get();
       const activeWork = control?.active_work ?? 0;
@@ -728,7 +729,7 @@ export class LichessStore {
       let reason = null;
       if (!control) reason = "provider_lifecycle_interlock_unavailable";
       else if (activeWork > 0) reason = "provider_owned_work_active";
-      else if ((activeLeases > 0 && !ownerLease)
+      else if ((activeLeases > (ownerLease ? 1 : 0))
           || (!control.owner_id && !control.admission_blocked && !allowUnowned)) {
         reason = "provider_lifecycle_interlock_unavailable";
       }
@@ -739,6 +740,17 @@ export class LichessStore {
           activeWork,
           admissionBlocked: Boolean(control?.admission_blocked),
         });
+      }
+      if (beforeEffect) {
+        const leases = control.owner_id ? this.db.prepare('SELECT pid,process_identity_json FROM api_client_leases WHERE owner_id=? LIMIT 2')
+          .all(control.owner_id) : [];
+        const identity = leases.length === 1 ? processIdentityFromJson(leases[0].process_identity_json, leases[0].pid) : null;
+        const captured = beforeEffect(Object.freeze({ ...control }), Object.freeze({ ...control,
+          admission_blocked: 1, updated_at: control.admission_blocked ? control.updated_at : now }),
+        identity ? Object.freeze({ owner_id: control.owner_id, process: Object.freeze({ ...identity }) }) : null);
+        if (captured && typeof captured.then === 'function') {
+          throw new Error('Before-state persistence must complete synchronously before gate closure');
+        }
       }
       if (!control.admission_blocked) {
         this.db.prepare(`
@@ -771,6 +783,44 @@ export class LichessStore {
         SET admission_blocked=0, owner_id='', updated_at=? WHERE id=1
       `).run(now);
       return Object.freeze({ admissionBlocked: false, activeWork: 0 });
+    });
+  }
+
+  completeProviderReplacement(before, expectedClosed, { alreadyCompleted = false, now = Date.now() } = {}) {
+    now = safeInteger(now, 'provider replacement completion timestamp');
+    if (!before || before.admission_blocked !== 0 || before.active_work !== 0 || !expectedClosed
+        || expectedClosed.admission_blocked !== 1 || expectedClosed.active_work !== 0
+        || typeof before.owner_id !== 'string' || !Number.isSafeInteger(before.updated_at)) {
+      throw new Error('Invalid replacement before authority');
+    }
+    return this.withImmediateTransaction(() => {
+      const current = this.db.prepare('SELECT admission_blocked,owner_id,active_work,updated_at FROM provider_lifecycle_control WHERE id=1').get();
+      const otherLease = this.db.prepare('SELECT 1 FROM api_client_leases WHERE owner_id<>? AND expires_at>? LIMIT 1').get(before.owner_id, now);
+      const same = (expected) => ['admission_blocked', 'owner_id', 'active_work', 'updated_at']
+        .every((field) => current?.[field] === expected[field]);
+      const completed = alreadyCompleted && current?.admission_blocked === 0 && current.owner_id === '' && current.active_work === 0;
+      if (!current || otherLease || (!same(expectedClosed) && !same(before) && !completed)) {
+        throw new Error('Provider replacement authority changed before completion');
+      }
+      if (completed) return Object.freeze({ admissionBlocked: false, activeWork: 0 });
+      this.db.prepare("UPDATE provider_lifecycle_control SET admission_blocked=0,owner_id='',updated_at=? WHERE id=1").run(now);
+      return Object.freeze({ admissionBlocked: false, activeWork: 0 });
+    });
+  }
+
+  confirmProviderReplacementRelease(expectedClosed, released, priorOwnerGone, capture) {
+    if (!expectedClosed?.owner_id || expectedClosed.admission_blocked !== 1 || expectedClosed.active_work !== 0
+        || released?.admission_blocked !== 1 || released.owner_id !== '' || released.active_work !== 0
+        || !Number.isSafeInteger(released.updated_at) || released.updated_at < expectedClosed.updated_at
+        || typeof priorOwnerGone !== 'function' || typeof capture !== 'function') throw new Error('Invalid replacement release proof');
+    return this.withImmediateTransaction(() => {
+      const current = this.db.prepare('SELECT admission_blocked,owner_id,active_work,updated_at FROM provider_lifecycle_control WHERE id=1').get();
+      const lease = this.db.prepare('SELECT 1 FROM api_client_leases WHERE owner_id=? LIMIT 1').get(expectedClosed.owner_id);
+      if (lease || ['admission_blocked', 'owner_id', 'active_work', 'updated_at'].some((key) => current?.[key] !== released[key])
+          || priorOwnerGone() !== true) throw new Error('Provider release authority was not confirmed');
+      const result = capture(Object.freeze({ ...current }));
+      if (result && typeof result.then === 'function') throw new Error('Release capture must be synchronous');
+      return result;
     });
   }
 
