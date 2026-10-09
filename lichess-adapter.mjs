@@ -3,6 +3,7 @@
 import { spawn } from "node:child_process";
 import { startupFailureDiagnostic, typedStartupOperation } from "./provider-lifecycle-diagnostics.mjs";
 import { readProviderInterlockSnapshot } from "./lichess-storage.mjs";
+import { recoverProviderMaintenance, MAINTENANCE_RECOVERY_SCHEMA } from "./provider-maintenance.mjs";
 import { continuousObservationFromRuntime, validateNativeAdmission, validateNativeCandidates,
   validateNativePublication, MOVE_EVIDENCE_PREFIX, EXECUTION_COMPLETION_PREFIX } from "./continuous-uci-observation.mjs";
 import { CONTINUOUS_PROFILE_SCHEMA, validateContinuousProfileShape, validateContinuousGameDiagnostic,
@@ -7682,7 +7683,7 @@ export function parseArguments(argv) {
   if (!command) throw new Error("Expected a Lichess adapter command");
   const rest = [...argumentsList];
   const options = { command };
-  if (new Set(["owner", "reservation", "scheduler", "incidents", "games", "game", "startup", "config", "qualification"])
+  if (new Set(["owner", "reservation", "scheduler", "incidents", "games", "game", "startup", "config", "qualification", "maintenance"])
     .has(command)
       && rest[0] && !rest[0].startsWith("--")) {
     options.action = rest.shift();
@@ -8405,6 +8406,65 @@ function resumeProviderReplacementAdmissions(runtimeDir, now = Date.now()) {
   }
 }
 
+async function runMaintenanceRecovery(options, runtimeDir) {
+  let store = null;
+  let result;
+  const controller = new AbortController();
+  const handlers = new Map();
+  try {
+    const allowed = new Set(['command', 'action', 'config', 'runtime_dir', 'store', 'engine_root',
+      'token_file', 'expected_account', 'maximum_milliseconds']);
+    if (options.action !== 'recover' || Object.keys(options).some((key) => !allowed.has(key))
+        || !options.config || !/^[A-Za-z0-9_-]{1,32}$/u.test(options.expected_account ?? '')) {
+      throw new Error('Invalid maintenance request');
+    }
+    const maximumMilliseconds = options.maximum_milliseconds === undefined ? 15000
+      : Number(options.maximum_milliseconds);
+    if (!Number.isSafeInteger(maximumMilliseconds) || maximumMilliseconds < 1 || maximumMilliseconds > 60000) {
+      throw new Error('Invalid maintenance bound');
+    }
+    const config = loadManagerConfig({ templatePath: path.resolve(options.config), engineRoot: options.engine_root });
+    const tokenFile = resolveExternalTokenFile(options);
+    const startup = process.platform === 'win32' ? await queryWindowsStartup({ runtimeDir })
+      : process.platform === 'linux' ? await queryLinuxStartup() : null;
+    const startupObservation = process.platform === 'linux' && startup?.installed === true
+      ? { installed: true, enabled: startup.enabled !== 'disabled', active: startup.active !== 'inactive' }
+      : startup;
+    const authority = apiAuthorityKey(config.url, options.expected_account);
+    store = new LichessStore(path.resolve(options.store ?? path.join(runtimeDir, 'matches.sqlite')), { mode: 'maintenance' });
+    const { runtime } = boundedRuntimeMetadata(runtimeDir);
+    const priorProcessIdentity = runtime?.adapter_id === 'lichess_node_adapter_v2'
+      && validProcessIdentity(runtime.process_instance, runtime.pid) ? runtime.process_instance : null;
+    const safetyCoordinator = new ApiSafetyCoordinator({ initialState: store.apiSafetyState(authority),
+      persistSafetyState: (state) => store.saveApiSafetyState(authority, state) });
+    // Do not restore/prune durable ambiguity before captureMaintenanceRecovery admits it.
+    const client = new LichessClient({ tokenProvider: () => readTokenForRuntime(tokenFile),
+      baseUrl: config.url, safetyCoordinator });
+    for (const name of ['SIGINT', 'SIGTERM']) {
+      const handler = () => controller.abort();
+      handlers.set(name, handler); process.once(name, handler);
+    }
+    result = await recoverProviderMaintenance({ store, client, authority, expectedAccount: options.expected_account,
+      ownerId: randomUUID(), pid: process.pid, processIdentity: currentProcessIdentity(),
+      ownerProcessProbe: probeProcessInstance, priorProcessIdentity, startupObservation,
+      signal: controller.signal, maximumMilliseconds });
+  } catch {
+    result = { schema: MAINTENANCE_RECOVERY_SCHEMA, status: 'failed', completion: 'not_attempted',
+      reason: 'recovery_unavailable' };
+  } finally {
+    controller.abort();
+    for (const [name, handler] of handlers) process.off(name, handler);
+    if (store) {
+      try { store.close(); }
+      catch { result = { schema: MAINTENANCE_RECOVERY_SCHEMA, status: 'failed',
+        completion: result?.completion ?? 'not_attempted', reason: result?.reason ?? 'recovery_unavailable',
+        cleanup: result?.cleanup === 'lease_release_failed' ? 'lease_and_storage_close_failed' : 'storage_close_failed' }; }
+    }
+  }
+  console.log(JSON.stringify(result));
+  return result.status === 'recovered' ? 0 : result.status === 'deferred' ? 2 : 1;
+}
+
 export async function main(argv = process.argv.slice(2)) {
   assertSupportedNode();
   const options = parseArguments(argv);
@@ -8414,6 +8474,7 @@ export async function main(argv = process.argv.slice(2)) {
     return runStoreCommand(options);
   }
   const runtimeDir = resolveProviderRuntimeDirectory(options);
+  if (options.command === 'maintenance') return runMaintenanceRecovery(options, runtimeDir);
   if (options.command === "run") configureRuntimeLog(runtimeDir);
   if (options.command === "status") {
     const { runtime, error: runtimeError } = boundedRuntimeMetadata(runtimeDir);
@@ -9132,6 +9193,12 @@ export async function main(argv = process.argv.slice(2)) {
 
 if (path.resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
   main().then((code) => { process.exitCode = code; }).catch((error) => {
+    if (process.argv[2] === 'maintenance') {
+      console.log(JSON.stringify({ schema: MAINTENANCE_RECOVERY_SCHEMA, status: 'failed',
+        completion: 'not_attempted', reason: 'recovery_unavailable' }));
+      process.exitCode = 1;
+      return;
+    }
     const operation = typedStartupOperation(process.argv.slice(2));
     if (operation) {
       console.log(JSON.stringify(providerLifecycleResult(operation, "failed",

@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "uci_arena_lichess_maintenance_recovery_v1",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "status", "completion", "priorActiveWork", "activeWork", "admissionBlocked"],
+      "properties": {
+        "schema": {"const": "uci_arena_lichess_maintenance_recovery_v1"},
+        "status": {"const": "recovered"},
+        "completion": {"const": "confirmed"},
+        "priorActiveWork": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "activeWork": {"const": 0},
+        "admissionBlocked": {"const": false}
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "status", "completion", "reason"],
+      "properties": {
+        "schema": {"const": "uci_arena_lichess_maintenance_recovery_v1"},
+        "status": {"enum": ["deferred", "failed"]},
+        "completion": {"enum": ["not_attempted", "unconfirmed", "confirmed"]},
+        "reason": {"enum": ["invalid_request", "cancelled_or_timeout", "startup_not_quiescent", "admission_blocked", "prior_ownership_unavailable", "durable_work_ambiguous", "prior_process_not_proven_absent", "exclusive_lease_unavailable", "account_identity_rejected", "remote_facts_malformed", "remote_work_pending", "authority_changed", "remote_scope_unavailable", "recovery_unavailable"]},
+        "cleanup": {"enum": ["lease_release_failed", "storage_close_failed", "lease_and_storage_close_failed"]}
+      }
+    }
+  ]
+}

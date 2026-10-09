@@ -8,6 +8,7 @@ import {
   LichessStorageError,
   LICHESS_STORAGE_SCHEMA_VERSION,
   openLichessStorage,
+  openLichessMaintenanceStorage,
   safeInteger,
 } from "./lichess-storage.mjs";
 import {
@@ -83,14 +84,28 @@ function exactIdentity(value, label) {
 
 export class LichessStore {
   constructor(filePath, storageOptions = {}) {
-    this.storage = openLichessStorage(filePath, storageOptions);
+    const { mode = 'runtime', ...options } = storageOptions;
+    if (!new Set(['runtime', 'maintenance']).has(mode)) throw new Error('Invalid storage admission mode');
+    this.maintenanceMode = mode === 'maintenance';
+    this.maintenanceBaselines = new WeakSet();
+    this.storage = this.maintenanceMode
+      ? openLichessMaintenanceStorage(filePath, options) : openLichessStorage(filePath, options);
     this.filePath = this.storage.filePath;
     this.db = this.storage.db;
-    this.statusControl = this.readControlProjection();
-    this.statusOpponents = this.queryOpponentStats();
-    this.statusApiLeases = new Map(this.listApiLeaseRows().map((lease) => [lease.authority_key, lease]));
-    this.statusIncidents = this.queryProviderIncidentSummary();
-    this.statusGameArchive = this.queryGameArchiveSummary();
+    try {
+      this.statusControl = this.maintenanceMode ? null : this.readControlProjection();
+      this.statusOpponents = this.maintenanceMode ? null : this.queryOpponentStats();
+      this.statusApiLeases = new Map(this.listApiLeaseRows().map((lease) => [lease.authority_key, lease]));
+      this.statusIncidents = this.maintenanceMode ? null : this.queryProviderIncidentSummary();
+      this.statusGameArchive = this.maintenanceMode ? null : this.queryGameArchiveSummary();
+    } catch (error) {
+      if (this.maintenanceMode) {
+        try { this.storage.close(); }
+        catch { throw new LichessStorageError('LICHESS_STORAGE_OPERATION_AND_RECOVERY_FAILED',
+          'Lichess storage initialization and cleanup both failed', error); }
+      }
+      throw error;
+    }
   }
 
   close() {
@@ -579,6 +594,58 @@ export class LichessStore {
         SET owner_id=?, active_work=0, updated_at=? WHERE id=1
       `).run(owner, now);
       return Object.freeze({ admissionBlocked: false, activeWork: 0 });
+    });
+  }
+
+  captureMaintenanceRecovery(key) {
+    if (!this.maintenanceMode) throw new Error('Maintenance admission is required');
+    const control = this.db.prepare('SELECT * FROM provider_lifecycle_control WHERE id=1').get();
+    const ownerLease = this.apiLease(key);
+    const baseline = Object.freeze({ control: Object.freeze(control ?? {}),
+      ownerLease: ownerLease ? Object.freeze(ownerLease) : null,
+      ambiguous: this.maintenanceWorkAmbiguous(key) });
+    this.maintenanceBaselines.add(baseline);
+    return baseline;
+  }
+
+  maintenanceWorkAmbiguous(key) {
+    return Boolean(this.db.prepare(`SELECT 1 AS present FROM challenge_attempts
+      WHERE status NOT IN ('accepted','declined','canceled','cancelled','timeout','failed') LIMIT 1`).get())
+      || this.apiSafetyState(key).challengeHalfOpen;
+  }
+
+  maintenanceLeaseAuthoritative(key, ownerId, pid, processIdentity, now = Date.now()) {
+    const lease = this.apiLease(key);
+    const conflict = this.db.prepare('SELECT 1 AS present FROM api_client_leases WHERE owner_id<>? AND expires_at>? LIMIT 1')
+      .get(ownerId, now);
+    return Boolean(lease && lease.owner_id === ownerId && lease.pid === pid && lease.expires_at > now
+      && sameProcessInstance(processIdentityFromJson(lease.process_identity_json, pid), processIdentity) && !conflict);
+  }
+
+  completeMaintenanceRecovery(key, ownerId, pid, processIdentity, baseline, priorOwnerGone, now = Date.now()) {
+    if (!this.maintenanceMode || !this.maintenanceBaselines.has(baseline)) {
+      throw new Error('Unadmitted maintenance baseline');
+    }
+    const normalized = authorityKey(key);
+    return this.withImmediateTransaction(() => {
+      const control = this.db.prepare('SELECT * FROM provider_lifecycle_control WHERE id=1').get();
+      if (!control || control.admission_blocked || Object.keys(baseline.control)
+        .some((field) => control[field] !== baseline.control[field])
+        || !this.maintenanceLeaseAuthoritative(normalized, ownerId, pid, processIdentity, now)
+        || baseline.ambiguous || this.maintenanceWorkAmbiguous(normalized) || !priorOwnerGone()) {
+        const error = new Error('Maintenance authority changed');
+        error.code = 'LICHESS_MAINTENANCE_AUTHORITY_CHANGED';
+        throw error;
+      }
+      // Same exclusive lease authority as a normal lifecycle claim, with the
+      // original work/gate fenced and no reset until remote proofs completed.
+      this.db.prepare("UPDATE provider_lifecycle_control SET owner_id='',active_work=0,updated_at=? WHERE id=1")
+        .run(safeInteger(now, 'maintenance completion timestamp'));
+      const removed = this.db.prepare('DELETE FROM api_client_leases WHERE authority_key=? AND owner_id=?')
+        .run(normalized, ownerId);
+      if (removed.changes !== 1) throw new Error('Maintenance lease release failed');
+      this.maintenanceBaselines.delete(baseline);
+      return Object.freeze({ priorActiveWork: baseline.control.active_work, activeWork: 0, admissionBlocked: false });
     });
   }
 

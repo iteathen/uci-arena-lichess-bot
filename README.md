@@ -432,6 +432,28 @@ operator-controlled data.
 
 ## Release and provenance
 
+An operator can request abandoned-work recovery with `maintenance recover
+--config <absolute-config> --runtime-dir <absolute-runtime-directory>
+--token-file <external-credential-file> --expected-account <bot-account>`.
+The optional `--store` names the existing provider database; `--maximum-milliseconds`
+bounds authenticated recovery to 1–60000 ms (default 15000), in addition to bounded
+storage/process/startup-query admission. This operation runs before engine/profile
+qualification and does not start an engine or stream, supervise a task, issue a
+challenge, abort a game or change reservations/history. It requires an absent or
+disabled/inactive startup registration, exact abandoned-process evidence, exclusive
+API authority and authenticated empty challenge/game lists. Missing proof or API
+scope defers without clearing work or the replacement gate. Ordinary API cooldown
+and maintenance lease bookkeeping are retained. A missing prior lease requires
+the provider's retained exact runtime process identity; expiry alone is insufficient.
+
+Service and operation catalog 1.2 add this explicit operator capability while
+retaining the existing major-1 operations. The closed
+`uci_arena_lichess_maintenance_recovery_v1` response reports `recovered` (exit 0),
+`deferred` (exit 2) or `failed` (exit 1). `completion: unconfirmed` preserves
+uncertain storage effects; cleanup failure cannot report recovery. Credentials,
+private identifiers and arbitrary errors are excluded. This is not replacement
+readiness or startup recovery; startup lifecycle remains credential-free.
+
 Windows process-instance observations use the component's explicitly packaged
 native helper through the public `@uci-arena/background-service-runtime` contract.
 The identity deadline remains at most 2000 ms; lifecycle callers can supply a

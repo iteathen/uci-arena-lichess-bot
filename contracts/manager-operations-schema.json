@@ -1,6 +1,6 @@
 {
   "schema": "uci_arena_lichess_manager_api_v1",
-  "version": "1.1",
+  "version": "1.2",
   "transport": {
     "kind": "cli_json",
     "entrypoint": "lichess-adapter.mjs",
@@ -9,6 +9,15 @@
     "shell": false
   },
   "operations": {
+    "maintenance_recover": {
+      "arguments": ["maintenance", "recover"],
+      "required_arguments": ["--config", "--token-file", "--expected-account"],
+      "optional_arguments": ["--runtime-dir", "--store", "--engine-root", "--maximum-milliseconds"],
+      "mutates": true,
+      "credential": "external_file_path_only",
+      "response": "uci_arena_lichess_maintenance_recovery_v1",
+      "response_schema": "contracts/maintenance-recovery-schema.json"
+    },
     "config_get": {
       "arguments": ["config", "get"],
       "mutates": false,
