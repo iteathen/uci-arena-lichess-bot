@@ -4025,10 +4025,12 @@ export class UciEngine {
     await this.newGame();
     this.latestInfo = {};
     this.send("position startpos");
+    const command = "go movetime 500";
+    const timeoutMs = Number(this.config.qualification_timeout_ms ?? 30_000);
     const line = await this.exchange(
-      "go depth 1",
+      command,
       (candidate) => candidate.startsWith("bestmove "),
-      Number(this.config.qualification_timeout_ms ?? 30_000),
+      timeoutMs,
     );
     const result = this.parseBestmove(line);
     const legality = new AuthoritativeChessState("startpos");
@@ -4056,6 +4058,13 @@ export class UciEngine {
       uci_id_lines: uciIdentity.id_lines,
       advertised_option_count: this.advertisedOptions.size,
       bestmove: result.bestmove,
+      probe: {
+        kind: "bounded_movetime_legal_move",
+        command,
+        position: "startpos",
+        movetime_ms: 500,
+        timeout_ms: timeoutMs,
+      },
     };
   }
 

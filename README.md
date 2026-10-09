@@ -102,8 +102,11 @@ receipt. The tracked suite default uses `models/latticeknight`.
 
 - `standard_uci_v1` requires an executable, optional literal argument array,
   working directory, successful `uci`/`isready` interrogation, and a fresh legal
-  depth-one move from the initial position. A freshly qualified engine owns one
-  game slot; greater concurrency requires a matching capacity artifact.
+  move from the initial position using the bounded `go movetime 500` onboarding
+  probe. This between-game probe proves protocol/legality and grants one game
+  slot; it makes no depth, strength or live timing-policy claim. Greater
+  concurrency requires a matching capacity artifact. Explicit fixed-depth smoke
+  remains depth-based and requires an engine that supports that command.
 - `uci_arena_extended_v1` additionally binds the UCI Arena Engine model,
   runtime-status, timing, and capacity evidence described below.
 
