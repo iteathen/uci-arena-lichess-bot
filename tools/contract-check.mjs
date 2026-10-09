@@ -22,6 +22,7 @@ const incidentPage = readJson("contracts/incident-page-schema.json");
 const gamePage = readJson("contracts/game-page-schema.json");
 const gameDetail = readJson("contracts/game-detail-schema.json");
 const qualificationResult = readJson("contracts/qualification-result-schema.json");
+const maintenanceRecovery = readJson("contracts/maintenance-recovery-schema.json");
 const template = readFileSync(path.join(root, "config.uci_arena.template.yml"), "utf8");
 const errors = [];
 const launchBindings = component.installation?.installer_integration?.dependency_bindings ?? [];
@@ -162,6 +163,7 @@ if (service.invocation?.kind !== "dependency_runtime"
   errors.push("service invocation runtime is incomplete or undeclared");
 }
 const requiredOperations = new Set([
+  "maintenance_recover",
   "account_probe", "config_get", "config_update", "owner_add", "owner_list",
   "owner_remove", "provider_status", "reservation_cancel", "reservation_create",
   "reservation_status", "scheduler_pause", "scheduler_resume", "scheduler_status",
@@ -169,7 +171,7 @@ const requiredOperations = new Set([
   "game_get", "games_list", "incidents_list",
 ]);
 if (operations.schema !== "uci_arena_lichess_manager_api_v1"
-    || operations.version !== "1.1"
+    || operations.version !== "1.2"
     || [...requiredOperations].some((name) => !operations.operations?.[name])) {
   errors.push("Manager operation catalog is missing required operations");
 }
@@ -178,6 +180,19 @@ for (const [name, operation] of Object.entries(operations.operations ?? {})) {
       || !["forbidden", "external_file_path_only"].includes(operation.credential)) {
     errors.push(`Manager operation ${name} has an invalid boundary`);
   }
+}
+if (operations.version !== service.service?.contract_version
+    || service.maintenance_recovery_schema !== 'contracts/maintenance-recovery-schema.json'
+    || component.contracts?.maintenance_recovery !== service.maintenance_recovery_schema
+    || operations.operations?.maintenance_recover?.response_schema !== service.maintenance_recovery_schema
+    || operations.operations?.maintenance_recover?.response !== maintenanceRecovery.$id
+    || operations.operations?.maintenance_recover?.credential !== 'external_file_path_only'
+    || operations.operations?.maintenance_recover?.mutates !== true
+    || JSON.stringify(operations.operations?.maintenance_recover?.arguments) !== JSON.stringify(['maintenance', 'recover'])
+    || maintenanceRecovery.$id !== 'uci_arena_lichess_maintenance_recovery_v1'
+    || maintenanceRecovery.oneOf?.length !== 2
+    || !maintenanceRecovery.oneOf.every((branch) => branch.additionalProperties === false)) {
+  errors.push('maintenance recovery contract bindings differ');
 }
 if (configuration.properties?.schema?.const !== "uci_arena_lichess_manager_options_v1") {
   errors.push("configuration projection schema is incompatible");
@@ -203,7 +218,7 @@ if (configurationUpdate.required?.[0] !== "settings"
 if (status.properties?.schema?.const !== "uci_arena_lichess_status_v5") {
   errors.push("status projection schema is incompatible");
 }
-if (service.service?.contract_version !== "1.1"
+if (service.service?.contract_version !== "1.2"
     || JSON.stringify(operations.operations?.incidents_list?.arguments)
       !== JSON.stringify(["incidents", "list"])
     || operations.operations?.incidents_list?.mutates !== false

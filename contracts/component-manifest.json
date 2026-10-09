@@ -37,6 +37,7 @@
       "provider_incidents",
       "provider_games",
       "installed_qualification",
+      "maintenance_recovery",
       "startup_install",
       "startup_recover",
       "startup_uninstall"
@@ -139,6 +140,7 @@
     "game_page": "contracts/game-page-schema.json",
     "game_detail": "contracts/game-detail-schema.json",
     "qualification_result": "contracts/qualification-result-schema.json",
+    "maintenance_recovery": "contracts/maintenance-recovery-schema.json",
     "manager_operations": "contracts/manager-operations-schema.json"
   },
   "compatibility": {

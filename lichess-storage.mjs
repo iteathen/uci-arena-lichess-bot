@@ -1578,6 +1578,41 @@ export function openLichessStorage(filePath, {
 
 export const LICHESS_STORAGE_SCHEMA_VERSION = CURRENT_SCHEMA_VERSION;
 
+export function openLichessMaintenanceStorage(filePath, {
+  databaseFactory = (filename, options) => new DatabaseSync(filename, options),
+} = {}) {
+  const requested = path.resolve(filePath);
+  const admitted = admitExactFileSync(requested,
+    { maximumBytes: DATABASE_MAXIMUM_BYTES, label: 'Existing maintenance storage' });
+  const authority = { filePath: requested, databaseIdentity: admitted.identity };
+  assertStoragePaths(authority);
+  let database = null;
+  try {
+    database = databaseFactory(requested, { timeout: BUSY_TIMEOUT_MS, readBigInts: true,
+      enableForeignKeyConstraints: true, enableDoubleQuotedStringLiterals: false,
+      allowExtension: false, defensive: true });
+    assertStoragePaths(authority);
+    // Connection-local settings only. Never change journal mode or run migrations.
+    database.exec(`PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;
+      PRAGMA busy_timeout=${BUSY_TIMEOUT_MS}; PRAGMA trusted_schema=OFF; BEGIN`);
+    verifySqliteConfiguration(database);
+    const version = schemaVersion(database);
+    verifySchema(database, version, { requireLifecycle: true });
+    database.exec('COMMIT');
+    assertStoragePaths(authority);
+    const safeDatabase = new SafeDatabase(database);
+    return Object.freeze({ filePath: requested, db: safeDatabase, schemaVersion: version,
+      assertPaths: () => assertStoragePaths(authority), close: () => safeDatabase.close() });
+  } catch (error) {
+    if (database) {
+      try { database.close(); }
+      catch { throw storageError('LICHESS_STORAGE_OPERATION_AND_RECOVERY_FAILED',
+        'Maintenance storage admission and closure failed', error); }
+    }
+    throw error;
+  }
+}
+
 // Diagnostic reads use SQLite's normal read-lock/readmark coordination. They
 // never create a missing database, migrate, repair, prune, or change owner data.
 export function readProviderInterlockSnapshot(filePath, {
