@@ -182,6 +182,27 @@ for (const condition of ['pending_challenge', 'pending_game', 'malformed', 'scop
   });
 }
 
+for (const phase of ['account', 'challenges', 'playing']) {
+  for (const httpStatus of [401, 403]) {
+    test(`${phase} scope rejection exposes only closed phase and numeric ${httpStatus}`, async (t) => {
+      let reads = 0;
+      const { result } = await deferredCase(t, { client: { async json(endpoint) {
+        const current = endpoint === 'api/account' ? 'account' : endpoint === 'api/challenge' ? 'challenges' : 'playing';
+        if (current === phase) {
+          const error = new Error('PRIVATE_RESPONSE_OR_ACCOUNT');
+          Object.defineProperty(error, 'status', { get() { reads += 1; return reads === 1 ? httpStatus : 'PRIVATE_GETTER'; } });
+          throw error;
+        }
+        return current === 'account' ? { username: 'fixture', title: 'BOT' }
+          : current === 'challenges' ? { in: [], out: [] } : { nowPlaying: [], nbMyTurn: 0 };
+      } } });
+      assert.equal(result.reason, 'remote_scope_unavailable');
+      assert.equal(result.phase, phase); assert.equal(result.httpStatus, httpStatus); assert.equal(reads, 1);
+      assert.ok(!JSON.stringify(result).includes('PRIVATE_'));
+    });
+  }
+}
+
 test('already cancelled maintenance makes no account requests', async (t) => {
   const controller = new AbortController(); controller.abort();
   const { result, calls } = await deferredCase(t, { signal: controller.signal });

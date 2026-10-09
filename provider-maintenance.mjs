@@ -16,6 +16,7 @@ export async function recoverProviderMaintenance({ store, client, authority, exp
   let acquired = false;
   let leaseClaimUnconfirmed = false;
   let completion = 'not_attempted';
+  let phase = null;
   let result;
   const check = () => {
     if (boundedSignal.aborted || performance.now() - started >= maximumMilliseconds) defer('cancelled_or_timeout');
@@ -67,21 +68,25 @@ export async function recoverProviderMaintenance({ store, client, authority, exp
     refresh();
     heartbeat = setInterval(() => { try { refresh(); } catch { controller.abort(); } }, 10000);
     const requestOptions = { signal: boundedSignal, beforeDispatch: refresh };
+    phase = 'account';
     const profile = await client.json('api/account', requestOptions);
     check();
     if (typeof profile?.username !== 'string' || profile.username.toLowerCase() !== expectedAccount.toLowerCase()
         || profile.title !== 'BOT') defer('account_identity_rejected');
     refresh();
+    phase = 'challenges';
     const challenges = await client.json('api/challenge', requestOptions);
     check();
     if (!Array.isArray(challenges?.in) || !Array.isArray(challenges?.out)) defer('remote_facts_malformed');
     if (challenges.in.length || challenges.out.length) defer('remote_work_pending');
     refresh();
+    phase = 'playing';
     const playing = await client.json('api/account/playing?nb=50', requestOptions);
     check();
     if (!Array.isArray(playing?.nowPlaying) || !Number.isSafeInteger(playing.nbMyTurn)
         || playing.nbMyTurn < 0 || (!playing.nowPlaying.length && playing.nbMyTurn !== 0)) defer('remote_facts_malformed');
     if (playing.nowPlaying.length) defer('remote_work_pending');
+    phase = null;
     refresh();
     completion = 'unconfirmed';
     const facts = store.completeMaintenanceRecovery(authority, ownerId, pid, processIdentity, baseline, priorGone, now());
@@ -96,7 +101,8 @@ export async function recoverProviderMaintenance({ store, client, authority, exp
       status: leaseClaimUnconfirmed || (completion === 'unconfirmed' && !knownRejection) ? 'failed' : 'deferred', completion,
       reason: error instanceof Deferred ? error.reason : boundedSignal.aborted
         ? 'cancelled_or_timeout' : knownRejection ? 'authority_changed'
-          : status === 401 || status === 403 ? 'remote_scope_unavailable' : 'recovery_unavailable' };
+          : status === 401 || status === 403 ? 'remote_scope_unavailable' : 'recovery_unavailable',
+      ...(phase && (status === 401 || status === 403) ? { phase, httpStatus: status } : {}) };
   } finally {
     clearTimeout(timer);
     if (heartbeat) clearInterval(heartbeat);
@@ -105,7 +111,8 @@ export async function recoverProviderMaintenance({ store, client, authority, exp
         if (!store.releaseApiLease(authority, ownerId)) throw new Error('Unobserved lease release');
       } catch {
         result = { schema: MAINTENANCE_RECOVERY_SCHEMA, status: 'failed',
-          reason: result?.reason ?? 'recovery_unavailable', cleanup: 'lease_release_failed', completion };
+          reason: result?.reason ?? 'recovery_unavailable', cleanup: 'lease_release_failed', completion,
+          ...(result?.phase ? { phase: result.phase, httpStatus: result.httpStatus } : {}) };
       }
     }
   }

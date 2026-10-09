@@ -8458,7 +8458,8 @@ async function runMaintenanceRecovery(options, runtimeDir) {
       try { store.close(); }
       catch { result = { schema: MAINTENANCE_RECOVERY_SCHEMA, status: 'failed',
         completion: result?.completion ?? 'not_attempted', reason: result?.reason ?? 'recovery_unavailable',
-        cleanup: result?.cleanup === 'lease_release_failed' ? 'lease_and_storage_close_failed' : 'storage_close_failed' }; }
+        cleanup: result?.cleanup === 'lease_release_failed' ? 'lease_and_storage_close_failed' : 'storage_close_failed',
+        ...(result?.phase ? { phase: result.phase, httpStatus: result.httpStatus } : {}) }; }
     }
   }
   console.log(JSON.stringify(result));
