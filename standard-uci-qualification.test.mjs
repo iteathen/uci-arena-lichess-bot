@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {mkdtempSync,readFileSync,rmSync,writeFileSync} from 'node:fs';
+import {lstatSync,mkdtempSync,readFileSync,realpathSync,rmSync,writeFileSync} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -7,7 +7,14 @@ import {UciEngine,loadCapacityProfile} from './lichess-adapter.mjs';
 
 function fixture(t,{move='e2e4',silent=false,exitCode=0}={}){
  const directory=mkdtempSync(path.join(os.tmpdir(),'bot-standard-movetime-'));
- t.after(()=>{assert.equal(path.dirname(directory),os.tmpdir());rmSync(directory,{recursive:true,force:true});});
+ const temporaryRoot=realpathSync(os.tmpdir()),created=lstatSync(directory,{bigint:true});
+ t.after(()=>{
+  const actualRoot=realpathSync(os.tmpdir()),actualDirectory=realpathSync(directory),current=lstatSync(directory,{bigint:true});
+  assert(path.isAbsolute(actualRoot)&&path.isAbsolute(actualDirectory));assert.equal(actualRoot,temporaryRoot);assert.equal(path.dirname(actualDirectory),actualRoot);
+  const relative=path.relative(actualRoot,actualDirectory);assert(relative.startsWith('bot-standard-movetime-')&&!relative.includes(path.sep));
+  assert(current.isDirectory()&&!current.isSymbolicLink());assert.equal(current.dev,created.dev);assert.equal(current.ino,created.ino);assert.equal(current.birthtimeNs,created.birthtimeNs);
+  rmSync(actualDirectory,{recursive:true,force:true});
+ });
  const script=path.join(directory,'engine.mjs'),journal=path.join(directory,'commands.jsonl');
  writeFileSync(script,`
 import {createInterface} from 'node:readline';
