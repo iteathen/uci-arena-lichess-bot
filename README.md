@@ -1,5 +1,13 @@
 # UCI Arena Lichess Bot
 
+`startup status` includes `startup.replacementInterlock`: `ready` exposes only
+`admissionBlocked`, `owned`, and `activeWork`; missing storage is `unavailable`,
+and rejected storage is `failed` with a sanitized diagnostic. This read-only
+inspection never migrates, repairs, prunes, or changes provider rows. SQLite may
+create or update its normal WAL/SHM coordination files for an existing database.
+A missing database is never created. The snapshot does not grant replacement
+permission or change the admission gate.
+
 `uci-arena-lichess-bot` is the independently released Lichess BOT provider for
 the UCI Arena suite. It owns Lichess transport, challenge policy, scheduling,
 capacity admission, game reconstruction, move submission, persistent bot state,
