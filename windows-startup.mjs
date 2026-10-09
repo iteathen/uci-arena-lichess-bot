@@ -192,19 +192,38 @@ export async function inspectWindowsReplacement({ componentRoot, allowedRoots = 
       || createHash('sha256').update(observed.definition_xml, 'utf8').digest('hex') !== observed.definition_sha256) {
     throw new Error('Windows startup before-image was not confirmed');
   }
+  if (windowsDefinitionEnablement(observed.definition_xml).enabled !== observed.enabled) {
+    throw new Error('Windows startup enablement observation is inconsistent');
+  }
   return Object.freeze({ platform: 'win32', registered: true, enabled: observed.enabled,
     active: observed.instance_guids.length > 0, definition_text: observed.definition_xml,
     definition_sha256: observed.definition_sha256, action,
     instances: Object.freeze([...observed.instance_guids]) });
 }
 
-function enabledWindowsDefinition(definition, enabled) {
+function windowsDefinitionEnablement(definition) {
   const blocks = [...definition.matchAll(/<Settings>[\s\S]*?<\/Settings>/giu)];
-  if (blocks.length !== 1 || [...blocks[0][0].matchAll(/<Enabled>(?:true|false)<\/Enabled>/giu)].length !== 1) {
+  if (blocks.length !== 1 || [...definition.matchAll(/<Settings(?=[\s/>])/giu)].length !== 1
+      || [...definition.matchAll(/<\/Settings\s*>/giu)].length !== 1) {
     throw new Error('Windows startup enablement definition is unavailable');
   }
-  return definition.replace(blocks[0][0], blocks[0][0].replace(/<Enabled>(?:true|false)<\/Enabled>/iu,
-    `<Enabled>${enabled ? 'true' : 'false'}</Enabled>`));
+  const block = blocks[0][0];
+  const opening = [...block.matchAll(/<Enabled(?=[\s/>])/giu)];
+  const closing = [...block.matchAll(/<\/Enabled\s*>/giu)];
+  const values = [...block.matchAll(/<Enabled>(true|false)<\/Enabled>/giu)];
+  if (!opening.length && !closing.length) return { block, omitted: true, enabled: true };
+  if (opening.length !== 1 || closing.length !== 1 || values.length !== 1) {
+    throw new Error('Windows startup enablement definition is unavailable');
+  }
+  return { block, omitted: false, enabled: values[0][1].toLowerCase() === 'true' };
+}
+
+function enabledWindowsDefinition(definition, enabled) {
+  const settings = windowsDefinitionEnablement(definition);
+  if (settings.enabled === enabled) return definition;
+  const block = settings.omitted ? settings.block.replace(/<\/Settings>/iu, '<Enabled>false</Enabled></Settings>')
+    : settings.block.replace(/<Enabled>(?:true|false)<\/Enabled>/iu, `<Enabled>${enabled ? 'true' : 'false'}</Enabled>`);
+  return definition.replace(settings.block, block);
 }
 
 const xmlDigest = (definition) => createHash('sha256').update(definition, 'utf8').digest('hex');

@@ -12,7 +12,7 @@ const action = { command: path.join(componentRoot, 'native', 'lichess_adapter_la
     '--config', configPath, '--token-file', path.resolve('fixture-external', 'token-locator'),
     '--expected-account', 'fixture', '--runtime-dir', runtimeDir].map((value) => `"${value}"`).join(' '),
   working_directory: componentRoot };
-const definition = '<Task>opaque fixture SDK definition</Task>';
+const definition = '<Task><Settings><Enabled>false</Enabled></Settings>opaque fixture SDK definition</Task>';
 const registered = { registered: true, enabled: false, definition_xml: definition,
   definition_sha256: createHash('sha256').update(definition).digest('hex'), instance_guids: [],
   principal: { current_user_sid: 'S-1-5-21-1', user_sid: 'S-1-5-21-1', logon_type: 3, run_level: 0 }, action };
@@ -24,8 +24,8 @@ const taskDefinition = (enabled) => `<Task><Settings><Enabled>${enabled}</Enable
 function taskFixture(xml, active = false) {
   const calls = [];
   let current = xml;
-  let instances = active ? ['11111111-1111-4111-8111-111111111111'] : [];
-  const snapshot = () => ({ ...registered, enabled: /<Enabled>true<\/Enabled>/.test(current),
+  let instances = active ? ['{11111111-1111-4111-8111-111111111111}'] : [];
+  const snapshot = () => ({ ...registered, enabled: !/<Settings>[\s\S]*?<Enabled>false<\/Enabled>[\s\S]*?<\/Settings>/.test(current),
     definition_xml: current, definition_sha256: createHash('sha256').update(current).digest('hex'),
     instance_guids: [...instances], action: Object.fromEntries(['Command', 'Arguments', 'WorkingDirectory'].map((key, index) =>
       [['command', 'arguments', 'working_directory'][index], unescape(current.match(new RegExp(`<${key}>([\\s\\S]*?)<\\/${key}>`))[1])])) });
@@ -33,16 +33,70 @@ function taskFixture(xml, active = false) {
     calls.push(request.operation);
     if (request.operation === 'inspect') return { outcome: 'completed', observation: snapshot() };
     if (request.operation === 'register' && current === request.definition_xml) return { outcome: 'completed', observation: snapshot() };
+    if (request.operation === 'set_enabled' && request.enabled === snapshot().enabled) {
+      return { outcome: 'completed', observation: snapshot() };
+    }
     assert.equal(request.expected_xml_sha256, snapshot().definition_sha256, 'public exact-definition admission');
-    if (request.operation === 'set_enabled') current = current.replace(/<Enabled>(true|false)<\/Enabled>/,
-      `<Enabled>${request.enabled}</Enabled>`);
+    if (request.operation === 'set_enabled') current = current.replace(/<Settings>([\s\S]*?)<\/Settings>/,
+      (_whole, settings) => `<Settings>${/<Enabled>/.test(settings)
+        ? settings.replace(/<Enabled>(true|false)<\/Enabled>/, `<Enabled>${request.enabled}</Enabled>`)
+        : `${settings}<Enabled>${request.enabled}</Enabled>`}</Settings>`);
     else if (request.operation === 'stop_instances') {
       assert.deepEqual(request.instance_guids, instances); instances = [];
     } else if (request.operation === 'register') current = request.definition_xml;
-    else if (request.operation === 'run') instances = ['11111111-1111-4111-8111-111111111111'];
+    else if (request.operation === 'run') instances = ['{11111111-1111-4111-8111-111111111111}'];
     else assert.fail('unadmitted SDK operation');
     return { outcome: 'completed', observation: snapshot() };
   } } };
+}
+
+function publicFixtureScheduler(fixture, override = {}) {
+  return new WindowsTaskScheduler({ platform: 'win32', invoke: async (request) => {
+    const response = await fixture.scheduler.perform(request);
+    return { stdout: Buffer.from(JSON.stringify({ schema: 'uci_arena_windows_task_result_v1', schema_version: 1,
+      operation: request.operation, task_path: request.task_path, outcome: 'completed', failure: null,
+      observation: { ...response.observation, ...override } })), exitCode: 0, signal: null };
+  } });
+}
+
+test('SDK-admitted omitted task Enabled defaults true and quiesces without changing trigger enablement', async () => {
+  const { inspectWindowsReplacement, quiesceWindowsReplacement } = await import('./windows-startup.mjs');
+  const xml = taskDefinition(true).replace('<Enabled>true</Enabled>', '')
+    .replace('<Actions>', '<Triggers><LogonTrigger><Enabled>false</Enabled></LogonTrigger></Triggers><Actions>');
+  const fixture = taskFixture(xml); const scheduler = publicFixtureScheduler(fixture);
+  const before = await inspectWindowsReplacement({ componentRoot, runtimeDir, configPath, platform: 'win32', scheduler });
+  assert.equal(before.enabled, true); assert.equal(before.definition_text, xml);
+  const state = { previous_root: componentRoot, replacement_root: componentRoot, before };
+  const result = await quiesceWindowsReplacement({ state, runtimeDir, configPath, platform: 'win32', scheduler,
+    execute: async () => fixture.calls.push('native_join') });
+  assert.equal(result.observation.enabled, false); assert.equal(state.before.definition_text, xml);
+  assert.ok(result.observation.definition_text.includes('<LogonTrigger><Enabled>false</Enabled></LogonTrigger>'));
+  assert.ok(result.observation.definition_text.includes('<Priority>4</Priority>'));
+});
+
+test('SDK-admitted omitted task Enabled remains an exact raw definition during activation', async () => {
+  const { inspectWindowsReplacement, activateWindowsReplacement } = await import('./windows-startup.mjs');
+  const xml = taskDefinition(true).replace('<Enabled>true</Enabled>', '');
+  const fixture = taskFixture(xml); const scheduler = publicFixtureScheduler(fixture);
+  const observation = await inspectWindowsReplacement({ componentRoot, runtimeDir, configPath, platform: 'win32', scheduler });
+  const result = await activateWindowsReplacement({ observation, componentRoot, runtimeDir, configPath, scheduler,
+    ready: async () => true, delay: async () => {}, pollMilliseconds: 10, stabilityMilliseconds: 20,
+    timeoutMilliseconds: 100, launchGraceMilliseconds: 20 });
+  assert.equal(result.active, true); assert.equal(fixture.snapshot().definition_xml, xml);
+});
+
+for (const [name, xml, enabled] of [
+  ['omitted default reported false', taskDefinition(true).replace('<Enabled>true</Enabled>', ''), false],
+  ['duplicate task setting', taskDefinition(true).replace('<Enabled>true</Enabled>', '<Enabled>true</Enabled><Enabled>false</Enabled>'), true],
+  ['malformed task setting', taskDefinition(true).replace('<Enabled>true</Enabled>', '<Enabled>unknown</Enabled>'), true],
+  ['duplicate Settings blocks', taskDefinition(true).replace('</Settings>', '</Settings><Settings></Settings>'), true],
+]) {
+  test(`SDK-shaped ${name} rejects before platform effects`, async () => {
+    const { inspectWindowsReplacement } = await import('./windows-startup.mjs');
+    const fixture = taskFixture(xml); const scheduler = publicFixtureScheduler(fixture, { enabled });
+    await assert.rejects(inspectWindowsReplacement({ componentRoot, runtimeDir, configPath, platform: 'win32', scheduler }));
+    assert.deepEqual(fixture.calls, ['inspect']);
+  });
 }
 
 test('canonical public SDK null absence normalizes to a provider inactive before-image', async () => {

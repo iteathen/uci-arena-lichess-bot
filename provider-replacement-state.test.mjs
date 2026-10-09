@@ -341,7 +341,7 @@ test('live replacement controller is rejected before runtime evidence preflight'
     arguments: [process.execPath, path.join(component, 'lichess-adapter.mjs'), 'run', '--config', configPath,
       '--token-file', path.join(root, 'blind-token-locator'), '--expected-account', 'fixture', '--runtime-dir', root]
       .map((value) => `"${value}"`).join(' '), working_directory: component };
-  const xml = '<Task>opaque guarded SDK snapshot</Task>';
+  const xml = '<Task><Settings><Enabled>true</Enabled></Settings>opaque guarded SDK snapshot</Task>';
   const observed = { platform: 'win32', registered: true, enabled: true, active: false,
     definition_text: xml, definition_sha256: createHash('sha256').update(xml).digest('hex'), action, instances: [] };
   store.requestProviderReplacement(Date.now(), { allowUnowned: true, beforeEffect(control, closedControl) {
