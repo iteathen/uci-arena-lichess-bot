@@ -24,8 +24,11 @@
         "status": {"enum": ["deferred", "failed"]},
         "completion": {"enum": ["not_attempted", "unconfirmed", "confirmed"]},
         "reason": {"enum": ["invalid_request", "cancelled_or_timeout", "startup_not_quiescent", "admission_blocked", "prior_ownership_unavailable", "durable_work_ambiguous", "prior_process_not_proven_absent", "exclusive_lease_unavailable", "account_identity_rejected", "remote_facts_malformed", "remote_work_pending", "authority_changed", "remote_scope_unavailable", "recovery_unavailable"]},
-        "cleanup": {"enum": ["lease_release_failed", "storage_close_failed", "lease_and_storage_close_failed"]}
-      }
+        "cleanup": {"enum": ["lease_release_failed", "storage_close_failed", "lease_and_storage_close_failed"]},
+        "phase": {"enum": ["account", "challenges", "playing"]},
+        "httpStatus": {"enum": [401, 403]}
+      },
+      "dependentRequired": {"phase": ["httpStatus"], "httpStatus": ["phase"]}
     }
   ]
 }

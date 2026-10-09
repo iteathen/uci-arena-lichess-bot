@@ -453,6 +453,12 @@ retaining the existing major-1 operations. The closed
 uncertain storage effects; cleanup failure cannot report recovery. Credentials,
 private identifiers and arbitrary errors are excluded. This is not replacement
 readiness or startup recovery; startup lifecycle remains credential-free.
+An authentication/scope rejection may include only `phase` (`account`,
+`challenges` or `playing`) and numeric `httpStatus` (401 or 403), retained even
+when cleanup fails. These fields locate the rejection; they do not infer token
+permissions from an error body. The public challenge-list API requires
+`challenge:read`; empty games or local history cannot replace the complete
+challenge proof. If that proof is unavailable, maintenance remains deferred.
 
 Windows process-instance observations use the component's explicitly packaged
 native helper through the public `@uci-arena/background-service-runtime` contract.
