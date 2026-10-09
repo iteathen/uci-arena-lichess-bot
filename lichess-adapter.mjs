@@ -2,6 +2,7 @@
 
 import { spawn } from "node:child_process";
 import { startupFailureDiagnostic, typedStartupOperation } from "./provider-lifecycle-diagnostics.mjs";
+import { readProviderInterlockSnapshot } from "./lichess-storage.mjs";
 import { continuousObservationFromRuntime, validateNativeAdmission, validateNativeCandidates,
   validateNativePublication, MOVE_EVIDENCE_PREFIX, EXECUTION_COMPLETION_PREFIX } from "./continuous-uci-observation.mjs";
 import { CONTINUOUS_PROFILE_SCHEMA, validateContinuousProfileShape, validateContinuousGameDiagnostic,
@@ -8445,7 +8446,14 @@ export async function main(argv = process.argv.slice(2)) {
       : process.platform === "linux"
         ? await queryLinuxStartup()
         : (() => { throw new Error(`Unsupported startup platform: ${process.platform}`); })();
-    console.log(JSON.stringify({ status: "ready", startup }));
+    let replacementInterlock;
+    try {
+      replacementInterlock = readProviderInterlockSnapshot(
+        path.resolve(options.store ?? path.join(runtimeDir, "matches.sqlite")));
+    } catch (error) {
+      replacementInterlock = { state: "failed", diagnostic: startupFailureDiagnostic(error, ROOT) };
+    }
+    console.log(JSON.stringify({ status: "ready", startup: { ...startup, replacementInterlock } }));
     return 0;
   }
   if (options.command === "startup" && options.action === "recover") {

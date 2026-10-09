@@ -48,6 +48,7 @@ provider_replacement_interlock_2026_08_23:
     - "After successful gate closure, startup control may disable restart, stop the now-idle exact owned process tree, and retarget the registration. Failure during that platform transition reopens admission before returning when the current provider remains authoritative."
     - "Post-replacement resume reopens admission only through provider-owned lifecycle code. A blocked provider process cannot clear the gate merely by restarting, so a restart race cannot invalidate successful pre_replace evidence."
     - "The gate, work count, lifecycle owner, and failure observations are credential-free. No lifecycle path reads, hashes, copies, validates, logs, or returns token contents."
+    - "Public startup status adds replacementInterlock as ready with only admissionBlocked/owned/activeWork, unavailable with storage_absent, or failed with the existing sanitized diagnostic. The storage owner opens an existing exact database readOnly with the admitted schema and read transaction, without initialization, migration, repair, pruning, or any provider row mutation. Missing database creates nothing. Ordinary SQLite WAL/SHM creation and read-lock/readmark coordination are permitted read transport at exact admitted sidecar targets; they are not provider state changes. Immutable reads that ignore current WAL are forbidden. Status never closes admission or grants replacement-ready authority."
   migration:
     store_schema_base: 5
     compatible_extension: provider_lifecycle_control

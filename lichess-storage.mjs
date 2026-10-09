@@ -1577,3 +1577,54 @@ export function openLichessStorage(filePath, {
 }
 
 export const LICHESS_STORAGE_SCHEMA_VERSION = CURRENT_SCHEMA_VERSION;
+
+// Diagnostic reads use SQLite's normal read-lock/readmark coordination. They
+// never create a missing database, migrate, repair, prune, or change owner data.
+export function readProviderInterlockSnapshot(filePath, {
+  databaseFactory = (filename, options) => new DatabaseSync(filename, options),
+} = {}) {
+  const requested = path.resolve(filePath);
+  const classified = classifyExactPathSync(requested, { label: 'Lichess read-only storage' });
+  if (classified.kind === 'missing') return Object.freeze({ state: 'unavailable', reason: 'storage_absent' });
+  if (classified.kind !== 'file') {
+    throw storageError('LICHESS_STORAGE_PATH_TYPE_INVALID', 'Lichess read-only storage is not an exact file');
+  }
+  const admitted = admitExactFileSync(requested,
+    { maximumBytes: DATABASE_MAXIMUM_BYTES, label: 'Lichess read-only storage' });
+  const authority = { filePath: requested, databaseIdentity: admitted.identity };
+  assertStoragePaths(authority); // Includes exact ancestor and WAL/SHM targets.
+  let database = null;
+  let primaryError = null;
+  try {
+    database = databaseFactory(requested, {
+      readOnly: true, readBigInts: true, timeout: BUSY_TIMEOUT_MS,
+      enableForeignKeyConstraints: true, enableDoubleQuotedStringLiterals: false,
+      allowExtension: false, defensive: true,
+    });
+    assertStoragePaths(authority);
+    database.exec('BEGIN'); // One consistent read transaction; never BEGIN IMMEDIATE.
+    const version = schemaVersion(database);
+    verifySchema(database, version, { requireLifecycle: true });
+    const row = database.prepare(`
+      SELECT admission_blocked, owner_id, active_work
+      FROM provider_lifecycle_control WHERE id=1
+    `).get();
+    if (!row) throw storageError('LICHESS_STORAGE_ROW_INVALID', 'Provider interlock singleton is unavailable');
+    const result = Object.freeze({ state: 'ready', admissionBlocked: row.admission_blocked === 1n,
+      owned: row.owner_id !== '', activeWork: projectSqliteValue(row.active_work) });
+    database.exec('COMMIT');
+    assertStoragePaths(authority);
+    return result;
+  } catch (error) {
+    primaryError = error;
+    throw error;
+  } finally {
+    if (database) {
+      try { database.close(); }
+      catch (error) {
+        throw storageError(primaryError ? 'LICHESS_STORAGE_OPERATION_AND_RECOVERY_FAILED'
+          : 'LICHESS_STORAGE_CLOSE_FAILED', 'Read-only storage closure failed', primaryError ?? error);
+      }
+    }
+  }
+}
