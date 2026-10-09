@@ -74,7 +74,10 @@ test('SDK-admitted omitted task Enabled defaults true and quiesces without chang
   assert.ok(result.observation.definition_text.includes('<Priority>4</Priority>'));
 });
 
-test('SDK-admitted omitted task Enabled remains an exact raw definition during activation', async () => {
+// Activation reaches the production Windows-only completion loop. Inspection
+// and quiescence use the portable injected SDK boundary tested above.
+test('SDK-admitted omitted task Enabled remains an exact raw definition during activation', async (t) => {
+  if (process.platform !== 'win32') return t.skip('Production startup activation requires Windows');
   const { inspectWindowsReplacement, activateWindowsReplacement } = await import('./windows-startup.mjs');
   const xml = taskDefinition(true).replace('<Enabled>true</Enabled>', '');
   const fixture = taskFixture(xml); const scheduler = publicFixtureScheduler(fixture);
@@ -135,7 +138,8 @@ test('same-root inverse convergence restores the captured Node tuple rather than
   assert.equal(fixture.snapshot().definition_xml, beforeXml);
 });
 
-test('activation uses the exact public task definition and requires sustained provider readiness', async () => {
+test('activation uses the exact public task definition and requires sustained provider readiness', async (t) => {
+  if (process.platform !== 'win32') return t.skip('Production startup activation requires Windows');
   const { inspectWindowsReplacement, activateWindowsReplacement } = await import('./windows-startup.mjs');
   const fixture = taskFixture(taskDefinition(false));
   const observation = await inspectWindowsReplacement({ componentRoot, runtimeDir, configPath,
