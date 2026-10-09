@@ -3382,6 +3382,7 @@ export class UciEngine {
     this.runtimeGeneration = 0;
     this.mode = "idle";
     this.activeSearch = null;
+    this.lastSentPosition = null;
     this.timeProfileStatus = timeProfileFallbackStatus(
       "missing",
       "no timing profile was configured",
@@ -3553,6 +3554,10 @@ export class UciEngine {
   send(command) {
     if (!this.child?.stdin.writable) throw new Error("UCI engine stdin is not writable");
     this.child.stdin.write(`${command}\n`);
+    if (command === "ucinewgame") this.lastSentPosition = null;
+    else if (command.startsWith("position ")) {
+      this.lastSentPosition = { command, runtimeGeneration: this.runtimeGeneration, child: this.child };
+    }
   }
 
   waitFor(predicate, timeoutMs) {
@@ -4094,6 +4099,27 @@ export class UciEngine {
     return moves.length ? `position startpos moves ${moves.join(" ")}` : "position startpos";
   }
 
+  sendPosition(moves) {
+    if (!Array.isArray(moves) || moves.length > 2048) throw new Error("Invalid bounded UCI move history");
+    moves = [...moves];
+    if (moves.length > 2048 || moves.some(move => typeof move !== "string" || !UCI_MOVE_PATTERN.test(move))) {
+      throw new Error("Invalid bounded UCI move history");
+    }
+    const command = this.formatPosition(moves), previous = this.lastSentPosition;
+    if (previous?.command === command && previous.runtimeGeneration === this.runtimeGeneration
+        && previous.child === this.child && this.child?.stdin.writable) return false;
+    this.send(command);
+    return true;
+  }
+
+  updateAuthoritativePosition(moves, { isCurrent = () => true } = {}) {
+    if (!isCurrent()) { this.lastSentPosition = null; return false; }
+    // A compatible running go retains its admitted hypothesis until the
+    // existing hit/miss/drain owner classifies it. Never retarget a live go.
+    if (this.activeSearch) return false;
+    return this.sendPosition(moves);
+  }
+
   formatClockGo(prefix, { wtime, btime, winc, binc }) {
     const clock = (value) => Math.max(0, Math.trunc(Number.isFinite(value) ? value : 0));
     return `${prefix} wtime ${clock(wtime)} btime ${clock(btime)} winc ${clock(winc)} binc ${clock(binc)}`;
@@ -4241,7 +4267,7 @@ export class UciEngine {
     }
     if (predictedMove) {
       const ponderRoot = [...moves, predictedMove];
-      this.send(this.formatPosition(ponderRoot));
+      this.sendPosition(ponderRoot);
       const active = this.beginSearch(
         "ponder",
         this.formatClockGo("go ponder", { wtime, btime, winc, binc }),
@@ -4250,7 +4276,7 @@ export class UciEngine {
       if (this.config.qualification_profile?.schema === CONTINUOUS_PROFILE_SCHEMA) await this.observeContinuousAdmission(ponderRoot);
       return active;
     }
-    this.send(this.formatPosition(moves));
+    this.sendPosition(moves);
     const command = this.config.adapter === "standard_uci_v1"
       ? "go infinite"
       : "go infinite opponentroot";
@@ -4291,7 +4317,7 @@ export class UciEngine {
     const drained = await this.stopAndDrain("foreground_search");
     if (signal?.aborted) throw searchCancellationError(signal);
     this.latestInfo = {};
-    this.send(this.formatPosition(moves));
+    this.sendPosition(moves);
     const ownTime = color === "white" ? wtime : btime;
     const timeoutMs = Math.max(10_000, ownTime + Number(this.config.search_timeout_grace_ms ?? 10_000));
     const active = this.beginSearch(
@@ -4350,6 +4376,7 @@ export class UciEngine {
       catch (telemetryError) { recordFailure("telemetry", telemetryError); }
     }
     this.child = undefined;
+    this.lastSentPosition = null;
     let exited = typeof child.exitCode === "number" || child.signalCode != null;
     let exitCode = child.exitCode;
     let exitSignal = child.signalCode ?? null;
@@ -5639,6 +5666,12 @@ export class GameSession {
       return;
     }
 
+    const updateFocus = () => this.engineOperation("authoritative_position", () => (
+      engine.updateAuthoritativePosition?.(moves, { isCurrent: () => (
+        this.observationIsLatest(observation) && !this.engineIncident && !this.finished
+      ) })
+    ));
+
     if (transition.kind === "duplicate" && status === "started") {
       if (!this.observationIsLatest(observation)) return;
       this.authoritativeMoves = moves;
@@ -5647,6 +5680,8 @@ export class GameSession {
         const stopped = await this.invalidateOpponentSearch("clock_correction");
         this.staleBestmoveDrained ||= stopped.drained;
       }
+      await updateFocus();
+      if (!this.observationIsLatest(observation)) return;
       if (colorToMove(moves) === this.color && this.lastSubmittedRootKey !== movesKey(moves)) {
         await this.playMove(state, engine, {
           moves,
@@ -5693,6 +5728,8 @@ export class GameSession {
       if (this.latestObservedState?.generation !== observation.generation) return;
       const stopped = await this.invalidateOpponentSearch("terminal_state");
       drained ||= stopped.drained;
+      await updateFocus();
+      if (!this.observationIsLatest(observation)) return;
       const winner = String(state.winner ?? "");
       const result = winner
         ? winner === this.color ? "win" : "loss"
@@ -5701,6 +5738,8 @@ export class GameSession {
       return;
     }
     if (this.latestObservedState?.generation !== observation.generation) return;
+    await updateFocus();
+    if (!this.observationIsLatest(observation)) return;
     if (moves.length === 0 && this.color === "black") {
       this.armFirstMoveWatchdog();
     }

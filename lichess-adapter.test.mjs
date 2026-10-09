@@ -1102,6 +1102,103 @@ function createGameSession(engine, client, config = gameConfig(), overrides = {}
   return session;
 }
 
+function standardFocusEngine(results = [], { ponder = false } = {}) {
+  const commands = [], engine = new UciEngine({ adapter: "standard_uci_v1", uci_options: {},
+    timing: { opponent_turn_search: true, foreground_preempts_ponder: true, initial_transport_reserve_ms: 250 } });
+  engine.child = { stdin: { writable: true, write: (line) => {
+    const command = line.trim();commands.push(command);
+    if (command === "isready") queueMicrotask(() => engine.onLine("readyok"));
+    if (command === "stop") queueMicrotask(() => engine.onLine("bestmove a7a6"));
+    if (command.startsWith("go wtime") || command === "ponderhit") queueMicrotask(() => engine.onLine(`bestmove ${results.shift()}`));
+  } } };
+  if (ponder) engine.advertisedOptions.add("Ponder");
+  engine.configureUciOptions();
+  return { engine, commands };
+}
+
+test("standard engine without Ponder receives each accepted own opponent and terminal focus once", async () => {
+  const { engine, commands } = standardFocusEngine(["f2f3", "g2g4"]),posts = [];
+  const config=gameConfig();config.engine.adapter="standard_uci_v1";delete config.engine.qualification_profile;
+  const session=createGameSession(engine,{post:async endpoint=>posts.push(endpoint)},config),initial=startedState("");
+  await session.initialize(gameFull(initial),engine);await session.onState(initial,engine);
+  assert.deepEqual(commands.filter(c=>c.startsWith("position ")),["position startpos"]);
+  await session.onState(startedState("f2f3"),engine);
+  await session.onState(startedState("f2f3"),engine);
+  await session.onState(startedState("f2f3 e7e5"),engine);
+  assert.equal(commands.filter(c=>c.startsWith("position ")).length,3,"unacknowledged own projection is never authoritative focus");
+  await session.onState(startedState("f2f3 e7e5 g2g4"),engine);
+  await session.onState(startedState("f2f3 e7e5 g2g4 d8h4",{status:"mate",winner:"black"}),engine);
+  assert.deepEqual(commands.filter(c=>c.startsWith("position ")),["position startpos","position startpos moves f2f3",
+    "position startpos moves f2f3 e7e5","position startpos moves f2f3 e7e5 g2g4","position startpos moves f2f3 e7e5 g2g4 d8h4"]);
+  assert.equal(posts.length,2);assert.equal(session.finished,true);
+  assert.equal(commands.some(c=>c.startsWith("go ponder")||c==="go infinite"),false);
+});
+
+test("authoritative UCI position cache is bounded to one runtime and cleared by new game", async () => {
+  const {engine,commands}=standardFocusEngine(["e7e5"]);
+  await engine.newGame();await engine.updateAuthoritativePosition(["e2e4"]);
+  await engine.updateAuthoritativePosition(["e2e4"]);
+  await engine.search({moves:["e2e4"],wtime:1000,btime:1000,winc:0,binc:0,color:"black"});
+  assert.equal(commands.filter(c=>c==="position startpos moves e2e4").length,1);
+  await engine.newGame();await engine.updateAuthoritativePosition(["e2e4"]);
+  assert.equal(commands.filter(c=>c==="position startpos moves e2e4").length,2);
+  engine.runtimeGeneration+=1;await engine.updateAuthoritativePosition(["e2e4"]);
+  assert.equal(commands.filter(c=>c==="position startpos moves e2e4").length,3);
+});
+test("superseded authoritative focus invalidates deduplication without sending stale or malformed history", async () => {
+  const {engine,commands}=standardFocusEngine();await engine.newGame();
+  await engine.updateAuthoritativePosition(["e2e4"]);
+  await engine.updateAuthoritativePosition(["e2e4"],{isCurrent:()=>false});
+  assert.equal(commands.filter(c=>c.startsWith("position ")).length,1);
+  await assert.rejects(async()=>engine.updateAuthoritativePosition(["e2e4\nquit"]),/history/);
+  await engine.updateAuthoritativePosition(["e2e4"]);
+  assert.equal(commands.filter(c=>c==="position startpos moves e2e4").length,2);
+});
+test("position deduplication never crosses child replacement or hides a closed transport", async () => {
+  const {engine}=standardFocusEngine();await engine.updateAuthoritativePosition(["e2e4"]);
+  const replacement=[];engine.child={stdin:{writable:true,write:line=>replacement.push(line)}};
+  await engine.updateAuthoritativePosition(["e2e4"]);assert.deepEqual(replacement,["position startpos moves e2e4\n"]);
+  engine.child.stdin.writable=false;
+  await assert.rejects(async()=>engine.updateAuthoritativePosition(["e2e4"]),/stdin/);
+});
+test("accepted illegal history never reaches standard engine focus", async () => {
+  const {engine,commands}=standardFocusEngine(),config=gameConfig();config.engine.adapter="standard_uci_v1";delete config.engine.qualification_profile;
+  const session=createGameSession(engine,{post:async()=>assert.fail("opponent state cannot submit")},config),initial=startedState("");
+  const full=gameFull(initial);full.white={id:"opponent"};full.black={id:"arena-bot"};
+  await session.initialize(full,engine);await session.onState(initial,engine);
+  const before=commands.filter(c=>c.startsWith("position "));
+  await assert.rejects(session.onState(startedState("e2e5"),engine),/illegal/);
+  assert.deepEqual(commands.filter(c=>c.startsWith("position ")),before);session.clearFirstMoveWatchdog("test_complete");
+});
+test("compatible standard ponder retains its hypothesis through own acknowledgement and exact opponent hit", async () => {
+  const {engine,commands}=standardFocusEngine(["f2f3 ponder e7e5","g2g4"],{ponder:true}),config=gameConfig(),posts=[];
+  config.engine.adapter="standard_uci_v1";delete config.engine.qualification_profile;
+  const session=createGameSession(engine,{post:async endpoint=>posts.push(endpoint)},config),initial=startedState("");
+  await session.initialize(gameFull(initial),engine);await session.onState(initial,engine);
+  await session.onState(startedState("f2f3"),engine);
+  assert.equal(engine.activeSearch?.kind,"ponder");
+  assert.equal(commands.includes("position startpos moves f2f3"),false,"own acknowledgement must not retarget a live hypothesis");
+  await session.onState(startedState("f2f3 e7e5"),engine);
+  assert.equal(commands.filter(c=>c==="ponderhit").length,1);assert.equal(posts.length,2);
+  assert.equal(commands.filter(c=>c==="position startpos moves f2f3 e7e5").length,1);
+  await engine.stopAndDrain("test_complete");
+});
+test("newer accepted state suppresses a stale focus update after asynchronous ponder drain", async () => {
+  const {engine,commands}=standardFocusEngine(["f2f3 ponder e7e5"],{ponder:true}),config=gameConfig();
+  config.engine.adapter="standard_uci_v1";delete config.engine.qualification_profile;
+  const session=createGameSession(engine,{post:async()=>{}},config),initial=startedState("");
+  await session.initialize(gameFull(initial),engine);await session.onState(initial,engine);
+  await session.onState(startedState("f2f3"),engine);
+  let entered;const draining=new Promise(resolve=>entered=resolve),originalWrite=engine.child.stdin.write;
+  engine.child.stdin.write=line=>{if(line.trim()==="stop"){commands.push("stop");entered();}else originalWrite(line);};
+  const older=session.onState(startedState("f2f3",{wtime:179999}),engine);await draining;
+  const terminal=startedState("f2f3 e7e5",{status:"resign",winner:"black"}),observation=session.observeState(terminal);
+  engine.onLine("bestmove g2g4");await older;
+  assert.equal(commands.includes("position startpos moves f2f3"),false);
+  await session.onState(terminal,engine,{observation});
+  assert.equal(commands.at(-1),"position startpos moves f2f3 e7e5");assert.equal(session.finished,true);
+});
+
 test("game sessions publish one canonical replay port with only the exact actor clock", async () => {
   const begins = [];
   const lines = [];
