@@ -2,7 +2,9 @@
 
 import { spawn } from "node:child_process";
 import { startupFailureDiagnostic, typedStartupOperation } from "./provider-lifecycle-diagnostics.mjs";
-import { readProviderInterlockSnapshot } from "./lichess-storage.mjs";
+import { LichessStorageError, readProviderInterlockSnapshot, readProviderReplacementMetadata } from "./lichess-storage.mjs";
+import { captureReplacementConvergence, captureReplacementState, matchesCompletedReplacement,
+  publishReplacementPhase, readReplacementState, recordReplacementGateRelease, selectReplacementTarget } from './provider-replacement-state.mjs';
 import { recoverProviderMaintenance, MAINTENANCE_RECOVERY_SCHEMA } from "./provider-maintenance.mjs";
 import { continuousObservationFromRuntime, validateNativeAdmission, validateNativeCandidates,
   validateNativePublication, MOVE_EVIDENCE_PREFIX, EXECUTION_COMPLETION_PREFIX } from "./continuous-uci-observation.mjs";
@@ -33,19 +35,27 @@ import { LichessStore, normalizedUsername } from "./lichess-store.mjs";
 import {
   completeWindowsStartupReplacement,
   installWindowsStartup,
-  prepareWindowsStartupReplacement,
   queryWindowsStartup,
   recoverWindowsStartup,
   reconcileWindowsStartupReplacement,
   uninstallWindowsStartup,
+  inspectWindowsReplacement,
+  quiesceWindowsReplacement,
+  deriveWindowsReplacementAction,
+  convergeWindowsReplacement,
+  activateWindowsReplacement,
 } from "./windows-startup.mjs";
 import {
   completeLinuxStartupReplacement,
   installLinuxStartup,
-  prepareLinuxStartupReplacement,
   queryLinuxStartup,
   recoverLinuxStartup,
   reconcileLinuxStartupReplacement,
+  inspectLinuxReplacement,
+  deriveLinuxReplacementAction,
+  quiesceLinuxReplacement,
+  convergeLinuxReplacement,
+  activateLinuxReplacement,
   uninstallLinuxStartup,
 } from "./linux-startup.mjs";
 import {
@@ -67,6 +77,7 @@ import {
   processInstanceIsCurrent,
   validProcessIdentity,
   sameProcessInstance,
+  processIdentityFromJson,
 } from "./process-instance-identity.mjs";
 import { RuntimeStatusPublisher } from "./runtime-status-publisher.mjs";
 import {
@@ -206,33 +217,13 @@ function startupReplacementIntentPath(runtimeDir) {
 }
 
 function readStartupReplacementIntent(runtimeDir) {
-  const filename = startupReplacementIntentPath(runtimeDir);
-  if (classifyExactPathSync(filename, { label: "Lichess startup replacement intent" }).kind
-      === "missing") {
-    return null;
-  }
-  const intent = readBoundedJson(
-    filename,
-    EXACT_FILE_LIMITS.startupDefinition,
-    "Lichess startup replacement intent",
-  );
-  if (intent?.schema !== STARTUP_REPLACEMENT_INTENT_SCHEMA
-      || Object.keys(intent).some((key) => !new Set([
-        "schema", "schema_version", "previous_root", "replacement_root",
-        "preserve_inactive", "registration_present", "phase",
-      ]).has(key))
-      || intent.schema_version !== 1
-      || !path.isAbsolute(intent.previous_root ?? "")
-      || !path.isAbsolute(intent.replacement_root ?? "")
-      || typeof intent.preserve_inactive !== "boolean"
-      || typeof intent.registration_present !== "boolean"
-      || !new Set(["preparing", "prepared", "completed"]).has(intent.phase)) {
-    throw new Error("Lichess startup replacement intent is invalid");
-  }
-  return intent;
+  return readReplacementState(runtimeDir);
 }
 
 function publishStartupReplacementIntent(runtimeDir, intent) {
+  if (intent.schema_version === 2) {
+    throw new Error('Captured replacement state requires exact owner phase publication');
+  }
   ensureExactDirectorySync(runtimeDir, "Lichess runtime directory");
   const document = {
     schema: STARTUP_REPLACEMENT_INTENT_SCHEMA,
@@ -8353,20 +8344,31 @@ function runStoreCommand(options) {
   }
 }
 
+function closeReplacementStore(store, primary) {
+  try { store.close(); }
+  catch (cleanup) {
+    if (primary) throw new LichessStorageError('LICHESS_STORAGE_OPERATION_AND_RECOVERY_FAILED',
+      'Provider replacement and storage closure both failed', primary);
+    throw cleanup;
+  }
+}
+
 export async function prepareProviderReplacementInterlock({
   runtimeDir,
   storeFile = path.join(path.resolve(runtimeDir), "matches.sqlite"),
   prepare,
+  capture = null,
   allowUnowned = false,
   now = Date.now,
 } = {}) {
-  if (!runtimeDir || typeof prepare !== "function" || typeof now !== "function") {
+  if (!runtimeDir || typeof prepare !== "function" || typeof now !== "function"
+      || (capture !== null && typeof capture !== 'function')) {
     throw new Error("Provider replacement interlock requires runtime authority and prepare action");
   }
-  const store = new LichessStore(path.resolve(storeFile));
-  let interlockClosed = false;
+  const store = new LichessStore(path.resolve(storeFile), { mode: 'maintenance' });
+  let primary = null;
   try {
-    const observation = store.requestProviderReplacement(now(), { allowUnowned });
+    const observation = store.requestProviderReplacement(now(), { allowUnowned, beforeEffect: capture });
     if (!observation.safe) {
       const error = new Error(
         `Provider replacement is unsafe: ${observation.reason} `
@@ -8379,31 +8381,224 @@ export async function prepareProviderReplacementInterlock({
       });
       throw error;
     }
-    interlockClosed = true;
     return await prepare();
-  } catch (error) {
-    if (interlockClosed) {
-      try {
-        store.resumeProviderAdmissions(now());
-      } catch (compensationError) {
-        error.cleanupDiagnostics = [
-          `provider_admission:${String(compensationError?.message ?? "failure").slice(0, 256)}`,
-        ];
-      }
-    }
-    throw error;
+  } catch (error) { primary = error; throw error;
   } finally {
-    store.close();
+    // The platform may already have changed when preparation throws. Only the
+    // paired owner convergence path can prove a safe target and reopen admission.
+    closeReplacementStore(store, primary);
   }
 }
 
 function resumeProviderReplacementAdmissions(runtimeDir, now = Date.now()) {
-  const store = new LichessStore(path.join(path.resolve(runtimeDir), "matches.sqlite"));
+  const store = new LichessStore(path.join(path.resolve(runtimeDir), "matches.sqlite"), { mode: 'maintenance' });
   try {
     return store.resumeProviderAdmissions(now);
   } finally {
     store.close();
   }
+}
+
+function replacementInvocationAuthority(options, argv) {
+  const allowed = new Set(['command', 'action', 'lifecycle_result', 'previous_root', 'replacement_root',
+    'runtime_dir', 'config', 'engine_root']);
+  if (Object.keys(options).some((key) => !allowed.has(key))) throw new Error('Unsupported replacement invocation field');
+  const ordered = [path.join(ROOT, 'lichess-adapter.mjs'), ...argv];
+  return { command: path.resolve(process.execPath), arguments: JSON.stringify(ordered), working_directory: path.resolve(process.cwd()) };
+}
+
+function finishCapturedReplacementGate(runtimeDir, state) {
+  const store = new LichessStore(path.join(runtimeDir, 'matches.sqlite'), { mode: 'maintenance' });
+  let primary = null;
+  try { return store.completeProviderReplacement(state.interlock_before, state.interlock_closed,
+    { alreadyCompleted: state.phase === 'completed' }); }
+  catch (error) { primary = error; throw error; }
+  finally { closeReplacementStore(store, primary); }
+}
+
+export function admitReplacementTargetPayload(targetRoot, platform = process.platform) {
+  const directory = path.resolve(targetRoot);
+  admitExactDirectorySync(directory, { label: 'Replacement provider target' });
+  const { value: inventory } = readExactJsonSync(path.join(directory, 'arena-component.json'),
+    { maximumBytes: EXACT_FILE_LIMITS.profile, label: 'Replacement provider inventory' });
+  if (inventory?.schema !== 'arena_install_component_v1' || inventory.schema_version !== 1
+      || inventory.component_id !== 'lichess.adapter' || typeof inventory.component_version !== 'string'
+      || !Array.isArray(inventory.files) || !inventory.files.length || inventory.files.length > 100000
+      || !['win32', 'linux'].includes(platform)) throw new Error('Replacement provider inventory is invalid');
+  const selected = ['lichess-adapter.mjs', ...(platform === 'win32' ? ['native/lichess_adapter_launcher.exe'] : [])];
+  for (const file of selected) {
+    const matches = inventory.files.filter((row) => row?.path === file);
+    if (matches.length !== 1 || !Number.isSafeInteger(matches[0].size_bytes) || matches[0].size_bytes < 0
+        || !/^[a-f0-9]{64}$/u.test(matches[0].sha256 ?? '')) throw new Error('Replacement provider inventory is invalid');
+    const actual = hashExactFileSync(path.join(directory, file),
+      { maximumBytes: EXACT_FILE_LIMITS.argumentFile, label: 'Replacement provider code' });
+    if (actual.byteLength !== matches[0].size_bytes || actual.sha256 !== `sha256:${matches[0].sha256}`) {
+      throw new Error('Replacement provider code differs from its inventory');
+    }
+  }
+  return Object.freeze({ component_id: inventory.component_id, component_version: inventory.component_version });
+}
+
+function capturedProviderProcessAuthority(runtimeDir, control, leaseAuthority) {
+  if (leaseAuthority || !control.owner_id) return leaseAuthority;
+  const { runtime } = boundedRuntimeMetadata(runtimeDir);
+  const identity = runtime?.adapter_id === 'lichess_node_adapter_v2'
+    && validProcessIdentity(runtime.process_instance, runtime.pid) ? runtime.process_instance : null;
+  if (!identity) throw new Error('Replacement prior process authority is unavailable');
+  // Retained provider status is exact process evidence, not an invented lease.
+  return { owner_id: control.owner_id, process: identity };
+}
+
+function refreshCapturedGateAfterJoin(runtimeDir, state) {
+  const file = path.join(runtimeDir, 'matches.sqlite');
+  const observed = readProviderReplacementMetadata(file);
+  if (observed.state !== 'ready') throw new Error('Replacement gate observation is unavailable');
+  const identity = state.lease_authority?.process;
+  const unchanged = JSON.stringify(observed.control) === JSON.stringify(state.interlock_closed);
+  if (unchanged && !state.interlock_closed.owner_id) return state;
+  if (!identity || state.lease_authority.owner_id !== state.interlock_closed.owner_id) {
+    throw new Error('Replacement gate release lacks exact prior process authority');
+  }
+  const gone = () => {
+    const process = probeProcessInstance(identity.pid);
+    return process.state === 'absent' || process.state === 'present' && validProcessIdentity(process.identity, identity.pid)
+      && !sameProcessInstance(identity, process.identity);
+  };
+  if (!gone()) throw new Error('Replacement prior process inactivity was not confirmed');
+  if (unchanged) return state;
+  const store = new LichessStore(file, { mode: 'maintenance' });
+  let primary = null;
+  try { return store.confirmProviderReplacementRelease(state.interlock_closed, observed.control, gone,
+    (released) => recordReplacementGateRelease(runtimeDir, state, released)); }
+  catch (error) { primary = error; throw error; }
+  finally { closeReplacementStore(store, primary); }
+}
+
+async function completeCapturedReplacement(state, options, runtimeDir, argv) {
+  const windows = process.platform === 'win32';
+  const inspect = windows ? inspectWindowsReplacement : inspectLinuxReplacement;
+  const deriveAction = windows ? deriveWindowsReplacementAction : deriveLinuxReplacementAction;
+  const converge = windows ? convergeWindowsReplacement : convergeLinuxReplacement;
+  const activate = windows ? activateWindowsReplacement : activateLinuxReplacement;
+  replacementInvocationAuthority(options, argv); // Closed credential-free replacement grammar.
+  const targetRoot = path.resolve(options.replacement_root);
+  const configPath = path.resolve(options.config ?? DEFAULT_TEMPLATE);
+  let startupOptions = state.before.registered ? startupRuntimeOptions(loadManagerConfig({ templatePath: configPath,
+    engineRoot: path.resolve(options.engine_root ?? targetRoot) }), configPath, runtimeDir) : null;
+  const requestedAction = deriveAction({ state, targetRoot, runtimeDir, configPath, startupOptions });
+  const target = selectReplacementTarget(state, options.previous_root, targetRoot, requestedAction);
+  if (target === 'desired' && state.phase === 'preparing') {
+    throw new Error('Desired replacement completion requires prepared owner state');
+  }
+  const metadata = readProviderReplacementMetadata(path.join(runtimeDir, 'matches.sqlite'));
+  if (metadata.state !== 'ready' || metadata.otherClient
+      || (metadata.control.admission_blocked
+        && JSON.stringify(metadata.control) !== JSON.stringify(state.interlock_closed))) {
+    throw new Error('Captured provider replacement interlock is unavailable');
+  }
+  const existing = await inspect({ componentRoot: targetRoot,
+    allowedRoots: [state.previous_root, state.replacement_root], runtimeDir, configPath });
+  if (!metadata.control.admission_blocked && matchesCompletedReplacement(state, targetRoot, existing, requestedAction)) {
+    if (!existing.enabled && !existing.active) {
+      await proveUnchangedPriorInactive(state, targetRoot, options, runtimeDir);
+      return providerLifecycleResult('post_replace', 'safe_inactive', {
+        id: 'startup.explicitly_inactive', message: 'Operator startup state remained inactive during replacement',
+      });
+    }
+    const { runtime, error: runtimeError } = boundedRuntimeMetadata(runtimeDir);
+    if (existing.enabled && existing.active && replacementStartupReadiness(providerStatusProjection({ runtime, runtimeError,
+      startup: { installed: true, active: windows ? true : 'active', enabled: windows ? true : 'enabled' } })).stable) {
+      return providerLifecycleResult('post_replace', 'ready');
+    }
+    throw new Error('Completed provider readiness was not confirmed');
+  }
+  if (metadata.control.active_work !== 0) throw new Error('Captured provider work is unresolved');
+  let requalification = null;
+  let inactive = state.preserve_inactive;
+  let admitted = state;
+  await prepareProviderReplacementInterlock({ runtimeDir, allowUnowned: !existing.registered || (!existing.enabled && !existing.active),
+    capture(control, closedControl, leaseAuthority) {
+      admitted = captureReplacementConvergence({ runtimeDir, state, control, closedControl,
+        leaseAuthority: capturedProviderProcessAuthority(runtimeDir, control, leaseAuthority) });
+    }, async prepare() {
+      // pre_replace only admits a future root lexically. The committed target
+      // must exist with inventoried code before post can retarget or execute it.
+      if (admitted.before.registered) admitReplacementTargetPayload(targetRoot);
+      // Even credential-free engine preflight is an owned effect. The exact
+      // replacement controller and interlock must be claimed before it runs.
+      if (!state.preserve_inactive) {
+        try {
+          const config = loadRuntimeConfig({ templatePath: configPath,
+            engineRoot: path.resolve(options.engine_root ?? targetRoot), environment: {} });
+          const { qualificationProfile, qualificationStatus } = await preflightDeploymentBundle(config);
+          loadCapacityProfile(config.capacity.capacity_profile, config, qualificationProfile, qualificationStatus);
+          startupOptions = startupRuntimeOptions(config, configPath, runtimeDir);
+        } catch (error) { requalification = exactEvidenceRequalification(error); if (!requalification) throw error; }
+      }
+      inactive = state.preserve_inactive || requalification !== null;
+      const selectedAction = target === 'before' ? requestedAction
+        : deriveAction({ state, targetRoot, runtimeDir, configPath, startupOptions });
+      const converged = await converge({ state: admitted, target, requestedAction: selectedAction, runtimeDir, configPath });
+      admitted = refreshCapturedGateAfterJoin(runtimeDir, admitted);
+      finishCapturedReplacementGate(runtimeDir, admitted);
+      if (!inactive) {
+        await activate({ observation: converged.observation, componentRoot: targetRoot, runtimeDir, configPath,
+          ready: async () => {
+            const { runtime, error: runtimeError } = boundedRuntimeMetadata(runtimeDir);
+            return replacementStartupReadiness(providerStatusProjection({ runtime, runtimeError,
+              startup: { installed: true, active: windows ? true : 'active', enabled: windows ? true : 'enabled' } })).stable;
+          } });
+      }
+      const completed = await inspect({ componentRoot: targetRoot, runtimeDir, configPath });
+      if (inactive ? completed.active || completed.enabled : !completed.active || !completed.enabled) {
+        throw new Error('Captured replacement final platform state was not confirmed');
+      }
+      publishReplacementPhase(runtimeDir, admitted, 'completed', targetRoot, completed);
+    } });
+  return inactive ? providerLifecycleResult('post_replace', 'safe_inactive', {
+    id: requalification ? 'evidence.requalification_required' : 'startup.explicitly_inactive',
+    message: requalification ? 'Exact engine evidence must be requalified before startup'
+      : 'Operator startup state remained inactive during replacement',
+  }) : providerLifecycleResult('post_replace', 'ready');
+}
+
+async function proveUnchangedPriorInactive(intent, targetRoot, options, runtimeDir) {
+  const file = path.join(path.resolve(runtimeDir), 'matches.sqlite');
+  const metadata = readProviderReplacementMetadata(file);
+  if (metadata.state !== 'ready' || metadata.control.admission_blocked || metadata.otherClient) {
+    throw new Error('Prior inactive provider authority is unavailable');
+  }
+  const platform = process.platform === 'win32'
+    ? await inspectWindowsReplacement({ componentRoot: targetRoot, runtimeDir,
+      configPath: options.config ? path.resolve(options.config) : undefined })
+    : process.platform === 'linux' ? await queryLinuxStartup({ replacementRoot: targetRoot }) : null;
+  const registered = process.platform === 'win32' ? platform?.registered : platform?.installed;
+  const inactive = process.platform === 'win32' ? platform?.active === false && platform?.enabled === false
+    : platform?.active === 'inactive' && platform?.enabled === 'disabled';
+  if (typeof registered !== 'boolean' || registered !== intent.registration_present || (registered && !inactive)) {
+    throw new Error('Prior inactive startup state was not confirmed');
+  }
+  if (metadata.control.owner_id || metadata.control.active_work > 0) {
+    if (metadata.leases.length > 1) throw new Error('Prior process authority is ambiguous');
+    const lease = metadata.leases[0];
+    const { runtime } = lease ? { runtime: null } : boundedRuntimeMetadata(runtimeDir);
+    const identity = lease ? processIdentityFromJson(lease.process_identity_json, lease.pid)
+      : runtime?.adapter_id === 'lichess_node_adapter_v2' && validProcessIdentity(runtime.process_instance, runtime.pid)
+        ? runtime.process_instance : null;
+    if (!identity) throw new Error('Prior process authority is unavailable');
+    const current = probeProcessInstance(identity.pid);
+    if (current.state !== 'absent' && !(current.state === 'present'
+        && validProcessIdentity(current.identity, identity.pid) && !sameProcessInstance(identity, current.identity))) {
+      throw new Error('Prior process inactivity was not confirmed');
+    }
+  }
+  const after = readProviderReplacementMetadata(file);
+  if (after.state !== 'ready' || after.otherClient
+      || JSON.stringify(after.control) !== JSON.stringify(metadata.control)) {
+    throw new Error('Prior provider authority changed during observation');
+  }
+  // No claim, reset, resume, intent write or pruning: positive historical work
+  // remains protected and does not become a future pre_replace admission.
 }
 
 async function runMaintenanceRecovery(options, runtimeDir) {
@@ -8466,7 +8661,20 @@ async function runMaintenanceRecovery(options, runtimeDir) {
   return result.status === 'recovered' ? 0 : result.status === 'deferred' ? 2 : 1;
 }
 
+let replacementCallActive = false;
 export async function main(argv = process.argv.slice(2)) {
+  const replacement = argv[0] === 'startup' && ['prepare_replace', 'complete_replace'].includes(argv[1]);
+  if (!replacement) return mainOwned(argv);
+  if (replacementCallActive) {
+    const error = new Error('Another startup replacement call owns this process');
+    error.code = 'LICHESS_STARTUP_REPLACEMENT_BUSY'; throw error;
+  }
+  replacementCallActive = true;
+  try { return await mainOwned(argv); }
+  finally { replacementCallActive = false; }
+}
+
+async function mainOwned(argv) {
   assertSupportedNode();
   const options = parseArguments(argv);
   if (options.command === "reserve"
@@ -8543,76 +8751,52 @@ export async function main(argv = process.argv.slice(2)) {
     if (!options.previous_root || !options.replacement_root) {
       throw new Error("startup prepare_replace requires exact previous and replacement roots");
     }
-    const existingStartup = process.platform === "win32"
-      ? await queryWindowsStartup({ runtimeDir })
-      : process.platform === "linux"
-        ? await queryLinuxStartup()
-        : (() => { throw new Error(`Unsupported startup platform: ${process.platform}`); })();
-    const previousRoot = path.resolve(options.previous_root);
-    const replacementRoot = path.resolve(options.replacement_root);
-    const retainedIntent = matchingStartupReplacementIntent(
-      runtimeDir,
-      previousRoot,
-      replacementRoot,
-    );
-    const priorIntent = readStartupReplacementIntent(runtimeDir);
-    if (priorIntent && !retainedIntent && priorIntent.phase !== "completed") {
-      throw new Error("Lichess startup replacement intent belongs to different exact roots");
+    if (process.platform === 'win32' || process.platform === 'linux') {
+      const authority = replacementInvocationAuthority(options, argv);
+      const previousRoot = path.resolve(options.previous_root);
+      const replacementRoot = path.resolve(options.replacement_root);
+      const inspect = process.platform === 'win32' ? inspectWindowsReplacement : inspectLinuxReplacement;
+      const quiesce = process.platform === 'win32' ? quiesceWindowsReplacement : quiesceLinuxReplacement;
+      const observation = await inspect({ componentRoot: previousRoot,
+        allowedRoots: [previousRoot, replacementRoot], runtimeDir,
+        configPath: options.config ? path.resolve(options.config) : undefined });
+      let state;
+      const replacement = await prepareProviderReplacementInterlock({ runtimeDir,
+        allowUnowned: !observation.registered || (!observation.enabled && !observation.active),
+        capture(control, closedControl, leaseAuthority) {
+          state = captureReplacementState({ runtimeDir, previousRoot, replacementRoot, observation, control, closedControl,
+            leaseAuthority: capturedProviderProcessAuthority(runtimeDir, control, leaseAuthority), authority });
+        },
+        async prepare() {
+          const ready = await quiesce({ state, runtimeDir,
+            configPath: options.config ? path.resolve(options.config) : undefined });
+          state = refreshCapturedGateAfterJoin(runtimeDir, state);
+          publishReplacementPhase(runtimeDir, state, 'prepared');
+          return ready;
+        } });
+      console.log(JSON.stringify(options.lifecycle_result === 'typed_v1' ? providerLifecycleResult('pre_replace', 'ready')
+        : { status: 'ready', startup: replacement }));
+      return 0;
     }
-    if (retainedIntent && (existingStartup.installed === true) !== retainedIntent.registration_present) {
-      throw new Error("Lichess startup registration changed during replacement");
-    }
-    const preserveInactive = retainedIntent?.preserve_inactive
-      ?? (existingStartup.installed !== true
-        || (process.platform === "win32"
-          ? existingStartup.active === false && existingStartup.enabled === false
-          : existingStartup.active === "inactive" && existingStartup.enabled === "disabled"));
-    const replacement = await prepareProviderReplacementInterlock({
-      runtimeDir,
-      allowUnowned: preserveInactive,
-      prepare: async () => {
-        const intent = publishStartupReplacementIntent(runtimeDir, {
-          previous_root: previousRoot,
-          replacement_root: replacementRoot,
-          preserve_inactive: preserveInactive,
-          registration_present: retainedIntent?.registration_present
-            ?? existingStartup.installed === true,
-          phase: "preparing",
-        });
-        const prepared = existingStartup.installed !== true
-          ? {
-            installed: false,
-            active: false,
-            enabled: false,
-            matchesCurrentConfiguration: true,
-            replacementReady: true,
-            supervisionPreservedInactive: true,
-          }
-          : process.platform === "win32"
-            ? await prepareWindowsStartupReplacement({
-              previousRoot,
-              replacementRoot,
-              runtimeDir,
-            })
-            : process.platform === "linux"
-              ? await prepareLinuxStartupReplacement({
-                previousRoot,
-                replacementRoot,
-              })
-              : (() => { throw new Error(`Unsupported startup platform: ${process.platform}`); })();
-        publishStartupReplacementIntent(runtimeDir, { ...intent, phase: "prepared" });
-        return prepared;
-      },
-    });
-    console.log(JSON.stringify(options.lifecycle_result === "typed_v1"
-      ? providerLifecycleResult("pre_replace", "ready")
-      : { status: "ready", startup: replacement }));
-    return 0;
+    throw new Error('Unsupported startup platform');
   }
   if (options.command === "startup" && options.action === "complete_replace") {
     const typedLifecycle = options.lifecycle_result === "typed_v1";
     if (typedLifecycle && (!options.previous_root || !options.replacement_root)) {
       throw new Error("typed startup complete_replace requires exact replacement roots");
+    }
+    const retainedState = options.previous_root && options.replacement_root ? readReplacementState(runtimeDir) : null;
+    if (retainedState?.schema_version === 2 && (process.platform === 'win32' || process.platform === 'linux')) {
+      const result = await completeCapturedReplacement(retainedState, options, runtimeDir, argv);
+      console.log(JSON.stringify(typedLifecycle ? result : { status: 'ready', startup: result.observed }));
+      return 0;
+    }
+    if (retainedState && selectReplacementTarget(retainedState, options.previous_root, options.replacement_root) === 'unchanged_legacy') {
+      await proveUnchangedPriorInactive(retainedState, path.resolve(options.replacement_root), options, runtimeDir);
+      console.log(JSON.stringify(typedLifecycle ? providerLifecycleResult('post_replace', 'safe_inactive', {
+        id: 'startup.prior_inactive_preserved', message: 'Prior inactive state was preserved without admitting a new replacement',
+      }) : { status: 'ready', startup: { supervisionPreservedInactive: true, replacementReady: false } }));
+      return 0;
     }
     const replacementIntent = options.previous_root && options.replacement_root
       ? matchingStartupReplacementIntent(

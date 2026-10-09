@@ -465,13 +465,59 @@ native helper through the public `@uci-arena/background-service-runtime` contrac
 The identity deadline remains at most 2000 ms; lifecycle callers can supply a
 smaller remaining budget. Access denial and unknown observations remain
 unverifiable. There is no PowerShell identity fallback or helper prewarm.
-The immutable 1.2.0 snapshot is pinned to Engine source
-`a535772f818eba76473e4f931dcfc7b764f0c6c5`; `vendor/upstream.lock.json` binds every
+The immutable 1.3.2 snapshot is pinned to shared SDK source
+`b61d244535316a894d03297d6a57ad023f2b46f6`; `vendor/upstream.lock.json` binds every
 source file. Runtime packages contain the public JavaScript closure and the
 Windows helper, while source tests and vendor provenance history remain outside
 the payload. Windows builds produce the helper and provider launcher in two
 independent roots with the application-local static C++ runtime, then verify
 exact native output and packaged current-instance query behavior.
+
+Replacement uses the existing startup-control v3 pre/post operations. The
+provider-private v2 intent captures the exact prior registration, action,
+enablement/running intent and current interlock tuple before closing admission
+or changing the platform. It admits existing schema 5 with the lifecycle
+extension, or schema 6, without migration or reservation/history pruning.
+Missing storage fails closed and creates no database. Fresh installation is a
+separate operation. Failed platform preparation retains its gate because the
+effect may be uncertain; paired post replacement converges only after proving
+an admitted target. Windows uses the public SDK Task Scheduler port and the
+unchanged qualified launcher tree-join capability; Linux uses its existing
+unit owner with exact bounded unit before-images.
+
+Completed retries compare full declared launch authority and actual platform
+intent; a later same-root dependency replacement captures its current baseline.
+Task instance identifiers may change while the running intent stays the same.
+Inverse same-root replacement selects the captured prior action only when the
+requested Node/config/runtime/profile tuple proves that target. Root equality
+does not denote rollback. An already completed, matching target is observed
+without cycling admission or restarting its provider. Historical v1 inactive
+compensation may prove the existing prior inactive state, including exact old
+process absence, without changing positive work, ownership, timestamps, gate
+or history. That result is not permission for a future forward replacement.
+Credentials remain blind external locators; lifecycle never accesses their
+contents. Missing or foreign state remains a typed failure.
+The same private intent owns an exact controller process instance. Concurrent
+unfinished pre/post callers defer while that controller is live or unverifiable;
+ownership transfers only after exact absence or PID reuse, without a lease TTL.
+Exported in-process replacement calls reject overlap before a second admission.
+The new provider preserves a closed gate tuple during ordinary shutdown. A
+historical provider's owner-release transition is recognized only after the old
+lease is gone, its captured exact process is absent/reused, and an immediate
+transaction rechecks the released tuple; it changes no work/history row.
+Task absence alone is never proof that the previous provider process ended.
+An owned interlock requires exact absence or a reused process incarnation even
+when its gate tuple is unchanged; a missing lease row may use the retained
+provider-owned runtime process identity, and missing identity remains a failure.
+The pre controller admits the future final root lexically while its payload is
+still absent. Post captures its actual interpreter/configuration authority under
+the controller gate and admits committed inventoried code before retargeting or
+executing registered startup. Pre's old Node interpreter need not equal post's
+new interpreter. Runtime engine preflight also runs only after controller claim.
+Disabled-but-running startup is rejected before capture or effects because this
+provider's readiness contract does not admit disabled active operation. On Linux,
+missing unit bytes require a `not-found` loaded-unit observation; cached or
+unknown systemd state is not absence.
 
 Component release automation is manual-only. Official artifacts require:
 

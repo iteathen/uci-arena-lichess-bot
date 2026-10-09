@@ -1615,9 +1615,9 @@ export function openLichessMaintenanceStorage(filePath, {
 
 // Diagnostic reads use SQLite's normal read-lock/readmark coordination. They
 // never create a missing database, migrate, repair, prune, or change owner data.
-export function readProviderInterlockSnapshot(filePath, {
+function readProviderStorage(filePath, {
   databaseFactory = (filename, options) => new DatabaseSync(filename, options),
-} = {}) {
+} = {}, read) {
   const requested = path.resolve(filePath);
   const classified = classifyExactPathSync(requested, { label: 'Lichess read-only storage' });
   if (classified.kind === 'missing') return Object.freeze({ state: 'unavailable', reason: 'storage_absent' });
@@ -1640,13 +1640,7 @@ export function readProviderInterlockSnapshot(filePath, {
     database.exec('BEGIN'); // One consistent read transaction; never BEGIN IMMEDIATE.
     const version = schemaVersion(database);
     verifySchema(database, version, { requireLifecycle: true });
-    const row = database.prepare(`
-      SELECT admission_blocked, owner_id, active_work
-      FROM provider_lifecycle_control WHERE id=1
-    `).get();
-    if (!row) throw storageError('LICHESS_STORAGE_ROW_INVALID', 'Provider interlock singleton is unavailable');
-    const result = Object.freeze({ state: 'ready', admissionBlocked: row.admission_blocked === 1n,
-      owned: row.owner_id !== '', activeWork: projectSqliteValue(row.active_work) });
+    const result = read(database);
     database.exec('COMMIT');
     assertStoragePaths(authority);
     return result;
@@ -1662,4 +1656,31 @@ export function readProviderInterlockSnapshot(filePath, {
       }
     }
   }
+}
+
+export function readProviderInterlockSnapshot(filePath, options = {}) {
+  return readProviderStorage(filePath, options, (database) => {
+    const row = database.prepare(`SELECT admission_blocked, owner_id, active_work
+      FROM provider_lifecycle_control WHERE id=1`).get();
+    if (!row) throw storageError('LICHESS_STORAGE_ROW_INVALID', 'Provider interlock singleton is unavailable');
+    return Object.freeze({ state: 'ready', admissionBlocked: row.admission_blocked === 1n,
+      owned: row.owner_id !== '', activeWork: projectSqliteValue(row.active_work) });
+  });
+}
+
+// Private producer authority for read-only compensation. This is never a CLI
+// status projection: account/owner/process records do not cross the wire.
+export function readProviderReplacementMetadata(filePath, { now = Date.now(), ...options } = {}) {
+  now = safeInteger(now, 'replacement observation timestamp');
+  return readProviderStorage(filePath, options, (database) => {
+    const control = database.prepare(`SELECT admission_blocked, owner_id, active_work, updated_at
+      FROM provider_lifecycle_control WHERE id=1`).get();
+    if (!control) throw storageError('LICHESS_STORAGE_ROW_INVALID', 'Provider interlock singleton is unavailable');
+    const leases = control.owner_id ? database.prepare(`SELECT pid, process_identity_json
+      FROM api_client_leases WHERE owner_id=? LIMIT 2`).all(control.owner_id) : [];
+    const otherClient = Boolean(database.prepare(`SELECT 1 AS present FROM api_client_leases
+      WHERE owner_id<>? AND expires_at>? LIMIT 1`).get(control.owner_id, now));
+    return Object.freeze({ state: 'ready', control: Object.freeze(projectSqliteValue(control)),
+      leases: Object.freeze(leases.map((lease) => Object.freeze(projectSqliteValue(lease)))), otherClient });
+  });
 }

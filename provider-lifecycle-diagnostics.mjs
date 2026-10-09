@@ -15,7 +15,8 @@ for (const suffix of ['ANCESTOR_INVALID', 'CLOSE_FAILED', 'IDENTITY_CHANGED', 'J
   'SIZE_CHANGED', 'TOO_LARGE', 'TYPE_INVALID']) codes.set(`EXACT_FILE_${suffix}`, 'path');
 for (const code of ['provider_owned_work_active', 'provider_lifecycle_interlock_unavailable',
   'LICHESS_PROVIDER_WORK_UNRESOLVED', 'LICHESS_PROVIDER_LIFECYCLE_AUTHORITY_INVALID',
-  'LICHESS_PROVIDER_LIFECYCLE_HELD', 'LICHESS_PROVIDER_REPLACEMENT_BLOCKED']) codes.set(code, 'interlock');
+  'LICHESS_PROVIDER_LIFECYCLE_HELD', 'LICHESS_PROVIDER_REPLACEMENT_BLOCKED',
+  'LICHESS_STARTUP_REPLACEMENT_BUSY']) codes.set(code, 'interlock');
 for (const code of ['ENOENT', 'EACCES', 'EPERM', 'ETIMEDOUT', 'ERR_SQLITE_ERROR',
   'ERR_CHILD_PROCESS_STDIO_MAXBUFFER']) codes.set(code, 'platform');
 

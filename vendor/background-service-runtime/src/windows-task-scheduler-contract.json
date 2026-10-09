@@ -1,0 +1,24 @@
+{
+  "schema": "uci_arena_windows_task_scheduler_contract_v1",
+  "schema_version": 1,
+  "request_schema": "uci_arena_windows_task_request_v1",
+  "result_schema": "uci_arena_windows_task_result_v1",
+  "scope": "current_user_interactive_least_privilege_root_folder_task",
+  "operations": ["inspect", "set_enabled", "stop_instances", "register", "delete", "run"],
+  "registration_flags": 38,
+  "bounds": {
+    "task_path_utf16_units": 256,
+    "definition_utf8_bytes": 1048576,
+    "action_field_utf16_units": 32767,
+    "maximum_instances": 16,
+    "maximum_running_tasks_inspected": 4096,
+    "request_bytes": 3145728,
+    "response_bytes": 8388608,
+    "timeout_ms": 30000
+  },
+  "request_fields": ["operation", "task_path", "expected_definition_xml", "expected_xml_sha256", "definition_xml", "enabled", "instance_guids"],
+  "observation_fields": ["registered", "enabled", "definition_xml", "definition_sha256", "instance_guids", "principal", "action"],
+  "action_fields": ["command", "arguments", "working_directory"],
+  "principal_fields": ["current_user_sid", "user_sid", "logon_type", "run_level"],
+  "failure_categories": ["unsupported_platform", "invalid_request", "transport_failure", "transport_timeout", "cancelled", "output_limit", "invalid_response", "identity_mismatch", "unsupported_principal", "instance_mismatch", "platform_failure"]
+}

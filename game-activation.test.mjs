@@ -162,7 +162,7 @@ test("pre-replacement leaves an active game and startup control untouched", asyn
   }
 });
 
-test("failed platform preparation compensates an idle replacement gate", async () => {
+test("unknown platform preparation failure retains the gate for explicit state convergence", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "uci-arena-interlock-compensation-"));
   const storeFile = path.join(directory, "matches.sqlite");
   const seed = new LichessStore(storeFile);
@@ -175,7 +175,7 @@ test("failed platform preparation compensates an idle replacement gate", async (
   }), /platform preparation failed/u);
   const observed = new LichessStore(storeFile);
   try {
-    assert.equal(observed.providerLifecycleSnapshot().admissionBlocked, false);
+    assert.equal(observed.providerLifecycleSnapshot().admissionBlocked, true);
   } finally {
     observed.close();
   }
