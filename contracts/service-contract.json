@@ -2,7 +2,7 @@
   "schema": "uci_arena_service_contract_v1",
   "service": {
     "component_id": "lichess.adapter",
-    "component_version": "1.0.41",
+    "component_version": "1.0.42",
     "product_id": "uci_arena.lichess_bot",
     "contract_version": "1.1",
     "transport": "cli_json",
@@ -34,7 +34,7 @@
     "uci.time_profile.contract.v3"
   ],
   "engine_adapters": {
-    "standard_uci_v1": "provider-neutral UCI process with fresh legal-move qualification",
+    "standard_uci_v1": "provider-neutral UCI process with fresh bounded-movetime legal-move startup qualification",
     "uci_arena_extended_v1": "UCI Arena Engine extensions with model, runtime-status, timing, and capacity evidence"
   },
   "credential_contract": {
