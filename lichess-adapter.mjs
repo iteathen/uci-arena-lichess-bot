@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import { startupFailureDiagnostic, typedStartupOperation } from "./provider-lifecycle-diagnostics.mjs";
 import { continuousObservationFromRuntime, validateNativeAdmission, validateNativeCandidates,
   validateNativePublication, MOVE_EVIDENCE_PREFIX, EXECUTION_COMPLETION_PREFIX } from "./continuous-uci-observation.mjs";
 import { CONTINUOUS_PROFILE_SCHEMA, validateContinuousProfileShape, validateContinuousGameDiagnostic,
@@ -160,9 +161,16 @@ export function providerLifecycleResult(operation, disposition, reason = null, s
       safe_inactive: ["installed", "inactive", "matches", "safe"],
     },
   };
-  const observed = observations[operation]?.[disposition];
+  const observed = disposition === "failed" && Object.hasOwn(observations, operation)
+    ? ["unknown", "unknown", "unknown", "unknown"] : observations[operation]?.[disposition];
   if (!observed) throw new Error("Lichess provider lifecycle result is invalid");
-  if (disposition === "safe_inactive"
+  if (disposition === "failed"
+      && (typeof reason?.id !== "string" || !/^[A-Za-z0-9._:-]{1,64}$/u.test(reason.id)
+        || typeof reason.message !== "string" || Buffer.byteLength(reason.message) > 512
+        || /[\0\r\n]/u.test(reason.message))) {
+    throw new Error("Lichess failed lifecycle reason is invalid");
+  }
+  if ((disposition === "safe_inactive" || disposition === "failed")
       && (typeof reason?.id !== "string" || !reason.id || /[\0\r\n]/u.test(reason.id))) {
     throw new Error("Lichess safe-inactive lifecycle reason is invalid");
   }
@@ -170,7 +178,9 @@ export function providerLifecycleResult(operation, disposition, reason = null, s
     schema: PROVIDER_LIFECYCLE_RESULT_SCHEMA,
     schema_version: 1,
     component_id: PROVIDER_COMPONENT_ID,
-    component_version: providerComponentVersion(),
+    component_version: disposition === "failed"
+      ? (() => { try { return providerComponentVersion(); } catch { return "unknown"; } })()
+      : providerComponentVersion(),
     operation,
     disposition,
     observed: {
@@ -9114,6 +9124,13 @@ export async function main(argv = process.argv.slice(2)) {
 
 if (path.resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
   main().then((code) => { process.exitCode = code; }).catch((error) => {
+    const operation = typedStartupOperation(process.argv.slice(2));
+    if (operation) {
+      console.log(JSON.stringify(providerLifecycleResult(operation, "failed",
+        startupFailureDiagnostic(error, ROOT))));
+      process.exitCode = 1;
+      return;
+    }
     log("adapter_fatal", { message: error.message });
     console.error(`lichess-adapter: ${error.message}`);
     process.exitCode = 1;

@@ -127,7 +127,11 @@ test("absent startup does not let replacement bypass unresolved provider work", 
   store.close();
   const prepared = run("prepare_replace");
   assert.equal(prepared.status, 1);
-  assert.match(prepared.stderr, /provider_owned_work_active/);
+  assert.equal(prepared.stderr, "");
+  const failure = JSON.parse(prepared.stdout);
+  assert.equal(failure.disposition, "failed");
+  assert.equal(failure.reason.id, "startup.interlock_failed");
+  assert.equal(JSON.parse(failure.reason.message).code, "provider_owned_work_active");
   assert.equal(snapshot().activeWork, 1);
   assert.equal(snapshot().admissionBlocked, false);
 });
