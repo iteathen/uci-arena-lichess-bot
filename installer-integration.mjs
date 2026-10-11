@@ -196,9 +196,24 @@ function portableStandardLaunch(bindings) {
     || Buffer.byteLength(String(value), 'utf8') > 4096 || /[\u0000\r\n]/u.test(String(value)))) {
     throw new Error('launch profile UCI options are invalid');
   }
+  const resolvedOptions = { ...options };
+  if (Object.hasOwn(options, 'TimingPolicyFile') || Object.hasOwn(options, 'TimingPolicySha256')) {
+    // This explicit pair names an opaque pinned artifact, not arbitrary scalar
+    // option text. Resolve only through the same component's owned inventory.
+    if (typeof options.TimingPolicyFile !== 'string'
+        || typeof options.TimingPolicySha256 !== 'string'
+        || !/^[a-f0-9]{64}$/u.test(options.TimingPolicySha256)) {
+      throw new Error('launch profile timing artifact requires its complete file and digest pair');
+    }
+    const policy = ownedFile(options.TimingPolicyFile);
+    if (policy.sha256 !== `sha256:${options.TimingPolicySha256}`) {
+      throw new Error('launch profile timing artifact digest differs from its component inventory');
+    }
+    resolvedOptions.TimingPolicyFile = policy.absolute;
+  }
   return {
     executable, arguments: [...argumentsList.slice(0, offset), program],
-    working_directory: root, uci_options: { ...options }, component_manifest: manifestPath,
+    working_directory: root, uci_options: resolvedOptions, component_manifest: manifestPath,
   };
 }
 
