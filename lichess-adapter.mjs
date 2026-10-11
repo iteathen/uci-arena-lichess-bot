@@ -6,6 +6,7 @@ import { LichessStorageError, readProviderInterlockSnapshot, readProviderReplace
 import { captureReplacementConvergence, captureReplacementState, matchesCompletedReplacement,
   publishReplacementPhase, readReplacementState, recordReplacementGateRelease, selectReplacementTarget } from './provider-replacement-state.mjs';
 import { recoverProviderMaintenance, MAINTENANCE_RECOVERY_SCHEMA } from "./provider-maintenance.mjs";
+import { restoreOfflineWorkspace, WORKSPACE_RESTORE_SCHEMA } from './offline-workspace-restore.mjs';
 import { continuousObservationFromRuntime, validateNativeAdmission, validateNativeCandidates,
   validateNativePublication, MOVE_EVIDENCE_PREFIX, EXECUTION_COMPLETION_PREFIX } from "./continuous-uci-observation.mjs";
 import { CONTINUOUS_PROFILE_SCHEMA, validateContinuousProfileShape, validateContinuousGameDiagnostic,
@@ -7705,7 +7706,7 @@ export function parseArguments(argv) {
   if (!command) throw new Error("Expected a Lichess adapter command");
   const rest = [...argumentsList];
   const options = { command };
-  if (new Set(["owner", "reservation", "scheduler", "incidents", "games", "game", "startup", "config", "qualification", "maintenance"])
+  if (new Set(["owner", "reservation", "scheduler", "incidents", "games", "game", "startup", "config", "qualification", "maintenance", "workspace"])
     .has(command)
       && rest[0] && !rest[0].startsWith("--")) {
     options.action = rest.shift();
@@ -8720,6 +8721,29 @@ async function mainOwned(argv) {
     return runStoreCommand(options);
   }
   const runtimeDir = resolveProviderRuntimeDirectory(options);
+  if (options.command === 'workspace') {
+    let result;
+    try {
+      const allowed = new Set(['command','action','source_workspace','runtime_dir','maximum_milliseconds']);
+      const suppliedFlags = argv.slice(2).filter((value,index) => index % 2 === 0);
+      if (options.action !== 'restore' || !options.runtime_dir || !path.isAbsolute(options.runtime_dir)
+          || !options.source_workspace || !path.isAbsolute(options.source_workspace)
+          || new Set(suppliedFlags).size !== suppliedFlags.length || Object.keys(options).some(key => !allowed.has(key))) throw new Error('Invalid restore request');
+      const { runtime } = boundedRuntimeMetadata(path.resolve(options.source_workspace));
+      const priorProcessIdentity = runtime?.adapter_id === 'lichess_node_adapter_v2'
+        && validProcessIdentity(runtime.process_instance, runtime.pid) ? runtime.process_instance : null;
+      result = await restoreOfflineWorkspace({ sourceWorkspace: options.source_workspace, destinationWorkspace: runtimeDir,
+        priorProcessIdentity, ownerProcessProbe: probeProcessInstance,
+        maximumMilliseconds: options.maximum_milliseconds === undefined ? 60000 : Number(options.maximum_milliseconds),
+        observeStartup: async () => {
+          const startup = process.platform === 'win32' ? await queryWindowsStartup({ runtimeDir })
+            : process.platform === 'linux' ? await queryLinuxStartup() : null;
+          return process.platform === 'linux' && startup?.installed === true
+            ? { installed: true, enabled: startup.enabled !== 'disabled', active: startup.active !== 'inactive' } : startup;
+        } });
+    } catch { result = { schema: WORKSPACE_RESTORE_SCHEMA, status: 'deferred', completion: 'not_attempted', reason: 'invalid_request' }; }
+    console.log(JSON.stringify(result)); return result.status === 'restored' ? 0 : result.status === 'deferred' ? 2 : 1;
+  }
   if (options.command === 'maintenance') return runMaintenanceRecovery(options, runtimeDir);
   if (options.command === "run") configureRuntimeLog(runtimeDir);
   if (options.command === "status") {
@@ -9415,6 +9439,10 @@ async function mainOwned(argv) {
 
 if (path.resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
   main().then((code) => { process.exitCode = code; }).catch((error) => {
+    if (process.argv[2] === 'workspace') {
+      console.log(JSON.stringify({ schema: WORKSPACE_RESTORE_SCHEMA, status: 'failed',
+        completion: 'not_attempted', reason: 'invalid_request' })); process.exitCode = 1; return;
+    }
     if (process.argv[2] === 'maintenance') {
       console.log(JSON.stringify({ schema: MAINTENANCE_RECOVERY_SCHEMA, status: 'failed',
         completion: 'not_attempted', reason: 'recovery_unavailable' }));

@@ -1,4 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
+import { createHash } from 'node:crypto';
 import path from "node:path";
 
 import {
@@ -1683,4 +1684,52 @@ export function readProviderReplacementMetadata(filePath, { now = Date.now(), ..
     return Object.freeze({ state: 'ready', control: Object.freeze(projectSqliteValue(control)),
       leases: Object.freeze(leases.map((lease) => Object.freeze(projectSqliteValue(lease)))), otherClient });
   });
+}
+
+// Producer-private durable projection. Runtime authority is deliberately absent.
+const OFFLINE_COLUMNS = Object.freeze({
+  games: [...GAME_COLUMNS_V1, ...GAME_PROVENANCE_COLUMNS, ...GAME_ARCHIVE_COLUMNS].map(([name]) => name),
+  game_plies: GAME_PLY_COLUMNS.map(([name]) => name),
+  game_archive_control: GAME_ARCHIVE_CONTROL_COLUMNS.map(([name]) => name),
+  api_safety_state: [...API_SAFETY_COLUMNS_V2, ...API_SAFETY_CHALLENGE_COLUMNS].map(([name]) => name),
+  challenge_attempts: CORE_TABLES.challenge_attempts.map(([name]) => name),
+  opponents: CORE_TABLES.opponents.map(([name]) => name),
+});
+const OFFLINE_ORDER = ['game_id', 'game_id,ply', 'id', 'authority_key', 'challenge_id', 'username'];
+function offlineAuthority(database) {
+  if (schemaVersion(database) !== CURRENT_SCHEMA_VERSION) throw Object.assign(new Error('Restore source schema unavailable'), { code: 'restore_unavailable' });
+  const leases = database.prepare('SELECT owner_id,pid,process_identity_json,heartbeat_at,expires_at,authority_key FROM api_client_leases ORDER BY authority_key LIMIT 65').all();
+  if (leases.length > 64) throw Object.assign(new Error('Restore lease bound'), { code: 'resource_limit' });
+  return projectSqliteValue({ control: database.prepare('SELECT * FROM provider_lifecycle_control WHERE id=1').get(), leases });
+}
+function offlineRows(database, visit, check) {
+  const digest = createHash('sha256'), counts = {}; let total = 0;
+  for (const [index, [table, columns]] of Object.entries(OFFLINE_COLUMNS).entries()) {
+    digest.update(`${table}\0`); counts[table] = 0;
+    for (const native of database.prepare(`SELECT ${columns.join(',')} FROM ${table} ORDER BY ${OFFLINE_ORDER[index]}`).iterate()) {
+      check(); if (++total > 10_000_000) throw Object.assign(new Error('Restore row bound'), { code: 'resource_limit' });
+      const row = projectSqliteValue(native);
+      if (table === 'opponents') row.online = 0;
+      digest.update(JSON.stringify(row)); digest.update('\n');
+      visit?.(table, columns, row); counts[table]++;
+    }
+  }
+  return { counts, projectionSha256: digest.digest('hex') };
+}
+export function copyOfflineWorkspaceRows(sourceFile, targetStorage, { check, validateAuthority }) {
+  return readProviderStorage(sourceFile, {}, database => {
+    const authority = offlineAuthority(database); validateAuthority(authority);
+    targetStorage.db.exec('BEGIN IMMEDIATE');
+    try {
+      targetStorage.db.exec('DELETE FROM game_archive_control; UPDATE scheduler_control SET paused=1 WHERE id=1');
+      const inserts = new Map(Object.entries(OFFLINE_COLUMNS).map(([table, columns]) => [table,
+        targetStorage.db.prepare(`INSERT INTO ${table}(${columns.join(',')}) VALUES(${columns.map(() => '?').join(',')})`)]));
+      const projection = offlineRows(database, (table, columns, row) => inserts.get(table).run(...columns.map(name => row[name])), check);
+      targetStorage.db.exec('COMMIT'); check();
+      return { authority, ...projection };
+    } catch (error) { if (targetStorage.db.isTransaction) targetStorage.db.exec('ROLLBACK'); throw error; }
+  });
+}
+export function inspectOfflineWorkspaceRows(file, check) {
+  return readProviderStorage(file, {}, database => ({ authority: offlineAuthority(database), ...offlineRows(database, null, check) }));
 }

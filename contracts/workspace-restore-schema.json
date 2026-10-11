@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "uci_arena_lichess_workspace_restore_v1",
+  "oneOf": [
+    {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema", "status", "completion", "games", "plies", "safetyRows", "challengeRows", "projectionSha256"],
+      "properties": {
+        "schema": {"const": "uci_arena_lichess_workspace_restore_v1"},
+        "status": {"const": "restored"}, "completion": {"const": "confirmed"},
+        "games": {"type": "integer", "minimum": 0, "maximum": 10000000},
+        "plies": {"type": "integer", "minimum": 0, "maximum": 10000000},
+        "safetyRows": {"type": "integer", "minimum": 0, "maximum": 10000000},
+        "challengeRows": {"type": "integer", "minimum": 0, "maximum": 10000000},
+        "projectionSha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      }
+    },
+    {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema", "status", "completion", "reason"],
+      "properties": {
+        "schema": {"const": "uci_arena_lichess_workspace_restore_v1"},
+        "status": {"enum": ["deferred", "failed"]},
+        "completion": {"enum": ["not_attempted", "unconfirmed", "confirmed"]},
+        "reason": {"enum": ["invalid_request", "startup_not_quiescent", "source_not_quiescent", "source_process_unverifiable", "source_changed", "destination_exists", "resource_limit", "cancelled_or_timeout", "restore_unavailable"]},
+        "cleanup": {"const": "cleanup_failed"}
+      }
+    }
+  ]
+}

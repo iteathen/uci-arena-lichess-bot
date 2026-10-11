@@ -11,12 +11,12 @@ const identity = (pid, start = `504911232000000${pid}`) => ({ schema: 'uci_arena
   platform: 'win32', pid, start_token: start, executable_path: 'C:\\fixture\\node.exe', boot_id: '' });
 const authority = 'https://lichess.org|fixture';
 
-test('additive service and operation 1.2 publish one closed maintenance response and packaged runtime', () => {
+test('additive service and operation 1.3 retain the closed maintenance response and packaged runtime', () => {
   const read = (file) => JSON.parse(readFileSync(path.join(import.meta.dirname, file), 'utf8'));
   const service = read('contracts/service-contract.json');
   const operations = read('contracts/manager-operations-schema.json');
-  assert.equal(service.service.contract_version, '1.2');
-  assert.equal(operations.version, '1.2');
+  assert.equal(service.service.contract_version, '1.3');
+  assert.equal(operations.version, '1.3');
   assert.deepEqual(operations.operations.maintenance_recover.arguments, ['maintenance', 'recover']);
   assert.equal(operations.operations.maintenance_recover.credential, 'external_file_path_only');
   assert.equal(operations.operations.maintenance_recover.response_schema, service.maintenance_recovery_schema);
