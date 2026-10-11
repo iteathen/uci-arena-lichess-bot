@@ -335,7 +335,9 @@ opponent_scheduler:
   randomization: weighted_random
   rules:
     - "Never challenge self, an offline/stale candidate, a cooled-down opponent, or an opponent at its daily game cap."
-    - "Create outbound challenges one request at a time, at least challenge_interval_seconds apart, until target_active is reserved by pending plus active bot slots. Version 8 requires a minimum configured spacing of 300 seconds; older configurations migrate upward instead of retaining an unsafe faster effective value."
+    - "Ordinary automatic outbound bot challenges are created one request at a time, at least challenge_interval_seconds apart, until target_active is reserved by pending plus active bot slots. Version 8 retains a minimum ordinary configured spacing of 300 seconds; older configurations migrate upward."
+    - "User-authorized terminal-invitation retry: an authoritative challengeDeclined or challengeCanceled event for a currently owned pending/preparing outbound bot invitation permits the next automatic bot invitation ten seconds after that event, once owned engine cleanup has completed. This replaces the ordinary spacing for that next invitation only; it does not change opponent cooldowns/daily caps, discovery eligibility, slot capacity, scheduler pause or global/challenge-create server backoff."
+    - "Unknown/duplicate/inbound/human terminal events, active games and timeout-driven cancelling slots grant no shortened retry. A new dispatched automatic bot invitation consumes the terminal retry and resumes ordinary spacing until another qualifying terminal event. Provider restart does not clear durable API or opponent cooldowns."
     - "Game move submission has highest request priority, but no request class bypasses an active HTTP 429 cooldown."
 
 storage:

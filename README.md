@@ -1,5 +1,11 @@
 # UCI Arena Lichess Bot
 
+After a confirmed decline or cancellation of an owned outgoing bot invitation,
+the next automatic invitation becomes eligible after ten seconds. The ordinary
+five-minute spacing remains for other attempts. Opponent cooldowns, capacity,
+scheduler pause and API backoff remain authoritative. Engine preparation can add
+time after eligibility; `bot_invitation_retry_scheduled` records the exact deadline.
+
 Standard engines advertising `TimingInitialTimeMs` receive the provider's known
 original control before startup readiness, then the exact `gameFull.clock.initial`
 at each genuine game boundary. Reused children bind that input after `ucinewgame`
