@@ -1,5 +1,11 @@
 # UCI Arena Lichess Bot
 
+Standard engines advertising `TimingInitialTimeMs` receive the provider's known
+original control before startup readiness, then the exact `gameFull.clock.initial`
+at each genuine game boundary. Reused children bind that input after `ucinewgame`
+and before `isready`; reconnects retain the admitted game. Remaining clocks never
+substitute for original control, and engine-owned timing policy remains unchanged.
+
 `startup status` includes `startup.replacementInterlock`: `ready` exposes only
 `admissionBlocked`, `owned`, and `activeWork`; missing storage is `unavailable`,
 and rejected storage is `failed` with a sanitized diagnostic. This read-only

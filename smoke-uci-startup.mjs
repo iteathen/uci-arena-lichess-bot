@@ -35,7 +35,10 @@ export async function smoke(options) {
   if (extended) applySingleGameProfile(config);
   const engine = new UciEngine(config.engine);
   try {
-    await engine.start();
+    await engine.start({
+      initialTimeMs: config.outbound_challenge.clock_limit * 1000,
+      incrementMs: config.outbound_challenge.clock_increment * 1000,
+    });
     if (extended && engine.timeProfileStatus?.accepted !== true) {
       throw new Error(
         `UCI Arena extended smoke rejected its timing profile: ${engine.timeProfileStatus?.reason ?? "unknown reason"}`,

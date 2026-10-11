@@ -3372,7 +3372,9 @@ function timingValidationOperations(profile, singleGameProfile) {
 
 export class UciEngine {
   constructor(config, telemetry = () => {}) {
-    this.config = config;
+    // A prewarmed child and each subsequent game own their applied options.
+    this.config = config.adapter === 'standard_uci_v1'
+      ? { ...config, uci_options: { ...config.uci_options } } : config;
     this.telemetry = telemetry;
     this.waiters = [];
     this.advertisedOptions = new Set();
@@ -3392,7 +3394,7 @@ export class UciEngine {
     );
   }
 
-  async start() {
+  async start(initialClockControl) {
     if (this.config.qualification_profile?.schema === CONTINUOUS_PROFILE_SCHEMA) {
       validateContinuousLaunchContext(this.config.qualification_profile.runtime_binding, this.config);
     }
@@ -3427,7 +3429,7 @@ export class UciEngine {
 
     await this.exchange("uci", (line) => line === "uciok", 30_000);
     if (this.config.qualification_profile?.schema === CONTINUOUS_PROFILE_SCHEMA) this.captureContinuousChildIdentity();
-    this.configureUciOptions();
+    this.configureUciOptions(initialClockControl);
     await this.exchange("isready", (line) => line === "readyok", 30_000);
     this.runtimeGeneration += 1;
     if (usesExtendedEngineAdapter({ engine: this.config })) {
@@ -3448,7 +3450,7 @@ export class UciEngine {
     if (this.qualificationStatus) this.qualificationStatus.time_profile = this.timeProfileStatus;
   }
 
-  configureUciOptions() {
+  configureUciOptions(initialClockControl) {
     const unknown = Object.keys(this.config.uci_options)
       .filter((name) => !this.advertisedOptions.has(name));
     if (unknown.length) throw new Error(`Configured UCI options are not advertised: ${unknown.join(", ")}`);
@@ -3468,6 +3470,7 @@ export class UciEngine {
           this.setOption("Ponder", true);
         }
       }
+      this.bindInitialClockControl(initialClockControl);
       return;
     }
     const requiredTimingOptions = [
@@ -3583,9 +3586,31 @@ export class UciEngine {
     return response;
   }
 
-  async newGame() {
+  validateInitialClockControl(control) {
+    if (this.config.adapter !== 'standard_uci_v1'
+        || !this.advertisedOptions.has('TimingInitialTimeMs')) return;
+    // Never infer an original control from a game's remaining wtime/btime.
+    if (!Number.isSafeInteger(control?.initialTimeMs) || control.initialTimeMs < 1
+        || control.initialTimeMs > 86_400_000 || !Number.isSafeInteger(control.incrementMs)
+        || control.incrementMs < 0 || control.incrementMs > 300_000) {
+      throw new Error('Actual initial game clock control is missing or invalid');
+    }
+    return Object.freeze({ initialTimeMs: control.initialTimeMs, incrementMs: control.incrementMs });
+  }
+
+  bindInitialClockControl(control) {
+    const admitted = this.validateInitialClockControl(control);
+    if (!admitted) return;
+    this.setOption('TimingInitialTimeMs', admitted.initialTimeMs);
+    this.config.uci_options.TimingInitialTimeMs = admitted.initialTimeMs;
+    this.boundInitialClockControl = admitted;
+  }
+
+  async newGame(initialClockControl = this.boundInitialClockControl) {
+    const admitted = this.validateInitialClockControl(initialClockControl);
     await this.stopAndDrain("new_game");
     this.send("ucinewgame");
+    this.bindInitialClockControl(admitted);
     await this.exchange("isready", (line) => line === "readyok", 30_000);
     this.runtimeGeneration += 1;
     // A genuine game boundary owns replacement. The new game's first admission establishes its own baseline.
@@ -5237,7 +5262,10 @@ export class GameSession {
       engineComponent: this.config.engine.component_identity ?? null,
     };
     try {
-      await this.engineOperation("new_game", () => engine.newGame());
+      await this.engineOperation("new_game", () => engine.newGame({
+        initialTimeMs: event.clock?.initial,
+        incrementMs: event.clock?.increment,
+      }));
     } catch (error) {
       if (!(error instanceof GameEngineError)) throw error;
       this.store.beginGame(gameMetadata);
@@ -6251,7 +6279,7 @@ export class BotController {
     }
   }
 
-  async prepareSlot(slot) {
+  async prepareSlot(slot, initialClockControl = outboundClockControl(this.config)) {
     const slotGeneration = slot.generation;
     let engine = null;
     try {
@@ -6261,7 +6289,7 @@ export class BotController {
           ...details,
         }));
         try {
-          await prepared.start();
+          await prepared.start(initialClockControl);
           return prepared;
         } catch (error) {
           await prepared.close();
@@ -6402,7 +6430,10 @@ export class BotController {
     }
     const slotGeneration = slot.generation;
     try {
-      await this.prepareSlot(slot);
+      await this.prepareSlot(slot, {
+        initialTimeMs: challenge.timeControl?.limit * 1000,
+        incrementMs: challenge.timeControl?.increment * 1000,
+      });
       await this.client.post(`${endpoint}/accept`, undefined, this.signal, undefined, () => {
         this.slots.requireOwned(slot, "preparing", slotGeneration);
         if (this.now() - receivedAt >= CHALLENGE_RESPONSE_MAX_AGE_MS) {
@@ -7732,12 +7763,18 @@ async function preflightQualifiedEngine(config) {
   return (await preflightQualifiedEngines(config, 1))[0];
 }
 
+function outboundClockControl(config) {
+  // Challenge configuration is expressed in seconds; gameFull clocks are ms.
+  return { initialTimeMs: config.outbound_challenge?.clock_limit * 1000,
+    incrementMs: config.outbound_challenge?.clock_increment * 1000 };
+}
+
 async function preflightQualifiedEngines(config, count) {
   const engines = Array.from({ length: count }, () => new UciEngine(config.engine));
   let primaryError;
   let startupRejected = false;
   try {
-    const outcomes = await Promise.allSettled(engines.map((engine) => engine.start()));
+    const outcomes = await Promise.allSettled(engines.map((engine) => engine.start(outboundClockControl(config))));
     const failure = outcomes.find((outcome) => outcome.status === "rejected");
     if (failure) throw failure.reason;
   } catch (error) {
