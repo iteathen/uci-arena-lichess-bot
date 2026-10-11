@@ -4,7 +4,7 @@
     "component_id": "lichess.adapter",
     "component_version": "1.0.44",
     "product_id": "uci_arena.lichess_bot",
-    "contract_version": "1.2",
+    "contract_version": "1.3",
     "transport": "cli_json",
     "entrypoint": "lichess-adapter.mjs"
   },
@@ -25,7 +25,8 @@
     "lichess.provider_games",
     "lichess.installed_qualification",
     "lichess.startup",
-    "lichess.maintenance_recovery"
+    "lichess.maintenance_recovery",
+    "lichess.offline_workspace_restore"
   ],
   "required_capabilities": [
     "uci.engine.process"
@@ -63,6 +64,7 @@
   "game_detail_schema": "contracts/game-detail-schema.json",
   "qualification_result_schema": "contracts/qualification-result-schema.json",
   "maintenance_recovery_schema": "contracts/maintenance-recovery-schema.json",
+  "workspace_restore_schema": "contracts/workspace-restore-schema.json",
   "error_contract": {
     "format": "bounded_typed_json",
     "secrets": "redacted",

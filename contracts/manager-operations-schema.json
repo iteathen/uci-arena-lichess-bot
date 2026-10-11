@@ -1,6 +1,6 @@
 {
   "schema": "uci_arena_lichess_manager_api_v1",
-  "version": "1.2",
+  "version": "1.3",
   "transport": {
     "kind": "cli_json",
     "entrypoint": "lichess-adapter.mjs",
@@ -9,6 +9,14 @@
     "shell": false
   },
   "operations": {
+    "workspace_restore": {
+      "arguments": ["workspace", "restore"],
+      "required_arguments": ["--source-workspace", "--runtime-dir"],
+      "optional_arguments": ["--maximum-milliseconds"],
+      "mutates": true, "credential": "forbidden",
+      "response": "uci_arena_lichess_workspace_restore_v1",
+      "response_schema": "contracts/workspace-restore-schema.json"
+    },
     "maintenance_recover": {
       "arguments": ["maintenance", "recover"],
       "required_arguments": ["--config", "--token-file", "--expected-account"],

@@ -23,6 +23,7 @@ const gamePage = readJson("contracts/game-page-schema.json");
 const gameDetail = readJson("contracts/game-detail-schema.json");
 const qualificationResult = readJson("contracts/qualification-result-schema.json");
 const maintenanceRecovery = readJson("contracts/maintenance-recovery-schema.json");
+const workspaceRestore = readJson('contracts/workspace-restore-schema.json');
 const template = readFileSync(path.join(root, "config.uci_arena.template.yml"), "utf8");
 const errors = [];
 const launchBindings = component.installation?.installer_integration?.dependency_bindings ?? [];
@@ -163,6 +164,7 @@ if (service.invocation?.kind !== "dependency_runtime"
   errors.push("service invocation runtime is incomplete or undeclared");
 }
 const requiredOperations = new Set([
+  "workspace_restore",
   "maintenance_recover",
   "account_probe", "config_get", "config_update", "owner_add", "owner_list",
   "owner_remove", "provider_status", "reservation_cancel", "reservation_create",
@@ -171,7 +173,7 @@ const requiredOperations = new Set([
   "game_get", "games_list", "incidents_list",
 ]);
 if (operations.schema !== "uci_arena_lichess_manager_api_v1"
-    || operations.version !== "1.2"
+    || operations.version !== "1.3"
     || [...requiredOperations].some((name) => !operations.operations?.[name])) {
   errors.push("Manager operation catalog is missing required operations");
 }
@@ -218,13 +220,18 @@ if (configurationUpdate.required?.[0] !== "settings"
 if (status.properties?.schema?.const !== "uci_arena_lichess_status_v5") {
   errors.push("status projection schema is incompatible");
 }
-if (service.service?.contract_version !== "1.2"
+if (service.service?.contract_version !== "1.3"
     || JSON.stringify(operations.operations?.incidents_list?.arguments)
       !== JSON.stringify(["incidents", "list"])
     || operations.operations?.incidents_list?.mutates !== false
     || operations.operations?.incidents_list?.credential !== "forbidden") {
   errors.push("provider incident operation boundary is incomplete");
 }
+if (workspaceRestore.$id !== 'uci_arena_lichess_workspace_restore_v1'
+    || service.workspace_restore_schema !== 'contracts/workspace-restore-schema.json'
+    || component.contracts?.workspace_restore !== service.workspace_restore_schema
+    || operations.operations?.workspace_restore?.response_schema !== service.workspace_restore_schema
+    || operations.operations?.workspace_restore?.credential !== 'forbidden') errors.push('offline workspace restore boundary is incomplete');
 if (service.incident_page_schema !== "contracts/incident-page-schema.json"
     || component.contracts?.incident_page !== service.incident_page_schema
     || operations.operations?.incidents_list?.response_schema !== service.incident_page_schema

@@ -38,6 +38,7 @@
       "provider_games",
       "installed_qualification",
       "maintenance_recovery",
+      "workspace_restore",
       "startup_install",
       "startup_recover",
       "startup_uninstall"
@@ -132,6 +133,7 @@
     "uninstall_preserves_user_data": true
   },
   "contracts": {
+    "workspace_restore": "contracts/workspace-restore-schema.json",
     "service": "contracts/service-contract.json",
     "configuration": "contracts/configuration-schema.json",
     "configuration_update": "contracts/configuration-update-schema.json",

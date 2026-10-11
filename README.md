@@ -9,6 +9,18 @@ Portable managed profiles resolve the explicit `TimingPolicyFile` and
 `TimingPolicySha256` pair through that component's exact file inventory, keeping
 the policy bytes and digest unchanged.
 
+After uninstalling startup, `workspace restore --source-workspace <old workspace>
+--runtime-dir <fresh workspace>` restores canonical archives and durable API,
+challenge and opponent backoff state offline. It requires quiescent startup,
+exact absence or reuse of prior process instances, and an absent destination
+database. Game provenance retains its original bytes and paths. Leases,
+lifecycle ownership, owners, reservations, runtime receipts and startup intents
+are excluded; the new scheduler is paused and opponent online presence is false.
+No engine, task or account request starts. The bounded response reports
+`restored` (exit 0), `deferred` (exit 2) or `failed` (exit 1); publication and cleanup
+uncertainty remain explicit. Existing source data is preserved. This operator
+operation does not register fresh startup or copy files outside the database.
+
 `startup status` includes `startup.replacementInterlock`: `ready` exposes only
 `admissionBlocked`, `owned`, and `activeWork`; missing storage is `unavailable`,
 and rejected storage is `failed` with a sanitized diagnostic. This read-only
