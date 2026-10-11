@@ -11,6 +11,29 @@ import { safePublicPath } from "./continuous-game-qualification.mjs";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const selectedHelper = process.env.UCI_ARENA_NATIVE_HELPER?.trim();
 
+test("declared portable payload imports the adapter without native-helper availability", { timeout: 15000 }, t => {
+  const staged = mkdtempSync(path.join(os.tmpdir(), "uci-bot-portable-closure-"));
+  t.after(() => rmSync(staged, { recursive: true, force: true }));
+  const definition = JSON.parse(readFileSync(path.join(here, "packaging/component-definition.json")));
+  for (const mapping of definition.include) {
+    const target = path.join(staged, mapping.target);
+    mkdirSync(path.dirname(target), { recursive: true });
+    cpSync(path.join(here, mapping.source), target, { recursive: true });
+  }
+  for (const name of ["background-service-runtime", "time-profile-contract"]) {
+    const target = path.join(staged, "node_modules", "@uci-arena", name);
+    mkdirSync(target, { recursive: true });
+    copyFileSync(path.join(here, "vendor", name, "package.json"), path.join(target, "package.json"));
+    cpSync(path.join(here, "vendor", name, "src"), path.join(target, "src"), { recursive: true });
+  }
+  cpSync(path.join(here, "node_modules", "chess.js"), path.join(staged, "node_modules", "chess.js"), { recursive: true });
+  const source = `const adapter=await import(${JSON.stringify(pathToFileURL(path.join(staged,"lichess-adapter.mjs")).href)}); process.stdout.write(JSON.stringify({main:typeof adapter.main,engine:typeof adapter.UciEngine}));`;
+  const result = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "--eval", source], {
+    cwd: staged, windowsHide: true, timeout: 10000, maxBuffer: 65536, encoding: "utf8",
+  }));
+  assert.deepEqual(result, { main: "function", engine: "function" });
+});
+
 test("declared component closure imports continuous adapters and captures a real child through the explicit public helper", {
   skip: process.platform === "win32" && !selectedHelper ? "explicit qualified native helper path was not supplied" : false,
   timeout: 15000,
