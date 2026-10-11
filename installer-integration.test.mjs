@@ -28,9 +28,10 @@ function managedStandardEngine(t) {
     state: 'conservative', enabled: true, uci_options: { Hash: 128 },
     expected_runtime: null, evidence: {}, knowledge: {}, diagnostics: [],
   };
+  const extraFiles = [];
   function publish() {
     writeFileSync(path.join(root, 'contracts', 'uci-engine-launch-profile.json'), JSON.stringify(profile));
-    const files = ['bin/node.exe', 'dist/uci.mjs', 'contracts/uci-engine-launch-profile.json'].map((relative) => {
+    const files = ['bin/node.exe', 'dist/uci.mjs', 'contracts/uci-engine-launch-profile.json', ...extraFiles].map((relative) => {
       const bytes = readFileSync(path.join(root, relative));
       return { path: relative, size_bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') };
     });
@@ -52,8 +53,51 @@ function managedStandardEngine(t) {
       default_engine_launch_manifest: path.join(root, 'arena-component.json'),
     }, locators: {},
   };
-  return { root, profile, publish, context };
+  return { root, profile, publish, context, extraFiles };
 }
+
+function pinnedPolicy(t) {
+  const fixture = managedStandardEngine(t);
+  const relative = 'contracts/timing-policy.json';
+  const bytes = 'Opaque producer-owned policy bytes, never parsed by the provider.';
+  writeFileSync(path.join(fixture.root, relative), bytes);
+  fixture.extraFiles.push(relative);
+  Object.assign(fixture.profile.uci_options, { RequireTimingPolicy: true,
+    TimingPolicyFile: relative, TimingPolicySha256: createHash('sha256').update(bytes).digest('hex') });
+  fixture.publish();
+  return fixture;
+}
+
+test('portable pinned timing artifact resolves through exact component inventory without interpreting its contents', t => {
+  const { root, profile, context } = pinnedPolicy(t);
+  const result = renderInstallerConfiguration(context);
+  assert.equal(result.configuration.engine.uci_options.TimingPolicyFile, path.join(root, 'contracts/timing-policy.json'));
+  assert.equal(result.configuration.engine.uci_options.TimingPolicySha256, profile.uci_options.TimingPolicySha256);
+  assert.equal(result.configuration.engine.uci_options.RequireTimingPolicy, true);
+  assert.equal(profile.uci_options.TimingPolicyFile, 'contracts/timing-policy.json');
+});
+
+for (const [name, mutate] of [
+  ['file without hash', options => { delete options.TimingPolicySha256; }],
+  ['hash without file', options => { delete options.TimingPolicyFile; }],
+  ['empty file', options => { options.TimingPolicyFile = ''; }],
+  ['escaping file', options => { options.TimingPolicyFile = '../policy.json'; }],
+  ['absolute file', options => { options.TimingPolicyFile = path.resolve('policy.json'); }],
+  ['unlisted file', options => { options.TimingPolicyFile = 'contracts/unlisted.json'; }],
+  ['wrong digest', options => { options.TimingPolicySha256 = '0'.repeat(64); }],
+]) {
+  test(`portable pinned timing artifact rejects ${name} before configuration publication`, t => {
+    const { profile, context, publish } = pinnedPolicy(t);
+    mutate(profile.uci_options); publish();
+    assert.throws(() => renderInstallerConfiguration(context), /timing|launch profile/i);
+  });
+}
+
+test('portable pinned timing artifact rejects changed inventoried policy bytes', t => {
+  const { root, context } = pinnedPolicy(t);
+  writeFileSync(path.join(root, 'contracts/timing-policy.json'), 'changed producer bytes');
+  assert.throws(() => renderInstallerConfiguration(context), /inventory/i);
+});
 
 test('installed standard engine launch uses its owned runtime and program without legacy model or profiles', (t) => {
   const { root, context } = managedStandardEngine(t);

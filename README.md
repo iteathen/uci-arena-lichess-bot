@@ -5,6 +5,9 @@ original control before startup readiness, then the exact `gameFull.clock.initia
 at each genuine game boundary. Reused children bind that input after `ucinewgame`
 and before `isready`; reconnects retain the admitted game. Remaining clocks never
 substitute for original control, and engine-owned timing policy remains unchanged.
+Portable managed profiles resolve the explicit `TimingPolicyFile` and
+`TimingPolicySha256` pair through that component's exact file inventory, keeping
+the policy bytes and digest unchanged.
 
 `startup status` includes `startup.replacementInterlock`: `ready` exposes only
 `admissionBlocked`, `owned`, and `activeWork`; missing storage is `unavailable`,
