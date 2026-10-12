@@ -3612,6 +3612,11 @@ export class UciEngine {
     const admitted = this.validateInitialClockControl(initialClockControl);
     await this.stopAndDrain("new_game");
     this.send("ucinewgame");
+    if (admitted) {
+      // Retirement can be asynchronous. Rebind startup-only clock inputs only
+      // after the prior game's authority has actually closed.
+      await this.exchange("isready", (line) => line === "readyok", 30_000);
+    }
     this.bindInitialClockControl(admitted);
     await this.exchange("isready", (line) => line === "readyok", 30_000);
     this.runtimeGeneration += 1;

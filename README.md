@@ -8,8 +8,9 @@ time after eligibility; `bot_invitation_retry_scheduled` records the exact deadl
 
 Standard engines advertising `TimingInitialTimeMs` receive the provider's known
 original control before startup readiness, then the exact `gameFull.clock.initial`
-at each genuine game boundary. Reused children bind that input after `ucinewgame`
-and before `isready`; reconnects retain the admitted game. Remaining clocks never
+at each genuine game boundary. Reused children send `ucinewgame` and wait for an
+`isready`/`readyok` retirement barrier before binding that input. A fresh `isready`
+then admits the new control; reconnects retain the admitted game. Remaining clocks never
 substitute for original control, and engine-owned timing policy remains unchanged.
 Portable managed profiles resolve the explicit `TimingPolicyFile` and
 `TimingPolicySha256` pair through that component's exact file inventory, keeping

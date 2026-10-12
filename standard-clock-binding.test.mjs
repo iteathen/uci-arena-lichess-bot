@@ -8,13 +8,13 @@ import { fileURLToPath } from 'node:url';
 import { UciEngine, GameSession, BotController } from './lichess-adapter.mjs';
 import { LichessStore } from './lichess-store.mjs';
 
-function clockEngine(t, initial = 0, advertised = true) {
+function clockEngine(t, initial = 0, advertised = true, retirementDelay = 0) {
   const root = mkdtempSync(path.join(os.tmpdir(), 'bot-clock-input-'));
   const program = path.join(root, 'uci.mjs'), transcript = path.join(root, 'transcript.txt');
   writeFileSync(program, `
 import { createInterface } from 'node:readline';
 import { appendFileSync } from 'node:fs';
-let initial = 0, gameActive = false;
+let initial = 0, gameActive = false, retirement = Promise.resolve();
 for await (const line of createInterface({ input: process.stdin })) {
   appendFileSync(${JSON.stringify(transcript)}, line + '\\n');
   if (line === 'uci') {
@@ -24,9 +24,12 @@ for await (const line of createInterface({ input: process.stdin })) {
   } else if (line.startsWith('setoption name TimingInitialTimeMs value ')) {
     if (gameActive) process.exit(4);
     initial = Number(line.split(' ').at(-1));
-  } else if (line === 'ucinewgame') gameActive = false;
+  } else if (line === 'ucinewgame') {
+    ${retirementDelay ? `retirement = new Promise(resolve => setTimeout(() => { gameActive = false; resolve(); }, ${retirementDelay}));` : 'gameActive = false;'}
+  }
   else if (line.startsWith('position ')) gameActive = true;
   else if (line === 'isready') {
+    await retirement;
     ${advertised ? "if (![180000,300000].includes(initial)) process.exit(3);" : ''}
     console.log('readyok');
   } else if (line.startsWith('go ')) console.log('bestmove e2e4');
@@ -58,8 +61,22 @@ test('reused child binds the next game initial control before its new game readi
   const before = commands().length;
   await engine.newGame({ initialTimeMs: 300000, incrementMs: 2000 });
   const sent = commands().slice(before);
-  assert.deepEqual(sent.slice(0, 3), ['ucinewgame', 'setoption name TimingInitialTimeMs value 300000', 'isready']);
+  assert.deepEqual(sent.slice(0, 4), ['ucinewgame', 'isready', 'setoption name TimingInitialTimeMs value 300000', 'isready']);
   assert.equal(config.uci_options.TimingInitialTimeMs, 180000);
+});
+
+test('clock rebinding waits for asynchronous prior-game retirement', async t => {
+  const { engine, commands } = clockEngine(t, 180000, true, 50);
+  await engine.start({ initialTimeMs: 180000, incrementMs: 0 });
+  engine.send('position startpos');
+  const before = commands().length;
+  await engine.newGame({ initialTimeMs: 300000, incrementMs: 2000 });
+  const sent = commands().slice(before);
+  const boundary = sent.indexOf('ucinewgame');
+  assert.deepEqual(sent.slice(boundary, boundary + 4), [
+    'ucinewgame', 'isready', 'setoption name TimingInitialTimeMs value 300000', 'isready',
+  ]);
+  assert.equal(engine.boundInitialClockControl.initialTimeMs, 300000);
 });
 
 test('missing actual game initial clock rejects the new game rather than inferring from remaining clock', async t => {

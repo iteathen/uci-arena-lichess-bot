@@ -1,6 +1,6 @@
 meta:
   spec_id: move_submission_timing_boundary_v1
-  version: 4
+  version: 5
   status: active
   owner: lichess_transport
   purpose: >
@@ -58,7 +58,7 @@ clock_handoff:
     - "Do not hide transport reserve inside a generic chess-value modifier; retain its transport meaning and measurement provenance."
     - "Transport reserve may constrain safely available time but cannot command search behavior."
     - "A standard engine advertising TimingInitialTimeMs receives the actual original clock control in milliseconds before readiness. Provider preflight and outbound preparation use the configured outbound clock_limit (seconds converted to milliseconds); inbound preparation uses the admitted challenge timeControl.limit. The gameFull clock.initial (already milliseconds) supersedes preparation authority at the genuine game boundary. Residual wtime/btime, profile evidence and policy contents never supply an original control. Missing, zero or malformed actual initial control fails closed for this advertised input."
-    - "Each standard child owns a private copy of applied UCI options. Between games the provider validates the actual original control, stops and drains search, sends ucinewgame to close prior game authority, binds TimingInitialTimeMs and then sends isready. An initialized gameFull reconnect never rebinds the admitted game. Unadvertised timing options are never sent. RequireTimingPolicy and policy path/digest remain opaque Engine-owned configuration; the provider neither changes nor weakens their qualification."
+    - "Each standard child owns a private copy of applied UCI options. Between games the provider validates the actual original control, stops and drains search, sends ucinewgame, and waits for an isready/readyok retirement barrier before rebinding an advertised startup-only TimingInitialTimeMs. A fresh isready then admits the new control. Sending ucinewgame alone does not establish that asynchronous prior game authority has closed. An initialized gameFull reconnect never rebinds the admitted game. Unadvertised timing options are never sent. RequireTimingPolicy and policy path/digest remain opaque Engine-owned configuration; the provider neither changes nor weakens their qualification."
 
 transport_reserve_is_not_delay:
   invariant: >
