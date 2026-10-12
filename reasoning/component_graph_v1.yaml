@@ -10,7 +10,7 @@ global_graph:
 imports:
   objectives: [G-O1, G-O2]
   mission: [G-M2]
-  premises: [G-P2, G-P3, G-P4, G-P5, G-P6, G-P10, G-P16, G-P17, G-P18, G-P20, G-P21, G-P24, G-P26]
+  premises: [G-P2, G-P3, G-P4, G-P5, G-P6, G-P10, G-P16, G-P17, G-P18, G-P20, G-P21, G-P24, G-P26, G-P28]
   targets: [G-T1, G-T3, G-T5, G-T6, G-T8, G-T9, G-T10, G-T14, G-T15]
 
 local_objectives:
@@ -144,6 +144,14 @@ implicit_assertions:
     derived_from: [L-P8, L-P2]
     confidence: 0.98
 
+  - id: L-A11
+    statement: >
+      Loopback API simulation can validate provider orchestration and transport contracts but
+      cannot establish real Lichess availability, latency distribution, opponent population,
+      or external playing strength.
+    derived_from: [G-P28, L-P6, L-P8]
+    confidence: 0.999
+
 implementation_targets:
   - {id: L-T1, name: exact_remote_game_reconstruction, supports: [L-O1, G-T1]}
   - {id: L-T2, name: legal_current_move_submission, supports: [L-O1, G-T1]}
@@ -164,8 +172,8 @@ target_derivations:
   L-T3: [L-O1, L-P2, L-P8, G-P21]
   L-T4: [L-O1, L-P7, L-P8, G-P20]
   L-T5: [L-O1, L-O2, L-P1, L-P7, G-P20]
-  L-T6: [L-O1, L-P3, L-P6, G-P24]
-  L-T7: [L-O1, L-P3, L-P6, G-P18, G-P26]
+  L-T6: [L-O1, L-P3, L-P6, G-P24, G-P28]
+  L-T7: [L-O1, L-P3, L-P6, G-P18, G-P26, G-P28]
   L-T8: [L-O1, L-P4, L-P6, L-P7, G-P6]
   L-T9: [L-O2, L-P5]
   L-T10: [L-O1, L-O2, L-P2, G-P5]
@@ -183,6 +191,7 @@ assertion_relevance:
   L-A8: [L-T6, L-T7]
   L-A9: [L-T1, L-T2, L-T8]
   L-A10: [L-T3, L-T4, L-T12]
+  L-A11: [L-T4, L-T6, L-T7, L-T12]
 
 dominance_relations:
   - {id: L-D1, stronger: L-T1, weaker: L-T11, context: convenience_conflicts_with_authoritative_remote_state, confidence: 0.999, consequence: critical}
