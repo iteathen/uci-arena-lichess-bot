@@ -74,9 +74,9 @@ premises:
     confidence: 0.995
   - id: L-P9
     statement: >
-      Platform-specific chess rules that materially differ from a local/default rule context
-      can change legal terminal outcomes and therefore must match the engine's admitted rule
-      semantics for a valid external game.
+      Platform-specific chess rules can materially differ from local/default rule contexts;
+      a disagreement with an engine's admitted rule semantics can change legal terminal
+      outcomes and invalidate the meaning of an external game result.
     confidence: 0.999
 
 premise_metadata:
