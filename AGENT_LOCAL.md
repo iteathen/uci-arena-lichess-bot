@@ -6,6 +6,16 @@ Universal engineering and design guidance comes from the account-global `AGENTS.
 
 UCI Arena Lichess Bot is the standalone Lichess provider product. It owns Lichess API transport, event/game streams, reconnect/recovery, challenge policy, game reconstruction/move submission, bot scheduling/capacity, account state, token-file access, bot telemetry, and provider packaging. It consumes a conforming UCI executable as an external process.
 
+## Decision reasoning
+
+Before a substantive architecture, design, implementation-selection, or cross-component
+decision, read `reasoning/component_graph_v1.yaml` and the canonical suite graph at
+`iteathen/uci-arena-installer/reasoning/suite_graph_v1.yaml`.
+
+Lichess is the suite's principal uncontrolled external-validation environment, but provider
+transport reasoning must not absorb engine chess semantics. Accepted Bot specs/contracts
+remain behavior authority; contradictions trigger review rather than silent override.
+
 ## Local routing
 
 Before substantive work run:
