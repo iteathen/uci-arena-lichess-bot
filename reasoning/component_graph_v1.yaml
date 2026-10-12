@@ -53,6 +53,31 @@ premises:
       Credentials are operator-owned secrets and have no role in engine or evidence semantics.
     confidence: 0.999
 
+  - id: L-P6
+    statement: >
+      The available Lichess opponent pool, ratings, engine versions, hardware, books, and
+      configurations are not stationary or randomly sampled; scheduler choices therefore
+      affect what external population the observed results describe.
+    confidence: 0.99
+  - id: L-P7
+    statement: >
+      Lichess rules, time controls, challenge state, rate limits, and API lifecycle are
+      externally imposed parts of the proving environment and must be retained as evidence
+      context rather than normalized into engine behavior.
+    confidence: 0.995
+  - id: L-P8
+    statement: >
+      Network, queue, request, and acknowledgement latency are stochastic provider-side costs
+      that share the physical chess clock but are semantically distinct from engine thinking
+      time.
+    confidence: 0.995
+  - id: L-P9
+    statement: >
+      Platform-specific chess rules that materially differ from a local/default rule context
+      can change legal terminal outcomes and therefore must match the engine's admitted rule
+      semantics for a valid external game.
+    confidence: 0.999
+
 implicit_assertions:
   - id: L-A1
     statement: >
@@ -86,6 +111,39 @@ implicit_assertions:
     derived_from: [G-P5, L-O1]
     confidence: 0.95
 
+  - id: L-A6
+    statement: >
+      Scheduler filters, rating targets, cooldowns, availability, and repeated-opponent limits
+      shape the sampled external population, so observed win rate generalizes only to that
+      admitted sampling process.
+    derived_from: [L-P6, G-P24]
+    confidence: 0.99
+  - id: L-A7
+    statement: >
+      A Lichess rating or win-rate change across calendar time can reflect opponent-pool,
+      platform, time-control, or configuration drift rather than an engine regression or gain.
+    derived_from: [L-P6, L-P7, G-P16]
+    confidence: 0.99
+  - id: L-A8
+    statement: >
+      Playing many games against one narrow or repeatedly selected opponent class can improve
+      precision without establishing broad external strength.
+    derived_from: [L-P6, G-P24]
+    confidence: 0.99
+  - id: L-A9
+    statement: >
+      If the engine and Lichess disagree about automatic draw or other platform rule semantics,
+      a legally transmitted move sequence can still yield invalid chess-strength evidence.
+    derived_from: [L-P9, G-P17]
+    confidence: 0.999
+  - id: L-A10
+    statement: >
+      A conservative transport reserve can protect against flagging while still wasting chess
+      opportunity if it materially exceeds the measured provider tail; transport safety and
+      engine thinking allocation therefore require separate evidence.
+    derived_from: [L-P8, L-P2]
+    confidence: 0.98
+
 implementation_targets:
   - {id: L-T1, name: exact_remote_game_reconstruction, supports: [L-O1, G-T1]}
   - {id: L-T2, name: legal_current_move_submission, supports: [L-O1, G-T1]}
@@ -99,6 +157,32 @@ implementation_targets:
   - {id: L-T10, name: engine_neutral_uci_process_hosting, supports: [L-O1, G-T5]}
   - {id: L-T11, name: usable_scheduler_capacity_and_operator_controls, supports: [L-O2, G-T7]}
   - {id: L-T12, name: separate_transport_health_from_engine_health, supports: [G-T4, G-T9]}
+
+target_derivations:
+  L-T1: [L-O1, L-P1, L-P7, L-P9]
+  L-T2: [L-O1, L-P1, L-P2, L-P9]
+  L-T3: [L-O1, L-P2, L-P8, G-P21]
+  L-T4: [L-O1, L-P7, L-P8, G-P20]
+  L-T5: [L-O1, L-O2, L-P1, L-P7, G-P20]
+  L-T6: [L-O1, L-P3, L-P6, G-P24]
+  L-T7: [L-O1, L-P3, L-P6, G-P18, G-P26]
+  L-T8: [L-O1, L-P4, L-P6, L-P7, G-P6]
+  L-T9: [L-O2, L-P5]
+  L-T10: [L-O1, L-O2, L-P2, G-P5]
+  L-T11: [L-O2, L-P6, L-P7]
+  L-T12: [L-O1, L-P4, L-P8, G-P20]
+
+assertion_relevance:
+  L-A1: [L-T3, L-T10]
+  L-A2: [L-T3, L-T4]
+  L-A3: [L-T7, L-T8, L-T12]
+  L-A4: [L-T7]
+  L-A5: [L-T6, L-T10]
+  L-A6: [L-T6, L-T7, L-T8]
+  L-A7: [L-T6, L-T7, L-T8, L-T12]
+  L-A8: [L-T6, L-T7]
+  L-A9: [L-T1, L-T2, L-T8]
+  L-A10: [L-T3, L-T4, L-T12]
 
 dominance_relations:
   - {id: L-D1, stronger: L-T1, weaker: L-T11, context: convenience_conflicts_with_authoritative_remote_state, confidence: 0.999, consequence: critical}
