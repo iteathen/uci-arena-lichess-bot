@@ -16,7 +16,7 @@ const authority = 'https://127.0.0.1|fixture';
 // The producer storage/race tests below run on every supported platform.
 const cliTest = process.platform === 'win32' ? test : test.skip;
 const identity = { schema: 'uci_arena_process_instance_identity_v1', platform: 'win32', pid: 4242,
-  start_token: '504911232000000001', executable_path: process.execPath, boot_id: '' };
+  start_token: '504911232000000001', executable_path: process.platform === 'win32' ? process.execPath : 'C:\\fixture\\node.exe', boot_id: '' };
 function fixture(t) {
   const folder = mkdtempSync(path.join(os.tmpdir(), 'bot-offline-restore-'));
   t.after(() => rmSync(folder, { recursive: true, force: true }));
