@@ -378,6 +378,7 @@ const REQUIRED_PROFILE_EVIDENCE = Object.freeze([
 ]);
 const CURRENT_CONFIG_SCHEMA = "uci_arena_lichess_adapter_v8";
 const MINIMUM_CHALLENGE_INTERVAL_SECONDS = 300;
+const TERMINAL_BOT_INVITATION_RETRY_MS = 10_000;
 const LEGACY_CONFIG_SCHEMAS = new Set([
   "uci_arena_lichess_adapter_v2",
   "uci_arena_lichess_adapter_v3",
@@ -6094,6 +6095,8 @@ export class BotController {
     });
     this.lastDiscoveryAt = 0;
     this.lastBotChallengeAt = 0;
+    this.botChallengeRetry = null;
+    this.botChallengeTerminalCleanups = 0;
     this.lastOwnerChallengeAt = 0;
     this.lastReconciliationAt = 0;
     this.needsReconciliation = false;
@@ -6477,13 +6480,34 @@ export class BotController {
     if (!challengeId) return;
     const slot = this.slots.findChallenge(challengeId);
     const declined = event.type === "challengeDeclined";
-    this.store.updateChallenge(challengeId, declined ? "declined" : "canceled", {
+    const retry = slot?.direction === "outbound" && slot.audience === "bot"
+      && ["pending", "preparing"].includes(slot.state)
+      ? { deadline: Math.max(this.botChallengeRetry?.deadline ?? 0,
+        this.now() + TERMINAL_BOT_INVITATION_RETRY_MS) } : null;
+    const priorRetry = this.botChallengeRetry;
+    if (retry) {
+      this.botChallengeRetry = retry;
+      this.botChallengeTerminalCleanups += 1;
+    }
+    let released = false;
+    try {
+      this.store.updateChallenge(challengeId, declined ? "declined" : "canceled", {
       cooldownMinutes: declined && slot?.audience === "bot"
         ? this.config.scheduler.decline_cooldown_minutes
         : 0,
     });
-    if (["pending", "cancelling", "preparing"].includes(slot?.state)) {
-      await this.releaseProviderSlot(slot, slot.generation);
+      if (["pending", "cancelling", "preparing"].includes(slot?.state)) {
+        released = await this.releaseProviderSlot(slot, slot.generation);
+        if (released && retry) log("bot_invitation_retry_scheduled", {
+          challenge_id: challengeId, status: declined ? "declined" : "canceled",
+          next_eligible_at: retry.deadline, wait_ms: TERMINAL_BOT_INVITATION_RETRY_MS,
+        });
+      }
+    } finally {
+      if (retry) {
+        this.botChallengeTerminalCleanups -= 1;
+        if (!released && this.botChallengeRetry === retry) this.botChallengeRetry = priorRetry;
+      }
     }
     log("challenge_terminal", { challenge_id: challengeId, status: declined ? "declined" : "canceled" });
   }
@@ -6700,8 +6724,7 @@ export class BotController {
     try {
       await this.prepareSlot(slot);
       const outbound = this.config.outbound_challenge;
-      if (audience === "bot") this.lastBotChallengeAt = Date.now();
-      else this.lastOwnerChallengeAt = Date.now();
+      if (audience !== "bot") this.lastOwnerChallengeAt = Date.now();
       const challenge = await this.client.postJson(`api/challenge/${encodeURIComponent(normalized)}`, {
         rated: outbound.rated,
         color: outbound.color,
@@ -6713,6 +6736,14 @@ export class BotController {
         this.slots.requireOwned(slot, "preparing", slotGeneration);
         if (!this.streamConnected || this.store.control().paused) {
           throw new StaleApiOperationError("challenge_create", "scheduler authority changed");
+        }
+        if (audience === "bot") {
+          if (this.botChallengeTerminalCleanups > 0
+              || (this.botChallengeRetry && this.now() < this.botChallengeRetry.deadline)) {
+            throw new StaleApiOperationError("challenge_create", "terminal invitation retry is not eligible");
+          }
+          this.botChallengeRetry = null;
+          this.lastBotChallengeAt = this.now();
         }
       });
       const challengeId = challenge.id ?? challenge.challenge?.id;
@@ -6920,7 +6951,10 @@ export class BotController {
         await this.discoverBots(now);
       }
       if (challengeCreationBlocked) return;
-      if (now - this.lastBotChallengeAt < this.config.scheduler.challenge_interval_seconds * 1_000) return;
+      if (this.botChallengeTerminalCleanups > 0) return;
+      const nextBotChallengeAt = this.botChallengeRetry?.deadline
+        ?? this.lastBotChallengeAt + this.config.scheduler.challenge_interval_seconds * 1_000;
+      if (now < nextBotChallengeAt) return;
       while (this.slots.occupied("bot") < this.config.capacity.bot.target_active
           && this.slots.available("bot") > 0) {
         const eligible = this.store.eligibleBots({
