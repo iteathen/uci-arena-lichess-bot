@@ -1,0 +1,125 @@
+schema: uci_arena_component_reasoning_graph_v1
+graph_id: uci_arena_lichess_bot
+version: 1
+status: initial_owner_directed
+component: uci_arena_lichess_bot
+global_graph:
+  repository: iteathen/uci-arena-installer
+  path: reasoning/suite_graph_v1.yaml
+
+imports:
+  objectives: [G-O1, G-O2]
+  mission: [G-M2]
+  premises: [G-P2, G-P3, G-P4, G-P5, G-P6, G-P10]
+  targets: [G-T1, G-T3, G-T5, G-T6, G-T8, G-T9, G-T10, G-T14, G-T15]
+
+local_objectives:
+  - id: L-O1
+    statement: >
+      Extend UCI Arena's proving ground into uncontrolled competitive play against independently
+      operated engines, including increasingly strong opposition.
+    derived_from: [G-O1, G-M2]
+    confidence: 0.999
+  - id: L-O2
+    statement: >
+      Make external engine testing reliable and manageable without changing the selected
+      engine's chess semantics.
+    derived_from: [G-O2, G-T5]
+    confidence: 0.99
+
+premises:
+  - id: L-P1
+    statement: >
+      Lichess stream state is authoritative for the remote game; local projections and UCI
+      work must reconcile to it before submitting a move.
+    confidence: 0.995
+  - id: L-P2
+    statement: >
+      The selected UCI engine owns chess move choice and chess-thinking timing; the provider
+      owns API transport, queueing, cooldown, remote-state validation, and acknowledgement.
+    confidence: 0.995
+  - id: L-P3
+    statement: >
+      Unknown opponents and configurations are a feature of external validation, not noise to
+      be designed away, although they limit causal interpretation.
+    confidence: 0.99
+  - id: L-P4
+    statement: >
+      Network and API failures can mimic engine failure unless transport evidence is retained
+      separately from engine evidence.
+    confidence: 0.97
+  - id: L-P5
+    statement: >
+      Credentials are operator-owned secrets and have no role in engine or evidence semantics.
+    confidence: 0.999
+
+implicit_assertions:
+  - id: L-A1
+    statement: >
+      A Bot that silently modifies engine thinking time changes the engine under test and
+      weakens the external-validation claim.
+    derived_from: [L-P2, G-P10]
+    confidence: 0.995
+  - id: L-A2
+    statement: >
+      Fixed post-bestmove delay or repeatedly restarting an already-active API cooldown wastes
+      clock without adding chess value or API compliance.
+    derived_from: [L-P2, G-O1]
+    confidence: 0.99
+  - id: L-A3
+    statement: >
+      External wins are strongest validation when exact engine/runtime identity, opponent,
+      control, and provider health are retained so transport accidents are not mistaken for
+      chess strength.
+    derived_from: [G-P3, G-P6, L-P4]
+    confidence: 0.97
+  - id: L-A4
+    statement: >
+      A final elite-engine benchmark requires repeated competitive evidence rather than a
+      memorable isolated win.
+    derived_from: [G-M2, G-T15]
+    confidence: 0.97
+  - id: L-A5
+    statement: >
+      Preserving a broad, engine-neutral standard-UCI path increases the external proving
+      ground's usefulness beyond the suite's default engine.
+    derived_from: [G-P5, L-O1]
+    confidence: 0.95
+
+implementation_targets:
+  - {id: L-T1, name: exact_remote_game_reconstruction, supports: [L-O1, G-T1]}
+  - {id: L-T2, name: legal_current_move_submission, supports: [L-O1, G-T1]}
+  - {id: L-T3, name: correct_clock_and_timing_handoff_without_chess_policy, supports: [L-O1, G-T6]}
+  - {id: L-T4, name: api_serialization_cooldown_and_remaining_wait_correctness, supports: [L-O1, G-T8]}
+  - {id: L-T5, name: reconnect_and_game_recovery, supports: [L-O1, L-O2, G-T8]}
+  - {id: L-T6, name: diverse_unknown_opponent_competition, supports: [L-O1, G-T3]}
+  - {id: L-T7, name: path_to_repeated_elite_external_opposition, supports: [L-O1, G-T15]}
+  - {id: L-T8, name: canonical_external_game_archive_and_provenance, supports: [G-T3, G-T4, G-T9]}
+  - {id: L-T9, name: secure_credential_boundary, supports: [L-O2, G-T14]}
+  - {id: L-T10, name: engine_neutral_uci_process_hosting, supports: [L-O1, G-T5]}
+  - {id: L-T11, name: usable_scheduler_capacity_and_operator_controls, supports: [L-O2, G-T7]}
+  - {id: L-T12, name: separate_transport_health_from_engine_health, supports: [G-T4, G-T9]}
+
+dominance_relations:
+  - {id: L-D1, stronger: L-T1, weaker: L-T11, context: convenience_conflicts_with_authoritative_remote_state, confidence: 0.999, consequence: critical}
+  - {id: L-D2, stronger: L-T3, weaker: L-T11, context: provider_convenience_would_reinterpret_engine_chess_timing, confidence: 0.995, consequence: major}
+  - {id: L-D3, stronger: L-T9, weaker: L-T11, context: convenience_would_expose_or_internalize_credentials, confidence: 0.999, consequence: critical}
+  - {id: L-D4, stronger: L-T4, weaker: L-T7, context: stronger_opponent_access_would_violate_actual_api_cooldown_or_serialization, confidence: 0.999, consequence: critical}
+  - {id: L-D5, stronger: L-T12, weaker: L-T8, context: archive_or_reporting_would_conflate_transport_fault_with_engine_chess_failure, confidence: 0.96, consequence: major}
+
+importance_relations:
+  - {id: L-I1, more_important: L-T7, less_important: L-T6, context: mature_engine_terminal_external_validation, confidence: 0.89}
+  - {id: L-I2, more_important: L-T6, less_important: L-T7, context: broad_generalization_before_elite_claim, confidence: 0.88}
+  - {id: L-I3, more_important: L-T5, less_important: L-T8, context: active_game_transport_failure, confidence: 0.94}
+  - {id: L-I4, more_important: L-T8, less_important: L-T11, context: investigating_unexpected_external_strength_or_regression, confidence: 0.9}
+
+exports:
+  - id: L-X1
+    statement: authoritative external game clocks state result opponent and transport outcome
+    supports_global: [G-T3, G-T4, G-T15]
+  - id: L-X2
+    statement: provider transport reserve and API constraints without chess timing reinterpretation
+    supports_global: [G-T1, G-T6]
+  - id: L-X3
+    statement: immutable external game evidence eligible only through explicit later evidence admission
+    supports_global: [G-T4, G-T13]
