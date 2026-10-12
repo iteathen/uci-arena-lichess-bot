@@ -31,8 +31,8 @@ local_objectives:
 premises:
   - id: L-P1
     statement: >
-      Lichess stream state is authoritative for the remote game; local projections and UCI
-      work must reconcile to it before submitting a move.
+      Lichess stream state is authoritative for the remote game; stale or divergent local
+      projections and UCI work can otherwise cause invalid move submission.
     confidence: 0.995
   - id: L-P2
     statement: >
