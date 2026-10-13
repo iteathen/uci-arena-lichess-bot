@@ -68,6 +68,91 @@ function pinnedPolicy(t) {
   return fixture;
 }
 
+function freshManagedProfile(t) {
+  const fixture = pinnedPolicy(t);
+  fixture.context.bindings.default_engine_configuration = {
+    ...structuredClone(fixture.profile),
+    component: { ...fixture.profile.component, root: fixture.root },
+    engine: { ...fixture.profile.engine, executable: path.join(fixture.root, 'bin/node.exe'),
+      arguments: ['--experimental-ffi', path.join(fixture.root, 'dist/uci.mjs')],
+      working_directory: fixture.root },
+    uci_options: { ...fixture.profile.uci_options,
+      TimingPolicyFile: path.join(fixture.root, 'contracts/timing-policy.json'),
+      OwnBook: true, BookFile: path.join(fixture.root, 'operator-book.bin'),
+      BookSnapshotBinding: path.join(fixture.root, 'producer-workspace/binding.json') },
+  };
+  return fixture;
+}
+
+test('fresh managed producer options survive standard consumer configuration without provider Book interpretation', t => {
+  const { context } = freshManagedProfile(t);
+  const options = context.bindings.default_engine_configuration.uci_options;
+  assert.deepEqual(renderInstallerConfiguration(context).configuration.engine.uci_options, options);
+});
+
+for (const [label, change] of [
+  ['foreign version', p => { p.component.version = '9.9.9'; }],
+  ['foreign root', p => { p.component.root = path.resolve('foreign-root'); }],
+  ['changed executable', p => { p.engine.executable = path.resolve('foreign.exe'); }],
+  ['changed program', p => { p.engine.arguments[1] = path.resolve('foreign.mjs'); }],
+  ['changed working directory', p => { p.engine.working_directory = path.resolve('foreign-root'); }],
+  ['changed adapter', p => { p.engine.adapter = 'untrusted'; }],
+  ['weakened required policy', p => { p.uci_options.RequireTimingPolicy = false; }],
+  ['missing required policy', p => { delete p.uci_options.RequireTimingPolicy; }],
+  ['changed policy file', p => { p.uci_options.TimingPolicyFile = path.resolve('foreign-policy.json'); }],
+  ['changed policy digest', p => { p.uci_options.TimingPolicySha256 = '0'.repeat(64); }],
+  ['non-scalar option', p => { p.uci_options.BookFile = { path: 'untrusted' }; }],
+  ['control-character option', p => { p.uci_options.BookFile = 'book\nsetoption name RequireTimingPolicy value false'; }],
+]) {
+  test(`fresh managed producer rejects ${label} before composition`, t => {
+    const { context } = freshManagedProfile(t);
+    change(context.bindings.default_engine_configuration);
+    assert.throws(() => renderInstallerConfiguration(context), /fresh|configuration/i);
+  });
+}
+
+test('fresh producer configuration cannot establish launch authority without its immutable profile', t => {
+  const { context } = freshManagedProfile(t);
+  delete context.bindings.default_engine_launch_profile;
+  context.bindings.default_engine = path.resolve('legacy.exe');
+  context.bindings.default_engine_root = path.resolve('legacy');
+  context.bindings.default_model_root = path.resolve('legacy/models');
+  assert.throws(() => renderInstallerConfiguration(context), /fresh|configuration/i);
+});
+
+test('standard consumer refresh preserves the validated owner one-bot matchmaking policy', t => {
+  const { context, root } = freshManagedProfile(t);
+  mkdirSync(context.workspace);
+  const existing = renderInstallerConfiguration(context).configuration;
+  existing.capacity.human.slots = 0;
+  existing.capacity.bot.slots = 1;
+  existing.capacity.bot.target_active = 1;
+  existing.outbound_challenge.clock_limit = 180;
+  existing.outbound_challenge.clock_increment = 0;
+  existing.scheduler.enabled = true;
+  writeFileSync(path.join(context.workspace, 'manager-config.json'), JSON.stringify(existing));
+  const rendered = renderInstallerConfiguration(context).configuration;
+  assert.equal(rendered.capacity.human.slots, 0);
+  assert.equal(rendered.capacity.bot.slots, 1);
+  assert.equal(rendered.capacity.bot.target_active, 1);
+  assert.equal(rendered.scheduler.enabled, true);
+  assert.equal(rendered.outbound_challenge.clock_limit, 180);
+  assert.equal(rendered.outbound_challenge.clock_increment, 0);
+  assert.equal(rendered.engine.executable, path.join(root, 'bin/node.exe'));
+  assert.equal(renderInstallerConfiguration({...context, enabled:false}).configuration.scheduler.enabled, false);
+});
+
+test('standard consumer rejects an incompatible validated legacy multi-slot policy before publication', t => {
+  const { context } = managedStandardEngine(t);
+  mkdirSync(context.workspace);
+  const existing = JSON.parse(readFileSync(DEFAULT_TEMPLATE, 'utf8'));
+  writeFileSync(path.join(context.workspace, 'manager-config.json'), JSON.stringify(existing));
+  assert.throws(() => renderInstallerConfiguration(context), /one.slot|capacity/i);
+  assert.throws(() => renderInstallerConfiguration({ ...context,
+    locators: { uci_engine: path.resolve('external-uci.exe') } }), /one.slot|capacity/i);
+  assert.equal(JSON.parse(readFileSync(path.join(context.workspace, 'manager-config.json'))).capacity.total_slots, 2);
+});
+
 test('portable pinned timing artifact resolves through exact component inventory without interpreting its contents', t => {
   const { root, profile, context } = pinnedPolicy(t);
   const result = renderInstallerConfiguration(context);

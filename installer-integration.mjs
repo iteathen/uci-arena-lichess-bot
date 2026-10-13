@@ -121,6 +121,18 @@ function preserveManagerOptions(configuration, workspace, engineRoot) {
   return applyManagerOptionsPatch(configuration, editableManagerOptionsProjection(current));
 }
 
+function scalarUciOptions(options, label) {
+  requireObject(options, label);
+  if (Object.keys(options).length > 128 || Object.entries(options).some(([name, value]) =>
+    !/^[A-Za-z0-9_ -]{1,128}$/u.test(name)
+    || !['string', 'number', 'boolean'].includes(typeof value)
+    || (typeof value === 'number' && !Number.isFinite(value))
+    || Buffer.byteLength(String(value), 'utf8') > 4096 || /[\u0000\r\n]/u.test(String(value)))) {
+    throw new Error(`${label} are invalid`);
+  }
+  return { ...options };
+}
+
 function portableStandardLaunch(bindings) {
   const profilePath = optionalAbsolutePath(bindings.default_engine_launch_profile, 'launch profile binding');
   if (profilePath === undefined) return undefined;
@@ -188,14 +200,7 @@ function portableStandardLaunch(bindings) {
     throw new Error('launch profile executable is not a declared component entrypoint');
   }
   const program = ownedFile(argumentsList[offset]).absolute;
-  const options = requireObject(profile.uci_options, 'launch profile UCI options');
-  if (Object.keys(options).length > 128 || Object.entries(options).some(([name, value]) =>
-    !/^[A-Za-z0-9_ -]{1,128}$/u.test(name)
-    || !['string', 'number', 'boolean'].includes(typeof value)
-    || (typeof value === 'number' && !Number.isFinite(value))
-    || Buffer.byteLength(String(value), 'utf8') > 4096 || /[\u0000\r\n]/u.test(String(value)))) {
-    throw new Error('launch profile UCI options are invalid');
-  }
+  const options = scalarUciOptions(profile.uci_options, 'launch profile UCI options');
   const resolvedOptions = { ...options };
   if (Object.hasOwn(options, 'TimingPolicyFile') || Object.hasOwn(options, 'TimingPolicySha256')) {
     // This explicit pair names an opaque pinned artifact, not arbitrary scalar
@@ -214,7 +219,37 @@ function portableStandardLaunch(bindings) {
   return {
     executable, arguments: [...argumentsList.slice(0, offset), program],
     working_directory: root, uci_options: resolvedOptions, component_manifest: manifestPath,
+    component: { id: manifest.component_id, version: manifest.component_version, root },
   };
+}
+
+function freshStandardLaunch(bindings, immutableLaunch) {
+  if (bindings.default_engine_configuration === undefined) return immutableLaunch;
+  if (!immutableLaunch) throw new Error('fresh configuration requires its immutable launch profile');
+  const profile = requireObject(bindings.default_engine_configuration, 'fresh engine configuration');
+  const samePath = (actual, expected) => typeof actual === 'string' && path.isAbsolute(actual)
+    && path.normalize(actual) === path.normalize(expected);
+  if (profile.schema !== 'arena_uci_engine_launch_profile_v1' || profile.schema_version !== 1
+      || profile.component?.id !== immutableLaunch.component.id
+      || profile.component?.version !== immutableLaunch.component.version
+      || !samePath(profile.component?.root, immutableLaunch.component.root)
+      || profile.engine?.adapter !== 'standard_uci_v1'
+      || !samePath(profile.engine?.executable, immutableLaunch.executable)
+      || !samePath(profile.engine?.working_directory, immutableLaunch.working_directory)
+      || JSON.stringify(profile.engine?.arguments) !== JSON.stringify(immutableLaunch.arguments)
+      || profile.state !== 'conservative' || profile.enabled !== true || profile.expected_runtime !== null) {
+    throw new Error('fresh engine configuration differs from immutable launch authority');
+  }
+  const options = scalarUciOptions(profile.uci_options, 'fresh configuration UCI options');
+  for (const key of ['RequireTimingPolicy', 'TimingPolicyFile', 'TimingPolicySha256']) {
+    if (Object.hasOwn(options, key) !== Object.hasOwn(immutableLaunch.uci_options, key)
+        || options[key] !== immutableLaunch.uci_options[key]) {
+      throw new Error('fresh configuration differs from immutable pinned timing authority');
+    }
+  }
+  // Producer owns every remaining option and generated knowledge binding. The
+  // provider forwards bounded scalar inputs without inventing Book semantics.
+  return { ...immutableLaunch, uci_options: options };
 }
 
 export function renderInstallerConfiguration(context) {
@@ -232,7 +267,8 @@ export function renderInstallerConfiguration(context) {
     label: 'Default Lichess configuration template',
   }).value;
   const importedEngine = optionalAbsolutePath(locators.uci_engine, 'locators.uci_engine');
-  const standardLaunch = importedEngine ? undefined : portableStandardLaunch(bindings);
+  const standardLaunch = importedEngine ? undefined
+    : freshStandardLaunch(bindings, portableStandardLaunch(bindings));
   const defaultEngine = optionalAbsolutePath(bindings.default_engine, 'bindings.default_engine');
   const engine = importedEngine ?? standardLaunch?.executable ?? defaultEngine;
   if (!engine) throw new Error('no conforming UCI engine binding is available');
@@ -240,8 +276,6 @@ export function renderInstallerConfiguration(context) {
     bindings.default_engine_root,
     'bindings.default_engine_root',
   ) ?? path.dirname(engine);
-  configuration = preserveManagerOptions(configuration, workspace, policyEngineRoot);
-
   if (importedEngine || standardLaunch) {
     configuration.engine.adapter = 'standard_uci_v1';
     configuration.engine.executable = engine;
@@ -262,7 +296,12 @@ export function renderInstallerConfiguration(context) {
     delete configuration.capacity.capacity_profile;
     configuration.timing.opponent_turn_search = false;
     delete configuration.qualification;
+    configuration = preserveManagerOptions(configuration, workspace, policyEngineRoot);
+    if (configuration.capacity.total_slots !== 1 || configuration.capacity.startup_parallelism !== 1) {
+      throw new Error('standard UCI configuration requires a compatible one-slot capacity policy');
+    }
   } else {
+    configuration = preserveManagerOptions(configuration, workspace, policyEngineRoot);
     const engineRoot = requireAbsolutePath(bindings.default_engine_root, 'bindings.default_engine_root');
     const engineManifest = optionalAbsolutePath(
       bindings.default_engine_manifest,
