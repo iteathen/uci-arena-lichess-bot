@@ -6318,7 +6318,23 @@ export class BotController {
     const reconciliationWork = this.beginProviderWork();
     try {
       const playing = await this.client.json("api/account/playing?nb=50", { signal: this.signal });
-      const games = playing.nowPlaying ?? [];
+      let games;
+      try {
+        if (!playing || typeof playing !== 'object' || Array.isArray(playing)
+            || !Array.isArray(playing.nowPlaying) || playing.nowPlaying.length > 50
+            || !Number.isSafeInteger(playing.nbMyTurn) || playing.nbMyTurn < 0
+            || (playing.nowPlaying.length === 0 && playing.nbMyTurn !== 0)) throw new Error();
+        const identities = new Set();
+        for (const game of playing.nowPlaying) {
+          if (!game || typeof game !== 'object' || Array.isArray(game)) throw new Error();
+          const identity = normalizeProviderGameId(game.gameId);
+          if (identities.has(identity)) throw new Error();
+          identities.add(identity);
+        }
+        games = playing.nowPlaying;
+      } catch {
+        throw new Error('Lichess ongoing-game response is malformed');
+      }
       let recovered = 0;
       await Promise.all(games.map(async (game) => {
         const gameId = String(game.gameId ?? game.id ?? "");
@@ -6396,6 +6412,7 @@ export class BotController {
     const receivedAt = this.now();
     const audience = String(challenge.challenger?.title ?? "").toUpperCase() === "BOT" ? "bot" : "human";
     let reason = challengeDeclineReason(challenge, this.config.challenges, 0);
+    if (!reason && this.store.control().paused) reason = "later";
     if (!reason && this.client.isCoolingDown?.()) reason = "later";
     const owner = audience === "human" && this.store.isOwner(opponent);
     if (!reason && audience === "human" && !owner && !this.config.capacity.human.accept_public) reason = "later";
@@ -6445,6 +6462,9 @@ export class BotController {
       });
       await this.client.post(`${endpoint}/accept`, undefined, this.signal, undefined, () => {
         this.slots.requireOwned(slot, "preparing", slotGeneration);
+        if (this.store.control().paused) {
+          throw new StaleApiOperationError("accept", "provider admission is paused");
+        }
         if (this.now() - receivedAt >= CHALLENGE_RESPONSE_MAX_AGE_MS) {
           throw new StaleApiOperationError("accept", "challenge response window expired");
         }

@@ -1407,6 +1407,9 @@ manager_account_and_options_contract_2026_07_31:
       - "Missing, malformed, unqualified, identity-mismatched, or undersized capacity evidence rejects a capacity change."
       - "Adding rated games to either the inbound challenge modes or the outbound challenge policy requires the rated-play confirmation; enabling automatic outbound challenges requires its distinct confirmation value. A generic save action is insufficient."
   account_controls:
+    admission_rules:
+      - "Durable scheduler pause prevents new inbound acceptance as well as outbound challenge creation. An inbound event checks pause before engine preparation and an accept rechecks pause at serialized API dispatch. A pause arriving while preparation or queueing is in progress releases the exact prepared slot and child without accepting the challenge. Existing remote games continue to reconcile and play while paused."
+      - "Normal current-game reconciliation requires the API's complete nowPlaying array and nonnegative exact nbMyTurn count; an empty array requires count zero. Every game has a valid unique provider game identity. Missing, malformed or contradictory responses leave reconciliation pending and cannot establish readiness or replacement quiescence."
     operations:
       - owner_list
       - owner_add

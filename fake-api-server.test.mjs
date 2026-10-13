@@ -346,6 +346,7 @@ test("loopback API server simulates NDJSON, challenges, and move submission", as
   try {
     assert.deepEqual(await client.json("api/account/playing"), {
       nowPlaying: [],
+      nbMyTurn: 0,
     });
     assert.equal(
       (await client.json("api/user/FixtureOpponent")).username,
