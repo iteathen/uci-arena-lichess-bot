@@ -132,7 +132,8 @@ export async function startFakeLichessApi({
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/account/playing") {
-        jsonResponse(response, 200, { nowPlaying: state.playing });
+        jsonResponse(response, 200, { nowPlaying: state.playing,
+          nbMyTurn: state.playing.filter(game => game.isMyTurn === true).length });
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/bot/online") {

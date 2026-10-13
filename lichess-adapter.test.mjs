@@ -5135,6 +5135,7 @@ test("restart recovery prefers canonical opponent id over a title-prefixed displ
     json: async (endpoint) => {
       requestedEndpoint = endpoint;
       return {
+        nbMyTurn: 0,
         nowPlaying: [{
           gameId: "game",
           opponent: { id: "usunfish", username: "BOT uSunfish" },
@@ -5213,7 +5214,7 @@ test("initial reconciliation failure remains supervised and retries before strea
     json: async () => {
       recoveryCalls += 1;
       if (recoveryCalls === 1) throw new Error("temporary startup API failure");
-      return { nowPlaying: [] };
+      return { nowPlaying: [], nbMyTurn: 0 };
     },
     openStream: async () => ({
       async *[Symbol.asyncIterator]() {
@@ -5362,7 +5363,7 @@ test("permanent timeout cancellation failure retains the slot and faults outboun
       post: async (endpoint) => {
         throw new LichessHttpError("POST", endpoint, 400);
       },
-      json: async () => ({ nowPlaying: [] }),
+      json: async () => ({ nowPlaying: [], nbMyTurn: 0 }),
     },
     config: {
       capacity: {
@@ -5422,7 +5423,7 @@ test("timeout cancellation 404 reconciles once then releases after the late-even
         posts += 1;
         throw new LichessHttpError("POST", endpoint, 404);
       },
-      json: async () => ({ nowPlaying: [] }),
+      json: async () => ({ nowPlaying: [], nbMyTurn: 0 }),
     },
     config: {
       capacity: {
