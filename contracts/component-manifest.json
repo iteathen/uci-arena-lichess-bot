@@ -3,7 +3,7 @@
   "component": {
     "id": "lichess.adapter",
     "product_id": "uci_arena.lichess_bot",
-    "version": "1.0.47",
+    "version": "1.0.48",
     "repository": "iteathen/uci-arena-lichess-bot"
   },
   "runtime": {
@@ -64,6 +64,7 @@
       "workspace_name": "lichess-adapter",
       "configure_when_disabled": true,
       "dependency_bindings": [
+        {"name": "default_engine_configuration", "component_id": "uci_arena.vector", "source": "configuration", "required": false},
         {"name": "default_engine_launch_profile", "component_id": "uci_arena.vector", "source": "entrypoint", "entrypoint": "uci_launch_profile", "required": false},
         {"name": "default_engine_launch_manifest", "component_id": "uci_arena.vector", "source": "component_path", "path": "arena-component.json", "required": false},
         {"name": "default_engine", "component_id": "uci_arena.engine", "source": "entrypoint", "entrypoint": "uci", "required": false},
